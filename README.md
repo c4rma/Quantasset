@@ -170,6 +170,64 @@ both brokers — not an estimate.
 
 ---
 
+## Running `copycat` from Anywhere
+
+By default you need to navigate to the folder and type `python copycat.py ...`.
+Follow the steps below for your platform to shorten this to just `copycat ...`
+from any directory.
+
+### Windows
+
+**1. Create a scripts folder** (if you don't have one):
+```
+mkdir C:\scripts
+```
+
+**2. Create `C:\scripts\copycat.bat`** with this content:
+```batch
+@echo off
+python C:\path\to\your\copycat\copycat.py %*
+```
+Replace `C:\path\to\your\copycat` with the actual path to your folder.
+
+**3. Add `C:\scripts` to your PATH:**
+- Search **"environment variables"** in the Windows start menu
+- Click **Environment Variables**
+- Under **System Variables**, select **Path** → **Edit** → **New**
+- Add `C:\scripts` and click OK
+- Open a new terminal — `copycat balance` should now work from anywhere
+
+---
+
+### Termux
+
+**Option 1 — Alias (simpler):**
+
+Find your copycat folder path first:
+```bash
+cd /path/to/copycat && pwd
+```
+
+Then add the alias to your shell config:
+```bash
+echo "alias copycat='python /path/to/your/copycat/copycat.py'" >> ~/.bashrc
+source ~/.bashrc
+```
+
+**Option 2 — Shell script (more permanent, survives reboots):**
+```bash
+cat > $PREFIX/bin/copycat << 'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+exec python /path/to/your/copycat/copycat.py "$@"
+EOF
+chmod +x $PREFIX/bin/copycat
+```
+
+Replace `/path/to/your/copycat` with your actual path in both options.
+After either approach, `copycat balance` works from any directory.
+
+---
+
 ## Usage
 
 ```

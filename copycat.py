@@ -672,30 +672,14 @@ async def cmd_balance():
         avail = round(bal - used, 4)
         bonus = float(acc.get('bonusBalanceRv') or 0)
 
-        # Today's closed PnL — sum REALIZED_PNL entries from wallet history
+        # Today's closed PnL — sum curTermRealisedPnlRv across all positions
         closed_pnl = 0.0
         try:
-            day_start_ms = int(datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-            hist = await phemex_request('GET', '/g-accounts/accountPositionHistory',
-                                        params={'currency': 'USDT',
-                                                'limit':    '50',
-                                                'start':    str(day_start_ms)})
-            for entry in (hist.get('data', {}).get('rows', []) or []):
-                if entry.get('transactTypeEn') == 'RealisedPnl':
-                    closed_pnl += float(entry.get('amountRv') or 0)
+            for p in (data.get('data', {}).get('positions', []) or []):
+                if p.get('symbol') == PHEMEX_SYMBOL:
+                    closed_pnl += float(p.get('curTermRealisedPnlRv') or 0)
         except Exception:
-            # Fallback: try the wallet transactions endpoint
-            try:
-                wallet = await phemex_request('GET', '/api-data/g/assets/walletTransactions',
-                                              params={'currency': 'USDT',
-                                                      'limit':    '50',
-                                                      'start':    str(day_start_ms)})
-                for entry in (wallet.get('data', {}).get('rows', []) or []):
-                    if entry.get('typeDesc') == 'REALIZED_PNL':
-                        closed_pnl += float(entry.get('amountRv') or 0)
-            except Exception:
-                pass
+            pass
 
         # Open PnL — sum unrealized PnL across open positions
         open_pnl = 0.0

@@ -1,135 +1,263 @@
-# Blackjack Trade Copier
+# Copycat — Blackjack Trade Copier
 ### Confidential — Fund Intellectual Property
 
----
-
-## Prerequisites
-
-- Windows PC (required for MT5 Python library)
-- Python 3.10+
-- Node.js 18+
-- MetaTrader 5 terminal installed and running with XLTRADE (Chimera) logged in
-- Phemex API key with trading permissions enabled
-
----
-
-## Setup
-
-### 1. Clone / copy the project folder
-
-### 2. Backend setup
-
-```bash
-cd trade-copier
-pip install -r requirements.txt
-```
-
-Copy the env template and fill in your credentials:
-
-```bash
-copy .env.example .env
-```
-
-Edit `.env`:
-```
-PHEMEX_API_KEY=your_key_here
-PHEMEX_API_SECRET=your_secret_here
-MT5_LOGIN=your_account_number
-MT5_PASSWORD=your_password
-MT5_SERVER=Chimera-Live
-```
-
-### 3. Frontend setup
-
-```bash
-cd frontend
-npm install
-```
-
----
-
-## Running
-
-**Terminal 1 — Backend:**
-```bash
-cd trade-copier/backend
-python main.py
-```
-You should see:
-```
-[MT5] Connected — Account: XXXXXX | Balance: XXXX.XX
-INFO:     Uvicorn running on http://127.0.0.1:8000
-```
-
-**Terminal 2 — Frontend:**
-```bash
-cd trade-copier/frontend
-npm run dev
-```
-
-Open your browser at: **http://localhost:3000**
+A CLI tool that simultaneously executes ETH perpetual futures trades across
+Phemex (personal account) and XLTRADE (Chimera MT5 prop firm) from a single
+command. Supports market and limit orders, live position monitoring, account
+balances, and full flatten across both brokers.
 
 ---
 
 ## How It Works
 
-### Placing a Trade
-1. Select LONG or SHORT
-2. Select the current sequence step (1R, 1R+W, 2R, etc.)
-3. Enter the current market price as Entry Price
-4. Enter your Take Profit price
-5. Enter your Phemex position size in ETH
-6. Click EXECUTE
+```
+copycat.py  ──────────────────────▶  Phemex API (USDT Perp)
+                │
+                └── file bridge ──▶  BlackjackCopier.mq5 ──▶  XLTRADE (MT5)
+```
 
-The system will simultaneously:
-- Send a market order to **Phemex** with your exact size, SL at entry ± $15.00
-- Send a market order to **XLTRADE** with size × 0.829, SL at entry ± $18.10, TP + $3.10
+When you run a trade command, `copycat.py` fires both brokers simultaneously:
+- **Phemex** — called directly via the Phemex REST API
+- **XLTRADE** — signalled via a text file that `BlackjackCopier.mq5` (an MT5
+  Expert Advisor) polls every 50ms and executes on your behalf
 
-### XLTRADE Adjustments (automatic)
-| Parameter  | Rule |
-|------------|------|
-| Size       | Phemex size × 0.829 |
-| SL (Long)  | Entry − $18.10 |
-| SL (Short) | Entry + $18.10 |
-| TP (Long)  | Phemex TP + $3.10 |
-| TP (Short) | Phemex TP − $3.10 |
+When running from **Termux (Android)**, a third piece called `bridge.py` runs
+on your Windows PC and relays signals from your phone to the EA over HTTP:
 
-### Flatten
-Click **FLATTEN ALL** once → confirm by clicking again within 4 seconds.
-All positions across all brokers are closed at market simultaneously.
-
-### Position Tracker
-Updates every 500ms via WebSocket. Shows per-broker positions with
-live mark price, SL, TP, and unrealised PnL.
+```
+copycat.py (phone)  ──HTTP──▶  bridge.py (PC)  ──files──▶  MT5 EA
+```
 
 ---
 
-## Adding Quantasset
+## Files
 
-When ready to add Quantasset:
-1. Obtain a separate Phemex API key for the Quantasset sub-account
-2. Add to `.env`:
-   ```
-   QUANTASSET_ENABLED=true
-   QUANTASSET_API_KEY=your_key
-   QUANTASSET_API_SECRET=your_secret
-   ```
-3. Restart the backend — Quantasset will appear automatically in the dashboard
+| File | Purpose |
+|---|---|
+| `copycat.py` | Main CLI — run this to trade |
+| `BlackjackCopier.mq5` | MT5 Expert Advisor — compile and run in MT5 |
+| `bridge.py` | Network bridge — run on Windows PC when using Termux |
+| `.env` | Your credentials (create from `.env.example`) |
+| `requirements.txt` | Python dependencies |
+
+---
+
+## Prerequisites
+
+**Windows (primary setup):**
+- Python 3.10+
+- MetaTrader 5 open and logged into XLTRADE (Chimera terminal)
+- Phemex account in **Hedge Mode** with a USDT perpetual API key
+
+**Termux / Android (remote setup):**
+- Termux app installed
+- Python and pip installed in Termux
+- Windows PC running `bridge.py` on the same network (or via Tailscale)
+
+---
+
+## Setup — Windows
+
+### 1. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configure credentials
+
+```bash
+copy .env.example .env
+```
+
+Edit `.env` and fill in:
+
+```
+PHEMEX_API_KEY=your_phemex_api_key
+PHEMEX_API_SECRET=your_phemex_api_secret
+MT5_FILES_PATH=C:\Users\YourName\AppData\Roaming\MetaQuotes\Terminal\Common\Files
+```
+
+> **Finding MT5_FILES_PATH:** In MT5, go to File → Open Data Folder,
+> navigate up one level, then open the `Common` folder, then `Files`.
+> Copy that full path.
+
+### 3. Install the MT5 Expert Advisor
+
+1. Copy `BlackjackCopier.mq5` into your MT5 `Experts` folder
+   (File → Open Data Folder → MQL5 → Experts)
+2. Open MetaEditor (press F4 in MT5)
+3. Open `BlackjackCopier.mq5` and press F7 to compile — should show 0 errors
+4. In MT5, drag `BlackjackCopier` from the Navigator onto your ETHUSD.nx M1 chart
+5. Enable **Allow automated trading** in the EA settings
+
+The EA is now running. It polls for signals every 50ms and writes a heartbeat
+file every 2 seconds so `copycat.py` knows it is alive.
+
+### 4. Test the connection
+
+```bash
+python copycat.py balance
+```
+
+You should see your Phemex balance and XLTRADE account data.
+
+---
+
+## Setup — Termux (Android)
+
+### 1. Install Termux dependencies
+
+```bash
+pkg install python git
+pip install httpx
+```
+
+### 2. Clone the repo
+
+```bash
+git clone https://YOUR_GITHUB_TOKEN@github.com/YOUR_USERNAME/YOUR_REPO.git
+cd YOUR_REPO
+```
+
+### 3. Configure credentials
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Fill in your Phemex credentials plus the bridge settings:
+
+```
+PHEMEX_API_KEY=your_phemex_api_key
+PHEMEX_API_SECRET=your_phemex_api_secret
+BRIDGE_URL=http://YOUR_PC_LOCAL_IP:7373
+BRIDGE_TOKEN=your_shared_secret
+```
+
+### 4. Start the bridge on your Windows PC
+
+On your PC, in the `copycat` folder:
+
+```bash
+python bridge.py
+```
+
+It will print the URL and local IP to use in `BRIDGE_URL`.
+
+> **For access outside your home network:** Install [Tailscale](https://tailscale.com)
+> (free) on both your PC and phone. Use the Tailscale IP instead of your
+> local IP in `BRIDGE_URL` — works from anywhere.
+
+---
+
+## XLTRADE Adjustments
+
+All XLTRADE parameters are automatically derived. You only ever specify the
+Phemex values in your command:
+
+| Parameter | Rule |
+|---|---|
+| Size | Specified separately with `-sx` flag |
+| SL (Long) | Fill/limit price − $17.60 |
+| SL (Short) | Fill/limit price + $17.60 |
+| TP (Long) | Phemex TP + $2.60 |
+| TP (Short) | Phemex TP − $2.60 |
+
+For **market orders**, SL is set after fill using the actual fill price on
+both brokers — not an estimate.
+
+---
+
+## Usage
+
+```
+python copycat.py buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+python copycat.py buy   limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+python copycat.py sell  market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+python copycat.py sell  limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+python copycat.py positions
+python copycat.py positions --refresh
+python copycat.py orders
+python copycat.py balance
+python copycat.py flatten
+```
+
+### Arguments
+
+| Flag | Description |
+|---|---|
+| `-p` | Limit price (limit orders only) |
+| `-sp` | Position size on Phemex in ETH |
+| `-sx` | Position size on XLTRADE in lots |
+| `-tp` | Take profit price (Phemex price — XLTRADE TP auto-adjusted) |
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `buy / sell` | Place a market or limit order on both brokers simultaneously |
+| `positions` | Show all open positions with SL, TP, and unrealised PnL |
+| `positions --refresh` | Live auto-refreshing positions view (updates every 5s) |
+| `orders` | Show all pending and conditional orders on both brokers |
+| `balance` | Show account balance, margin, open PnL, and today's closed PnL |
+| `flatten` | Close all positions and cancel all orders on both brokers |
+
+### Examples
+
+```bash
+# Market orders
+python copycat.py buy market -sp 0.33 -sx 0.27 -tp 2400.00
+python copycat.py sell market -sp 0.33 -sx 0.27 -tp 2100.00
+
+# Limit orders
+python copycat.py buy limit -p 2130.00 -sp 0.33 -sx 0.27 -tp 2400.00
+python copycat.py sell limit -p 2150.00 -sp 0.33 -sx 0.27 -tp 2100.00
+
+# Info
+python copycat.py positions --refresh
+python copycat.py balance
+python copycat.py orders
+python copycat.py flatten
+```
+
+---
+
+## Daily Workflow
+
+1. Open MT5 with `BlackjackCopier` running on the ETHUSD.nx M1 chart
+2. *(If using Termux)* Run `python bridge.py` on your PC
+3. Open a terminal (Windows or Termux) in the `copycat` folder
+4. Activate your venv if using one: `venv\Scripts\activate`
+5. Run any command — `balance` is a good first check each session
 
 ---
 
 ## Troubleshooting
 
-**MT5 not connecting:**
-- Ensure MT5 terminal is open and logged into XLTRADE (Chimera)
-- Confirm `MT5_SERVER` matches exactly what appears in MT5 (case-sensitive)
-- Run `python -c "import MetaTrader5 as mt5; print(mt5.initialize())"` to test
+**`EA heartbeat not found`**
+- The MT5 EA is not running. Make sure `BlackjackCopier` is on the chart with
+  automated trading enabled and the MT5 terminal is open.
 
-**Phemex orders failing:**
-- Check API key has `Trading` permissions enabled on Phemex
-- Ensure IP whitelist includes `127.0.0.1` if you set one
-- Check the symbol `ETHUSD` matches your Phemex contract name
+**`EA heartbeat stale`**
+- The EA stopped responding. Remove it from the chart and re-add it.
 
-**Frontend can't connect:**
-- Confirm backend is running on port 8000
-- Check browser console for WebSocket errors
+**Phemex `API Signature verification failed`**
+- Check that `PHEMEX_API_KEY` and `PHEMEX_API_SECRET` are correct in `.env`
+- Ensure your system clock is accurate (signature includes a timestamp)
+
+**Phemex `TE_PRICE_TOO_SMALL` or similar**
+- Your limit price is too far from the current market price. Phemex rejects
+  limit orders that are more than ~20% from the mark price.
+
+**XLTRADE `Timeout — EA did not respond`**
+- On Windows: check the heartbeat file age and that MT5 is not frozen
+- On Termux: check that `bridge.py` is running on your PC and that
+  `BRIDGE_URL` and `BRIDGE_TOKEN` match on both devices
+
+**`Bridge error: ...` on Termux**
+- Confirm your PC and phone are on the same network (or both on Tailscale)
+- Confirm `bridge.py` is running and printed `active` on startup
+- Check that `BRIDGE_URL` uses the correct IP and port (default 7373)
+- Check that `BRIDGE_TOKEN` is identical in both `.env` files

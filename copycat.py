@@ -105,6 +105,11 @@ def _phemex_headers(path, query='', body=''):
     }
 
 async def phemex_request(method, path, params=None, body=None):
+    # When running remotely, proxy Phemex requests through bridge.py on the
+    # PC so all traffic originates from the PC's whitelisted IP address
+    if USE_BRIDGE and BRIDGE_URL:
+        return await phemex_request_via_bridge(method, path, params, body)
+
     try:
         import httpx
     except ImportError:
@@ -113,7 +118,6 @@ async def phemex_request(method, path, params=None, body=None):
     query    = '&'.join(f'{k}={v}' for k, v in params.items()) if params else ''
     body_str = json.dumps(body) if body else ''
 
-    # For PUT with params (query string), sign with query; for POST with body, sign with body
     if method == 'PUT' and params and not body:
         headers = _phemex_headers(path, query, '')
     else:
@@ -136,6 +140,40 @@ async def phemex_request(method, path, params=None, body=None):
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
         return r.json()
+
+
+async def phemex_request_via_bridge(method, path, params=None, body=None):
+    """Proxy a Phemex API request through bridge.py on the PC."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _send():
+        import urllib.request
+        payload = json.dumps({
+            'method': method,
+            'path':   path,
+            'params': params,
+            'body':   body,
+        }).encode()
+        req = urllib.request.Request(
+            f"{BRIDGE_URL}/phemex",
+            data    = payload,
+            headers = {
+                'Content-Type':   'application/json',
+                'X-Bridge-Token': BRIDGE_TOKEN,
+            },
+            method = 'POST',
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+
+    try:
+        result = await loop.run_in_executor(None, _send)
+        if 'error' in result:
+            raise RuntimeError(result['error'])
+        return result.get('resp', {})
+    except Exception as e:
+        raise RuntimeError(f"Bridge Phemex proxy error: {e}")
 
 async def phemex_get_fill_price(cl_ord_id, side, retries=8, delay=0.3):
     """Get fill price — first try position avg entry, then order history."""

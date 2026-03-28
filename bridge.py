@@ -151,23 +151,82 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_json(400, {'error': 'Invalid JSON'})
             return
 
+        # ── Route by path ─────────────────────────────────────────────────────
+        if self.path == '/phemex':
+            self._handle_phemex(body)
+        elif self.path == '/signal':
+            self._handle_signal(body)
+        else:
+            self.send_json(404, {'error': f'Unknown endpoint: {self.path}'})
+
+    def _handle_signal(self, body):
+        """Relay a signal to the MT5 EA via the file bridge."""
         signal  = body.get('signal', '')
         timeout = int(body.get('timeout', 20))
-
         if not signal:
             self.send_json(400, {'error': 'Missing signal'})
             return
-
-        # ── Relay to EA ───────────────────────────────────────────────────────
-        log(f"← {self.client_address[0]}  {signal[:60]}{'...' if len(signal)>60 else ''}")
+        log(f"← MT5  {self.client_address[0]}  {signal[:60]}{'...' if len(signal)>60 else ''}")
         resp, err = mt5_send(signal, timeout=timeout)
-
         if err:
             log(f"→ ERROR: {err}", RED)
             self.send_json(200, {'error': err})
         else:
             log(f"→ {resp[:60]}{'...' if len(resp)>60 else ''}", GRN)
             self.send_json(200, {'resp': resp})
+
+    def _handle_phemex(self, body):
+        """Proxy a Phemex API request from the phone through the PC's IP."""
+        import hmac as _hmac, hashlib as _hashlib, time as _time
+        method = body.get('method', 'GET')
+        path   = body.get('path', '')
+        params = body.get('params') or {}
+        req_body = body.get('body')
+
+        if not path:
+            self.send_json(400, {'error': 'Missing path'})
+            return
+
+        log(f"← PHX  {self.client_address[0]}  {method} {path}")
+
+        try:
+            import urllib.request as _req
+            import urllib.parse   as _parse
+
+            phemex_key    = os.environ.get('PHEMEX_API_KEY', '')
+            phemex_secret = os.environ.get('PHEMEX_API_SECRET', '')
+            base_url      = 'https://api.phemex.com'
+
+            query    = '&'.join(f'{k}={v}' for k, v in params.items()) if params else ''
+            body_str = json.dumps(req_body) if req_body else ''
+
+            # Sign the request
+            expiry = str(int(_time.time()) + 60)
+            if method == 'PUT' and params and not req_body:
+                msg = path + query + expiry
+            else:
+                msg = path + query + expiry + body_str
+            sig = _hmac.new(phemex_secret.encode(), msg.encode(), _hashlib.sha256).hexdigest()
+
+            headers = {
+                'x-phemex-access-token':      phemex_key,
+                'x-phemex-request-expiry':    expiry,
+                'x-phemex-request-signature': sig,
+                'Content-Type':               'application/json',
+            }
+
+            url = f"{base_url}{path}" + (f"?{query}" if query else '')
+            data = body_str.encode() if body_str else None
+            request = _req.Request(url, data=data, headers=headers, method=method)
+            with _req.urlopen(request, timeout=12) as r:
+                resp_data = json.loads(r.read())
+
+            log(f"→ PHX  code={resp_data.get('code')} msg={resp_data.get('msg','')}", GRN)
+            self.send_json(200, {'resp': resp_data})
+
+        except Exception as e:
+            log(f"→ PHX ERROR: {e}", RED)
+            self.send_json(200, {'error': str(e)})
 
     def do_GET(self):
         # Health check endpoint

@@ -201,22 +201,18 @@ def render(results, errors, fetch_time, interval):
         print(f"    {'24h Call Volume':<20} {GRN}{call_vol:>12,.2f}{RST}  {ccy}")
         print(f"    {'24h Total Volume':<20} {DIM}{total:>12,.2f}{RST}  {ccy}")
         print()
-        print(f"    {'Put/Call Ratio':<20} {rc}{BLD}{ratio:>12.4f}{RST}")
+        print(f"    {'Put/Call Ratio':<20} {rc}{BLD}{ratio:>12.2f}{RST}")
         print()
 
-        # Sentiment label
-        if ratio > 1.2:
-            sentiment = f"{RED}▲ PUT HEAVY  (bearish lean){RST}"
-        elif ratio > 1.05:
-            sentiment = f"{YLW}▲ SLIGHT PUT BIAS{RST}"
-        elif ratio < 0.8:
-            sentiment = f"{GRN}▼ CALL HEAVY (bullish lean){RST}"
-        elif ratio < 0.95:
-            sentiment = f"{YLW}▼ SLIGHT CALL BIAS{RST}"
+        # Sentiment
+        if ratio >= 1.02:
+            sentiment = f"{RED}BEARISH{RST}"
+        elif ratio <= 0.98:
+            sentiment = f"{GRN}BULLISH{RST}"
         else:
-            sentiment = f"{YLW}  NEUTRAL{RST}"
+            sentiment = f"{YLW}NEUTRAL{RST}"
 
-        print(f"    Sentiment     {sentiment}")
+        print(f"    {'Sentiment':<20} {BLD}{sentiment}")
         print()
 
         # Volume bar

@@ -62,6 +62,10 @@ XLTRADE_SL        = 17.60
 XLTRADE_TP_OFFSET = 2.60
 XLTRADE_SIZE_RATIO= 0.829
 
+# On-sides fixed offsets (1:2 R:R)
+OS_PHEMEX_TP  = 30.00   # fill ± 30.00
+OS_XLTRADE_TP = 32.60   # fill ± 32.60
+
 # ── Terminal colours ──────────────────────────────────────────────────────────
 if sys.platform == 'win32':
     import ctypes
@@ -387,6 +391,135 @@ def mt5_orders():
         except (ValueError, IndexError):
             continue
     return result, None
+
+# ── Command: on-sides trade ───────────────────────────────────────────────────
+async def cmd_on_sides(direction, phemex_size, xltrade_size):
+    """
+    Market order with fixed 1:2 R:R offsets calculated from fill price.
+    Phemex:  SL = fill ± $15.00  |  TP = fill ± $30.00
+    XLTRADE: SL = fill ± $17.60  |  TP = fill ± $35.20
+    """
+    side        = 'Long'  if direction == 'buy'  else 'Short'
+    mt5_side    = 'BUY'   if direction == 'buy'  else 'SELL'
+    phemex_side = 'Buy'   if direction == 'buy'  else 'Sell'
+    cl_ord_id   = f'cc_os_{int(time.time()*1000)}'
+
+    header(f"{side.upper()} ON-SIDES  {DIM}(1:2 fixed R:R){RST}")
+    print(f"  {'Size (Phemex)':<20} {phemex_size} ETH")
+    print(f"  {'Size (XLTRADE)':<20} {xltrade_size} lots")
+    print(f"  {'Phemex SL/TP':<20} fill ± $15.00 / ± $30.00")
+    print(f"  {'XLTRADE SL/TP':<20} fill ± $17.60 / ± $32.60")
+    print()
+
+    confirm = input(f"  {BLD}Confirm? (y/n): {RST}").strip().lower()
+    if confirm != 'y':
+        warn("Cancelled.")
+        return
+
+    print()
+    errors = []
+
+    # Build Phemex params — TP/SL set post-fill from actual fill price
+    phemex_params = {
+        'symbol':      PHEMEX_SYMBOL,
+        'clOrdID':     cl_ord_id,
+        'side':        phemex_side,
+        'posSide':     side,
+        'orderQtyRq':  str(phemex_size),
+        'ordType':     'Market',
+        'reduceOnly':  'false',
+        'timeInForce': 'GoodTillCancel',
+    }
+
+    xltrade_signal = f"OPEN|{MT5_SYMBOL}|{mt5_side}|{xltrade_size:.2f}|0.00|0.00|CC-OnSides|MARKET"
+
+    # ── Pre-clear MT5 response file ───────────────────────────────────────────
+    resp_path = os.path.join(MT5_FILES_PATH, 'bj_response.txt') if MT5_FILES_PATH else ''
+    if resp_path and os.path.exists(resp_path):
+        try:
+            os.remove(resp_path)
+        except Exception:
+            pass
+
+    # ── Fire both simultaneously ──────────────────────────────────────────────
+    print(f"  Sending to {CYN}Phemex{RST} + {YLW}XLTRADE{RST} simultaneously...", flush=True)
+    loop = asyncio.get_event_loop()
+    phemex_task  = phemex_request('PUT', '/g-orders/create', params=phemex_params)
+    xltrade_task = loop.run_in_executor(None, lambda: mt5_send(xltrade_signal, timeout=20))
+    phemex_result, xltrade_resp_tuple = await asyncio.gather(phemex_task, xltrade_task)
+    xltrade_resp, xltrade_err = xltrade_resp_tuple
+
+    # ── Process Phemex ────────────────────────────────────────────────────────
+    phemex_fill = None
+    if phemex_result.get('code') == 0:
+        ok("Phemex market order placed")
+        print(f"  Getting fill price...", end=' ', flush=True)
+        phemex_fill = await phemex_get_fill_price(cl_ord_id, side)
+        if phemex_fill and phemex_fill > 0:
+            sl_phemex = round(phemex_fill - PHEMEX_SL   if side == 'Long' else phemex_fill + PHEMEX_SL,   2)
+            tp_phemex = round(phemex_fill + OS_PHEMEX_TP if side == 'Long' else phemex_fill - OS_PHEMEX_TP, 2)
+            # Place SL stop order
+            _, sl_amend = await phemex_amend_sl(side, phemex_fill, tp_phemex)
+            # Place TP conditional order
+            tp_params = {
+                'symbol':        PHEMEX_SYMBOL,
+                'clOrdID':       f'cc_os_tp_{int(time.time()*1000)}',
+                'side':          'Sell' if side == 'Long' else 'Buy',
+                'posSide':       side,
+                'orderQtyRq':    '0',
+                'ordType':       'MarketIfTouched',
+                'stopPxRp':      str(tp_phemex),
+                'triggerType':   'ByMarkPrice',
+                'closeOnTrigger': 'true',
+                'reduceOnly':    'true',
+                'timeInForce':   'GoodTillCancel',
+            }
+            tp_result = await phemex_request('PUT', '/g-orders/create', params=tp_params)
+            if isinstance(sl_amend, dict) and sl_amend.get('code') == 0 and tp_result.get('code') == 0:
+                ok(f"Fill @ {phemex_fill} | SL @ {sl_phemex} | TP @ {tp_phemex}")
+            else:
+                warn(f"Fill @ {phemex_fill} | SL result: {sl_amend.get('code')} | TP result: {tp_result.get('code')} — verify manually")
+        else:
+            warn("Could not confirm fill price — set SL/TP manually on Phemex")
+    else:
+        msg  = phemex_result.get('msg', str(phemex_result))
+        code = phemex_result.get('code', '')
+        print(f"{RED}✗ Phemex failed ({code}): {msg}{RST}")
+        errors.append(f"Phemex: ({code}) {msg}")
+
+    # ── Process XLTRADE ───────────────────────────────────────────────────────
+    # EA receives SL=0.00 TP=0.00 — override with actual fill-based values
+    if xltrade_err:
+        print(f"{RED}✗ XLTRADE: {xltrade_err}{RST}")
+        errors.append(f"XLTRADE: {xltrade_err}")
+    elif xltrade_resp and xltrade_resp.startswith('OK|OPEN'):
+        parts  = xltrade_resp.split('|')
+        ticket = parts[8] if len(parts) > 8 else '?'
+        fill   = parts[5] if len(parts) > 5 else '?'
+        try:
+            fill_f    = float(fill)
+            xt_sl     = round(fill_f - XLTRADE_SL    if side == 'Long' else fill_f + XLTRADE_SL,    2)
+            xt_tp     = round(fill_f + OS_XLTRADE_TP if side == 'Long' else fill_f - OS_XLTRADE_TP, 2)
+            ok(f"XLTRADE filled — ticket {ticket} @ {fill_f:.2f} | SL @ {xt_sl:.2f} | TP @ {xt_tp:.2f}")
+            # Note: EA sets SL from fill automatically (SL=0 triggers EA's own calc)
+            # TP must be set separately via SLTP signal
+            sltp_signal = f"SLTP|{ticket}|{xt_sl:.2f}|{xt_tp:.2f}"
+            sltp_resp, sltp_err = mt5_send(sltp_signal, timeout=10)
+            if sltp_err:
+                warn(f"XLTRADE TP not set: {sltp_err} — set manually")
+        except (ValueError, TypeError):
+            ok(f"XLTRADE order placed — ticket {ticket}")
+    else:
+        print(f"{RED}✗ XLTRADE: {xltrade_resp}{RST}")
+        errors.append(f"XLTRADE: {xltrade_resp}")
+
+    print()
+    if not errors:
+        ok(f"{side.upper()} ON-SIDES {phemex_size} ETH — both brokers filled")
+    else:
+        warn("Completed with errors:")
+        for e in errors:
+            print(f"    {RED}{e}{RST}")
 
 # ── Command: trade ────────────────────────────────────────────────────────────
 async def cmd_trade(direction, order_type, limit_price, phemex_size, xltrade_size, tp):
@@ -811,8 +944,10 @@ USAGE = f"""
 
 {BLD}Usage:{RST}
   python copycat.py buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py buy   market -os -sp <phemex_size> -sx <xltrade_size>
   python copycat.py buy   limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
   python copycat.py sell  market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py sell  market -os -sp <phemex_size> -sx <xltrade_size>
   python copycat.py sell  limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
   python copycat.py positions
   python copycat.py positions --refresh
@@ -820,11 +955,16 @@ USAGE = f"""
   python copycat.py balance
   python copycat.py flatten
 
+{BLD}On-sides (-os):{RST}
+  Market order with fixed 1:2 R:R. No -tp needed.
+  Phemex:  SL = fill ± $15.00  |  TP = fill ± $30.00
+  XLTRADE: SL = fill ± $17.60  |  TP = fill ± $32.60
+
 {BLD}Examples:{RST}
   python copycat.py buy market -sp 0.33 -sx 0.27 -tp 2400.00
-  python copycat.py sell market -sp 0.33 -sx 0.27 -tp 2100.00
+  python copycat.py buy market -os -sp 0.33 -sx 0.27
+  python copycat.py sell market -os -sp 0.33 -sx 0.27
   python copycat.py buy limit -p 2130.00 -sp 0.33 -sx 0.27 -tp 2400.00
-  python copycat.py sell limit -p 2150.00 -sp 0.33 -sx 0.27 -tp 2100.00
 """
 
 # ── Command: orders ───────────────────────────────────────────────────────────
@@ -977,7 +1117,22 @@ def parse_args():
     between = args[2:tp_idx]
 
     if order_type == 'market':
-        # buy market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+        # On-sides shorthand: buy market -os -sp <size> -sx <size>
+        if '-os' in args:
+            if '-sp' not in args: die("On-sides requires -sp <phemex_size>")
+            if '-sx' not in args: die("On-sides requires -sx <xltrade_size>")
+            sp_idx = args.index('-sp')
+            sx_idx = args.index('-sx')
+            if sp_idx + 1 >= len(args): die("-sp requires a size value")
+            if sx_idx + 1 >= len(args): die("-sx requires a size value")
+            try:
+                phemex_size  = float(args[sp_idx + 1])
+                xltrade_size = float(args[sx_idx + 1])
+            except ValueError:
+                die("Invalid -sp or -sx value")
+            return ('on_sides', cmd, phemex_size, xltrade_size)
+
+        # Regular market order: buy market -sp <size> -sx <size> -tp <tp>
         if '-sp' not in args:
             die(f"Usage: python copycat.py {cmd} market -sp <phemex_size> -sx <xltrade_size> -tp <tp>")
         if '-sx' not in args:
@@ -1029,6 +1184,9 @@ def main():
     elif cmd == 'orders':  asyncio.run(cmd_orders())
     elif cmd == 'balance': asyncio.run(cmd_balance())
     elif cmd == 'flatten': asyncio.run(cmd_flatten())
+    elif cmd == 'on_sides':
+        _, direction, phemex_size, xltrade_size = parsed
+        asyncio.run(cmd_on_sides(direction, phemex_size, xltrade_size))
     elif cmd == 'trade':
         _, direction, order_type, price, phemex_size, xltrade_size, tp = parsed
         asyncio.run(cmd_trade(direction, order_type, price, phemex_size, xltrade_size, tp))

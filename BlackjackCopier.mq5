@@ -368,6 +368,34 @@ void ProcessSignal(string raw)
       );
    }
 
+   // ── SLTP: set SL and TP on an open position ───────
+   // Signal: SLTP|TICKET|SL|TP
+   else if (action == "SLTP" && count >= 4)
+   {
+      ulong  ticket = (ulong)StringToInteger(parts[1]);
+      double sl     = StringToDouble(parts[2]);
+      double tp     = StringToDouble(parts[3]);
+
+      if (!PositionSelectByTicket(ticket))
+      {
+         WriteResponse("ERROR|SLTP: position not found for ticket " + parts[1]);
+      }
+      else
+      {
+         MqlTradeRequest req = {};
+         MqlTradeResult  res = {};
+         req.action   = TRADE_ACTION_SLTP;
+         req.position = ticket;
+         req.sl       = sl;
+         req.tp       = tp;
+         bool ok = OrderSend(req, res);
+         if (ok)
+            WriteResponse("OK|SLTP|ticket:" + parts[1] + "|sl:" + DoubleToString(sl,2) + "|tp:" + DoubleToString(tp,2));
+         else
+            WriteResponse("ERROR|SLTP failed: " + IntegerToString(res.retcode) + " " + res.comment);
+      }
+   }
+
    else
    {
       WriteResponse("ERROR|Unknown action: " + action);

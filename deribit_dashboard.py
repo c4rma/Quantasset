@@ -25,7 +25,7 @@ except ImportError:
     sys.exit(1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WS_URL   = 'wss://www.deribit.com/ws/api/v2'
+WS_URL     = 'wss://www.deribit.com/ws/api/v2'
 CURRENCIES = ['ETH', 'BTC']
 
 # ── Terminal colours ──────────────────────────────────────────────────────────
@@ -34,76 +34,161 @@ if sys.platform == 'win32':
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-GRN  = '\033[92m'
-RED  = '\033[91m'
-YLW  = '\033[93m'
-CYN  = '\033[96m'
-MAG  = '\033[95m'
-BLD  = '\033[1m'
-DIM  = '\033[2m'
-RST  = '\033[0m'
+GRN = '\033[92m'
+RED = '\033[91m'
+YLW = '\033[93m'
+CYN = '\033[96m'
+MAG = '\033[95m'
+BLD = '\033[1m'
+DIM = '\033[2m'
+RST = '\033[0m'
+
+# ── Cursor helpers ────────────────────────────────────────────────────────────
+def move(row, col=1):
+    sys.stdout.write(f'\033[{row};{col}H')
+
+def erase_line():
+    sys.stdout.write('\033[K')
+
+def hide_cursor():
+    sys.stdout.write('\033[?25l')
+
+def show_cursor():
+    sys.stdout.write('\033[?25h')
 
 def clr():
-    """Clear terminal screen."""
     os.system('cls' if sys.platform == 'win32' else 'clear')
 
 def ratio_colour(ratio):
-    """Colour the P/C ratio: green = puts dominant (bearish), red = calls dominant (bullish)."""
-    if ratio > 1.1:
-        return RED    # put-heavy = bearish sentiment
-    elif ratio < 0.9:
-        return GRN    # call-heavy = bullish sentiment
-    else:
-        return YLW    # neutral
+    if ratio >= 1.02:   return RED
+    elif ratio <= 0.98: return GRN
+    else:               return YLW
 
-# ── Deribit API ───────────────────────────────────────────────────────────────
-async def fetch_options_volume(ws, currency):
-    """
-    Fetch all option book summaries for a currency and aggregate
-    put/call 24h volumes across ALL expiries.
-    """
-    req = {
-        "jsonrpc": "2.0",
-        "id":      1,
-        "method":  "public/get_book_summary_by_currency",
-        "params":  {"currency": currency, "kind": "option"}
-    }
-    await ws.send(json.dumps(req))
+# ── Layout ────────────────────────────────────────────────────────────────────
+WIDTH = 62
+ROWS  = {}  # dynamic field row positions, populated in draw_static()
 
-    # Read responses until we get the one matching our request id
-    while True:
-        raw  = await asyncio.wait_for(ws.recv(), timeout=15)
-        data = json.loads(raw)
-        if data.get('id') == 1:
-            break
+def draw_static():
+    clr()
+    hide_cursor()
+    row = [1]
 
-    result = data.get('result', [])
+    def p(text=''):
+        print(text)
+        row[0] += 1
 
-    put_vol  = 0.0
-    call_vol = 0.0
+    def mark(key):
+        ROWS[key] = row[0]
 
-    for inst in result:
-        name   = inst.get('instrument_name', '')
-        volume = float(inst.get('volume') or 0)
-        if volume == 0:
+    p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
+    p(f"{BLD}{CYN}  DERIBIT  PUT/CALL VOLUME MONITOR  —  ALL EXPIRIES{RST}")
+    p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
+    mark('ts'); p()
+    p()
+
+    for ccy in CURRENCIES:
+        ccy_col = MAG if ccy == 'BTC' else CYN
+        p(f"  {BLD}{ccy_col}{'─'*4} {ccy} {'─'*(WIDTH-7-len(ccy))}{RST}")
+        mark(f'{ccy}_put');       p(f"    {'24h Put Volume':<20}")
+        mark(f'{ccy}_call');      p(f"    {'24h Call Volume':<20}")
+        mark(f'{ccy}_total');     p(f"    {'24h Total Volume':<20}")
+        p()
+        mark(f'{ccy}_ratio');     p(f"    {'Put/Call Ratio':<20}")
+        p()
+        mark(f'{ccy}_sentiment'); p(f"    {'Sentiment':<20}")
+        p()
+        mark(f'{ccy}_bar');       p(f"    {DIM}Put  {RST}{'':30}{DIM}  Call{RST}")
+        mark(f'{ccy}_pct');       p(f"    {DIM}     {'':35}{RST}")
+        p()
+
+    p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
+    p(f"  {DIM}Source: Deribit API  |  Covers all strikes & expiries{RST}")
+    p(f"  {DIM}Red bar = Puts  |  Green bar = Calls{RST}")
+    p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
+    p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
+    mark('exit'); p(f"  {DIM}Press Ctrl+C to exit{RST}")
+
+    sys.stdout.flush()
+
+
+def update_values(results, errors, fetch_time, remaining):
+    bar_width = 30
+    ts = fetch_time.strftime('%Y-%m-%d  %H:%M:%S UTC')
+
+    # Timestamp + countdown
+    move(ROWS['ts'])
+    erase_line()
+    sys.stdout.write(f"  {DIM}{ts}    refreshing in {remaining}s{RST}")
+
+    for ccy in CURRENCIES:
+        if ccy in errors:
+            move(ROWS[f'{ccy}_put'])
+            erase_line()
+            sys.stdout.write(f"    {RED}✗ Error: {errors[ccy]}{RST}")
+            for key in ('call', 'total', 'ratio', 'sentiment', 'bar', 'pct'):
+                move(ROWS[f'{ccy}_{key}'])
+                erase_line()
             continue
-        # Instrument name format: ETH-27MAR26-2000-P or ETH-27MAR26-2000-C
-        suffix = name.split('-')[-1]
-        if suffix == 'P':
-            put_vol  += volume
-        elif suffix == 'C':
-            call_vol += volume
 
-    ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
-    return put_vol, call_vol, ratio
+        put_vol, call_vol, ratio = results[ccy]
+        total    = put_vol + call_vol
+        rc       = ratio_colour(ratio)
+        put_pct  = put_vol  / total if total > 0 else 0
+        call_pct = call_vol / total if total > 0 else 0
+        put_bars  = int(round(put_pct  * bar_width))
+        call_bars = int(round(call_pct * bar_width))
 
+        move(ROWS[f'{ccy}_put'])
+        erase_line()
+        sys.stdout.write(f"    {'24h Put Volume':<20} {RED}{put_vol:>12,.2f}{RST}  {ccy}")
+
+        move(ROWS[f'{ccy}_call'])
+        erase_line()
+        sys.stdout.write(f"    {'24h Call Volume':<20} {GRN}{call_vol:>12,.2f}{RST}  {ccy}")
+
+        move(ROWS[f'{ccy}_total'])
+        erase_line()
+        sys.stdout.write(f"    {'24h Total Volume':<20} {DIM}{total:>12,.2f}{RST}  {ccy}")
+
+        move(ROWS[f'{ccy}_ratio'])
+        erase_line()
+        sys.stdout.write(f"    {'Put/Call Ratio':<20} {rc}{BLD}{ratio:>12.2f}{RST}")
+
+        if ratio >= 1.02:
+            sentiment = f"{RED}{BLD}BEARISH{RST}"
+        elif ratio <= 0.98:
+            sentiment = f"{GRN}{BLD}BULLISH{RST}"
+        else:
+            sentiment = f"{YLW}{BLD}NEUTRAL{RST}"
+        move(ROWS[f'{ccy}_sentiment'])
+        erase_line()
+        sys.stdout.write(f"    {'Sentiment':<20} {sentiment}")
+
+        put_bar  = f"{RED}{'█' * put_bars}{RST}"
+        call_bar = f"{GRN}{'█' * call_bars}{RST}"
+        move(ROWS[f'{ccy}_bar'])
+        erase_line()
+        sys.stdout.write(f"    {DIM}Put  {RST}{put_bar}{call_bar}{DIM}  Call{RST}")
+
+        move(ROWS[f'{ccy}_pct'])
+        erase_line()
+        sys.stdout.write(f"    {DIM}     {put_pct*100:>5.1f}%{' '*(bar_width-1)}{call_pct*100:>5.1f}%{RST}")
+
+    move(ROWS['exit'])
+    erase_line()
+    sys.stdout.write(f"  {DIM}Press Ctrl+C to exit{RST}")
+
+    sys.stdout.flush()
+
+
+# ── Deribit fetch loop ────────────────────────────────────────────────────────
 async def fetch_all(interval):
-    """Main loop: connect once, poll every interval seconds."""
     msg_id = 0
+    first  = True
 
     async with websockets.connect(WS_URL, ping_interval=20) as ws:
         while True:
-            msg_id += 1
+            msg_id    += 1
             fetch_time = datetime.now(timezone.utc)
             results    = {}
             errors     = {}
@@ -129,9 +214,7 @@ async def fetch_all(interval):
                         continue
 
                     instruments = resp.get('result', [])
-                    put_vol  = 0.0
-                    call_vol = 0.0
-
+                    put_vol = call_vol = 0.0
                     for inst in instruments:
                         name   = inst.get('instrument_name', '')
                         volume = float(inst.get('volume') or 0)
@@ -152,80 +235,13 @@ async def fetch_all(interval):
                 except Exception as e:
                     errors[ccy] = str(e)
 
-            # ── Render dashboard then countdown ───────────────────────────────
+            if first:
+                draw_static()
+                first = False
+
             for remaining in range(interval, 0, -1):
-                render(results, errors, fetch_time, remaining)
+                update_values(results, errors, fetch_time, remaining)
                 await asyncio.sleep(1)
-
-
-def render(results, errors, fetch_time, interval):
-    clr()
-    width = 62
-    ts    = fetch_time.strftime('%Y-%m-%d  %H:%M:%S UTC')
-    next_refresh = f"refreshing in {interval}s"
-
-    # Header
-    print(f"{BLD}{CYN}{'─'*width}{RST}")
-    print(f"{BLD}{CYN}  DERIBIT  PUT/CALL VOLUME MONITOR  —  ALL EXPIRIES{RST}")
-    print(f"{BLD}{CYN}{'─'*width}{RST}")
-    print(f"  {DIM}{ts}    {next_refresh}{RST}")
-    print()
-
-    for ccy in CURRENCIES:
-        ccy_col = MAG if ccy == 'BTC' else CYN
-        print(f"  {BLD}{ccy_col}{'─'*4} {ccy} {'─'*(width-7-len(ccy))}{RST}")
-
-        if ccy in errors:
-            print(f"    {RED}✗ Error: {errors[ccy]}{RST}")
-            print()
-            continue
-
-        put_vol, call_vol, ratio = results[ccy]
-        total  = put_vol + call_vol
-        rc     = ratio_colour(ratio)
-
-        # Bar chart: put vs call proportion
-        bar_width = 30
-        if total > 0:
-            put_pct  = put_vol / total
-            call_pct = call_vol / total
-            put_bars  = int(round(put_pct  * bar_width))
-            call_bars = int(round(call_pct * bar_width))
-        else:
-            put_bars = call_bars = 0
-
-        put_bar  = f"{RED}{'█' * put_bars}{RST}"
-        call_bar = f"{GRN}{'█' * call_bars}{RST}"
-
-        print(f"    {'24h Put Volume':<20} {RED}{put_vol:>12,.2f}{RST}  {ccy}")
-        print(f"    {'24h Call Volume':<20} {GRN}{call_vol:>12,.2f}{RST}  {ccy}")
-        print(f"    {'24h Total Volume':<20} {DIM}{total:>12,.2f}{RST}  {ccy}")
-        print()
-        print(f"    {'Put/Call Ratio':<20} {rc}{BLD}{ratio:>12.2f}{RST}")
-        print()
-
-        # Sentiment
-        if ratio >= 1.02:
-            sentiment = f"{RED}BEARISH{RST}"
-        elif ratio <= 0.98:
-            sentiment = f"{GRN}BULLISH{RST}"
-        else:
-            sentiment = f"{YLW}NEUTRAL{RST}"
-
-        print(f"    {'Sentiment':<20} {BLD}{sentiment}")
-        print()
-
-        # Volume bar
-        print(f"    {DIM}Put  {RST}{put_bar}{call_bar}{DIM}  Call{RST}")
-        print(f"    {DIM}     {put_pct*100:>5.1f}%{' '*(bar_width-1)}{call_pct*100:>5.1f}%{RST}")
-        print()
-
-    print(f"{BLD}{CYN}{'─'*width}{RST}")
-    print(f"  {DIM}Source: Deribit API  |  Covers all strikes & expiries{RST}")
-    print(f"  {DIM}Red bar = Puts  |  Green bar = Calls{RST}")
-    print(f"  {DIM}P/C > 1.0 = more puts traded  |  P/C < 1.0 = more calls{RST}")
-    print(f"{BLD}{CYN}{'─'*width}{RST}")
-    print(f"\n  {DIM}Press Ctrl+C to exit{RST}")
 
 
 def main():
@@ -234,10 +250,14 @@ def main():
                         help='Refresh interval in seconds (default: 30)')
     args = parser.parse_args()
 
-    print(f"Connecting to Deribit...")
+    sys.stdout.write("Connecting to Deribit...\n")
+    sys.stdout.flush()
     try:
         asyncio.run(fetch_all(args.interval))
     except KeyboardInterrupt:
+        show_cursor()
+        # Move cursor below dashboard before exiting
+        move(50)
         print(f"\n{DIM}Exited.{RST}")
 
 

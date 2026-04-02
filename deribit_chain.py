@@ -21,7 +21,12 @@ except ModuleNotFoundError:
         print(f"Could not load curses: {e}")
         print("Run:  pip install windows-curses")
         sys.exit(1)
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"], stdout=subprocess.DEVNULL)
+    import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 

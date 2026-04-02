@@ -10,7 +10,7 @@
 #   python copycat.py sell  limit  <price> <size> -tp <tp>
 #   python copycat.py positions
 #   python copycat.py balance
-#   python copycat.py flatten
+#   python copycat.py -f
 #
 # Examples:
 #   python copycat.py buy market 0.33 -tp 2400.00
@@ -953,7 +953,7 @@ USAGE = f"""
   python copycat.py positions --refresh
   python copycat.py orders
   python copycat.py balance
-  python copycat.py flatten
+  python copycat.py -f
 
 {BLD}On-sides (-os):{RST}
   Market order with fixed 1:2 R:R. No -tp needed.
@@ -1090,7 +1090,7 @@ def parse_args():
         return ('positions', refresh)
     if cmd == 'orders':    return ('orders',)
     if cmd == 'balance':   return ('balance',)
-    if cmd == 'flatten':   return ('flatten',)
+    if cmd == '-f':        return ('flatten',)
 
     if cmd not in ('buy', 'sell'):
         die(f"Unknown command '{cmd}'. Run 'python copycat.py' for usage.")
@@ -1102,7 +1102,22 @@ def parse_args():
     if order_type not in ('market', 'limit'):
         die(f"Order type must be 'market' or 'limit', got '{order_type}'")
 
-    # Extract -tp
+    # On-sides: no -tp needed, handle before the -tp check
+    if order_type == 'market' and '-os' in args:
+        if '-sp' not in args: die("On-sides requires -sp <phemex_size>")
+        if '-sx' not in args: die("On-sides requires -sx <xltrade_size>")
+        sp_idx = args.index('-sp')
+        sx_idx = args.index('-sx')
+        if sp_idx + 1 >= len(args): die("-sp requires a size value")
+        if sx_idx + 1 >= len(args): die("-sx requires a size value")
+        try:
+            phemex_size  = float(args[sp_idx + 1])
+            xltrade_size = float(args[sx_idx + 1])
+        except ValueError:
+            die("Invalid -sp or -sx value")
+        return ('on_sides', cmd, phemex_size, xltrade_size)
+
+    # Extract -tp (required for all non-OS orders)
     if '-tp' not in args:
         die("Missing -tp <takeProfitPrice>")
     tp_idx = args.index('-tp')
@@ -1117,21 +1132,6 @@ def parse_args():
     between = args[2:tp_idx]
 
     if order_type == 'market':
-        # On-sides shorthand: buy market -os -sp <size> -sx <size>
-        if '-os' in args:
-            if '-sp' not in args: die("On-sides requires -sp <phemex_size>")
-            if '-sx' not in args: die("On-sides requires -sx <xltrade_size>")
-            sp_idx = args.index('-sp')
-            sx_idx = args.index('-sx')
-            if sp_idx + 1 >= len(args): die("-sp requires a size value")
-            if sx_idx + 1 >= len(args): die("-sx requires a size value")
-            try:
-                phemex_size  = float(args[sp_idx + 1])
-                xltrade_size = float(args[sx_idx + 1])
-            except ValueError:
-                die("Invalid -sp or -sx value")
-            return ('on_sides', cmd, phemex_size, xltrade_size)
-
         # Regular market order: buy market -sp <size> -sx <size> -tp <tp>
         if '-sp' not in args:
             die(f"Usage: python copycat.py {cmd} market -sp <phemex_size> -sx <xltrade_size> -tp <tp>")

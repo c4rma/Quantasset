@@ -200,9 +200,9 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
     if in_excl:
         sys.stdout.write(f"    {'Session':<24} {RED}{BLD}EXCLUDED (09:00-10:00){RST}")
     elif session_name:
-        sys.stdout.write(f"    {'Session':<24} {session_col}{BLD}{session_name}{RST}")
+        sys.stdout.write(f"    {'Session':<24} {GRN}{BLD}{session_name}{RST}")
     else:
-        sys.stdout.write(f"    {'Session':<24} {DIM}No active session{RST}")
+        sys.stdout.write(f"    {'Session':<24} {RED}{BLD}No active session{RST}")
 
     # P/C data per currency
     for ccy in CURRENCIES:

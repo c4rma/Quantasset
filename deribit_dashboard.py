@@ -15,6 +15,8 @@ import time
 import argparse
 from datetime import datetime, timezone, timedelta
 
+import threading
+
 try:
     import websockets
 except ImportError:
@@ -26,6 +28,43 @@ try:
 except ImportError:
     print("httpx not installed — run: pip install httpx")
     sys.exit(1)
+
+# ── Keyboard input ────────────────────────────────────────────────────────────
+# Reads single keypresses in a background thread without requiring Enter.
+# q = quit, r = force refresh now
+
+_ev_quit    = None  # asyncio.Event, set in main()
+_ev_refresh = None
+
+def _read_keys(loop):
+    """Background thread: read keypresses and signal the async loop."""
+    if sys.platform == 'win32':
+        import msvcrt
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch().lower()
+                if ch == 'q':
+                    loop.call_soon_threadsafe(_ev_quit.set)
+                    break
+                elif ch == 'r':
+                    loop.call_soon_threadsafe(_ev_refresh.set)
+            time.sleep(0.05)
+    else:
+        import tty, termios
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1).lower()
+                if ch == 'q':
+                    loop.call_soon_threadsafe(_ev_quit.set)
+                    break
+                elif ch == 'r':
+                    loop.call_soon_threadsafe(_ev_refresh.set)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WS_URL         = 'wss://www.deribit.com/ws/api/v2'
@@ -171,7 +210,7 @@ def draw_static():
     p(f"  {DIM}Red bar = Puts  |  Green bar = Calls{RST}")
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    mark('exit'); p(f"  {DIM}Press Ctrl+C to exit{RST}")
+    mark('exit'); p(f"  {DIM}[q] quit   [r] refresh now{RST}")
 
     sys.stdout.flush()
 
@@ -261,10 +300,18 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
 
     move(ROWS['exit'])
     erase_line()
-    sys.stdout.write(f"  {DIM}Press Ctrl+C to exit{RST}")
+    sys.stdout.write(f"  {DIM}[q] quit   [r] refresh now{RST}")
 
     sys.stdout.flush()
 
+
+# ── Terminal cleanup ──────────────────────────────────────────────────────────
+def cleanup_terminal():
+    """Restore cursor and move below dashboard on any exit."""
+    show_cursor()
+    move(60)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
 
 # ── Main fetch loop ───────────────────────────────────────────────────────────
 async def fetch_all(interval):
@@ -272,71 +319,88 @@ async def fetch_all(interval):
     first     = True
     eth_price = None
 
-    async with websockets.connect(WS_URL, ping_interval=20) as ws:
-        while True:
-            msg_id    += 1
-            fetch_time = datetime.now(timezone.utc)
-            results    = {}
-            errors     = {}
+    while True:  # outer reconnect loop
+        try:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+                while True:
+                    msg_id    += 1
+                    fetch_time = datetime.now(timezone.utc)
+                    results    = {}
+                    errors     = {}
 
-            # Fetch Deribit P/C data
-            for ccy in CURRENCIES:
-                try:
-                    req = {
-                        "jsonrpc": "2.0",
-                        "id":      msg_id,
-                        "method":  "public/get_book_summary_by_currency",
-                        "params":  {"currency": ccy, "kind": "option"}
-                    }
-                    await ws.send(json.dumps(req))
+                    # Fetch Deribit P/C data
+                    for ccy in CURRENCIES:
+                        try:
+                            req = {
+                                "jsonrpc": "2.0",
+                                "id":      msg_id,
+                                "method":  "public/get_book_summary_by_currency",
+                                "params":  {"currency": ccy, "kind": "option"}
+                            }
+                            await ws.send(json.dumps(req))
 
-                    while True:
-                        raw  = await asyncio.wait_for(ws.recv(), timeout=20)
-                        resp = json.loads(raw)
-                        if resp.get('id') == msg_id:
+                            while True:
+                                raw  = await asyncio.wait_for(ws.recv(), timeout=20)
+                                resp = json.loads(raw)
+                                if resp.get('id') == msg_id:
+                                    break
+
+                            if 'error' in resp:
+                                errors[ccy] = resp['error'].get('message', 'Unknown error')
+                                continue
+
+                            instruments = resp.get('result', [])
+                            put_vol = call_vol = 0.0
+                            for inst in instruments:
+                                name   = inst.get('instrument_name', '')
+                                volume = float(inst.get('volume') or 0)
+                                if volume == 0:
+                                    continue
+                                suffix = name.split('-')[-1]
+                                if suffix == 'P':
+                                    put_vol  += volume
+                                elif suffix == 'C':
+                                    call_vol += volume
+
+                            ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
+                            results[ccy] = (put_vol, call_vol, ratio)
+                            msg_id += 1
+
+                        except asyncio.TimeoutError:
+                            errors[ccy] = "Timeout — retrying"
+                        except Exception as e:
+                            errors[ccy] = str(e)
+
+                    # Fetch ETH price from Phemex
+                    eth_price = await fetch_eth_price()
+
+                    if first:
+                        draw_static()
+                        first = False
+
+                    # Countdown — break early if 'r' pressed
+                    for remaining in range(interval, 0, -1):
+                        if _ev_refresh.is_set():
+                            _ev_refresh.clear()
                             break
+                        update_values(results, errors, fetch_time, remaining, eth_price)
+                        await asyncio.sleep(1)
 
-                    if 'error' in resp:
-                        errors[ccy] = resp['error'].get('message', 'Unknown error')
-                        continue
-
-                    instruments = resp.get('result', [])
-                    put_vol = call_vol = 0.0
-                    for inst in instruments:
-                        name   = inst.get('instrument_name', '')
-                        volume = float(inst.get('volume') or 0)
-                        if volume == 0:
-                            continue
-                        suffix = name.split('-')[-1]
-                        if suffix == 'P':
-                            put_vol  += volume
-                        elif suffix == 'C':
-                            call_vol += volume
-
-                    ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
-                    results[ccy] = (put_vol, call_vol, ratio)
-                    msg_id += 1
-
-                except asyncio.TimeoutError:
-                    errors[ccy] = "Timeout waiting for response"
-                except Exception as e:
-                    errors[ccy] = str(e)
-
-            # Fetch ETH price from Phemex
-            eth_price = await fetch_eth_price()
-
-            if first:
-                draw_static()
-                first = False
-
-            # Countdown — update dynamic fields every second
-            # Session status recalculated each second (it changes live)
-            for remaining in range(interval, 0, -1):
-                update_values(results, errors, fetch_time, remaining, eth_price)
-                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise  # let KeyboardInterrupt propagate cleanly
+        except Exception as e:
+            # WebSocket dropped — show reconnecting message and retry
+            if not first and ROWS:
+                move(ROWS.get('exit', 50))
+                erase_line()
+                sys.stdout.write(f"  {YLW}Connection lost — reconnecting...{RST}")
+                sys.stdout.flush()
+            await asyncio.sleep(5)
 
 
 def main():
+    global _ev_quit, _ev_refresh
+
     parser = argparse.ArgumentParser(description='Deribit Put/Call Volume Dashboard')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
@@ -344,12 +408,37 @@ def main():
 
     sys.stdout.write("Connecting to Deribit...\n")
     sys.stdout.flush()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _ev_quit    = asyncio.Event()
+    _ev_refresh = asyncio.Event()
+
+    # Start keyboard reader thread
+    t = threading.Thread(target=_read_keys, args=(loop,), daemon=True)
+    t.start()
+
+    async def run():
+        fetch_task = loop.create_task(fetch_all(args.interval))
+        # Wait for either the fetch to finish or 'q' to be pressed
+        await asyncio.wait(
+            [fetch_task, loop.create_task(_ev_quit.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        fetch_task.cancel()
+        try:
+            await fetch_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     try:
-        asyncio.run(fetch_all(args.interval))
+        loop.run_until_complete(run())
     except KeyboardInterrupt:
-        show_cursor()
-        move(60)
-        print(f"\n{DIM}Exited.{RST}")
+        pass
+    finally:
+        loop.close()
+        cleanup_terminal()
+        print(f"{DIM}Exited.{RST}")
 
 
 if __name__ == '__main__':

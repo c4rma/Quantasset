@@ -689,41 +689,6 @@ async def cmd_trade(direction, order_type, limit_price, phemex_size, xltrade_siz
             print(f"    {RED}{e}{RST}")
 
 # ── Command: positions ────────────────────────────────────────────────────────
-# ── Keyboard input (for refresh mode) ────────────────────────────────────────
-import threading as _threading
-
-_pos_ev_quit    = None  # asyncio.Event
-_pos_ev_refresh = None
-
-def _pos_read_keys(loop):
-    """Background thread: read q/r keypresses for positions --refresh mode."""
-    if sys.platform == 'win32':
-        import msvcrt
-        while True:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch().lower()
-                if ch == 'q':
-                    loop.call_soon_threadsafe(_pos_ev_quit.set)
-                    break
-                elif ch == 'r':
-                    loop.call_soon_threadsafe(_pos_ev_refresh.set)
-            time.sleep(0.05)
-    else:
-        import tty, termios
-        fd  = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
-                ch = sys.stdin.read(1).lower()
-                if ch == 'q':
-                    loop.call_soon_threadsafe(_pos_ev_quit.set)
-                    break
-                elif ch == 'r':
-                    loop.call_soon_threadsafe(_pos_ev_refresh.set)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
 async def cmd_positions(refresh=False):
     def _hide(): sys.stdout.write('\033[?25l'); sys.stdout.flush()
     def _show(): sys.stdout.write('\033[?25h'); sys.stdout.flush()
@@ -792,7 +757,7 @@ async def cmd_positions(refresh=False):
 
         # ── Build output into a single buffer ─────────────────────────────────
         buf = []
-        suffix = f"  {DIM}[auto-refresh  {ts}  |  q: quit  r: refresh now]{RST}" if refresh else ""
+        suffix = f"  {DIM}[auto-refresh  {ts}  Ctrl+C to exit]{RST}" if refresh else ""
         pad = max(0, 54 - len('OPEN POSITIONS'))
         buf.append(f"\n{BLD}{CYN}{'─'*4} OPEN POSITIONS {'─'*pad}{RST}{suffix}")
 
@@ -843,16 +808,9 @@ async def cmd_positions(refresh=False):
         sys.stdout.flush()
 
         for remaining in range(5, 0, -1):
-            if _pos_ev_quit.is_set() or _pos_ev_refresh.is_set():
-                break
-            sys.stdout.write(f"  {DIM}[q] quit  [r] refresh now  ({remaining}s){RST}\r")
+            sys.stdout.write(f"  {DIM}Refreshing in {remaining}s...{RST}\r")
             sys.stdout.flush()
             await asyncio.sleep(1)
-
-        if _pos_ev_quit.is_set():
-            break
-        if _pos_ev_refresh.is_set():
-            _pos_ev_refresh.clear()
 
     except asyncio.CancelledError:
         pass
@@ -1246,42 +1204,12 @@ def main():
 
     if cmd == 'positions':
         _, refresh = parsed
-        if not refresh:
-            try:
-                asyncio.run(cmd_positions(refresh=False))
-            except KeyboardInterrupt:
-                print(f"\n{DIM}Stopped.{RST}")
-        else:
-            global _pos_ev_quit, _pos_ev_refresh
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            _pos_ev_quit    = asyncio.Event()
-            _pos_ev_refresh = asyncio.Event()
-
-            t = _threading.Thread(target=_pos_read_keys, args=(loop,), daemon=True)
-            t.start()
-
-            async def _run_positions():
-                task = loop.create_task(cmd_positions(refresh=True))
-                await asyncio.wait(
-                    [task, loop.create_task(_pos_ev_quit.wait())],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-            try:
-                loop.run_until_complete(_run_positions())
-            except KeyboardInterrupt:
-                pass
-            finally:
-                loop.close()
-                sys.stdout.write('\033[?25h')
-                sys.stdout.flush()
-                print(f"\n{DIM}Stopped.{RST}")
+        try:
+            asyncio.run(cmd_positions(refresh=refresh))
+        except KeyboardInterrupt:
+            sys.stdout.write('\033[?25h')
+            sys.stdout.flush()
+            print(f"\n{DIM}Stopped.{RST}")
     elif cmd == 'orders':  asyncio.run(cmd_orders())
     elif cmd == 'balance': asyncio.run(cmd_balance())
     elif cmd == 'flatten': asyncio.run(cmd_flatten())

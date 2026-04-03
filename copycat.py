@@ -690,7 +690,16 @@ async def cmd_trade(direction, order_type, limit_price, phemex_size, xltrade_siz
 
 # ── Command: positions ────────────────────────────────────────────────────────
 async def cmd_positions(refresh=False):
-    while True:
+    def _hide(): sys.stdout.write('\033[?25l'); sys.stdout.flush()
+    def _show(): sys.stdout.write('\033[?25h'); sys.stdout.flush()
+    def _home(): sys.stdout.write('\033[H')    # move cursor to top-left
+
+    if refresh:
+        _hide()
+        os.system('cls' if sys.platform == 'win32' else 'clear')
+
+    try:
+      while True:
         results = []
         errors  = []
         ts      = datetime.now().strftime('%H:%M:%S')
@@ -746,50 +755,68 @@ async def cmd_positions(refresh=False):
                                  'avg': p['avg_price'], 'mark': p['mark'],
                                  'sl': p['sl'], 'tp': p['tp'], 'upnl': p['upnl']})
 
-        # ── Clear AFTER data is ready, so screen is blank for <1ms ──────────
-        if refresh:
-            os.system('cls' if sys.platform == 'win32' else 'clear')
-
+        # ── Build output into a single buffer ─────────────────────────────────
+        buf = []
         suffix = f"  {DIM}[auto-refresh  {ts}  Ctrl+C to exit]{RST}" if refresh else ""
-        header(f"OPEN POSITIONS{suffix}")
+        pad = max(0, 54 - len('OPEN POSITIONS'))
+        buf.append(f"\n{BLD}{CYN}{'─'*4} OPEN POSITIONS {'─'*pad}{RST}{suffix}")
 
         if not results:
-            print(f"  No open positions")
+            buf.append(f"  No open positions")
         else:
-            print(f"  {'Broker':<12}{'Symbol':<12}{'Side':<8}{'Size':<10}{'Avg':<10}{'Mark':<10}{'SL':<10}{'TP':<10}{'UPnL':>10}")
-            print(f"  {'─'*90}")
+            buf.append(f"  {'Broker':<12}{'Symbol':<12}{'Side':<8}{'Size':<10}{'Avg':<10}{'Mark':<10}{'SL':<10}{'TP':<10}{'UPnL':>10}")
+            buf.append(f"  {'─'*90}")
             total = 0
             for p in results:
                 pc = GRN if p['upnl'] >= 0 else RED
                 sc = GRN if p['side'] == 'Long' else RED
                 bc = CYN if p['broker'] == 'Phemex' else YLW
-                print(f"  {bc}{p['broker']:<12}{RST}"
-                      f"{p['symbol']:<12}"
-                      f"{sc}{p['side']:<8}{RST}"
-                      f"{p['size']:<10}"
-                      f"{p['avg']:<10.2f}"
-                      f"{p['mark']:<10.2f}"
-                      f"{RED}{p['sl']:<10.2f}{RST}"
-                      f"{GRN}{p['tp']:<10.2f}{RST}"
-                      f"{pc}{p['upnl']:>+10.2f}{RST}")
+                buf.append(
+                    f"  {bc}{p['broker']:<12}{RST}"
+                    f"{p['symbol']:<12}"
+                    f"{sc}{p['side']:<8}{RST}"
+                    f"{p['size']:<10}"
+                    f"{p['avg']:<10.2f}"
+                    f"{p['mark']:<10.2f}"
+                    f"{RED}{p['sl']:<10.2f}{RST}"
+                    f"{GRN}{p['tp']:<10.2f}{RST}"
+                    f"{pc}{p['upnl']:>+10.2f}{RST}")
                 total += p['upnl']
-            print(f"  {'─'*90}")
+            buf.append(f"  {'─'*90}")
             tc = GRN if total >= 0 else RED
-            print(f"  {'Total UPnL':<70}{tc}{total:>+10.2f}{RST}")
+            buf.append(f"  {'Total UPnL':<70}{tc}{total:>+10.2f}{RST}")
 
         if errors:
-            print()
+            buf.append('')
             for e in errors:
-                warn(e)
+                buf.append(f"  {YLW}⚠ {e}{RST}")
+
+        # ── Render ────────────────────────────────────────────────────────────
+        output = '\n'.join(buf) + '\n'
 
         if not refresh:
+            sys.stdout.write(output)
+            sys.stdout.flush()
             break
 
+        # Refresh mode: jump to top and write entire buffer atomically —
+        # no clear, so the terminal never shows a blank frame
+        _home()
+        sys.stdout.write(output)
+        # Erase anything below current position left from a previous longer render
+        sys.stdout.write('\033[J')
+        sys.stdout.flush()
+
         for remaining in range(5, 0, -1):
-            # Reprint the last line with countdown
-            print(f"\r  {DIM}Refreshing in {remaining}s...  {RST}", end='', flush=True)
+            sys.stdout.write(f"  {DIM}Refreshing in {remaining}s...{RST}\r")
+            sys.stdout.flush()
             await asyncio.sleep(1)
-        print()
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if refresh:
+            _show()
 
 
 
@@ -1180,6 +1207,8 @@ def main():
         try:
             asyncio.run(cmd_positions(refresh=refresh))
         except KeyboardInterrupt:
+            sys.stdout.write('\033[?25h')  # restore cursor
+            sys.stdout.flush()
             print(f"\n{DIM}Stopped.{RST}")
     elif cmd == 'orders':  asyncio.run(cmd_orders())
     elif cmd == 'balance': asyncio.run(cmd_balance())

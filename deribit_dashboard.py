@@ -2,12 +2,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # deribit_dashboard.py — Real-time Deribit Put/Call Volume Monitor
 #
-# Displays 24h Put Volume, Call Volume, and Put/Call Ratio for ETH and BTC
-# across ALL expiries. Refreshes every 30 seconds.
-#
 # Usage:
 #   python deribit_dashboard.py
-#   python deribit_dashboard.py --interval 60    # refresh every 60s
+#   python deribit_dashboard.py --interval 60
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -16,7 +13,7 @@ import os
 import sys
 import time
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 try:
     import websockets
@@ -24,9 +21,33 @@ except ImportError:
     print("websockets not installed — run: pip install websockets")
     sys.exit(1)
 
+try:
+    import httpx
+except ImportError:
+    print("httpx not installed — run: pip install httpx")
+    sys.exit(1)
+
 # ── Config ────────────────────────────────────────────────────────────────────
-WS_URL     = 'wss://www.deribit.com/ws/api/v2'
-CURRENCIES = ['ETH', 'BTC']
+WS_URL         = 'wss://www.deribit.com/ws/api/v2'
+CURRENCIES     = ['ETH', 'BTC']
+PHEMEX_TICKER  = 'https://api.phemex.com/md/v3/ticker/24hr?symbol=ETHUSDT'
+CT_OFFSET      = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
+
+# ── Kill zones (CT, minutes since midnight) ───────────────────────────────────
+# Each entry: (label, start_min, end_min, colour)
+KILL_ZONES = [
+    ('NDO',         0,    210,  'CYN'),   # 12:00am – 3:30am
+    ('Morning',     510,  630,  'YLW'),   # 8:30am  – 10:30am
+    ('Lunchtime',   690,  810,  'YLW'),   # 11:30am – 1:30pm
+    ('Power Hour',  840,  900,  'YLW'),   # 2:00pm  – 3:00pm
+    ('EOD',         960,  1080, 'YLW'),   # 4:00pm  – 6:00pm
+    ('EEOD',        1110, 1440, 'YLW'),   # 6:30pm  – 12:00am
+]
+EXCL_DAYS = {0, 2, 6}  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+# 09:00-10:00 excluded on Wed(2), Thu(3), Sun(6)
+EXCL_DAYS_09 = {2, 3, 6}
+EXCL_START   = 540   # 09:00
+EXCL_END     = 600   # 10:00
 
 # ── Terminal colours ──────────────────────────────────────────────────────────
 if sys.platform == 'win32':
@@ -42,6 +63,7 @@ MAG = '\033[95m'
 BLD = '\033[1m'
 DIM = '\033[2m'
 RST = '\033[0m'
+COLS = {'GRN': GRN, 'RED': RED, 'YLW': YLW, 'CYN': CYN, 'MAG': MAG}
 
 # ── Cursor helpers ────────────────────────────────────────────────────────────
 def move(row, col=1):
@@ -60,13 +82,49 @@ def clr():
     os.system('cls' if sys.platform == 'win32' else 'clear')
 
 def ratio_colour(ratio):
-    if ratio >= 1.02:   return RED
-    elif ratio <= 0.98: return GRN
-    else:               return YLW
+    if ratio >= 1.02:    return RED
+    elif ratio <= 0.98:  return GRN
+    else:                return YLW
+
+# ── Kill zone logic ───────────────────────────────────────────────────────────
+def get_session_status():
+    """
+    Returns (label, colour, is_excluded) for the current CT time.
+    label    — session name or 'No active session'
+    colour   — ANSI colour string
+    excluded — True if in the 09:00-10:00 exclusion window
+    """
+    now_ct  = datetime.now(timezone.utc) + CT_OFFSET
+    t_mins  = now_ct.hour * 60 + now_ct.minute
+    dow     = now_ct.weekday()  # Mon=0 … Sun=6
+
+    # Check exclusion window first
+    in_excl = (dow in EXCL_DAYS_09 and EXCL_START <= t_mins < EXCL_END)
+
+    for name, start, end, col in KILL_ZONES:
+        if start <= t_mins < end:
+            return name, COLS[col], in_excl
+
+    return None, None, in_excl
+
+# ── Phemex price fetch ────────────────────────────────────────────────────────
+async def fetch_eth_price():
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(PHEMEX_TICKER)
+            data = r.json()
+            # Response: data.result.lastRp  or  data.result.lastPrice
+            result = data.get('result', {})
+            price = result.get('lastRp') or result.get('lastPrice') or result.get('last')
+            if price:
+                return float(price)
+    except Exception:
+        pass
+    return None
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 WIDTH = 62
-ROWS  = {}  # dynamic field row positions, populated in draw_static()
+ROWS  = {}
 
 def draw_static():
     clr()
@@ -83,9 +141,16 @@ def draw_static():
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     p(f"{BLD}{CYN}  DERIBIT  PUT/CALL VOLUME MONITOR  —  ALL EXPIRIES{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    mark('ts'); p()
+    mark('ts');        p()
     p()
 
+    # ── Market info section ───────────────────────────────────────────────────
+    p(f"  {BLD}{'─'*4} MARKET {'─'*(WIDTH-10)}{RST}")
+    mark('eth_price'); p(f"    {'ETH Perp (Phemex)':<24}")
+    mark('session');   p(f"    {'Session':<24}")
+    p()
+
+    # ── P/C ratio sections ────────────────────────────────────────────────────
     for ccy in CURRENCIES:
         ccy_col = MAG if ccy == 'BTC' else CYN
         p(f"  {BLD}{ccy_col}{'─'*4} {ccy} {'─'*(WIDTH-7-len(ccy))}{RST}")
@@ -111,7 +176,7 @@ def draw_static():
     sys.stdout.flush()
 
 
-def update_values(results, errors, fetch_time, remaining):
+def update_values(results, errors, fetch_time, remaining, eth_price):
     bar_width = 30
     ts = fetch_time.strftime('%Y-%m-%d  %H:%M:%S UTC')
 
@@ -120,6 +185,26 @@ def update_values(results, errors, fetch_time, remaining):
     erase_line()
     sys.stdout.write(f"  {DIM}{ts}    refreshing in {remaining}s{RST}")
 
+    # ETH price
+    move(ROWS['eth_price'])
+    erase_line()
+    if eth_price:
+        sys.stdout.write(f"    {'ETH Perp (Phemex)':<24} {BLD}${eth_price:,.2f}{RST}")
+    else:
+        sys.stdout.write(f"    {'ETH Perp (Phemex)':<24} {DIM}unavailable{RST}")
+
+    # Session / kill zone
+    session_name, session_col, in_excl = get_session_status()
+    move(ROWS['session'])
+    erase_line()
+    if in_excl:
+        sys.stdout.write(f"    {'Session':<24} {RED}{BLD}EXCLUDED (09:00-10:00){RST}")
+    elif session_name:
+        sys.stdout.write(f"    {'Session':<24} {session_col}{BLD}{session_name}{RST}")
+    else:
+        sys.stdout.write(f"    {'Session':<24} {DIM}No active session{RST}")
+
+    # P/C data per currency
     for ccy in CURRENCIES:
         if ccy in errors:
             move(ROWS[f'{ccy}_put'])
@@ -181,10 +266,11 @@ def update_values(results, errors, fetch_time, remaining):
     sys.stdout.flush()
 
 
-# ── Deribit fetch loop ────────────────────────────────────────────────────────
+# ── Main fetch loop ───────────────────────────────────────────────────────────
 async def fetch_all(interval):
-    msg_id = 0
-    first  = True
+    msg_id    = 0
+    first     = True
+    eth_price = None
 
     async with websockets.connect(WS_URL, ping_interval=20) as ws:
         while True:
@@ -193,6 +279,7 @@ async def fetch_all(interval):
             results    = {}
             errors     = {}
 
+            # Fetch Deribit P/C data
             for ccy in CURRENCIES:
                 try:
                     req = {
@@ -235,12 +322,17 @@ async def fetch_all(interval):
                 except Exception as e:
                     errors[ccy] = str(e)
 
+            # Fetch ETH price from Phemex
+            eth_price = await fetch_eth_price()
+
             if first:
                 draw_static()
                 first = False
 
+            # Countdown — update dynamic fields every second
+            # Session status recalculated each second (it changes live)
             for remaining in range(interval, 0, -1):
-                update_values(results, errors, fetch_time, remaining)
+                update_values(results, errors, fetch_time, remaining, eth_price)
                 await asyncio.sleep(1)
 
 
@@ -256,8 +348,7 @@ def main():
         asyncio.run(fetch_all(args.interval))
     except KeyboardInterrupt:
         show_cursor()
-        # Move cursor below dashboard before exiting
-        move(50)
+        move(60)
         print(f"\n{DIM}Exited.{RST}")
 
 

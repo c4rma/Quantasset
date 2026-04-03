@@ -2,7 +2,8 @@
 """
 Quantasset — Deribit 0DTE Options Chain
 Curses-based terminal viewer with in-place cell updates (no flicker).
-Usage: python deribit_chain.py [ETH|BTC]
+Usage: python deribit_chain.py [ETH|BTC] [-s]
+  -s   Simple mode: Strike, Vol, OI, Mark only
 """
 
 import sys
@@ -30,34 +31,92 @@ except ModuleNotFoundError:
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-CURRENCY    = sys.argv[1].upper() if len(sys.argv) > 1 else "ETH"
+# ── ARG PARSING ───────────────────────────────────────────────────────────────
+args     = sys.argv[1:]
+SIMPLE   = "-s" in args
+args     = [a for a in args if a != "-s"]
+CURRENCY = args[0].upper() if args else "ETH"
+
+import os
+import hmac
+import hashlib
+
 BASE_URL    = "https://www.deribit.com/api/v2"
 REFRESH_SEC = 10
 MAX_STRIKES = 36   # rows centred around ATM
 
+# ── PHEMEX CONFIG ─────────────────────────────────────────────────────────────
+# Reads from environment variables or a .env file in the same directory.
+# Set PHEMEX_API_KEY and PHEMEX_API_SECRET in your environment,
+# or create a .env file alongside this script with those two lines.
+def _load_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
+PHEMEX_API_KEY    = os.environ.get("PHEMEX_API_KEY", "")
+PHEMEX_API_SECRET = os.environ.get("PHEMEX_API_SECRET", "")
+PHEMEX_BASE_URL   = "https://api.phemex.com"
+
 # ── COLUMN LAYOUT ─────────────────────────────────────────────────────────────
 # (label, width, justify)  justify: L=left R=right C=center
-CALL_COLS = [
-    ("Theta",  11, "R"),
-    ("Gamma",  10, "R"),
-    ("Delta",   9, "R"),
-    ("Mark",   16, "R"),
-    ("OI",     10, "R"),
-    ("Vol",    10, "R"),
-]
-STRIKE_COL = ("Strike", 14, "C")
-PUT_COLS   = [
-    ("Vol",    10, "L"),
-    ("OI",     10, "L"),
-    ("Mark",   16, "L"),
-    ("Delta",   9, "L"),
-    ("Gamma",  10, "L"),
-    ("Theta",  11, "L"),
-]
+if SIMPLE:
+    CALL_COLS = [
+        ("Chg",     8, "R"),
+        ("Mark",   11, "R"),
+        ("OI",     10, "R"),
+        ("Vol",    10, "R"),
+    ]
+    STRIKE_COL = ("Strike", 14, "C")
+    PUT_COLS   = [
+        ("Vol",    10, "L"),
+        ("OI",     10, "L"),
+        ("Mark",   11, "L"),
+        ("Chg",     8, "L"),
+    ]
+else:
+    CALL_COLS = [
+        ("Theta",  11, "R"),
+        ("Gamma",  10, "R"),
+        ("Delta",   9, "R"),
+        ("Chg",     8, "R"),
+        ("Mark",   11, "R"),
+        ("OI",     10, "R"),
+        ("Vol",    10, "R"),
+    ]
+    STRIKE_COL = ("Strike", 14, "C")
+    PUT_COLS   = [
+        ("Vol",    10, "L"),
+        ("OI",     10, "L"),
+        ("Mark",   11, "L"),
+        ("Chg",     8, "L"),
+        ("Delta",   9, "L"),
+        ("Gamma",  10, "L"),
+        ("Theta",  11, "L"),
+    ]
 
 ALL_COLS = CALL_COLS + [STRIKE_COL] + PUT_COLS
 TOTAL_W  = sum(w for _, w, _ in ALL_COLS)
+
+# Column index helpers (derived so they're always correct for both modes)
+N_CALL        = len(CALL_COLS)
+IDX_STRIKE    = N_CALL
+IDX_CALL_MARK = next(i for i, (l,_,_) in enumerate(CALL_COLS) if l == "Mark")
+IDX_CALL_CHG  = next(i for i, (l,_,_) in enumerate(CALL_COLS) if l == "Chg")
+IDX_CALL_OI   = next(i for i, (l,_,_) in enumerate(CALL_COLS) if l == "OI")
+IDX_CALL_VOL  = next(i for i, (l,_,_) in enumerate(CALL_COLS) if l == "Vol")
+IDX_PUT_VOL   = IDX_STRIKE + 1 + next(i for i, (l,_,_) in enumerate(PUT_COLS) if l == "Vol")
+IDX_PUT_OI    = IDX_STRIKE + 1 + next(i for i, (l,_,_) in enumerate(PUT_COLS) if l == "OI")
+IDX_PUT_MARK  = IDX_STRIKE + 1 + next(i for i, (l,_,_) in enumerate(PUT_COLS) if l == "Mark")
+IDX_PUT_CHG   = IDX_STRIKE + 1 + next(i for i, (l,_,_) in enumerate(PUT_COLS) if l == "Chg")
+IDX_CALL_GREEKS = [i for i, (l,_,_) in enumerate(CALL_COLS) if l in ("Theta","Gamma","Delta")]
+IDX_PUT_GREEKS  = [IDX_STRIKE + 1 + i for i, (l,_,_) in enumerate(PUT_COLS) if l in ("Theta","Gamma","Delta")]
 
 # ── API ───────────────────────────────────────────────────────────────────────
 def api(path, **params):
@@ -71,37 +130,47 @@ def api(path, **params):
 def fetch_ticker(name):
     return name, api("/public/ticker", instrument_name=name)
 
-def fetch_phemex_price():
-    """Fetch ETH/USDT perp mark price from Phemex public API."""
+def fetch_perp_mark_price():
+    """Fetch ETH perp mark price from Phemex using the same signed API call as copycat.
+    Reads markPriceRp from /g-accounts/accountPositions (USDT hedged perp account).
+    Falls back to Deribit index price (handled by caller) if keys not set or call fails.
+    """
+    if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
+        return None, None
+
     try:
+        path   = "/g-accounts/accountPositions"
+        query  = "currency=USDT"
+        expiry = str(int(time.time()) + 60)
+        msg    = path + query + expiry
+        sig    = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        hdrs   = {
+            "x-phemex-access-token":      PHEMEX_API_KEY,
+            "x-phemex-request-expiry":    expiry,
+            "x-phemex-request-signature": sig,
+            "Content-Type":               "application/json",
+        }
         r = requests.get(
-            "https://api.phemex.com/md/v3/ticker/24hr",
-            params={"symbol": "ETHUSD"},
+            f"{PHEMEX_BASE_URL}{path}?{query}",
+            headers=hdrs,
             timeout=6,
         )
-        j = r.json()
-        # Phemex returns markPrice scaled by 10000 for USD-settled perps
-        result = j.get("result", {})
-        mark = result.get("markPrice")
-        if mark:
-            return float(mark) / 10000
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            # markPriceRp lives on any active position, or in account-level tick data
+        symbol = f"{CURRENCY}USDT"
+        for pos in data.get("positions", []):
+                if pos.get("symbol") != symbol:
+                    continue
+                mp = pos.get("markPriceRp")
+                if mp:
+                    price = float(mp)
+                    if 100 < price < 100_000:
+                        return price, "Phemex"
     except Exception:
         pass
-    # Fallback: try the USDT perp endpoint
-    try:
-        r = requests.get(
-            "https://api.phemex.com/md/v3/ticker/24hr",
-            params={"symbol": "ETHUSDTPERP"},
-            timeout=6,
-        )
-        j = r.json()
-        result = j.get("result", {})
-        mark = result.get("markPrice")
-        if mark:
-            return float(mark) / 10000
-    except Exception:
-        pass
-    return None
+
+    return None, None
 
 # ── FORMAT HELPERS ────────────────────────────────────────────────────────────
 def fv(v, d=2, sign=False):
@@ -177,13 +246,13 @@ def fetch_all():
     # ── Step 2: fire Phemex, Deribit index, and ALL tickers concurrently ─────
     with ThreadPoolExecutor(max_workers=40) as ex:
         fut_index  = ex.submit(api, "/public/get_index_price", index_name=f"{CURRENCY.lower()}_usd")
-        fut_phemex = ex.submit(fetch_phemex_price) if CURRENCY == "ETH" else None
+        fut_perp   = ex.submit(fetch_perp_mark_price)
         ticker_futs = {ex.submit(fetch_ticker, ins["instrument_name"]): ins for ins in chain_ins}
 
         idx_data    = fut_index.result()
         index_price = idx_data["index_price"]
-        phemex_price = fut_phemex.result() if fut_phemex else None
-        atm_ref_price = phemex_price if phemex_price else index_price
+        perp_price, perp_source = fut_perp.result() if fut_perp else (None, None)
+        atm_ref_price = perp_price if perp_price else index_price
 
         tickers = {}
         for fut in as_completed(ticker_futs):
@@ -210,7 +279,8 @@ def fetch_all():
 
     return {
         "index_price":   index_price,
-        "phemex_price":  phemex_price,
+        "perp_price":    perp_price,
+        "perp_source":   perp_source,
         "atm_ref_price": atm_ref_price,
         "expiry_ts":     target_exp,
         "strikes_data":  strikes_data,
@@ -273,7 +343,8 @@ def draw(win, data, status=""):
     h, w = win.getmaxyx()
 
     index_price  = data["index_price"]
-    phemex_price = data.get("phemex_price")
+    perp_price   = data.get("perp_price")
+    perp_source  = data.get("perp_source") or "Perp"
     atm_ref_price= data.get("atm_ref_price", index_price)
     expiry_ts    = data["expiry_ts"]
     strikes_data = data["strikes_data"]
@@ -287,24 +358,40 @@ def draw(win, data, status=""):
     # ── Row 0: header bar ────────────────────────────────────────────────────
     win.move(0, 0)
     win.clrtoeol()
-    x = 1
-    pieces = [
-        ("QUANTASSET",             cp(P_CYAN, bold=True)),
-        ("  │  ",                  cp(P_DIM, dim=True)),
-        ("Instrument ",            cp(P_DIM, dim=True)),
-        (f"{CURRENCY}-0DTE",       cp(P_DEFAULT, bold=True)),
-        ("  Phemex ",              cp(P_DIM, dim=True)),
-        (f"${phemex_price:,.2f}" if phemex_price else "—",  cp(P_YELLOW, bold=True)),
-        ("  Deribit Index ",       cp(P_DIM, dim=True)),
-        (f"${index_price:,.2f}",   cp(P_DEFAULT)),
-        ("  ATM IV ",              cp(P_DIM, dim=True)),
-        (f"{atm_iv:.1f}%",         cp(P_YELLOW, bold=True)),
-        ("  Expiry ",              cp(P_DIM, dim=True)),
-        (exp_str,                  cp(P_DEFAULT)),
-        ("  Time Left ",           cp(P_DIM, dim=True)),
-        (ttl,                      cp(P_YELLOW, bold=True)),
-        (f"  Updated {fetched_at}",cp(P_DIM, dim=True)),
-    ]
+    start_x = max(0, (w - TOTAL_W) // 2)
+    x = start_x
+
+    if SIMPLE:
+        pieces = [
+            ("QUANTASSET",                                      cp(P_CYAN, bold=True)),
+            ("  │  ",                                           cp(P_DIM, dim=True)),
+            (f"{CURRENCY}-0DTE",                                cp(P_DEFAULT, bold=True)),
+            ("  Perp Mk ",                                      cp(P_DIM, dim=True)),
+            (f"${perp_price:,.2f}" if perp_price else "—",  cp(P_YELLOW, bold=True)),
+            ("  IV ",                                           cp(P_DIM, dim=True)),
+            (f"{atm_iv:.1f}%",                                  cp(P_YELLOW, bold=True)),
+            ("  ",                                              cp(P_DIM, dim=True)),
+            (ttl,                                               cp(P_YELLOW, bold=True)),
+            (f"  {fetched_at}",                                 cp(P_DIM, dim=True)),
+        ]
+    else:
+        pieces = [
+            ("QUANTASSET",                                      cp(P_CYAN, bold=True)),
+            ("  │  ",                                           cp(P_DIM, dim=True)),
+            ("Instrument ",                                     cp(P_DIM, dim=True)),
+            (f"{CURRENCY}-0DTE",                                cp(P_DEFAULT, bold=True)),
+            ("  Perp Mk ",                                      cp(P_DIM, dim=True)),
+            (f"${perp_price:,.2f}" if perp_price else "—",  cp(P_YELLOW, bold=True)),
+            ("  Deribit Index ",                                cp(P_DIM, dim=True)),
+            (f"${index_price:,.2f}",                            cp(P_DEFAULT)),
+            ("  ATM IV ",                                       cp(P_DIM, dim=True)),
+            (f"{atm_iv:.1f}%",                                  cp(P_YELLOW, bold=True)),
+            ("  Expiry ",                                       cp(P_DIM, dim=True)),
+            (exp_str,                                           cp(P_DEFAULT)),
+            ("  Time Left ",                                    cp(P_DIM, dim=True)),
+            (ttl,                                               cp(P_YELLOW, bold=True)),
+            (f"  Updated {fetched_at}",                         cp(P_DIM, dim=True)),
+        ]
     for text, attr in pieces:
         safe_add(win, 0, x, text, attr)
         x += len(text)
@@ -314,7 +401,6 @@ def draw(win, data, status=""):
     win.clrtoeol()
 
     # ── Row 2: column headers ─────────────────────────────────────────────────
-    start_x = max(0, (w - TOTAL_W) // 2)
     win.move(2, 0)
     win.clrtoeol()
     cx = start_x
@@ -383,38 +469,53 @@ def draw(win, data, status=""):
         c_mark_full = f"{c_mark_str} {c_pct_str}" if c_pct_str else c_mark_str
         p_mark_full = f"{p_mark_str} {p_pct_str}" if p_pct_str else p_mark_str
 
-        # Raw vol values for comparison
+        # Build cell values in full-mode order, then select the ones we need
         c_vol_raw = c.get("stats", {}).get("volume") if c else None
         p_vol_raw = p.get("stats", {}).get("volume") if p else None
 
-        cells = [
-            fv(cg.get("theta"), 4),           # 0  call theta
-            fv(cg.get("gamma"), 5),           # 1  call gamma
-            fv(cg.get("delta"), 3, sign=True),# 2  call delta
-            c_mark_full,                       # 3  call mark
-            foi(c.get("open_interest") if c else None),  # 4 call OI
-            fvol(c_vol_raw),                   # 5 call vol
-            fstrike(strike, atm_strike),       # 6  strike
-            fvol(p_vol_raw),                   # 7 put vol
-            foi(p.get("open_interest") if p else None),  # 8 put OI
-            p_mark_full,                       # 9  put mark
-            fv(pg.get("delta"), 3, sign=True), # 10 put delta
-            fv(pg.get("gamma"), 5),            # 11 put gamma
-            fv(pg.get("theta"), 4),            # 12 put theta
+        # Full 15-cell list — Theta Gamma Delta Chg Mark OI Vol | Strike | Vol OI Mark Chg Delta Gamma Theta
+        full_cells = [
+            fv(cg.get("theta"), 4),            # 0  call theta
+            fv(cg.get("gamma"), 5),            # 1  call gamma
+            fv(cg.get("delta"), 3, sign=True), # 2  call delta
+            c_pct_str,                          # 3  call chg
+            fmark(c_mark_usd),                  # 4  call mark (price only)
+            foi(c.get("open_interest") if c else None),  # 5  call OI
+            fvol(c_vol_raw),                    # 6  call vol
+            fstrike(strike, atm_strike),        # 7  strike
+            fvol(p_vol_raw),                    # 8  put vol
+            foi(p.get("open_interest") if p else None),  # 9  put OI
+            fmark(p_mark_usd),                  # 10 put mark (price only)
+            p_pct_str,                          # 11 put chg
+            fv(pg.get("delta"), 3, sign=True),  # 12 put delta
+            fv(pg.get("gamma"), 5),             # 13 put gamma
+            fv(pg.get("theta"), 4),             # 14 put theta
         ]
 
+        # Map label → full_cells index
+        call_label_to_full = {"Theta":0,"Gamma":1,"Delta":2,"Chg":3,"Mark":4,"OI":5,"Vol":6}
+        put_label_to_full  = {"Vol":8,"OI":9,"Mark":10,"Chg":11,"Delta":12,"Gamma":13,"Theta":14}
+
+        cells = []
+        for label, _, _ in CALL_COLS:
+            cells.append(full_cells[call_label_to_full[label]])
+        cells.append(full_cells[7])  # strike
+        for label, _, _ in PUT_COLS:
+            cells.append(full_cells[put_label_to_full[label]])
+
         # Vol colour: green = higher side, red = lower side
+        # If only one side has volume, that side is green
         cv_raw = c_vol_raw or 0
         pv_raw = p_vol_raw or 0
         if cv_raw > 0 and pv_raw > 0:
             call_vol_attr = cp(P_GREEN) if cv_raw >= pv_raw else cp(P_RED)
             put_vol_attr  = cp(P_GREEN) if pv_raw >= cv_raw else cp(P_RED)
         elif cv_raw > 0:
-            call_vol_attr = cp(P_DEFAULT)
+            call_vol_attr = cp(P_GREEN)
             put_vol_attr  = cp(P_DIM, dim=True)
         elif pv_raw > 0:
             call_vol_attr = cp(P_DIM, dim=True)
-            put_vol_attr  = cp(P_DEFAULT)
+            put_vol_attr  = cp(P_GREEN)
         else:
             call_vol_attr = cp(P_DIM, dim=True)
             put_vol_attr  = cp(P_DIM, dim=True)
@@ -423,43 +524,46 @@ def draw(win, data, status=""):
         for col_i, ((label, width, just), cell) in enumerate(zip(ALL_COLS, cells)):
             text = pad(cell, width, just)
 
-            # ── colour logic ──────────────────────────────────────────────
-            if col_i == 6:   # strike
+            if col_i == IDX_STRIKE:
                 attr = cp(P_ATM, bold=True) if is_atm else cp(P_STRIKE)
                 safe_add(win, row, cx, text, attr)
 
-            elif col_i == 3:   # call mark — price in yellow, pct coloured
-                mark_text = pad(c_mark_str, width, just)
-                safe_add(win, row, cx, mark_text, cp(P_MARK))
-                if c_pct_str:
-                    pct_x = cx + len(mark_text.rstrip()) + 1
-                    pct_attr = cp(P_GREEN) if c_dir > 0 else cp(P_RED)
-                    safe_add(win, row, pct_x, c_pct_str, pct_attr)
+            elif col_i == IDX_CALL_MARK:
+                safe_add(win, row, cx, pad(cell, width, just), cp(P_MARK))
 
-            elif col_i == 9:   # put mark
-                mark_text = pad(p_mark_str, width, just)
-                safe_add(win, row, cx, mark_text, cp(P_MARK))
-                if p_pct_str:
-                    pct_x = cx + len(mark_text) - len(mark_text.lstrip()) + len(p_mark_str.strip()) + 1
-                    pct_attr = cp(P_GREEN) if p_dir > 0 else cp(P_RED)
-                    safe_add(win, row, pct_x, p_pct_str, pct_attr)
+            elif col_i == IDX_CALL_CHG:
+                if cell:
+                    attr = cp(P_GREEN) if c_dir > 0 else cp(P_RED)
+                else:
+                    attr = cp(P_DIM, dim=True)
+                safe_add(win, row, cx, pad(cell or "—", width, just), attr)
 
-            elif col_i in (0, 1, 2):   # call greeks
+            elif col_i == IDX_PUT_MARK:
+                safe_add(win, row, cx, pad(cell, width, just), cp(P_MARK))
+
+            elif col_i == IDX_PUT_CHG:
+                if cell:
+                    attr = cp(P_GREEN) if p_dir > 0 else cp(P_RED)
+                else:
+                    attr = cp(P_DIM, dim=True)
+                safe_add(win, row, cx, pad(cell or "—", width, just), attr)
+
+            elif col_i in IDX_CALL_GREEKS:
                 attr = cp(P_DIM, dim=True) if cell == "—" else cp(P_CALL)
                 safe_add(win, row, cx, text, attr)
 
-            elif col_i in (10, 11, 12): # put greeks
+            elif col_i in IDX_PUT_GREEKS:
                 attr = cp(P_DIM, dim=True) if cell == "—" else cp(P_PUT)
                 safe_add(win, row, cx, text, attr)
 
-            elif col_i in (4, 8): # OI
+            elif col_i in (IDX_CALL_OI, IDX_PUT_OI):
                 attr = cp(P_DIM, dim=True) if cell == "—" else cp(P_DEFAULT)
                 safe_add(win, row, cx, text, attr)
 
-            elif col_i == 5:  # call vol
+            elif col_i == IDX_CALL_VOL:
                 safe_add(win, row, cx, text, call_vol_attr)
 
-            elif col_i == 7:  # put vol
+            elif col_i == IDX_PUT_VOL:
                 safe_add(win, row, cx, text, put_vol_attr)
 
             else:
@@ -469,7 +573,8 @@ def draw(win, data, status=""):
 
     # ── Bottom status bar ─────────────────────────────────────────────────────
     bot = h - 1
-    hint = f" q=quit  r=refresh  [{CURRENCY}]  {status}"
+    mode_tag = "SIMPLE" if SIMPLE else "FULL"
+    hint = f" q=quit  r=refresh  [{CURRENCY}]  [{mode_tag}]  {status}"
     safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
 
     win.noutrefresh()
@@ -565,6 +670,34 @@ def curses_main(stdscr):
         curses.doupdate()   # single atomic flip — zero flicker
 
 def main():
+    if "--debug-phemex" in sys.argv:
+        import json
+        print(f"API key loaded: {'yes' if PHEMEX_API_KEY else 'NO — set PHEMEX_API_KEY in .env'}")
+        try:
+            path   = "/g-accounts/accountPositions"
+            query  = "currency=USDT"
+            expiry = str(int(time.time()) + 60)
+            msg    = path + query + expiry
+            sig    = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+            hdrs   = {
+                "x-phemex-access-token":      PHEMEX_API_KEY,
+                "x-phemex-request-expiry":    expiry,
+                "x-phemex-request-signature": sig,
+                "Content-Type":               "application/json",
+            }
+            r = requests.get(f"{PHEMEX_BASE_URL}{path}?{query}", headers=hdrs, timeout=6)
+            print(f"Status: {r.status_code}")
+            data = r.json()
+            positions = data.get("data", {}).get("positions", [])
+            for p in positions:
+                print(f"  symbol={p.get('symbol')}  markPriceRp={p.get('markPriceRp')}")
+            if not positions:
+                print("  No positions found (markPriceRp requires an open position)")
+                print("  Raw response snippet:", str(data)[:300])
+        except Exception as e:
+            print(f"Error: {e}")
+        print(f"\nResolved price: {fetch_perp_mark_price()}")
+        return
     try:
         curses.wrapper(curses_main)
     except KeyboardInterrupt:

@@ -63,6 +63,9 @@ _load_env()
 PHEMEX_API_KEY    = os.environ.get("PHEMEX_API_KEY", "")
 PHEMEX_API_SECRET = os.environ.get("PHEMEX_API_SECRET", "")
 PHEMEX_BASE_URL   = "https://api.phemex.com"
+BRIDGE_URL        = os.environ.get("BRIDGE_URL", "").rstrip("/")
+BRIDGE_TOKEN      = os.environ.get("BRIDGE_TOKEN", "")
+USE_BRIDGE        = bool(BRIDGE_URL) and sys.platform != "win32"
 
 # ── COLUMN LAYOUT ─────────────────────────────────────────────────────────────
 # (label, width, justify)  justify: L=left R=right C=center
@@ -130,43 +133,69 @@ def api(path, **params):
 def fetch_ticker(name):
     return name, api("/public/ticker", instrument_name=name)
 
+def _phemex_get(path, query):
+    """Signed GET to Phemex — routes through bridge when USE_BRIDGE is set."""
+    expiry = str(int(time.time()) + 60)
+    msg    = path + query + expiry
+    sig    = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    hdrs   = {
+        "x-phemex-access-token":      PHEMEX_API_KEY,
+        "x-phemex-request-expiry":    expiry,
+        "x-phemex-request-signature": sig,
+        "Content-Type":               "application/json",
+    }
+    if USE_BRIDGE:
+        import json as _json, urllib.request as _req
+        payload = _json.dumps({
+            "method": "GET", "path": path,
+            "query": query, "body": "", "headers": hdrs,
+        }).encode()
+        req = _req.Request(
+            f"{BRIDGE_URL}/phemex", data=payload,
+            headers={"Content-Type": "application/json",
+                     "X-Bridge-Token": BRIDGE_TOKEN},
+            method="POST",
+        )
+        with _req.urlopen(req, timeout=8) as resp:
+            return __import__("json").loads(resp.read())
+    else:
+        r = requests.get(f"{PHEMEX_BASE_URL}{path}?{query}", headers=hdrs, timeout=6)
+        return r.json()
+
 def fetch_perp_mark_price():
-    """Fetch ETH perp mark price from Phemex using the same signed API call as copycat.
-    Reads markPriceRp from /g-accounts/accountPositions (USDT hedged perp account).
-    Falls back to Deribit index price (handled by caller) if keys not set or call fails.
+    """Fetch current perp mark price from Phemex.
+    Tries /md/v3/ticker/24hr first (always has markPrice, no open position needed),
+    then falls back to accountPositions. Routes through bridge.py on Termux.
     """
     if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
         return None, None
 
+    symbol = f"{CURRENCY}USDT"
+
+    # Primary: public ticker — use lastRp (last trade price, always live)
     try:
-        path   = "/g-accounts/accountPositions"
-        query  = "currency=USDT"
-        expiry = str(int(time.time()) + 60)
-        msg    = path + query + expiry
-        sig    = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-        hdrs   = {
-            "x-phemex-access-token":      PHEMEX_API_KEY,
-            "x-phemex-request-expiry":    expiry,
-            "x-phemex-request-signature": sig,
-            "Content-Type":               "application/json",
-        }
-        r = requests.get(
-            f"{PHEMEX_BASE_URL}{path}?{query}",
-            headers=hdrs,
-            timeout=6,
-        )
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            # markPriceRp lives on any active position, or in account-level tick data
-        symbol = f"{CURRENCY}USDT"
-        for pos in data.get("positions", []):
-                if pos.get("symbol") != symbol:
-                    continue
-                mp = pos.get("markPriceRp")
-                if mp:
-                    price = float(mp)
-                    if 100 < price < 100_000:
-                        return price, "Phemex"
+        data   = _phemex_get("/md/v3/ticker/24hr", f"symbol={symbol}")
+        result = data.get("result") or {}
+        for field in ("lastRp", "lastPrice", "markPriceRp", "indexPriceRp", "closeRp"):
+            val = result.get(field)
+            if val:
+                price = float(val)
+                if 100 < price < 1_000_000:
+                    return price, "Phemex"
+    except Exception:
+        pass
+
+    # Fallback: authenticated positions endpoint
+    try:
+        data = _phemex_get("/g-accounts/accountPositions", "currency=USDT")
+        for pos in (data.get("data") or {}).get("positions", []):
+            if pos.get("symbol") != symbol:
+                continue
+            mp = pos.get("markPriceRp")
+            if mp:
+                price = float(mp)
+                if 100 < price < 1_000_000:
+                    return price, "Phemex"
     except Exception:
         pass
 
@@ -671,31 +700,28 @@ def curses_main(stdscr):
 
 def main():
     if "--debug-phemex" in sys.argv:
-        import json
-        print(f"API key loaded: {'yes' if PHEMEX_API_KEY else 'NO — set PHEMEX_API_KEY in .env'}")
-        try:
-            path   = "/g-accounts/accountPositions"
-            query  = "currency=USDT"
-            expiry = str(int(time.time()) + 60)
-            msg    = path + query + expiry
-            sig    = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-            hdrs   = {
-                "x-phemex-access-token":      PHEMEX_API_KEY,
-                "x-phemex-request-expiry":    expiry,
-                "x-phemex-request-signature": sig,
-                "Content-Type":               "application/json",
-            }
-            r = requests.get(f"{PHEMEX_BASE_URL}{path}?{query}", headers=hdrs, timeout=6)
-            print(f"Status: {r.status_code}")
-            data = r.json()
-            positions = data.get("data", {}).get("positions", [])
-            for p in positions:
-                print(f"  symbol={p.get('symbol')}  markPriceRp={p.get('markPriceRp')}")
-            if not positions:
-                print("  No positions found (markPriceRp requires an open position)")
-                print("  Raw response snippet:", str(data)[:300])
-        except Exception as e:
-            print(f"Error: {e}")
+        print(f"API key loaded: {'yes' if PHEMEX_API_KEY else 'NO'}")
+        print(f"Bridge:         {'yes — ' + BRIDGE_URL if USE_BRIDGE else 'no (direct)'}")
+        symbol = f"{CURRENCY}USDT"
+        for path, query in [
+            ("/md/v3/ticker/24hr",           f"symbol={symbol}"),
+            ("/g-accounts/accountPositions", "currency=USDT"),
+        ]:
+            try:
+                data = _phemex_get(path, query)
+                print(f"\n── {path} ──")
+                if "result" in data:
+                    r = data.get("result") or {}
+                    for field in ("lastRp", "lastPrice", "markPriceRp", "indexPriceRp", "closeRp"):
+                        if field in r:
+                            print(f"  {field}: {r[field]}")
+                elif "data" in data:
+                    for pos in (data.get("data") or {}).get("positions", []):
+                        if pos.get("symbol") == symbol:
+                            print(f"  symbol={pos['symbol']}  markPriceRp={pos.get('markPriceRp')}")
+                            break
+            except Exception as e:
+                print(f"\n── {path} — error: {e}")
         print(f"\nResolved price: {fetch_perp_mark_price()}")
         return
     try:

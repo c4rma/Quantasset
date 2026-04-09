@@ -724,15 +724,40 @@ async def cmd_positions(refresh=False):
             tp_map = {}
             sl_map = {}
             try:
-                ord_data = await phemex_request('GET', '/g-orders/activeList',
-                                                params={'symbol': PHEMEX_SYMBOL, 'currency': 'USDT'})
-                if ord_data and ord_data.get('code') == 0:
-                    for o in (ord_data.get('data', {}).get('rows', []) or []):
-                        spx      = float(o.get('stopPxRp') or 0)
-                        stop_dir = o.get('stopDirection', '')
-                        side_o   = o.get('side', '')
-                        if spx == 0:
-                            continue
+                # Fetch both active and conditional orders to capture SL (Stop)
+                # and TP (MarketIfTouched) which live in different endpoints
+                active_data = await phemex_request('GET', '/g-orders/activeList',
+                                                   params={'symbol': PHEMEX_SYMBOL, 'currency': 'USDT'})
+                cond_data   = await phemex_request('GET', '/g-orders/activeList',
+                                                   params={'symbol': PHEMEX_SYMBOL, 'currency': 'USDT',
+                                                           'orderType': 'conditional'})
+                all_orders = []
+                if active_data and active_data.get('code') == 0:
+                    all_orders += (active_data.get('data', {}).get('rows', []) or [])
+                if cond_data and cond_data.get('code') == 0:
+                    all_orders += (cond_data.get('data', {}).get('rows', []) or [])
+
+                for o in all_orders:
+                    spx      = float(o.get('stopPxRp') or 0)
+                    stop_dir = o.get('stopDirection', '')
+                    side_o   = o.get('side', '')
+                    ord_type = o.get('ordType', '')
+                    if spx == 0:
+                        continue
+                    # TP: MarketIfTouched — Rising+Sell = Long TP, Falling+Buy = Short TP
+                    if ord_type == 'MarketIfTouched':
+                        if stop_dir == 'Rising' and side_o == 'Sell':
+                            tp_map['Long'] = spx
+                        elif stop_dir == 'Falling' and side_o == 'Buy':
+                            tp_map['Short'] = spx
+                    # SL: Stop — Falling+Sell = Long SL, Rising+Buy = Short SL
+                    elif ord_type == 'Stop':
+                        if stop_dir == 'Falling' and side_o == 'Sell':
+                            sl_map['Long'] = spx
+                        elif stop_dir == 'Rising' and side_o == 'Buy':
+                            sl_map['Short'] = spx
+                    else:
+                        # Fallback: use original stopDirection heuristic
                         if stop_dir == 'Rising' and side_o == 'Sell':
                             tp_map['Long'] = spx
                         elif stop_dir == 'Falling' and side_o == 'Sell':

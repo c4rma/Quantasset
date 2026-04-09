@@ -179,11 +179,10 @@ async def phemex_request_via_bridge(method, path, params=None, body=None):
     except Exception as e:
         raise RuntimeError(f"Bridge Phemex proxy error: {e}")
 
-async def phemex_get_fill_price(cl_ord_id, side, retries=8, delay=0.3):
-    """Get fill price — first try position avg entry, then order history."""
-    # Try position first — fastest since market orders fill instantly
+async def phemex_get_fill_price(cl_ord_id, side, retries=12, delay=0.5):
+    """Get fill price — polls position avg entry then falls back to order history."""
     for attempt in range(retries):
-        await asyncio.sleep(delay if attempt > 0 else 0.2)
+        await asyncio.sleep(delay if attempt > 0 else 0.3)
         try:
             data = await phemex_request('GET', '/g-accounts/accountPositions',
                                         params={'currency': 'USDT'})
@@ -194,7 +193,7 @@ async def phemex_get_fill_price(cl_ord_id, side, retries=8, delay=0.3):
                     price = float(p.get('avgEntryPriceRp') or 0)
                     if price > 0:
                         return price
-            # Fallback: check order history
+            # Fallback: order history
             data2 = await phemex_request('GET', '/g-orders/hist',
                                          params={'symbol': PHEMEX_SYMBOL, 'limit': '10'})
             for o in (data2.get('data', {}).get('rows', []) or []):
@@ -206,28 +205,35 @@ async def phemex_get_fill_price(cl_ord_id, side, retries=8, delay=0.3):
             pass
     return None
 
-async def phemex_amend_sl(side, fill_price, tp):
-    """Place a stop-market order to act as SL after a market fill."""
+async def phemex_amend_sl(side, fill_price, tp, retries=3):
+    """Place a stop-market SL order after a market fill. Retries on failure."""
     sl = round(fill_price - PHEMEX_SL if side == 'Long' else fill_price + PHEMEX_SL, 2)
     close_side = 'Sell' if side == 'Long' else 'Buy'
-    try:
-        params = {
-            'symbol':        PHEMEX_SYMBOL,
-            'clOrdID':       f'cc_sl_{int(time.time()*1000)}',
-            'side':          close_side,
-            'posSide':       side,
-            'orderQtyRq':    '0',
-            'ordType':       'Stop',
-            'stopPxRp':      str(sl),
-            'triggerType':   'ByMarkPrice',
-            'closeOnTrigger': 'true',
-            'reduceOnly':    'true',
-            'timeInForce':   'GoodTillCancel',
-        }
-        result = await phemex_request('PUT', '/g-orders/create', params=params)
-        return sl, result
-    except Exception as e:
-        return sl, {'error': str(e)}
+    last_result = None
+    for attempt in range(retries):
+        if attempt > 0:
+            await asyncio.sleep(1.0)
+        try:
+            params = {
+                'symbol':         PHEMEX_SYMBOL,
+                'clOrdID':        f'cc_sl_{int(time.time()*1000)}',
+                'side':           close_side,
+                'posSide':        side,
+                'orderQtyRq':     '0',
+                'ordType':        'Stop',
+                'stopPxRp':       str(sl),
+                'triggerType':    'ByMarkPrice',
+                'closeOnTrigger': 'true',
+                'reduceOnly':     'true',
+                'timeInForce':    'GoodTillCancel',
+            }
+            result = await phemex_request('PUT', '/g-orders/create', params=params)
+            last_result = result
+            if result.get('code') == 0:
+                return sl, result
+        except Exception as e:
+            last_result = {'error': str(e)}
+    return sl, last_result
 
 # ── MT5 bridge ────────────────────────────────────────────────────────────────
 # On Windows with MT5_FILES_PATH set: uses local file bridge directly.
@@ -704,9 +710,17 @@ async def cmd_positions(refresh=False):
         errors  = []
         ts      = datetime.now().strftime('%H:%M:%S')
 
+        # ── Fetch both brokers concurrently ───────────────────────────────────
+        loop = asyncio.get_event_loop()
+        phemex_task  = phemex_request('GET', '/g-accounts/accountPositions', params={'currency': 'USDT'})
+        xltrade_task = loop.run_in_executor(None, mt5_positions)
         try:
-            data = await phemex_request('GET', '/g-accounts/accountPositions', params={'currency': 'USDT'})
+            data, (mt5_pos, mt5_err) = await asyncio.gather(phemex_task, xltrade_task)
+        except Exception as e:
+            data    = {}
+            mt5_pos, mt5_err = [], str(e)
 
+        try:
             tp_map = {}
             sl_map = {}
             try:
@@ -731,23 +745,26 @@ async def cmd_positions(refresh=False):
                 pass
 
             for p in data.get('data', {}).get('positions', []):
-                if p.get('symbol') == PHEMEX_SYMBOL and float(p.get('size', 0)) != 0:
-                    pos_side = p.get('posSide', 'Long')
-                    avg      = float(p.get('avgEntryPriceRp', 0))
-                    mark     = float(p.get('markPriceRp', 0))
-                    size     = abs(float(p.get('size', 0)))
-                    sl       = sl_map.get(pos_side) or round(avg - PHEMEX_SL if pos_side == 'Long' else avg + PHEMEX_SL, 2)
-                    tp_val   = tp_map.get(pos_side) or float(p.get('takeProfitRp') or 0)
-                    upnl     = round((mark - avg) * size if pos_side == 'Long' else (avg - mark) * size, 4)
-                    results.append({'broker': 'Phemex', 'symbol': PHEMEX_SYMBOL,
-                                    'side': pos_side, 'size': size, 'avg': avg,
-                                    'mark': mark, 'sl': sl, 'tp': tp_val, 'upnl': upnl})
+                if p.get('symbol') != PHEMEX_SYMBOL:
+                    continue
+                # Use both size fields — Phemex sometimes briefly returns 0 for one
+                size = abs(float(p.get('size') or p.get('cumEntryQtyRq') or 0))
+                if size == 0:
+                    continue
+                pos_side = p.get('posSide', 'Long')
+                avg      = float(p.get('avgEntryPriceRp') or 0)
+                mark     = float(p.get('markPriceRp') or 0)
+                sl       = sl_map.get(pos_side) or round(avg - PHEMEX_SL if pos_side == 'Long' else avg + PHEMEX_SL, 2)
+                tp_val   = tp_map.get(pos_side) or float(p.get('takeProfitRp') or 0)
+                upnl     = round((mark - avg) * size if pos_side == 'Long' else (avg - mark) * size, 4)
+                results.append({'broker': 'Phemex', 'symbol': PHEMEX_SYMBOL,
+                                'side': pos_side, 'size': size, 'avg': avg,
+                                'mark': mark, 'sl': sl, 'tp': tp_val, 'upnl': upnl})
         except Exception as e:
             errors.append(f"Phemex: {e}")
 
-        mt5_pos, err = mt5_positions()
-        if err:
-            errors.append(f"XLTRADE: {err}")
+        if mt5_err:
+            errors.append(f"XLTRADE: {mt5_err}")
         else:
             for p in mt5_pos:
                 results.append({'broker': 'XLTRADE', 'symbol': p['symbol'],
@@ -799,18 +816,20 @@ async def cmd_positions(refresh=False):
             sys.stdout.flush()
             break
 
-        # Refresh mode: jump to top and write entire buffer atomically —
-        # no clear, so the terminal never shows a blank frame
+        # Refresh mode: jump to top, write full buffer, erase stale lines below
         _home()
         sys.stdout.write(output)
-        # Erase anything below current position left from a previous longer render
-        sys.stdout.write('\033[J')
+        sys.stdout.write('\033[J')  # erase everything below current position
         sys.stdout.flush()
 
         for remaining in range(5, 0, -1):
-            sys.stdout.write(f"  {DIM}Refreshing in {remaining}s...{RST}\r")
+            # Write countdown on its own line, then move back up to overwrite it
+            sys.stdout.write(f"  {DIM}Refreshing in {remaining}s...{RST}  \n")
+            sys.stdout.write('\033[1A')  # move cursor back up one line
             sys.stdout.flush()
             await asyncio.sleep(1)
+        # Clear the countdown line before next render
+        sys.stdout.write('\033[K')
 
     except asyncio.CancelledError:
         pass

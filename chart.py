@@ -127,6 +127,7 @@ class ChartState:
         self.error         = ""       # last REST/WS error for display
         self.session       = 0
         self.cursor_offset = 0
+        self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
 
 state = ChartState()
 
@@ -526,17 +527,21 @@ def start_feed(asset: str, feed: str = ""):
     state.ws_thread = t
 
 # ── colors ────────────────────────────────────────────────────────────────────
-def init_colors():
+def init_colors(scheme: str = "bw"):
+    """scheme: 'bw' = white bull / blue bear  |  'rg' = green bull / red bear"""
     curses.start_color()
     curses.use_default_colors()
-    # Candle colors: bull = blue, bear = white (bright)
-    curses.init_pair(C_BULL,      curses.COLOR_WHITE,  -1)
-    curses.init_pair(C_BEAR,      curses.COLOR_BLUE,   -1)
+    if scheme == "rg":
+        bull_fg, bear_fg = curses.COLOR_GREEN, curses.COLOR_RED
+    else:
+        bull_fg, bear_fg = curses.COLOR_WHITE, curses.COLOR_BLUE
+    curses.init_pair(C_BULL,      bull_fg,             -1)
+    curses.init_pair(C_BEAR,      bear_fg,             -1)
     curses.init_pair(C_AXIS,      8,                   -1)
     curses.init_pair(C_LABEL,     curses.COLOR_WHITE,  -1)
     curses.init_pair(C_HEADER,    curses.COLOR_WHITE,  curses.COLOR_BLACK)
-    curses.init_pair(C_VOL_BULL,  curses.COLOR_WHITE,  -1)
-    curses.init_pair(C_VOL_BEAR,  curses.COLOR_BLUE,   -1)
+    curses.init_pair(C_VOL_BULL,  bull_fg,             -1)
+    curses.init_pair(C_VOL_BEAR,  bear_fg,             -1)
     curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
@@ -608,6 +613,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         status        = state.status
         error         = state.error
         cursor_offset = state.cursor_offset
+        color_scheme  = state.color_scheme
 
     all_candles = candles_snap + ([live] if live else [])
 
@@ -636,17 +642,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     visible    = all_candles[-chart_w:] if all_candles else []
 
-    # Wall-clock anchor: floor current time to the last completed minute.
-    # Every candle column i in visible[] opened at:
-    #   now_floor - (n_vis - 1 - i) * RESOLUTION
-    # Using this instead of candle.ts ensures timestamps are always correct.
-    _now_epoch = int(time.time())
-    now_floor  = _now_epoch - (_now_epoch % RESOLUTION)
-    n_vis      = len(visible)
-
-    def col_epoch(i: int) -> int:
-        """Unix timestamp of candle at visible-index i, derived from wall clock."""
-        return now_floor - (n_vis - 1 - i) * RESOLUTION
+    n_vis = len(visible)
 
 
     # ── cursor ────────────────────────────────────────────────────────────────
@@ -707,7 +703,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, "[E]TH  [B]TC  [F]eed  [<][>] cursor  [Esc] reset  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, "[E]TH  [B]TC  [F]eed  [C]olor  [<][>] cursor  [Esc] reset  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -722,10 +718,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         chg   = lc.c - lc.o
         pct   = chg / lc.o * 100 if lc.o else 0
         arrow = "+" if bull else "-"
-        # Cursor time: wall-clock derived from cursor column index
-        if in_cursor_mode and visible:
-            ts_lbl = datetime.fromtimestamp(
-                col_epoch(cursor_idx)).strftime("%H:%M:%S")
+        # Cursor time: directly from the selected candle's timestamp (local time)
+        if in_cursor_mode and selected:
+            ts_lbl = datetime.fromtimestamp(selected.ts).strftime("%H:%M:%S")
         else:
             ts_lbl = ""
         cursor_tag = f"  [{ts_lbl}]" if in_cursor_mode else ""
@@ -838,20 +833,20 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             MIN_LABEL_GAP  = 6
             last_label_col = -MIN_LABEL_GAP - 1
 
-            for i in range(n_vis):
+            for i, candle in enumerate(visible):
                 lbl_col = start_col + i
                 if not (0 <= lbl_col <= chart_r - 5):
                     continue
-                dt = datetime.fromtimestamp(col_epoch(i))
+                # Use candle.ts directly — fromtimestamp converts UTC epoch to local time
+                dt = datetime.fromtimestamp(candle.ts)
                 if dt.minute % 15 == 0 and lbl_col - last_label_col >= MIN_LABEL_GAP:
                     lbl = dt.strftime("%H:%M")
                     db.puts(time_row, lbl_col, lbl, C_LABEL, curses.A_BOLD)
                     last_label_col = lbl_col
 
-            # Cursor label — always show HH:MM at cursor column
-            if in_cursor_mode and 0 <= cursor_col <= chart_r - 5:
-                lbl = datetime.fromtimestamp(
-                    col_epoch(cursor_idx)).strftime("%H:%M")
+            # Cursor label — from selected candle's actual ts
+            if in_cursor_mode and selected and 0 <= cursor_col <= chart_r - 5:
+                lbl = datetime.fromtimestamp(selected.ts).strftime("%H:%M")
                 db.puts(time_row, cursor_col, lbl, C_CURSOR, curses.A_BOLD)
 
     # Bottom border of the time axis box (top of VOL pane)
@@ -863,7 +858,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         cinfo    = f"  cursor {cursor_offset:+d}" if in_cursor_mode else ""
         auth_tag = f"/{('auth' if PHEMEX_API_KEY else 'no-auth')}" if feed == "phemex" else ""
         err_str  = f"  ! {error}" if error and visible else ""
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [Q] Quit"
+        scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
@@ -872,7 +868,7 @@ def main(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.keypad(True)
-    init_colors()
+    init_colors(state.color_scheme)
 
     rows, cols = stdscr.getmaxyx()
     db = DoubleBuffer(rows, cols)
@@ -895,6 +891,14 @@ def main(stdscr):
             # Cycle to next feed
             idx      = FEEDS.index(state.feed)
             new_feed = FEEDS[(idx + 1) % len(FEEDS)]
+        elif key in (ord("c"), ord("C")):
+            with state.lock:
+                state.color_scheme = "rg" if state.color_scheme == "bw" else "bw"
+            # Reinit color pairs and invalidate the entire double-buffer cache
+            # so every cell is redrawn fresh with the new scheme next frame.
+            init_colors(state.color_scheme)
+            db.prev = None
+            stdscr.clear()
 
         if new_asset:
             state.asset = new_asset

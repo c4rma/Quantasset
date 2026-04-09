@@ -90,13 +90,13 @@ def _phemex_headers(path: str, query: str = "", body: str = "") -> dict:
     }
 
 # ── color pairs ────────────────────────────────────────────────────────────────
-C_GREEN     = 1
-C_RED       = 2
+C_BULL      = 1   # bearish  → blue
+C_BEAR      = 2   # bullish  → white
 C_AXIS      = 3
 C_LABEL     = 4
 C_HEADER    = 5
-C_VOL_BULL  = 6
-C_VOL_BEAR  = 7
+C_VOL_BULL  = 6   # blue
+C_VOL_BEAR  = 7   # white/dim
 C_ASSET_SEL = 9
 C_PRICE_LBL = 10
 C_CURSOR    = 11
@@ -529,15 +529,16 @@ def start_feed(asset: str, feed: str = ""):
 def init_colors():
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(C_GREEN,     curses.COLOR_GREEN,  -1)
-    curses.init_pair(C_RED,       curses.COLOR_RED,    -1)
+    # Candle colors: bull = blue, bear = white (bright)
+    curses.init_pair(C_BULL,      curses.COLOR_BLUE,   -1)
+    curses.init_pair(C_BEAR,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_AXIS,      8,                   -1)
     curses.init_pair(C_LABEL,     curses.COLOR_WHITE,  -1)
     curses.init_pair(C_HEADER,    curses.COLOR_WHITE,  curses.COLOR_BLACK)
-    curses.init_pair(C_VOL_BULL,  curses.COLOR_GREEN,  -1)
-    curses.init_pair(C_VOL_BEAR,  curses.COLOR_RED,    -1)
+    curses.init_pair(C_VOL_BULL,  curses.COLOR_BLUE,   -1)
+    curses.init_pair(C_VOL_BEAR,  curses.COLOR_WHITE,  -1)
     curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
-    curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_GREEN)
+    curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
 
 # ── formatting ────────────────────────────────────────────────────────────────
@@ -618,16 +619,35 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     FOOTER_H = 1
 
     chart_top  = HEADER_H
-    chart_bot  = rows - VOL_H - TIME_H - FOOTER_H - 1
+    chart_bot  = rows - VOL_H - TIME_H - FOOTER_H - 2
     chart_h    = max(1, chart_bot - chart_top)
     chart_r    = cols - PRICE_W - 1
     chart_w    = max(1, chart_r)
-    vol_top    = chart_bot + 1
+    # Layout (rows, top→bottom):
+    #   chart_top … chart_bot   chart area
+    #   chart_bot               separator line
+    #   chart_bot+1             time axis labels  ← between chart and VOL
+    #   chart_bot+2 … +2+VOL_H volume bars
+    #   rows-1                  footer
+    time_row   = chart_bot + 1
+    vol_top    = chart_bot + 2
     vol_bot    = vol_top + VOL_H
-    time_row   = vol_bot + 1
     footer_row = rows - 1
 
-    visible = all_candles[-chart_w:] if all_candles else []
+    visible    = all_candles[-chart_w:] if all_candles else []
+
+    # Wall-clock anchor: floor current time to the last completed minute.
+    # Every candle column i in visible[] opened at:
+    #   now_floor - (n_vis - 1 - i) * RESOLUTION
+    # Using this instead of candle.ts ensures timestamps are always correct.
+    _now_epoch = int(time.time())
+    now_floor  = _now_epoch - (_now_epoch % RESOLUTION)
+    n_vis      = len(visible)
+
+    def col_epoch(i: int) -> int:
+        """Unix timestamp of candle at visible-index i, derived from wall clock."""
+        return now_floor - (n_vis - 1 - i) * RESOLUTION
+
 
     # ── cursor ────────────────────────────────────────────────────────────────
     max_offset    = -(len(visible) - 1) if visible else 0
@@ -673,10 +693,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     badge = f" {feed.upper()} "
     db.puts(0, cols - len(badge) - 22, badge, C_ASSET_SEL, curses.A_BOLD)
 
-    now_str    = datetime.now().strftime("%H:%M:%S")
-    status_str = f"| {status}  1m  {now_str} "
+    now_str = datetime.now().strftime("%H:%M:%S")
+    # Countdown: seconds remaining until next 1-min candle close
+    now_epoch   = int(time.time())
+    secs_left   = RESOLUTION - (now_epoch % RESOLUTION)
+    countdown   = f"  {secs_left:02d}s" if status == "Live" else ""
+    status_str  = f"| {status}{countdown}  1m  {now_str} "
     db.puts(0, cols - len(status_str) - 1, status_str,
-            C_GREEN if status == "Live" else C_RED, curses.A_BOLD)
+            C_BULL if status == "Live" else C_BEAR, curses.A_BOLD)
 
     col = 2
     for a in ("ETH", "BTC"):
@@ -687,9 +711,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
-        db.puts(2, 2, f"ERR: {error}", C_RED, curses.A_BOLD)
+        db.puts(2, 2, f"ERR: {error}", C_BEAR, curses.A_BOLD)
     elif not visible and status not in ("Live",):
-        db.puts(2, 2, status, C_RED, curses.A_BOLD)
+        db.puts(2, 2, status, C_BEAR, curses.A_BOLD)
 
     display_candle = selected if selected else (visible[-1] if visible else None)
     if display_candle:
@@ -698,7 +722,12 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         chg   = lc.c - lc.o
         pct   = chg / lc.o * 100 if lc.o else 0
         arrow = "+" if bull else "-"
-        ts_lbl     = datetime.fromtimestamp(lc.ts, tz=timezone.utc).strftime("%H:%M")
+        # Cursor time: wall-clock derived from cursor column index
+        if in_cursor_mode and visible:
+            ts_lbl = datetime.fromtimestamp(
+                col_epoch(cursor_idx), tz=timezone.utc).strftime("%H:%M:%S")
+        else:
+            ts_lbl = ""
         cursor_tag = f"  [{ts_lbl}]" if in_cursor_mode else ""
         ohlcv = (f"  O {price_fmt(lc.o, asset)}"
                  f"  H {price_fmt(lc.h, asset)}"
@@ -707,22 +736,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                  f"  {arrow}{abs(chg):.2f} ({pct:+.2f}%)"
                  f"  Vol {vol_fmt(lc.v)}"
                  f"{cursor_tag}")
-        ohlc_pair = C_CURSOR if in_cursor_mode else (C_GREEN if bull else C_RED)
+        ohlc_pair = C_CURSOR if in_cursor_mode else (C_BULL if bull else C_BEAR)
         db.puts(2, 2, ohlcv, ohlc_pair, curses.A_BOLD)
 
-    # ── GRID ──────────────────────────────────────────────────────────────────
-    price_labels = smart_price_labels(lo_p, hi_p, asset)
-    for price, _ in price_labels:
-        gr = chart_top + p2r(price)
-        if chart_top <= gr < chart_bot:
-            for c2 in range(chart_r):
-                db.put(gr, c2, ".", C_AXIS)
-
     # ── PRICE AXIS ────────────────────────────────────────────────────────────
+    price_labels = smart_price_labels(lo_p, hi_p, asset)
     for r in range(chart_top, chart_bot + 1):
         db.put(r, chart_r, "|", C_AXIS)
-    for r in range(vol_top, min(vol_bot + 1, rows)):
-        db.put(r, chart_r, "|", C_AXIS)
+    # (price axis | through vol pane drawn inside VOLUME section)
 
     for price, lbl in price_labels:
         gr = chart_top + p2r(price)
@@ -734,7 +755,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         pr = chart_top + p2r(last_price)
         if chart_top <= pr < chart_bot:
             for c2 in range(chart_r):
-                if db.buf[pr][c2][0] in (".", " "):
+                if db.buf[pr][c2][0] == " ":
                     db.put(pr, c2, "-", C_PRICE_LBL)
             db.puts(pr, chart_r,     ">", C_PRICE_LBL, curses.A_BOLD)
             db.puts(pr, chart_r + 1, f"{price_fmt(last_price, asset):<{PRICE_W}}",
@@ -744,7 +765,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         pr = chart_top + p2r(selected.c)
         if chart_top <= pr < chart_bot:
             for c2 in range(chart_r):
-                if db.buf[pr][c2][0] in (".", " "):
+                if db.buf[pr][c2][0] == " ":
                     db.put(pr, c2, "-", C_CURSOR)
             db.puts(pr, chart_r,     ">", C_CURSOR, curses.A_BOLD)
             db.puts(pr, chart_r + 1, f"{price_fmt(selected.c, asset):<{PRICE_W}}",
@@ -759,7 +780,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
         is_selected = (i == cursor_idx and in_cursor_mode)
         bull        = candle.c >= candle.o
-        body_pair   = C_CURSOR if is_selected else (C_GREEN if bull else C_RED)
+        body_pair   = C_CURSOR if is_selected else (C_BULL if bull else C_BEAR)
 
         clamp = lambda v: max(chart_top, min(chart_bot - 1, v))
         r_hi  = clamp(chart_top + p2r(candle.h))
@@ -787,7 +808,13 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     db.puts(chart_bot, 0, "-" * chart_r + "+", C_AXIS)
 
     # ── VOLUME ────────────────────────────────────────────────────────────────
-    db.puts(vol_top, 0, "VOL", C_AXIS, curses.A_DIM)
+    # vol_top is now the bottom border of the time axis box.
+    # VOL bars live in vol_top+1 … vol_bot.
+    vol_bar_top = vol_top + 1
+    db.puts(vol_bar_top, 0, "VOL", C_AXIS, curses.A_DIM)
+    # Also extend the price axis | through the vol pane
+    for r in range(vol_bar_top, min(vol_bot + 1, rows)):
+        db.put(r, chart_r, "|", C_AXIS)
     for i, candle in enumerate(visible):
         col = start_col + i
         if not (0 <= col < chart_r):
@@ -800,21 +827,36 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             if 0 <= r < rows:
                 db.put(r, col, "#", pair)
 
-    # ── TIME AXIS ─────────────────────────────────────────────────────────────
+    # ── TIME AXIS (between chart separator and VOL) ──────────────────────────
+    # time_row = chart_bot+1: 15-min interval labels, bordered left/right.
+    # vol_top  = chart_bot+2: bottom border line, then VOL bars below.
     if 0 <= time_row < rows:
-        db.puts(time_row, 0, "-" * chart_r, C_AXIS)
+        # Right border | on the time label row
+        db.put(time_row, chart_r, "|", C_AXIS)
+
         if visible:
-            step = max(1, len(visible) // max(1, chart_w // 12))
-            for i in range(0, len(visible), step):
+            MIN_LABEL_GAP  = 6
+            last_label_col = -MIN_LABEL_GAP - 1
+
+            for i in range(n_vis):
                 lbl_col = start_col + i
-                if 0 <= lbl_col <= chart_r - 5:
-                    lbl = datetime.fromtimestamp(
-                        visible[i].ts, tz=timezone.utc).strftime("%H:%M")
-                    db.puts(time_row, lbl_col, lbl, C_LABEL)
-            if in_cursor_mode and selected and 0 <= cursor_col <= chart_r - 5:
+                if not (0 <= lbl_col <= chart_r - 5):
+                    continue
+                dt = datetime.fromtimestamp(col_epoch(i), tz=timezone.utc)
+                if dt.minute % 15 == 0 and lbl_col - last_label_col >= MIN_LABEL_GAP:
+                    lbl = dt.strftime("%H:%M")
+                    db.puts(time_row, lbl_col, lbl, C_LABEL, curses.A_BOLD)
+                    last_label_col = lbl_col
+
+            # Cursor label — always show HH:MM at cursor column
+            if in_cursor_mode and 0 <= cursor_col <= chart_r - 5:
                 lbl = datetime.fromtimestamp(
-                    selected.ts, tz=timezone.utc).strftime("%H:%M")
+                    col_epoch(cursor_idx), tz=timezone.utc).strftime("%H:%M")
                 db.puts(time_row, cursor_col, lbl, C_CURSOR, curses.A_BOLD)
+
+    # Bottom border of the time axis box (top of VOL pane)
+    if 0 <= vol_top < rows:
+        db.puts(vol_top, 0, "-" * chart_r + "+", C_AXIS)
 
     # ── FOOTER ────────────────────────────────────────────────────────────────
     if 0 <= footer_row < rows:

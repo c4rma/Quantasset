@@ -779,13 +779,16 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # Price buckets = chart rows; each candle's volume is distributed across
     # the rows it spans (high→low), proportional to the row count it covers.
     if show_vp and visible and chart_h > 0:
-        # Session start: today at midnight local time (00:00 CT)
-        import time as _time
-        _now_local   = datetime.now()
-        session_start = datetime(
-            _now_local.year, _now_local.month, _now_local.day,
-            0, 0, 0
-        ).timestamp()  # local midnight as UTC epoch
+        # Session start: most recent 19:00 CT (futures session open).
+        # If current local time is before 19:00 today, use yesterday's 19:00.
+        _now_local = datetime.now()
+        _session_today = datetime(
+            _now_local.year, _now_local.month, _now_local.day, 19, 0, 0)
+        if _now_local < _session_today:
+            # Before 19:00 today — session started yesterday at 19:00
+            import datetime as _dt
+            _session_today -= _dt.timedelta(days=1)
+        session_start = _session_today.timestamp()
 
         # Accumulate volume per price bucket using ALL loaded candles in session
         vp_buckets = [0.0] * chart_h   # index 0 = top row (high price)

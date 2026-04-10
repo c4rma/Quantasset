@@ -113,7 +113,11 @@ WIDTH = 62
 ROWS  = {}
 
 def draw_static():
+    ROWS.clear()
     clr()
+    # After cls the cursor position is unreliable — force it to row 1
+    sys.stdout.write('\033[H')
+    sys.stdout.flush()
     hide_cursor()
     row = [1]
 
@@ -260,13 +264,6 @@ async def fetch_all(interval):
     backoff   = 5   # seconds, doubles on each failed attempt up to 60s
 
     while True:
-        # ── Show reconnecting status on screen if layout already drawn ─────
-        if ROWS:
-            move(ROWS.get('exit', 50))
-            erase_line()
-            sys.stdout.write(f"  {YLW}Connecting to Deribit...{RST}")
-            sys.stdout.flush()
-
         try:
             async with websockets.connect(
                 WS_URL,
@@ -323,8 +320,11 @@ async def fetch_all(interval):
                             msg_id += 1
 
                         except asyncio.TimeoutError:
-                            errors[ccy] = "Timeout — retrying"
+                            errors[ccy] = "Timeout"
                         except Exception as e:
+                            # If it's a WebSocket connection error, propagate to reconnect loop
+                            if 'websockets' in type(e).__module__ or 'close frame' in str(e).lower() or 'connection' in str(e).lower():
+                                raise
                             errors[ccy] = str(e)
 
                     eth_price = await fetch_eth_price()
@@ -352,8 +352,6 @@ def main():
                         help='Refresh interval in seconds (default: 30)')
     args = parser.parse_args()
 
-    sys.stdout.write("Connecting to Deribit...\n")
-    sys.stdout.flush()
     try:
         asyncio.run(fetch_all(args.interval))
     except KeyboardInterrupt:

@@ -256,12 +256,29 @@ def cleanup_terminal():
 # ── Main fetch loop ───────────────────────────────────────────────────────────
 async def fetch_all(interval):
     msg_id    = 0
-    first     = True
     eth_price = None
+    backoff   = 5   # seconds, doubles on each failed attempt up to 60s
 
     while True:
+        # ── Show reconnecting status on screen if layout already drawn ─────
+        if ROWS:
+            move(ROWS.get('exit', 50))
+            erase_line()
+            sys.stdout.write(f"  {YLW}Connecting to Deribit...{RST}")
+            sys.stdout.flush()
+
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+            async with websockets.connect(
+                WS_URL,
+                ping_interval = 30,
+                ping_timeout  = 20,
+                close_timeout = 10,
+            ) as ws:
+                backoff = 5  # reset backoff on successful connect
+
+                # Redraw static layout on every (re)connect so screen is clean
+                draw_static()
+
                 while True:
                     msg_id    += 1
                     fetch_time = datetime.now(timezone.utc)
@@ -279,7 +296,7 @@ async def fetch_all(interval):
                             await ws.send(json.dumps(req))
 
                             while True:
-                                raw  = await asyncio.wait_for(ws.recv(), timeout=20)
+                                raw  = await asyncio.wait_for(ws.recv(), timeout=25)
                                 resp = json.loads(raw)
                                 if resp.get('id') == msg_id:
                                     break
@@ -312,23 +329,21 @@ async def fetch_all(interval):
 
                     eth_price = await fetch_eth_price()
 
-                    if first:
-                        draw_static()
-                        first = False
-
                     for remaining in range(interval, 0, -1):
                         update_values(results, errors, fetch_time, remaining, eth_price)
                         await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             raise
-        except Exception:
-            if not first and ROWS:
+        except Exception as e:
+            # Show error and wait with exponential backoff before reconnecting
+            if ROWS:
                 move(ROWS.get('exit', 50))
                 erase_line()
-                sys.stdout.write(f"  {YLW}Connection lost — reconnecting...{RST}")
+                sys.stdout.write(f"  {RED}Disconnected — retrying in {backoff}s...{RST}")
                 sys.stdout.flush()
-            await asyncio.sleep(5)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # double up to 60s max
 
 
 def main():

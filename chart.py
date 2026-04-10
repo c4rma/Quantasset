@@ -100,6 +100,9 @@ C_VOL_BEAR  = 7   # white/dim
 C_ASSET_SEL = 9
 C_PRICE_LBL = 10
 C_CURSOR    = 11
+C_VP_NORM   = 12   # volume profile bar (dim)
+C_VP_POC    = 13   # point of control (brightest level)
+C_VP_VA     = 14   # value area high/low lines
 
 # ── data structures ────────────────────────────────────────────────────────────
 class Candle:
@@ -128,6 +131,7 @@ class ChartState:
         self.session       = 0
         self.cursor_offset = 0
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
+        self.show_vp       = True    # volume profile overlay toggle
 
 state = ChartState()
 
@@ -545,6 +549,9 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
+    curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_VP_POC,    curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_VP_VA,     curses.COLOR_MAGENTA,-1)
 
 # ── formatting ────────────────────────────────────────────────────────────────
 def price_fmt(p: float, asset: str) -> str:
@@ -614,6 +621,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         error         = state.error
         cursor_offset = state.cursor_offset
         color_scheme  = state.color_scheme
+        show_vp       = state.show_vp
 
     all_candles = candles_snap + ([live] if live else [])
 
@@ -703,7 +711,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, "[E]TH  [B]TC  [F]eed  [C]olor  [<][>] cursor  [Esc] reset  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, "[E]TH  [B]TC  [F]eed  [C]olor  [V]P  [<][>] cursor  [Esc] reset  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -765,6 +773,124 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             db.puts(pr, chart_r,     ">", C_CURSOR, curses.A_BOLD)
             db.puts(pr, chart_r + 1, f"{price_fmt(selected.c, asset):<{PRICE_W}}",
                     C_CURSOR, curses.A_BOLD)
+
+    # ── VOLUME PROFILE (session: today 00:00 local time → now) ──────────────
+    # Drawn behind candles so candles always overwrite profile bars.
+    # Price buckets = chart rows; each candle's volume is distributed across
+    # the rows it spans (high→low), proportional to the row count it covers.
+    if show_vp and visible and chart_h > 0:
+        # Session start: today at midnight local time (00:00 CT)
+        import time as _time
+        _now_local   = datetime.now()
+        session_start = datetime(
+            _now_local.year, _now_local.month, _now_local.day,
+            0, 0, 0
+        ).timestamp()  # local midnight as UTC epoch
+
+        # Accumulate volume per price bucket using ALL loaded candles in session
+        vp_buckets = [0.0] * chart_h   # index 0 = top row (high price)
+
+        # Use full all_candles (not just visible) for session scope
+        session_candles = [c for c in all_candles if c.ts >= session_start]
+
+        if session_candles and lo_p < hi_p:
+            for c in session_candles:
+                b_hi = int((1.0 - (c.h - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                b_lo = int((1.0 - (c.l - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                b_hi = max(0, min(chart_h - 1, b_hi))
+                b_lo = max(0, min(chart_h - 1, b_lo))
+                span = max(1, b_lo - b_hi + 1)
+                vol_per_row = c.v / span
+                for b in range(b_hi, b_lo + 1):
+                    vp_buckets[b] += vol_per_row
+
+            max_vp    = max(vp_buckets) or 1.0
+            total_vol = sum(vp_buckets)
+            VP_MAX_W  = max(4, chart_w // 5)
+            poc_row   = vp_buckets.index(max_vp)
+
+            # ── Value Area (70% of session volume) ────────────────────────────
+            # Standard algorithm: start at POC, expand up or down one bucket
+            # at a time, always choosing the side with more volume, until
+            # accumulated volume >= 70% of total.
+            TARGET    = total_vol * 0.70
+            va_accum  = vp_buckets[poc_row]
+            va_top    = poc_row   # lowest bucket index = highest price (row 0 = top)
+            va_bot    = poc_row   # highest bucket index = lowest price
+
+            while va_accum < TARGET:
+                # Volume available one step above (lower index) and below (higher index)
+                above_vol = vp_buckets[va_top - 1] if va_top > 0                else 0.0
+                below_vol = vp_buckets[va_bot + 1] if va_bot < chart_h - 1     else 0.0
+                if above_vol == 0 and below_vol == 0:
+                    break
+                if above_vol >= below_vol:
+                    va_top   -= 1
+                    va_accum += above_vol
+                else:
+                    va_bot   += 1
+                    va_accum += below_vol
+
+            # va_top = row index of VAH (highest price in value area)
+            # va_bot = row index of VAL (lowest price in value area)
+            vah_row = va_top
+            val_row = va_bot
+
+            # Convert bucket rows back to prices for axis labels
+            def row_to_price(b):
+                return lo_p + (1.0 - b / (chart_h - 1)) * (hi_p - lo_p)
+
+            vah_price = row_to_price(vah_row)
+            val_price = row_to_price(val_row)
+
+            # ── Draw profile bars ─────────────────────────────────────────────
+            for b, bvol in enumerate(vp_buckets):
+                if bvol <= 0:
+                    continue
+                bar_w = max(1, int(bvol / max_vp * VP_MAX_W))
+                row   = chart_top + b
+                if not (chart_top <= row < chart_bot):
+                    continue
+                if b == poc_row:
+                    pair, attrs, char = C_VP_POC, curses.A_BOLD, "="
+                elif vah_row <= b <= val_row:
+                    pair, attrs, char = C_VP_NORM, curses.A_NORMAL, "-"
+                else:
+                    pair, attrs, char = C_VP_NORM, curses.A_DIM, "-"
+                for c2 in range(bar_w):
+                    if 0 <= c2 < chart_r:
+                        db.put(row, c2, char, pair, attrs)
+
+            # ── Draw VAH line ─────────────────────────────────────────────────
+            vah_draw = chart_top + vah_row
+            if chart_top <= vah_draw < chart_bot:
+                for c2 in range(chart_r):
+                    if db.buf[vah_draw][c2][0] in (" ", "-"):
+                        db.put(vah_draw, c2, "~", C_VP_VA, curses.A_BOLD)
+                db.puts(vah_draw, chart_r, "+", C_VP_VA, curses.A_BOLD)
+                vah_lbl = f"VAH {price_fmt(vah_price, asset)}"
+                db.puts(vah_draw, chart_r + 1, f"{vah_lbl:<{PRICE_W}}", C_VP_VA, curses.A_BOLD)
+
+            # ── Draw VAL line ─────────────────────────────────────────────────
+            val_draw = chart_top + val_row
+            if chart_top <= val_draw < chart_bot and val_draw != vah_draw:
+                for c2 in range(chart_r):
+                    if db.buf[val_draw][c2][0] in (" ", "-"):
+                        db.put(val_draw, c2, "~", C_VP_VA, curses.A_BOLD)
+                db.puts(val_draw, chart_r, "+", C_VP_VA, curses.A_BOLD)
+                val_lbl = f"VAL {price_fmt(val_price, asset)}"
+                db.puts(val_draw, chart_r + 1, f"{val_lbl:<{PRICE_W}}", C_VP_VA, curses.A_BOLD)
+
+            # ── Draw POC line (on top of bars, after VA lines) ────────────────
+            poc_draw = chart_top + poc_row
+            if chart_top <= poc_draw < chart_bot:
+                for c2 in range(chart_r):
+                    if db.buf[poc_draw][c2][0] in (" ", "-", "~", "="):
+                        db.put(poc_draw, c2, "=", C_VP_POC, curses.A_BOLD)
+                db.puts(poc_draw, chart_r, "+", C_VP_POC, curses.A_BOLD)
+                poc_price = row_to_price(poc_row)
+                poc_lbl   = f"POC {price_fmt(poc_price, asset)}"
+                db.puts(poc_draw, chart_r + 1, f"{poc_lbl:<{PRICE_W}}", C_VP_POC, curses.A_BOLD)
 
     # ── CANDLES ───────────────────────────────────────────────────────────────
     start_col = chart_r - len(visible)
@@ -859,7 +985,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         auth_tag = f"/{('auth' if PHEMEX_API_KEY else 'no-auth')}" if feed == "phemex" else ""
         err_str  = f"  ! {error}" if error and visible else ""
         scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [Q] Quit"
+        vp_tag     = "VP:ON" if show_vp else "VP:OFF"
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [V] {vp_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
@@ -897,6 +1024,11 @@ def main(stdscr):
             # Reinit color pairs and invalidate the entire double-buffer cache
             # so every cell is redrawn fresh with the new scheme next frame.
             init_colors(state.color_scheme)
+            db.prev = None
+            stdscr.clear()
+        elif key in (ord("v"), ord("V")):
+            with state.lock:
+                state.show_vp = not state.show_vp
             db.prev = None
             stdscr.clear()
 

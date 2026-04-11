@@ -722,21 +722,31 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     vol_bot    = vol_top + VOL_H
     footer_row = rows - 1
 
-    visible    = all_candles[-chart_w:] if all_candles else []
+    n_all = len(all_candles)
 
-    n_vis = len(visible)
-
-
-    # ── cursor ────────────────────────────────────────────────────────────────
-    max_offset    = -(len(visible) - 1) if visible else 0
+    # ── cursor + viewport ─────────────────────────────────────────────────────
+    # cursor_offset: 0 = rightmost (live end), negative = scroll left.
+    # Clamp: can't go further left than the oldest loaded candle.
+    max_offset    = -(n_all - 1) if n_all > 0 else 0
     cursor_offset = max(max_offset, min(0, cursor_offset))
     with state.lock:
         state.cursor_offset = cursor_offset
 
+    # The cursor always sits at the rightmost column of the visible window.
+    # scroll_right = how many candles from the right end are hidden off-screen.
+    scroll_right = -cursor_offset   # >=0; 0 means live end visible
+
+    # Slice the viewport: chart_w candles ending at (n_all - scroll_right)
+    right_idx = n_all - scroll_right          # exclusive index of rightmost visible
+    left_idx  = max(0, right_idx - chart_w)
+    visible   = all_candles[left_idx:right_idx] if all_candles else []
+
+    n_vis = len(visible)
+
+    # Cursor is always the last candle in the visible window
     if visible:
-        cursor_idx = len(visible) - 1 + cursor_offset
-        cursor_idx = max(0, min(len(visible) - 1, cursor_idx))
-        cursor_col = chart_r - len(visible) + cursor_idx
+        cursor_idx = n_vis - 1
+        cursor_col = chart_r - 1             # rightmost chart column
         selected   = visible[cursor_idx]
     else:
         cursor_idx = 0
@@ -1022,7 +1032,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # Mark each candle column whose local timestamp crosses the 19:00 session
     # open. Draws a dim `:` column behind candles.
     if visible:
-        start_col_sep = chart_r - len(visible)
+        start_col_sep = chart_r - n_vis
         for i, candle in enumerate(visible):
             col_s = start_col_sep + i
             if not (0 <= col_s < chart_r):
@@ -1036,7 +1046,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 db.puts(chart_top, col_s, "S", C_LABEL, curses.A_DIM)
 
     # ── CANDLES ───────────────────────────────────────────────────────────────
-    start_col = chart_r - len(visible)
+    start_col = chart_r - n_vis
     for i, candle in enumerate(visible):
         col = start_col + i
         if not (0 <= col < chart_r):
@@ -1129,7 +1139,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         err_str  = f"  ! {error}" if error and visible else ""
         scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
         vp_tag     = "VP:ON" if show_vp else "VP:OFF"
-        hist_tag = "  loading..." if history_loading else ""
+        hist_tag = "  [loading history...]" if history_loading else ""
         footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [V] {vp_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
@@ -1213,13 +1223,14 @@ def main(stdscr):
 
         # ── Auto-load history when cursor reaches left edge ───────────────────
         with state.lock:
-            cur_off   = state.cursor_offset
-            n_loaded  = len(state.candles)
+            cur_off    = state.cursor_offset
+            n_loaded   = len(state.candles)
             is_loading = state.history_loading
-            cur_sess  = state.session
-        # If cursor is within 10 candles of the oldest loaded, fetch more
+            cur_sess   = state.session
+        # Trigger history fetch when cursor is within 20 candles of the oldest
+        # cur_off is negative; -(n_loaded-20) is the threshold
         if (not is_loading and n_loaded > 0
-                and cur_off <= -(n_loaded - 10)):
+                and cur_off <= -(n_loaded - 20)):
             with state.lock:
                 state.history_loading = True
             threading.Thread(

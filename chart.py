@@ -131,6 +131,7 @@ C_CURSOR    = 11
 C_VP_NORM   = 12   # volume profile bar (dim)
 C_VP_POC    = 13   # point of control (brightest level)
 C_VP_VA     = 14   # value area high/low lines
+C_LINE      = 15   # line chart
 
 # ── data structures ────────────────────────────────────────────────────────────
 class Candle:
@@ -157,11 +158,17 @@ class ChartState:
         self.status        = "Connecting..."
         self.error         = ""       # last REST/WS error for display
         self.session       = 0
-        self.cursor_offset = 0
+        # TV-style navigation: two independent values
+        # view_offset: how far viewport is panned left (>=0, 0=live)
+        # cursor_col_idx: cursor column within visible window
+        self.cursor_offset    = 0   # keep for compat, unused now
+        self.view_offset      = 0   # pan: candles hidden on right
+        self.cursor_col_idx   = -1  # -1 = no cursor (live mode)
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
         self.show_vp       = True    # volume profile overlay toggle
         self.interval_idx  = 0       # index into INTERVALS list
         self.history_loading = False # True while background history fetch running
+        self.chart_mode    = "candle" # "candle" | "line"
 
 state = ChartState()
 
@@ -554,7 +561,6 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
         state.candles.clear()
         state.live          = None
         state.last_price    = 0.0
-        state.cursor_offset = 0
         state.history_loading = False
 
     candles = fetch_kraken(asset) if my_feed == "kraken" else fetch_phemex(asset)
@@ -621,6 +627,7 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
+    curses.init_pair(C_LINE,      curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VP_POC,    curses.COLOR_YELLOW, -1)
     curses.init_pair(C_VP_VA,     curses.COLOR_MAGENTA,-1)
@@ -691,11 +698,11 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         last_price    = state.last_price
         status        = state.status
         error         = state.error
-        cursor_offset = state.cursor_offset
         color_scheme      = state.color_scheme
         show_vp           = state.show_vp
         interval_idx      = state.interval_idx
         history_loading   = state.history_loading
+        chart_mode        = state.chart_mode
 
     all_candles = candles_snap + ([live] if live else [])
 
@@ -724,36 +731,51 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     n_all = len(all_candles)
 
-    # ── cursor + viewport ─────────────────────────────────────────────────────
-    # cursor_offset: 0 = rightmost (live end), negative = scroll left.
-    # Clamp: can't go further left than the oldest loaded candle.
-    max_offset    = -(n_all - 1) if n_all > 0 else 0
-    cursor_offset = max(max_offset, min(0, cursor_offset))
+    # ── viewport + TV-style cursor ────────────────────────────────────────────
+    # view_offset : how many candles are hidden off the RIGHT edge (pan left).
+    #               0 = live end is rightmost visible candle.
+    # cursor_col_idx : cursor column within the visible window [0, chart_w-1].
+    #               -1 = no cursor / live mode.
     with state.lock:
-        state.cursor_offset = cursor_offset
+        view_offset    = state.view_offset
+        cursor_col_idx = state.cursor_col_idx
 
-    # The cursor always sits at the rightmost column of the visible window.
-    # scroll_right = how many candles from the right end are hidden off-screen.
-    scroll_right = -cursor_offset   # >=0; 0 means live end visible
+    # Clamp view_offset so we never go past the oldest candle
+    view_offset = max(0, min(n_all - 1, view_offset))
 
-    # Slice the viewport: chart_w candles ending at (n_all - scroll_right)
-    right_idx = n_all - scroll_right          # exclusive index of rightmost visible
+    # Slice visible window: chart_w candles ending at (n_all - view_offset)
+    right_idx = n_all - view_offset
     left_idx  = max(0, right_idx - chart_w)
     visible   = all_candles[left_idx:right_idx] if all_candles else []
+    n_vis     = len(visible)
 
-    n_vis = len(visible)
+    # Clamp cursor_col_idx to actual visible window
+    if cursor_col_idx < 0:
+        cursor_col_idx = -1          # live mode: no crosshair
+    else:
+        cursor_col_idx = max(0, min(n_vis - 1, cursor_col_idx))
 
-    # Cursor is always the last candle in the visible window
-    if visible:
+    # Write clamped values back (draw() is the single authority on clamping)
+    with state.lock:
+        state.view_offset    = view_offset
+        state.cursor_col_idx = cursor_col_idx
+
+    if visible and cursor_col_idx >= 0:
+        cursor_idx = cursor_col_idx
+        # Map candle index → screen column (candles fill from right)
+        start_col_base = chart_r - n_vis
+        cursor_col     = start_col_base + cursor_idx
+        selected       = visible[cursor_idx]
+    elif visible:
         cursor_idx = n_vis - 1
-        cursor_col = chart_r - 1             # rightmost chart column
-        selected   = visible[cursor_idx]
+        cursor_col = chart_r - 1
+        selected   = visible[-1]
     else:
         cursor_idx = 0
         cursor_col = -1
         selected   = None
 
-    in_cursor_mode = cursor_offset != 0
+    in_cursor_mode = (cursor_col_idx >= 0)
 
     # ── price range ───────────────────────────────────────────────────────────
     if visible:
@@ -796,7 +818,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [V]P  [I]{ivl_label}  [<][>] cursor  [Esc] reset  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [V]P  [I]{ivl_label}  [L]ine  [<][>]cursor  [Esc]live  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1032,7 +1054,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # Mark each candle column whose local timestamp crosses the 19:00 session
     # open. Draws a dim `:` column behind candles.
     if visible:
-        start_col_sep = chart_r - n_vis
+        start_col_sep = chart_r - n_vis  # same as main start_col
         for i, candle in enumerate(visible):
             col_s = start_col_sep + i
             if not (0 <= col_s < chart_r):
@@ -1045,38 +1067,66 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 # Label at top of separator
                 db.puts(chart_top, col_s, "S", C_LABEL, curses.A_DIM)
 
-    # ── CANDLES ───────────────────────────────────────────────────────────────
+    # ── CANDLES / LINE CHART ─────────────────────────────────────────────────
     start_col = chart_r - n_vis
-    for i, candle in enumerate(visible):
-        col = start_col + i
-        if not (0 <= col < chart_r):
-            continue
+    clamp = lambda v: max(chart_top, min(chart_bot - 1, v))
 
-        is_selected = (i == cursor_idx and in_cursor_mode)
-        bull        = candle.c >= candle.o
-        body_pair   = C_CURSOR if is_selected else (C_BULL if bull else C_BEAR)
-
-        clamp = lambda v: max(chart_top, min(chart_bot - 1, v))
-        r_hi  = clamp(chart_top + p2r(candle.h))
-        r_top = clamp(chart_top + p2r(max(candle.o, candle.c)))
-        r_bot = clamp(chart_top + p2r(min(candle.o, candle.c)))
-        r_lo  = clamp(chart_top + p2r(candle.l))
-
-        for r in range(r_hi, r_top):
-            db.put(r, col, "|", body_pair)
-        if r_top == r_bot:
-            db.put(r_top, col, "-", body_pair, curses.A_BOLD)
-        else:
-            for r in range(r_top, r_bot + 1):
-                db.put(r, col, "#", body_pair)
-        for r in range(r_bot + 1, r_lo + 1):
-            db.put(r, col, "|", body_pair)
-
-        if is_selected:
-            for r in range(chart_top, r_hi):
-                db.put(r, col, ":", C_AXIS, curses.A_DIM)
-            for r in range(r_lo + 1, chart_bot):
-                db.put(r, col, ":", C_AXIS, curses.A_DIM)
+    if chart_mode == "line":
+        # Line chart: connect each candle's close price with a dot/dash.
+        # Vertical connector drawn between consecutive close rows so the
+        # line is continuous even over large price moves.
+        prev_row = None
+        for i, candle in enumerate(visible):
+            col = start_col + i
+            if not (0 <= col < chart_r):
+                prev_row = None
+                continue
+            is_selected = (i == cursor_idx and in_cursor_mode)
+            pair  = C_CURSOR if is_selected else C_LINE
+            attrs = curses.A_BOLD if is_selected else curses.A_NORMAL
+            r_c   = clamp(chart_top + p2r(candle.c))
+            # Point at close
+            db.put(r_c, col, "*", pair, attrs)
+            # Vertical connector to previous close (fills gaps on big moves)
+            if prev_row is not None and col > 0:
+                r_from = min(prev_row, r_c)
+                r_to   = max(prev_row, r_c)
+                for r in range(r_from, r_to):
+                    if db.buf[r][col - 1][0] == " ":
+                        db.put(r, col - 1, "|", pair, curses.A_DIM)
+            prev_row = r_c
+            # Cursor crosshair
+            if is_selected:
+                for r in range(chart_top, chart_bot):
+                    if db.buf[r][col][0] == " ":
+                        db.put(r, col, ":", C_AXIS, curses.A_DIM)
+    else:
+        # Candlestick mode
+        for i, candle in enumerate(visible):
+            col = start_col + i
+            if not (0 <= col < chart_r):
+                continue
+            is_selected = (i == cursor_idx and in_cursor_mode)
+            bull        = candle.c >= candle.o
+            body_pair   = C_CURSOR if is_selected else (C_BULL if bull else C_BEAR)
+            r_hi  = clamp(chart_top + p2r(candle.h))
+            r_top = clamp(chart_top + p2r(max(candle.o, candle.c)))
+            r_bot = clamp(chart_top + p2r(min(candle.o, candle.c)))
+            r_lo  = clamp(chart_top + p2r(candle.l))
+            for r in range(r_hi, r_top):
+                db.put(r, col, "|", body_pair)
+            if r_top == r_bot:
+                db.put(r_top, col, "-", body_pair, curses.A_BOLD)
+            else:
+                for r in range(r_top, r_bot + 1):
+                    db.put(r, col, "#", body_pair)
+            for r in range(r_bot + 1, r_lo + 1):
+                db.put(r, col, "|", body_pair)
+            if is_selected:
+                for r in range(chart_top, r_hi):
+                    db.put(r, col, ":", C_AXIS, curses.A_DIM)
+                for r in range(r_lo + 1, chart_bot):
+                    db.put(r, col, ":", C_AXIS, curses.A_DIM)
 
     # ── SEPARATOR ─────────────────────────────────────────────────────────────
     db.puts(chart_bot, 0, "-" * chart_r + "+", C_AXIS)
@@ -1134,13 +1184,17 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     # ── FOOTER ────────────────────────────────────────────────────────────────
     if 0 <= footer_row < rows:
-        cinfo    = f"  cursor {cursor_offset:+d}" if in_cursor_mode else ""
+        with state.lock:
+            _cci = state.cursor_col_idx
+            _vo  = state.view_offset
+        cinfo = f"  cur:{_cci} pan:{_vo}" if in_cursor_mode else ""
         auth_tag = f"/{('auth' if PHEMEX_API_KEY else 'no-auth')}" if feed == "phemex" else ""
         err_str  = f"  ! {error}" if error and visible else ""
         scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
         vp_tag     = "VP:ON" if show_vp else "VP:OFF"
         hist_tag = "  [loading history...]" if history_loading else ""
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [V] {vp_tag}  [Q] Quit"
+        mode_tag = "LINE" if chart_mode == "line" else "CANDLE"
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [V] {vp_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
@@ -1197,15 +1251,47 @@ def main(stdscr):
                     state.show_vp = not state.show_vp
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("l"), ord("L")):
+                with state.lock:
+                    state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
+                db.prev = None
+                stdscr.clear()
             elif key == curses.KEY_LEFT:
                 with state.lock:
-                    state.cursor_offset -= 1
+                    cci = state.cursor_col_idx
+                    if cci < 0:
+                        # Enter cursor mode: place cursor at rightmost candle
+                        state.cursor_col_idx = max(0, len(state.candles) - 1)
+                    elif cci > 0:
+                        # Move cursor left within window
+                        state.cursor_col_idx -= 1
+                    else:
+                        # Cursor already at left edge — pan viewport left
+                        state.view_offset += 1
             elif key == curses.KEY_RIGHT:
                 with state.lock:
-                    state.cursor_offset = min(0, state.cursor_offset + 1)
-            elif key == 27:  # Escape
+                    cci = state.cursor_col_idx
+                    vo  = state.view_offset
+                    if cci < 0:
+                        pass   # already live, nothing to do
+                    elif vo > 0 and cci >= len(state.candles) - 1:
+                        # Cursor at right edge and viewport panned — pan right
+                        state.view_offset = max(0, vo - 1)
+                    elif cci >= 0:
+                        # Move cursor right within window
+                        n_loaded = len(state.candles)
+                        new_cci  = cci + 1
+                        if vo == 0 and new_cci >= n_loaded:
+                            # Reached live end — exit cursor mode
+                            state.cursor_col_idx = -1
+                            state.view_offset    = 0
+                        else:
+                            state.cursor_col_idx = new_cci
+            elif key == 27:  # Escape — snap back to live
                 with state.lock:
-                    state.cursor_offset = 0
+                    state.cursor_col_idx = -1
+                    state.view_offset    = 0
+
 
             if new_asset:
                 state.asset = new_asset
@@ -1223,14 +1309,13 @@ def main(stdscr):
 
         # ── Auto-load history when cursor reaches left edge ───────────────────
         with state.lock:
-            cur_off    = state.cursor_offset
+            vo         = state.view_offset
             n_loaded   = len(state.candles)
             is_loading = state.history_loading
             cur_sess   = state.session
-        # Trigger history fetch when cursor is within 20 candles of the oldest
-        # cur_off is negative; -(n_loaded-20) is the threshold
+        # Trigger history fetch when viewport is within 20 candles of oldest loaded
         if (not is_loading and n_loaded > 0
-                and cur_off <= -(n_loaded - 20)):
+                and vo >= n_loaded - 20):
             with state.lock:
                 state.history_loading = True
             threading.Thread(

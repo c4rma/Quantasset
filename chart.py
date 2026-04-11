@@ -905,7 +905,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     for r in range(HEADER_H):
         db.puts(r, 0, " " * cols, C_HEADER, curses.A_BOLD)
 
-    db.puts(0, 2, "Q U A N T A S S E T  |  Terminal Chart", C_HEADER, curses.A_BOLD)
+    db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker", C_HEADER, curses.A_BOLD)
 
     badge = f" {feed.upper()} "
     db.puts(0, cols - len(badge) - 22, badge, C_ASSET_SEL, curses.A_BOLD)

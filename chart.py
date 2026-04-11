@@ -132,6 +132,9 @@ C_VP_NORM   = 12   # volume profile bar (dim)
 C_VP_POC    = 13   # point of control (brightest level)
 C_VP_VA     = 14   # value area high/low lines
 C_LINE      = 15   # line chart
+C_VWAP      = 16   # VWAP line
+C_VWAP_BAND = 17   # 0.5σ shaded band
+C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
 
 # ── data structures ────────────────────────────────────────────────────────────
 class Candle:
@@ -166,6 +169,7 @@ class ChartState:
         self.cursor_col_idx   = -1  # -1 = no cursor (live mode)
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
         self.show_vp       = True    # volume profile overlay toggle
+        self.show_vwap    = True    # VWAP + SD bands overlay toggle
         self.interval_idx  = 0       # index into INTERVALS list
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
@@ -631,6 +635,9 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VP_POC,    curses.COLOR_YELLOW, -1)
     curses.init_pair(C_VP_VA,     curses.COLOR_MAGENTA,-1)
+    curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
+    curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
 
 # ── formatting ────────────────────────────────────────────────────────────────
 def price_fmt(p: float, asset: str) -> str:
@@ -700,6 +707,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         error         = state.error
         color_scheme      = state.color_scheme
         show_vp           = state.show_vp
+        show_vwap         = state.show_vwap
         interval_idx      = state.interval_idx
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
@@ -818,7 +826,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [V]P  [I]{ivl_label}  [L]ine  [<][>]cursor  [Esc]live  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [<][>]cursor  [Esc]live  [Prt]shot  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1050,6 +1058,116 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                         f"{'POC ' + price_fmt(poc_price, asset):<{PRICE_W}}",
                         C_VP_POC, curses.A_BOLD)
 
+    # ── VWAP + STANDARD DEVIATION BANDS ────────────────────────────────────────
+    # Anchored to the same 19:00 CT session start as the VP.
+    # VWAP = Σ(tp × vol) / Σ(vol)  where tp = (H+L+C)/3
+    # σ    = sqrt( Σ(vol × (tp - VWAP)²) / Σ(vol) )   (volume-weighted std dev)
+    # Drawn behind candles: VWAP solid line, 0.5σ shaded band (░),
+    # 2σ and 2.5σ as dashed lines on the price axis.
+    if show_vwap and visible and chart_h > 0:
+        import datetime as _dtmod2
+        _now2       = datetime.now()
+        _s2         = datetime(_now2.year, _now2.month, _now2.day, 19, 0, 0)
+        if _now2 < _s2:
+            _s2 -= _dtmod2.timedelta(days=1)
+        _sess_start = _s2.timestamp()
+
+        # Compute cumulative VWAP per visible candle (session-anchored)
+        # We use all session candles for the running sums, then map to visible cols
+        session_all = [c for c in all_candles if c.ts >= _sess_start]
+
+        if session_all:
+            # Build running sums over session candles ordered chronologically
+            _cum_tpv = 0.0   # Σ tp×vol
+            _cum_vol = 0.0   # Σ vol
+            _cum_tp2v= 0.0   # Σ vol×tp²  (for σ via Welford-style: E[x²]-E[x]²)
+            # Map ts → (vwap, sigma) for every session candle
+            _vwap_map = {}
+            for _c in session_all:
+                _tp   = (_c.h + _c.l + _c.c) / 3.0
+                _v    = _c.v
+                _cum_tpv  += _tp * _v
+                _cum_vol  += _v
+                _cum_tp2v += _tp * _tp * _v
+                if _cum_vol > 0:
+                    _vw = _cum_tpv / _cum_vol
+                    _var = max(0.0, _cum_tp2v / _cum_vol - _vw * _vw)
+                    _sd = _var ** 0.5
+                else:
+                    _vw, _sd = 0.0, 0.0
+                _vwap_map[_c.ts] = (_vw, _sd)
+
+            # Now draw per visible column
+            _start_c = chart_r - n_vis
+            _prev_vwap_row = None
+
+            for _i, _candle in enumerate(visible):
+                _col = _start_c + _i
+                if not (0 <= _col < chart_r):
+                    continue
+                if _candle.ts not in _vwap_map:
+                    _prev_vwap_row = None
+                    continue
+
+                _vw, _sd = _vwap_map[_candle.ts]
+                if _vw <= 0:
+                    continue
+
+                # Convert prices to rows
+                def _pr(p):
+                    if hi_p == lo_p: return chart_h // 2
+                    r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                    return max(chart_top, min(chart_bot - 1, chart_top + r))
+
+                _r_vwap  = _pr(_vw)
+                _r_sd05u = _pr(_vw + 0.5 * _sd)
+                _r_sd05l = _pr(_vw - 0.5 * _sd)
+                _r_sd2u  = _pr(_vw + 2.0 * _sd)
+                _r_sd2l  = _pr(_vw - 2.0 * _sd)
+                _r_sd25u = _pr(_vw + 2.5 * _sd)
+                _r_sd25l = _pr(_vw - 2.5 * _sd)
+
+                # 0.5σ shaded band (░ character, drawn first — behind everything)
+                for _r in range(min(_r_sd05u, _r_sd05l), max(_r_sd05u, _r_sd05l) + 1):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] == " ":
+                        db.put(_r, _col, ":", C_VWAP_BAND, curses.A_DIM)
+
+                # VWAP line
+                if chart_top <= _r_vwap < chart_bot:
+                    if db.buf[_r_vwap][_col][0] in (" ", ":"):
+                        db.put(_r_vwap, _col, "-", C_VWAP, curses.A_BOLD)
+
+                # 2σ lines
+                for _r in (_r_sd2u, _r_sd2l):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
+                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_NORMAL)
+
+                # 2.5σ lines
+                for _r in (_r_sd25u, _r_sd25l):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
+                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_DIM)
+
+            # ── VWAP price axis labels (rightmost column values) ──────────────
+            if session_all:
+                _last_ts = visible[-1].ts if visible else None
+                if _last_ts and _last_ts in _vwap_map:
+                    _vw_last, _sd_last = _vwap_map[_last_ts]
+                    if _vw_last > 0:
+                        def _axis_lbl(price, label, pair, attrs=curses.A_BOLD):
+                            _gr = _pr(price)
+                            if chart_top <= _gr < chart_bot:
+                                db.puts(_gr, chart_r, "+", pair, attrs)
+                                db.puts(_gr, chart_r + 1,
+                                        f"{label + ' ' + price_fmt(price, asset):<{PRICE_W}}",
+                                        pair, attrs)
+                        _axis_lbl(_vw_last,                "VW",  C_VWAP)
+                        _axis_lbl(_vw_last + 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
+                        _axis_lbl(_vw_last - 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
+                        _axis_lbl(_vw_last + 2.0*_sd_last, "2s",  C_VWAP_SD2)
+                        _axis_lbl(_vw_last - 2.0*_sd_last, "2s",  C_VWAP_SD2)
+                        _axis_lbl(_vw_last + 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
+                        _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
+
     # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────────
     # Mark each candle column whose local timestamp crosses the 19:00 session
     # open. Draws a dim `:` column behind candles.
@@ -1193,10 +1311,27 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
         vp_tag     = "VP:ON" if show_vp else "VP:OFF"
         hist_tag = "  [loading history...]" if history_loading else ""
-        mode_tag = "LINE" if chart_mode == "line" else "CANDLE"
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [V] {vp_tag}  [Q] Quit"
+        mode_tag  = "LINE" if chart_mode == "line" else "CANDLE"
+        vwap_tag  = "W:ON" if show_vwap else "W:OFF"
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
+
+
+# ── screenshot ────────────────────────────────────────────────────────────────
+def take_screenshot(db: "DoubleBuffer"):
+    """Dump the current rendered buffer to screenshots/<timestamp>.txt"""
+    folder = os.path.join(os.path.dirname(__file__), "screenshots")
+    os.makedirs(folder, exist_ok=True)
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn  = os.path.join(folder, f"quantasset_{ts}.txt")
+    buf = db.prev or db.buf   # use last flushed frame; fall back to current
+    lines = []
+    for row in buf:
+        lines.append("".join(cell[0] for cell in row).rstrip())
+    with open(fn, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return fn
 
 # ── main loop ────────────────────────────────────────────────────────────────
 def main(stdscr):
@@ -1256,6 +1391,16 @@ def main(stdscr):
                     state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("w"), ord("W")):
+                with state.lock:
+                    state.show_vwap = not state.show_vwap
+                db.prev = None
+                stdscr.clear()
+            elif key in (ord("p"), ord("P"), curses.KEY_PRINT):
+                fn = take_screenshot(db)
+                # Brief flash in footer — handled next draw frame
+                with state.lock:
+                    state.error = f"Screenshot: {os.path.basename(fn)}"
             elif key == curses.KEY_LEFT:
                 with state.lock:
                     cci = state.cursor_col_idx

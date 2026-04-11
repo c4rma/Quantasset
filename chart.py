@@ -846,7 +846,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [<][>]cursor  [Esc]live  [Prt]shot  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1445,37 +1445,58 @@ def main(stdscr):
                 # Brief flash in footer — handled next draw frame
                 with state.lock:
                     state.error = f"Screenshot: {os.path.basename(fn)}"
-            elif key == curses.KEY_LEFT:
+            elif key in (curses.KEY_LEFT,
+                          curses.KEY_SLEFT,   # Shift+Left (most terminals)
+                          541, 545,            # Ctrl+Left (xterm / Windows)
+                          ord("["), ord("{")): # fallback skip keys
+                # Determine step size
+                if key in (curses.KEY_SLEFT, ord("[")):
+                    step = 10
+                elif key in (541, 545, ord("{")):
+                    step = 50
+                else:
+                    step = 1
                 with state.lock:
                     cci = state.cursor_col_idx
                     if cci < 0:
-                        # Enter cursor mode: place cursor at rightmost candle
+                        # Enter cursor mode at rightmost, then apply step
                         state.cursor_col_idx = max(0, len(state.candles) - 1)
-                    elif cci > 0:
-                        # Move cursor left within window
-                        state.cursor_col_idx -= 1
+                        cci = state.cursor_col_idx
+                    # Move cursor left by step; overflow into pan
+                    move = step
+                    if cci >= move:
+                        state.cursor_col_idx -= move
                     else:
-                        # Cursor already at left edge — pan viewport left
-                        state.view_offset += 1
-            elif key == curses.KEY_RIGHT:
+                        state.view_offset    += move - cci
+                        state.cursor_col_idx  = 0
+            elif key in (curses.KEY_RIGHT,
+                         curses.KEY_SRIGHT,   # Shift+Right
+                         560, 564,             # Ctrl+Right (xterm / Windows)
+                         ord("]"), ord("}")):  # fallback skip keys
+                if key in (curses.KEY_SRIGHT, ord("]")):
+                    step = 10
+                elif key in (560, 564, ord("}")):
+                    step = 50
+                else:
+                    step = 1
                 with state.lock:
                     cci = state.cursor_col_idx
                     vo  = state.view_offset
                     if cci < 0:
                         pass   # already live, nothing to do
-                    elif vo > 0 and cci >= len(state.candles) - 1:
-                        # Cursor at right edge and viewport panned — pan right
-                        state.view_offset = max(0, vo - 1)
-                    elif cci >= 0:
-                        # Move cursor right within window
+                    else:
                         n_loaded = len(state.candles)
-                        new_cci  = cci + 1
-                        if vo == 0 and new_cci >= n_loaded:
-                            # Reached live end — exit cursor mode
+                        # First consume pan offset
+                        pan_consume = min(step, vo)
+                        remaining   = step - pan_consume
+                        new_vo      = vo - pan_consume
+                        new_cci     = cci + remaining
+                        if new_vo == 0 and new_cci >= n_loaded:
                             state.cursor_col_idx = -1
                             state.view_offset    = 0
                         else:
                             state.cursor_col_idx = new_cci
+                            state.view_offset    = new_vo
             elif key == 27:  # Escape — snap back to live
                 with state.lock:
                     state.cursor_col_idx = -1

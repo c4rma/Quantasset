@@ -695,6 +695,26 @@ class DoubleBuffer:
         self.prev = [row[:] for row in self.buf]
         self.buf  = [[EMPTY_CELL] * self.cols for _ in range(self.rows)]
 
+
+# ── session boundary helper ───────────────────────────────────────────────────
+def session_bounds():
+    """
+    Return (prev_start, prev_end, curr_start) as Unix timestamps.
+    Sessions run 19:00 CT → 19:00 CT.
+    prev_end == curr_start.
+    """
+    import datetime as _dt
+    now = datetime.now()
+    # floor to today 19:00
+    today_open = datetime(now.year, now.month, now.day, 19, 0, 0)
+    if now < today_open:
+        curr_start = (today_open - _dt.timedelta(days=1)).timestamp()
+    else:
+        curr_start = today_open.timestamp()
+    prev_start = curr_start - 86400   # exactly 24 hours earlier
+    prev_end   = curr_start
+    return prev_start, prev_end, curr_start
+
 # ── draw frame ────────────────────────────────────────────────────────────────
 def draw(win, db: DoubleBuffer, rows: int, cols: int):
     with state.lock:
@@ -889,193 +909,258 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             db.puts(pr, chart_r + 1, f"{price_fmt(selected.c, asset):<{PRICE_W}}",
                     C_CURSOR, curses.A_BOLD)
 
-    # ── VOLUME PROFILE (session: 19:00 CT → now) ────────────────────────────
-    # Uses fine-grained price buckets (VP_BUCKETS) independent of terminal
-    # rows for accurate POC/VAH/VAL calculation, then maps to rows to render.
-    # Volume distribution: up/down weighting — bullish candles concentrate
-    # volume in the upper half of their range (close→high), bearish in the
-    # lower half (low→close), matching TradingView's "Up/Down Volume" mode.
+    # ── VOLUME PROFILE — current + previous session ─────────────────────────
     if show_vp and visible and chart_h > 0:
-        # Session start: most recent 19:00 CT
-        import datetime as _dtmod
-        _now_local     = datetime.now()
-        _session_today = datetime(
-            _now_local.year, _now_local.month, _now_local.day, 19, 0, 0)
-        if _now_local < _session_today:
-            _session_today -= _dtmod.timedelta(days=1)
-        session_start = _session_today.timestamp()
+        _prev_start, _prev_end, _curr_start = session_bounds()
 
-        session_candles = [c for c in all_candles if c.ts >= session_start]
+        # Candle lists for each session
+        prev_sess_candles = [c for c in all_candles
+                             if _prev_start <= c.ts < _prev_end]
+        session_candles   = [c for c in all_candles if c.ts >= _curr_start]
 
-        if session_candles and lo_p < hi_p:
-            # Fine-grained bucket grid — price resolution independent of rows
-            VP_BUCKETS = 200   # price levels across visible range
-            price_range = hi_p - lo_p
+        # ── shared VP compute function ────────────────────────────────────────
+        VP_BUCKETS  = 200
+        price_range = hi_p - lo_p
 
-            def price_to_bucket(p):
-                return int((p - lo_p) / price_range * (VP_BUCKETS - 1))
-
-            vp = [0.0] * VP_BUCKETS  # index 0 = lo_p, index VP_BUCKETS-1 = hi_p
-
-            for c in session_candles:
-                bull    = c.c >= c.o
-                c_h     = max(0.0, min(c.h, hi_p))
-                c_l     = max(0.0, min(c.l, lo_p + price_range))
-                c_o     = c.o
-                c_c     = c.c
-
-                # Up/down volume split matching TradingView:
-                # Bull candle: half volume on body (open→close), half on full range
-                # Bear candle: same but inverted weighting toward lower half
-                # Simplified: split 50/50 between body zone and full wick zone,
-                # then weight body zone toward upper (bull) or lower (bear) half.
-                body_hi = max(c_o, c_c)
-                body_lo = min(c_o, c_c)
-
-                # Distribute 50% of volume across full high-low range (wicks)
-                wick_vol   = c.v * 0.5
-                wick_range = c_h - c_l
-                if wick_range > 0:
-                    b_lo_w = max(0, min(VP_BUCKETS - 1, price_to_bucket(c_l)))
-                    b_hi_w = max(0, min(VP_BUCKETS - 1, price_to_bucket(c_h)))
-                    span_w = max(1, b_hi_w - b_lo_w + 1)
-                    vpw    = wick_vol / span_w
-                    for b in range(b_lo_w, b_hi_w + 1):
-                        vp[b] += vpw
-
-                # Distribute 50% of volume on body range
-                body_vol   = c.v * 0.5
-                body_range = body_hi - body_lo
-                if body_range > 0:
-                    b_lo_b = max(0, min(VP_BUCKETS - 1, price_to_bucket(body_lo)))
-                    b_hi_b = max(0, min(VP_BUCKETS - 1, price_to_bucket(body_hi)))
-                    span_b = max(1, b_hi_b - b_lo_b + 1)
-                    vpb    = body_vol / span_b
-                    for b in range(b_lo_b, b_hi_b + 1):
-                        vp[b] += vpb
+        def compute_vp(candles):
+            """Returns (vp_buckets, poc_price, vah_price, val_price) or None."""
+            if not candles or price_range <= 0:
+                return None
+            vp = [0.0] * VP_BUCKETS
+            def ptb(p):
+                return max(0, min(VP_BUCKETS-1,
+                    int((p - lo_p) / price_range * (VP_BUCKETS - 1))))
+            for c in candles:
+                body_hi = max(c.o, c.c);  body_lo = min(c.o, c.c)
+                # 50% over wick range
+                wv = c.v * 0.5
+                bw, bh = ptb(max(lo_p, c.l)), ptb(min(hi_p, c.h))
+                sw = max(1, bh - bw + 1)
+                for b in range(bw, bh + 1): vp[b] += wv / sw
+                # 50% over body range
+                bv = c.v * 0.5
+                bl, bb = ptb(max(lo_p, body_lo)), ptb(min(hi_p, body_hi))
+                sb = max(1, bb - bl + 1)
+                if sb > 1:
+                    for b in range(bl, bb + 1): vp[b] += bv / sb
                 else:
-                    # Doji — put all body volume at close price bucket
-                    b = max(0, min(VP_BUCKETS - 1, price_to_bucket(c_c)))
-                    vp[b] += body_vol
+                    vp[ptb(c.c)] += bv
+            mx = max(vp) or 1.0
+            tv = sum(vp)
+            pi = vp.index(mx)
+            poc_p = lo_p + (pi / (VP_BUCKETS - 1)) * price_range
+            # Value area 70%
+            tgt = tv * 0.70; acc = vp[pi]; lo_b = pi; hi_b = pi
+            while acc < tgt:
+                ab = vp[hi_b+1] if hi_b < VP_BUCKETS-1 else 0.0
+                bb = vp[lo_b-1] if lo_b > 0            else 0.0
+                if ab == 0 and bb == 0: break
+                if ab >= bb: hi_b += 1; acc += ab
+                else:        lo_b -= 1; acc += bb
+            vah_p = lo_p + (hi_b / (VP_BUCKETS - 1)) * price_range
+            val_p = lo_p + (lo_b / (VP_BUCKETS - 1)) * price_range
+            return vp, poc_p, vah_p, val_p
 
-            # ── POC: bucket with max volume ───────────────────────────────────
-            max_vp    = max(vp) or 1.0
-            total_vol = sum(vp)
-            poc_b     = vp.index(max_vp)   # bucket index (0=lo_p)
-            poc_price = lo_p + (poc_b / (VP_BUCKETS - 1)) * price_range
+        def price_to_row(p):
+            if price_range <= 0: return chart_h // 2
+            r = int((1.0 - (p - lo_p) / price_range) * (chart_h - 1))
+            return max(0, min(chart_h - 1, r))
 
-            # ── Value Area: expand from POC until 70% of volume captured ──────
-            TARGET   = total_vol * 0.70
-            va_accum = vp[poc_b]
-            va_lo_b  = poc_b   # lower bucket bound (low price side)
-            va_hi_b  = poc_b   # upper bucket bound (high price side)
-
-            while va_accum < TARGET:
-                above = vp[va_hi_b + 1] if va_hi_b < VP_BUCKETS - 1 else 0.0
-                below = vp[va_lo_b - 1] if va_lo_b > 0               else 0.0
-                if above == 0 and below == 0:
-                    break
-                if above >= below:
-                    va_hi_b  += 1
-                    va_accum += above
-                else:
-                    va_lo_b  -= 1
-                    va_accum += below
-
-            vah_price = lo_p + (va_hi_b / (VP_BUCKETS - 1)) * price_range
-            val_price = lo_p + (va_lo_b / (VP_BUCKETS - 1)) * price_range
-
-            # ── Map fine buckets → terminal rows for rendering ─────────────────
-            # Aggregate VP_BUCKETS into chart_h rows for display
+        def draw_vp_bars(vp, poc_p, vah_p, val_p, alpha_dim=False):
+            """Render VP bars. alpha_dim=True for previous session (fainter)."""
             row_vol = [0.0] * chart_h
             for b, vol in enumerate(vp):
-                # bucket b → price → row
                 price = lo_p + (b / (VP_BUCKETS - 1)) * price_range
-                row   = int((1.0 - (price - lo_p) / price_range) * (chart_h - 1))
-                row   = max(0, min(chart_h - 1, row))
+                row   = price_to_row(price)
                 row_vol[row] += vol
-
-            max_row_vol = max(row_vol) or 1.0
-            VP_MAX_W    = max(4, chart_w // 5)
-
-            # Row indices for POC, VAH, VAL lines
-            poc_row = int((1.0 - (poc_price - lo_p) / price_range) * (chart_h - 1))
-            vah_row = int((1.0 - (vah_price - lo_p) / price_range) * (chart_h - 1))
-            val_row = int((1.0 - (val_price - lo_p) / price_range) * (chart_h - 1))
-            poc_row = max(0, min(chart_h - 1, poc_row))
-            vah_row = max(0, min(chart_h - 1, vah_row))
-            val_row = max(0, min(chart_h - 1, val_row))
-
-            # ── Draw profile bars ─────────────────────────────────────────────
+            mrv     = max(row_vol) or 1.0
+            VP_MAX_W = max(4, chart_w // 10 if alpha_dim else chart_w // 5)
+            poc_row = price_to_row(poc_p)
+            vah_row = price_to_row(vah_p)
+            val_row = price_to_row(val_p)
             for b, bvol in enumerate(row_vol):
-                if bvol <= 0:
-                    continue
-                bar_w = max(1, int(bvol / max_row_vol * VP_MAX_W))
+                if bvol <= 0: continue
+                bar_w = max(1, int(bvol / mrv * VP_MAX_W))
                 row   = chart_top + b
-                if not (chart_top <= row < chart_bot):
-                    continue
+                if not (chart_top <= row < chart_bot): continue
                 in_va = (vah_row <= b <= val_row)
-                if b == poc_row:
-                    pair, attrs, char = C_VP_POC, curses.A_BOLD,   "="
+                if alpha_dim:
+                    pair, attrs, char = C_VP_NORM, curses.A_DIM, "."
+                elif b == poc_row:
+                    pair, attrs, char = C_VP_POC, curses.A_BOLD, "="
                 elif in_va:
                     pair, attrs, char = C_VP_NORM, curses.A_NORMAL, "-"
                 else:
-                    pair, attrs, char = C_VP_NORM, curses.A_DIM,    "-"
+                    pair, attrs, char = C_VP_NORM, curses.A_DIM, "-"
                 for c2 in range(bar_w):
                     if 0 <= c2 < chart_r:
                         db.put(row, c2, char, pair, attrs)
 
-            # ── Draw VAH line ─────────────────────────────────────────────────
-            vah_draw = chart_top + vah_row
-            if chart_top <= vah_draw < chart_bot:
-                for c2 in range(chart_r):
-                    if db.buf[vah_draw][c2][0] in (" ", "-"):
-                        db.put(vah_draw, c2, "~", C_VP_VA, curses.A_BOLD)
-                db.puts(vah_draw, chart_r, "+", C_VP_VA, curses.A_BOLD)
-                db.puts(vah_draw, chart_r + 1,
-                        f"{'VAH ' + price_fmt(vah_price, asset):<{PRICE_W}}",
-                        C_VP_VA, curses.A_BOLD)
+        def draw_level_line(price, char, pair, attrs, label, label_suffix=""):
+            """Draw a full-width horizontal line and axis label."""
+            row = chart_top + price_to_row(price)
+            if not (chart_top <= row < chart_bot): return
+            for c2 in range(chart_r):
+                if db.buf[row][c2][0] in (" ", ".", "-", char):
+                    db.put(row, c2, char, pair, attrs)
+            db.puts(row, chart_r, "+", pair, attrs)
+            lbl = f"{label}{label_suffix} {price_fmt(price, asset)}"
+            db.puts(row, chart_r + 1, f"{lbl:<{PRICE_W}}", pair, attrs)
 
-            # ── Draw VAL line ─────────────────────────────────────────────────
-            val_draw = chart_top + val_row
-            if chart_top <= val_draw < chart_bot and val_draw != vah_draw:
-                for c2 in range(chart_r):
-                    if db.buf[val_draw][c2][0] in (" ", "-"):
-                        db.put(val_draw, c2, "~", C_VP_VA, curses.A_BOLD)
-                db.puts(val_draw, chart_r, "+", C_VP_VA, curses.A_BOLD)
-                db.puts(val_draw, chart_r + 1,
-                        f"{'VAL ' + price_fmt(val_price, asset):<{PRICE_W}}",
-                        C_VP_VA, curses.A_BOLD)
+        def virgin_line(price, char, pair, attrs, label,
+                        start_col, candles_after, col_offset):
+            """
+            Draw a virgin level: extends from start_col rightward until
+            a candle's high/low trades through the price level.
+            """
+            row = chart_top + price_to_row(price)
+            if not (chart_top <= row < chart_bot): return
+            end_col = chart_r  # default: extend to right edge
+            for j, c in enumerate(candles_after):
+                col = col_offset + j
+                if col < 0 or col >= chart_r: continue
+                # Level is "touched" when candle high crosses above or low crosses below
+                if c.h >= price >= c.l:
+                    end_col = col
+                    break
+            for c2 in range(max(0, start_col), min(chart_r, end_col + 1)):
+                if db.buf[row][c2][0] in (" ", ".", "-"):
+                    db.put(row, c2, char, pair, attrs)
+            # Axis label only if line reaches right edge (still virgin)
+            if end_col >= chart_r - 1:
+                db.puts(row, chart_r, "+", pair, attrs)
+                lbl = f"p{label} {price_fmt(price, asset)}"
+                db.puts(row, chart_r + 1, f"{lbl:<{PRICE_W}}", pair, attrs)
 
-            # ── Draw POC line (drawn last so it sits on top) ──────────────────
-            poc_draw = chart_top + poc_row
-            if chart_top <= poc_draw < chart_bot:
-                for c2 in range(chart_r):
-                    if db.buf[poc_draw][c2][0] in (" ", "-", "~", "="):
-                        db.put(poc_draw, c2, "=", C_VP_POC, curses.A_BOLD)
-                db.puts(poc_draw, chart_r, "+", C_VP_POC, curses.A_BOLD)
-                db.puts(poc_draw, chart_r + 1,
-                        f"{'POC ' + price_fmt(poc_price, asset):<{PRICE_W}}",
-                        C_VP_POC, curses.A_BOLD)
+        # ── PREVIOUS SESSION VP ───────────────────────────────────────────────
+        prev_result = compute_vp(prev_sess_candles)
+        if prev_result:
+            pvp, p_poc, p_vah, p_val = prev_result
+            draw_vp_bars(pvp, p_poc, p_vah, p_val, alpha_dim=True)
 
-    # ── VWAP + STANDARD DEVIATION BANDS ────────────────────────────────────────
-    # Anchored to the same 19:00 CT session start as the VP.
-    # VWAP = Σ(tp × vol) / Σ(vol)  where tp = (H+L+C)/3
-    # σ    = sqrt( Σ(vol × (tp - VWAP)²) / Σ(vol) )   (volume-weighted std dev)
-    # Drawn behind candles: VWAP solid line, 0.5σ shaded band (░),
-    # 2σ and 2.5σ as dashed lines on the price axis.
+            # Find the column index where the current session starts in visible[]
+            curr_start_col = chart_r  # default: off right edge
+            for _i, _vc in enumerate(visible):
+                if _vc.ts >= _curr_start:
+                    curr_start_col = (chart_r - n_vis) + _i
+                    break
+
+            # Candles in visible[] that belong to current session
+            curr_vis_candles = [c for c in visible if c.ts >= _curr_start]
+            curr_col_offset  = chart_r - len(curr_vis_candles)
+
+            # Draw previous session fixed lines (over prev-session columns only)
+            prev_end_col = curr_start_col - 1
+            for c2 in range(chart_r - n_vis, min(chart_r, prev_end_col + 1)):
+                # Draw prev POC/VAH/VAL only over prev-session area
+                pass  # handled by virgin_line extending from prev_end_col
+
+            # Virgin POC/VAH/VAL — extend into current session until touched
+            virgin_line(p_poc, "=", C_VP_POC, curses.A_DIM,
+                        "POC", curr_start_col, curr_vis_candles, curr_col_offset)
+            virgin_line(p_vah, "~", C_VP_VA, curses.A_DIM,
+                        "VAH", curr_start_col, curr_vis_candles, curr_col_offset)
+            virgin_line(p_val, "~", C_VP_VA, curses.A_DIM,
+                        "VAL", curr_start_col, curr_vis_candles, curr_col_offset)
+
+            # Draw prev-session lines over their own columns (solid, dim)
+            for _px, _lbl in [(p_vah, "pVAH"), (p_val, "pVAL"), (p_poc, "pPOC")]:
+                row = chart_top + price_to_row(_px)
+                if not (chart_top <= row < chart_bot): continue
+                _ch = "=" if _lbl == "pPOC" else "~"
+                _pr = C_VP_POC if _lbl == "pPOC" else C_VP_VA
+                for c2 in range(chart_r - n_vis, min(chart_r, curr_start_col)):
+                    if db.buf[row][c2][0] in (" ", ".", "-", _ch):
+                        db.put(row, c2, _ch, _pr, curses.A_DIM)
+
+        # ── CURRENT SESSION VP ────────────────────────────────────────────────
+        curr_result = compute_vp(session_candles)
+        if curr_result:
+            vp, poc_price, vah_price, val_price = curr_result
+            draw_vp_bars(vp, poc_price, vah_price, val_price, alpha_dim=False)
+            draw_level_line(vah_price, "~", C_VP_VA, curses.A_BOLD, "VAH")
+            draw_level_line(val_price, "~", C_VP_VA, curses.A_BOLD, "VAL")
+            draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC")
+
+    # ── VWAP + STANDARD DEVIATION BANDS — current + previous session ────────
     if show_vwap and visible and chart_h > 0:
-        import datetime as _dtmod2
-        _now2       = datetime.now()
-        _s2         = datetime(_now2.year, _now2.month, _now2.day, 19, 0, 0)
-        if _now2 < _s2:
-            _s2 -= _dtmod2.timedelta(days=1)
-        _sess_start = _s2.timestamp()
+        _pstart, _pend, _cstart = session_bounds()
 
-        # Compute cumulative VWAP per visible candle (session-anchored)
-        # We use all session candles for the running sums, then map to visible cols
-        session_all = [c for c in all_candles if c.ts >= _sess_start]
+        # All candles for each session (not just visible — for accurate VWAP)
+        prev_vwap_candles = [c for c in all_candles if _pstart <= c.ts < _pend]
+        session_all       = [c for c in all_candles if c.ts >= _cstart]
 
+        def build_vwap_map(candles):
+            """Compute cumulative VWAP + σ per candle. Returns {ts: (vwap, sd)}."""
+            _cum_tpv = _cum_vol = _cum_tp2v = 0.0
+            _map = {}
+            for _c in candles:
+                _tp = (_c.h + _c.l + _c.c) / 3.0
+                _v  = _c.v
+                _cum_tpv  += _tp * _v
+                _cum_vol  += _v
+                _cum_tp2v += _tp * _tp * _v
+                if _cum_vol > 0:
+                    _vw  = _cum_tpv / _cum_vol
+                    _var = max(0.0, _cum_tp2v / _cum_vol - _vw * _vw)
+                    _sd  = _var ** 0.5
+                else:
+                    _vw, _sd = 0.0, 0.0
+                _map[_c.ts] = (_vw, _sd)
+            return _map
+
+        def draw_vwap_on_candles(candles_subset, vwap_map, dim=False):
+            """Draw VWAP lines for the given candle subset using precomputed map."""
+            _start_c = chart_r - n_vis
+            _prev_r  = None
+            for _i, _candle in enumerate(visible):
+                if _candle not in candles_subset and _candle.ts not in {c.ts for c in candles_subset}:
+                    _prev_r = None
+                    continue
+                _col = _start_c + _i
+                if not (0 <= _col < chart_r):
+                    _prev_r = None
+                    continue
+                if _candle.ts not in vwap_map:
+                    _prev_r = None
+                    continue
+                _vw, _sd = vwap_map[_candle.ts]
+                if _vw <= 0:
+                    continue
+                def _pr(p):
+                    if hi_p == lo_p: return chart_h // 2
+                    r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                    return max(chart_top, min(chart_bot - 1, chart_top + r))
+                _r_vwap  = _pr(_vw)
+                _r_sd05u = _pr(_vw + 0.5 * _sd);  _r_sd05l = _pr(_vw - 0.5 * _sd)
+                _r_sd2u  = _pr(_vw + 2.0 * _sd);  _r_sd2l  = _pr(_vw - 2.0 * _sd)
+                _r_sd25u = _pr(_vw + 2.5 * _sd);  _r_sd25l = _pr(_vw - 2.5 * _sd)
+                _band_a  = curses.A_DIM
+                _line_a  = curses.A_DIM if dim else curses.A_BOLD
+                # 0.5σ band
+                for _r in range(min(_r_sd05u,_r_sd05l), max(_r_sd05u,_r_sd05l)+1):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] == " ":
+                        db.put(_r, _col, ":", C_VWAP_BAND, _band_a)
+                # VWAP line
+                if chart_top <= _r_vwap < chart_bot:
+                    if db.buf[_r_vwap][_col][0] in (" ", ":"):
+                        db.put(_r_vwap, _col, "-", C_VWAP, _line_a)
+                # 2σ / 2.5σ lines
+                for _r in (_r_sd2u, _r_sd2l):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
+                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_DIM if dim else curses.A_NORMAL)
+                for _r in (_r_sd25u, _r_sd25l):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
+                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_DIM)
+
+        # Previous session VWAP (dim)
+        if prev_vwap_candles:
+            _prev_map = build_vwap_map(prev_vwap_candles)
+            _prev_ts_set = {c.ts for c in prev_vwap_candles}
+            _prev_vis = [c for c in visible if c.ts in _prev_ts_set]
+            draw_vwap_on_candles(_prev_vis, _prev_map, dim=True)
+
+        # Current session VWAP (full brightness)
         if session_all:
             # Build running sums over session candles ordered chronologically
             _cum_tpv = 0.0   # Σ tp×vol
@@ -1097,76 +1182,35 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     _vw, _sd = 0.0, 0.0
                 _vwap_map[_c.ts] = (_vw, _sd)
 
-            # Now draw per visible column
-            _start_c = chart_r - n_vis
-            _prev_vwap_row = None
+            # Draw current session VWAP using the helper
+            _curr_ts_set = {c.ts for c in session_all}
+            _curr_vis    = [c for c in visible if c.ts in _curr_ts_set]
+            draw_vwap_on_candles(_curr_vis, _vwap_map, dim=False)
 
-            for _i, _candle in enumerate(visible):
-                _col = _start_c + _i
-                if not (0 <= _col < chart_r):
-                    continue
-                if _candle.ts not in _vwap_map:
-                    _prev_vwap_row = None
-                    continue
-
-                _vw, _sd = _vwap_map[_candle.ts]
-                if _vw <= 0:
-                    continue
-
-                # Convert prices to rows
-                def _pr(p):
-                    if hi_p == lo_p: return chart_h // 2
-                    r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
-                    return max(chart_top, min(chart_bot - 1, chart_top + r))
-
-                _r_vwap  = _pr(_vw)
-                _r_sd05u = _pr(_vw + 0.5 * _sd)
-                _r_sd05l = _pr(_vw - 0.5 * _sd)
-                _r_sd2u  = _pr(_vw + 2.0 * _sd)
-                _r_sd2l  = _pr(_vw - 2.0 * _sd)
-                _r_sd25u = _pr(_vw + 2.5 * _sd)
-                _r_sd25l = _pr(_vw - 2.5 * _sd)
-
-                # 0.5σ shaded band (░ character, drawn first — behind everything)
-                for _r in range(min(_r_sd05u, _r_sd05l), max(_r_sd05u, _r_sd05l) + 1):
-                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] == " ":
-                        db.put(_r, _col, ":", C_VWAP_BAND, curses.A_DIM)
-
-                # VWAP line
-                if chart_top <= _r_vwap < chart_bot:
-                    if db.buf[_r_vwap][_col][0] in (" ", ":"):
-                        db.put(_r_vwap, _col, "-", C_VWAP, curses.A_BOLD)
-
-                # 2σ lines
-                for _r in (_r_sd2u, _r_sd2l):
-                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
-                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_NORMAL)
-
-                # 2.5σ lines
-                for _r in (_r_sd25u, _r_sd25l):
-                    if chart_top <= _r < chart_bot and db.buf[_r][_col][0] in (" ", ":"):
-                        db.put(_r, _col, "~", C_VWAP_SD2, curses.A_DIM)
-
-            # ── VWAP price axis labels (rightmost column values) ──────────────
-            if session_all:
-                _last_ts = visible[-1].ts if visible else None
-                if _last_ts and _last_ts in _vwap_map:
-                    _vw_last, _sd_last = _vwap_map[_last_ts]
-                    if _vw_last > 0:
-                        def _axis_lbl(price, label, pair, attrs=curses.A_BOLD):
-                            _gr = _pr(price)
-                            if chart_top <= _gr < chart_bot:
-                                db.puts(_gr, chart_r, "+", pair, attrs)
-                                db.puts(_gr, chart_r + 1,
-                                        f"{label + ' ' + price_fmt(price, asset):<{PRICE_W}}",
-                                        pair, attrs)
-                        _axis_lbl(_vw_last,                "VW",  C_VWAP)
-                        _axis_lbl(_vw_last + 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
-                        _axis_lbl(_vw_last - 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
-                        _axis_lbl(_vw_last + 2.0*_sd_last, "2s",  C_VWAP_SD2)
-                        _axis_lbl(_vw_last - 2.0*_sd_last, "2s",  C_VWAP_SD2)
-                        _axis_lbl(_vw_last + 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
-                        _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
+            # ── VWAP price axis labels at rightmost visible current candle ─────
+            _last_curr = next((c for c in reversed(visible)
+                               if c.ts in _vwap_map), None)
+            if _last_curr:
+                _vw_last, _sd_last = _vwap_map[_last_curr.ts]
+                if _vw_last > 0:
+                    def _pr_ax(p):
+                        if hi_p == lo_p: return chart_h // 2
+                        r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                        return max(chart_top, min(chart_bot - 1, chart_top + r))
+                    def _axis_lbl(price, label, pair, attrs=curses.A_BOLD):
+                        _gr = _pr_ax(price)
+                        if chart_top <= _gr < chart_bot:
+                            db.puts(_gr, chart_r, "+", pair, attrs)
+                            db.puts(_gr, chart_r + 1,
+                                    f"{label + ' ' + price_fmt(price, asset):<{PRICE_W}}",
+                                    pair, attrs)
+                    _axis_lbl(_vw_last,                "VW",  C_VWAP)
+                    _axis_lbl(_vw_last + 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
+                    _axis_lbl(_vw_last - 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
+                    _axis_lbl(_vw_last + 2.0*_sd_last, "2s",  C_VWAP_SD2)
+                    _axis_lbl(_vw_last - 2.0*_sd_last, "2s",  C_VWAP_SD2)
+                    _axis_lbl(_vw_last + 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
+                    _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
 
     # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────────
     # Mark each candle column whose local timestamp crosses the 19:00 session

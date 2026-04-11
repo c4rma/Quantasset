@@ -87,7 +87,7 @@ def cur_ws_interval():
 def cur_label():
     return cur_interval()[0]
 
-MAX_CANDLES   = 2000    # expanded for scroll-back
+MAX_CANDLES   = 3000    # 48h × 60 = 2880 candles at 1m, plus headroom
 REST_LIMIT    = 500     # fetch up to 500 candles per request
 REFRESH_DELAY = 0.04    # ~25 fps (slightly faster for smoother scroll)
 
@@ -173,6 +173,7 @@ class ChartState:
         self.interval_idx  = 0       # index into INTERVALS list
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
+        self.n_vis        = 0       # visible candle count, set by draw()
 
 state = ChartState()
 
@@ -583,6 +584,82 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
     t.start()
     state.ws_thread = t
 
+    # For 1m interval, automatically preload 48h of history so VP/VWAP
+    # values are always computed over the full session.
+    if cur_resolution() == 60:
+        with state.lock:
+            state.history_loading = True
+        threading.Thread(
+            target=preload_48h, args=(my_session,), daemon=True).start()
+
+
+def preload_48h(session: int):
+    """
+    Background: fetch history until we have 48 hours of 1m candles.
+    Only runs when interval is 1m. Fires multiple REST requests back-to-back,
+    each prepending a batch, until either 2880 candles are loaded or the feed
+    is stale (user switched asset/interval/feed).
+    Updates status with progress so the user can see loading is happening.
+    """
+    TARGET_SECS = 48 * 3600   # 48 hours in seconds
+    resolution  = cur_resolution()
+
+    while True:
+        with state.lock:
+            if state.session != session:
+                state.history_loading = False
+                return
+            if not state.candles:
+                state.history_loading = False
+                return
+            oldest_ts  = state.candles[0].ts
+            newest_ts  = state.candles[-1].ts
+            n_loaded   = len(state.candles)
+            my_feed    = state.feed
+            asset      = state.asset
+
+        covered = newest_ts - oldest_ts
+        if covered >= TARGET_SECS:
+            with state.lock:
+                if state.session == session:
+                    state.history_loading = False
+                    state.error = ""
+            return
+
+        # Show progress
+        pct = min(99, int(covered / TARGET_SECS * 100))
+        with state.lock:
+            if state.session == session:
+                state.error = f"Preloading 48h... {pct}%"
+
+        candles = (fetch_kraken(asset, before_ts=oldest_ts)
+                   if my_feed == "kraken"
+                   else fetch_phemex(asset, before_ts=oldest_ts))
+
+        candles = [c for c in candles if c.ts < oldest_ts]
+        if not candles:
+            # Nothing more to fetch
+            with state.lock:
+                if state.session == session:
+                    state.history_loading = False
+                    state.error = ""
+            return
+
+        with state.lock:
+            if state.session != session:
+                state.history_loading = False
+                return
+            new_dq = collections.deque(candles, maxlen=MAX_CANDLES)
+            for c in state.candles:
+                new_dq.append(c)
+            state.candles = new_dq
+
+        # Small sleep to avoid hammering the API
+        time.sleep(0.3)
+
+    with state.lock:
+        state.history_loading = False
+
 
 def fetch_history_before(session: int):
     """Background: prepend older candles when user scrolls past the left edge."""
@@ -776,6 +853,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     left_idx  = max(0, right_idx - chart_w)
     visible   = all_candles[left_idx:right_idx] if all_candles else []
     n_vis     = len(visible)
+    with state.lock:
+        state.n_vis = n_vis   # expose to key handler
 
     # Clamp cursor_col_idx to actual visible window
     if cursor_col_idx < 0:
@@ -919,70 +998,115 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         session_candles   = [c for c in all_candles if c.ts >= _curr_start]
 
         # ── shared VP compute function ────────────────────────────────────────
-        VP_BUCKETS  = 200
-        price_range = hi_p - lo_p
+        # Strategy:
+        #   COMPUTE  — use the session's own fixed high/low as bucket boundaries.
+        #              This makes POC/VAH/VAL stable regardless of scroll position.
+        #   RENDER   — re-bin the stable buckets into the VISIBLE price range for
+        #              display, so bars are proportional to what's on screen and
+        #              don't collapse when the session range >> visible range.
+        VP_BUCKETS = 200
 
         def compute_vp(candles):
-            """Returns (vp_buckets, poc_price, vah_price, val_price) or None."""
-            if not candles or price_range <= 0:
+            """
+            Compute VP using session candles' own high/low as fixed bucket bounds.
+            Returns (vp_buckets, s_lo, s_hi, poc_price, vah_price, val_price).
+            """
+            if not candles:
+                return None
+            s_lo    = min(c.l for c in candles)
+            s_hi    = max(c.h for c in candles)
+            s_range = s_hi - s_lo
+            if s_range <= 0:
                 return None
             vp = [0.0] * VP_BUCKETS
+
             def ptb(p):
-                return max(0, min(VP_BUCKETS-1,
-                    int((p - lo_p) / price_range * (VP_BUCKETS - 1))))
+                return max(0, min(VP_BUCKETS - 1,
+                    int((p - s_lo) / s_range * (VP_BUCKETS - 1))))
+
             for c in candles:
-                body_hi = max(c.o, c.c);  body_lo = min(c.o, c.c)
-                # 50% over wick range
-                wv = c.v * 0.5
-                bw, bh = ptb(max(lo_p, c.l)), ptb(min(hi_p, c.h))
-                sw = max(1, bh - bw + 1)
-                for b in range(bw, bh + 1): vp[b] += wv / sw
-                # 50% over body range
-                bv = c.v * 0.5
-                bl, bb = ptb(max(lo_p, body_lo)), ptb(min(hi_p, body_hi))
-                sb = max(1, bb - bl + 1)
+                body_hi = max(c.o, c.c)
+                body_lo = min(c.o, c.c)
+                wv  = c.v * 0.5               # 50% over wick range
+                bw  = ptb(c.l);  bh = ptb(c.h)
+                sw  = max(1, bh - bw + 1)
+                for b in range(bw, bh + 1):
+                    vp[b] += wv / sw
+                bv  = c.v * 0.5               # 50% over body range
+                bl  = ptb(body_lo);  bb = ptb(body_hi)
+                sb  = max(1, bb - bl + 1)
                 if sb > 1:
-                    for b in range(bl, bb + 1): vp[b] += bv / sb
+                    for b in range(bl, bb + 1):
+                        vp[b] += bv / sb
                 else:
                     vp[ptb(c.c)] += bv
-            mx = max(vp) or 1.0
-            tv = sum(vp)
-            pi = vp.index(mx)
-            poc_p = lo_p + (pi / (VP_BUCKETS - 1)) * price_range
-            # Value area 70%
-            tgt = tv * 0.70; acc = vp[pi]; lo_b = pi; hi_b = pi
+
+            mx    = max(vp) or 1.0
+            tv    = sum(vp)
+            pi    = vp.index(mx)
+            poc_p = s_lo + (pi / (VP_BUCKETS - 1)) * s_range
+
+            tgt  = tv * 0.70
+            acc  = vp[pi]
+            lo_b = hi_b = pi
             while acc < tgt:
-                ab = vp[hi_b+1] if hi_b < VP_BUCKETS-1 else 0.0
-                bb = vp[lo_b-1] if lo_b > 0            else 0.0
-                if ab == 0 and bb == 0: break
-                if ab >= bb: hi_b += 1; acc += ab
-                else:        lo_b -= 1; acc += bb
-            vah_p = lo_p + (hi_b / (VP_BUCKETS - 1)) * price_range
-            val_p = lo_p + (lo_b / (VP_BUCKETS - 1)) * price_range
-            return vp, poc_p, vah_p, val_p
+                ab = vp[hi_b + 1] if hi_b < VP_BUCKETS - 1 else 0.0
+                bb = vp[lo_b - 1] if lo_b > 0               else 0.0
+                if ab == 0 and bb == 0:
+                    break
+                if ab >= bb:
+                    hi_b += 1;  acc += ab
+                else:
+                    lo_b -= 1;  acc += bb
+
+            vah_p = s_lo + (hi_b / (VP_BUCKETS - 1)) * s_range
+            val_p = s_lo + (lo_b / (VP_BUCKETS - 1)) * s_range
+            return vp, s_lo, s_hi, poc_p, vah_p, val_p
 
         def price_to_row(p):
-            if price_range <= 0: return chart_h // 2
-            r = int((1.0 - (p - lo_p) / price_range) * (chart_h - 1))
+            """Map a price to a chart row using the VISIBLE price range."""
+            if hi_p == lo_p: return chart_h // 2
+            r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
             return max(0, min(chart_h - 1, r))
 
-        def draw_vp_bars(vp, poc_p, vah_p, val_p, alpha_dim=False):
-            """Render VP bars. alpha_dim=True for previous session (fainter)."""
+        def draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p, alpha_dim=False):
+            """
+            Render VP bars.
+            - Session buckets (fixed s_lo/s_hi) are re-binned into the VISIBLE
+              row grid so bars fill the screen proportionally.
+            - Only buckets whose price falls within the visible range are shown.
+            - Bar width is normalised to the max volume among VISIBLE rows only,
+              so the profile always fills VP_MAX_W at the busiest visible level.
+            """
+            s_range = s_hi - s_lo
+            if s_range <= 0:
+                return
+
+            # Re-bin: for each session bucket, compute its price and check if
+            # it falls within the visible window. Only include visible ones.
             row_vol = [0.0] * chart_h
             for b, vol in enumerate(vp):
-                price = lo_p + (b / (VP_BUCKETS - 1)) * price_range
-                row   = price_to_row(price)
-                row_vol[row] += vol
-            mrv     = max(row_vol) or 1.0
+                price = s_lo + (b / (VP_BUCKETS - 1)) * s_range
+                # Skip buckets outside visible range
+                if price < lo_p or price > hi_p:
+                    continue
+                row = price_to_row(price)
+                if 0 <= row < chart_h:
+                    row_vol[row] += vol
+
+            mrv = max(row_vol) or 1.0   # normalise to visible max
             VP_MAX_W = max(4, chart_w // 10 if alpha_dim else chart_w // 5)
-            poc_row = price_to_row(poc_p)
-            vah_row = price_to_row(vah_p)
-            val_row = price_to_row(val_p)
+            poc_row  = price_to_row(poc_p)
+            vah_row  = price_to_row(vah_p)
+            val_row  = price_to_row(val_p)
+
             for b, bvol in enumerate(row_vol):
-                if bvol <= 0: continue
+                if bvol <= 0:
+                    continue
                 bar_w = max(1, int(bvol / mrv * VP_MAX_W))
                 row   = chart_top + b
-                if not (chart_top <= row < chart_bot): continue
+                if not (chart_top <= row < chart_bot):
+                    continue
                 in_va = (vah_row <= b <= val_row)
                 if alpha_dim:
                     pair, attrs, char = C_VP_NORM, curses.A_DIM, "."
@@ -1035,8 +1159,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         # ── PREVIOUS SESSION VP ───────────────────────────────────────────────
         prev_result = compute_vp(prev_sess_candles)
         if prev_result:
-            pvp, p_poc, p_vah, p_val = prev_result
-            draw_vp_bars(pvp, p_poc, p_vah, p_val, alpha_dim=True)
+            pvp, p_slo, p_shi, p_poc, p_vah, p_val = prev_result
+            draw_vp_bars(pvp, p_slo, p_shi, p_poc, p_vah, p_val, alpha_dim=True)
 
             # Find the column index where the current session starts in visible[]
             curr_start_col = chart_r  # default: off right edge
@@ -1076,8 +1200,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         # ── CURRENT SESSION VP ────────────────────────────────────────────────
         curr_result = compute_vp(session_candles)
         if curr_result:
-            vp, poc_price, vah_price, val_price = curr_result
-            draw_vp_bars(vp, poc_price, vah_price, val_price, alpha_dim=False)
+            vp, c_slo, c_shi, poc_price, vah_price, val_price = curr_result
+            draw_vp_bars(vp, c_slo, c_shi, poc_price, vah_price, val_price, alpha_dim=False)
             draw_level_line(vah_price, "~", C_VP_VA, curses.A_BOLD, "VAH")
             draw_level_line(val_price, "~", C_VP_VA, curses.A_BOLD, "VAL")
             draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC")
@@ -1091,18 +1215,31 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         session_all       = [c for c in all_candles if c.ts >= _cstart]
 
         def build_vwap_map(candles):
-            """Compute cumulative VWAP + σ per candle. Returns {ts: (vwap, sd)}."""
-            _cum_tpv = _cum_vol = _cum_tp2v = 0.0
+            """
+            Compute cumulative VWAP + σ per candle. Returns {ts: (vwap, sd)}.
+            Uses the same formula as TradingView:
+              VWAP = Σ(tp*vol) / Σ(vol)
+              σ²   = Σ(vol*(tp - VWAP)²) / Σ(vol)
+            Computed via Welford's online algorithm for numerical stability.
+            """
+            _cum_tpv  = 0.0   # Σ tp*vol
+            _cum_vol  = 0.0   # Σ vol
+            _cum_dev2 = 0.0   # Σ vol*(tp - VWAP)²  (updated each step)
             _map = {}
             for _c in candles:
-                _tp = (_c.h + _c.l + _c.c) / 3.0
-                _v  = _c.v
-                _cum_tpv  += _tp * _v
-                _cum_vol  += _v
-                _cum_tp2v += _tp * _tp * _v
+                _tp  = (_c.h + _c.l + _c.c) / 3.0
+                _v   = _c.v
+                _old_vol = _cum_vol
+                _cum_tpv += _tp * _v
+                _cum_vol += _v
                 if _cum_vol > 0:
                     _vw  = _cum_tpv / _cum_vol
-                    _var = max(0.0, _cum_tp2v / _cum_vol - _vw * _vw)
+                    # Welford update for volume-weighted variance
+                    # Δ = tp - new_VWAP; add _v*(tp - old_VWAP)*(tp - new_VWAP)
+                    if _old_vol > 0:
+                        _old_vw = (_cum_tpv - _tp * _v) / _old_vol
+                        _cum_dev2 += _v * (_tp - _old_vw) * (_tp - _vw)
+                    _var = max(0.0, _cum_dev2 / _cum_vol)
                     _sd  = _var ** 0.5
                 else:
                     _vw, _sd = 0.0, 0.0
@@ -1162,25 +1299,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
         # Current session VWAP (full brightness)
         if session_all:
-            # Build running sums over session candles ordered chronologically
-            _cum_tpv = 0.0   # Σ tp×vol
-            _cum_vol = 0.0   # Σ vol
-            _cum_tp2v= 0.0   # Σ vol×tp²  (for σ via Welford-style: E[x²]-E[x]²)
-            # Map ts → (vwap, sigma) for every session candle
-            _vwap_map = {}
-            for _c in session_all:
-                _tp   = (_c.h + _c.l + _c.c) / 3.0
-                _v    = _c.v
-                _cum_tpv  += _tp * _v
-                _cum_vol  += _v
-                _cum_tp2v += _tp * _tp * _v
-                if _cum_vol > 0:
-                    _vw = _cum_tpv / _cum_vol
-                    _var = max(0.0, _cum_tp2v / _cum_vol - _vw * _vw)
-                    _sd = _var ** 0.5
-                else:
-                    _vw, _sd = 0.0, 0.0
-                _vwap_map[_c.ts] = (_vw, _sd)
+            # Use the same Welford build function for consistency
+            _vwap_map = build_vwap_map(session_all)
 
             # Draw current session VWAP using the helper
             _curr_ts_set = {c.ts for c in session_all}
@@ -1357,8 +1477,11 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         hist_tag = "  [loading history...]" if history_loading else ""
         mode_tag  = "LINE" if chart_mode == "line" else "CANDLE"
         vwap_tag  = "W:ON" if show_vwap else "W:OFF"
+        # Count session candles for VP/VWAP diagnostic
+        _sb = session_bounds()
+        _n_sess = sum(1 for c in all_candles if c.ts >= _sb[2])
         footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [Q] Quit"
-                    f"   {len(all_candles)} candles  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
+                    f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
 
@@ -1480,23 +1603,31 @@ def main(stdscr):
                 else:
                     step = 1
                 with state.lock:
-                    cci = state.cursor_col_idx
-                    vo  = state.view_offset
+                    cci        = state.cursor_col_idx
+                    vo         = state.view_offset
+                    n_vis_now  = state.n_vis   # actual visible cols from last draw
+                    n_loaded   = len(state.candles)
                     if cci < 0:
                         pass   # already live, nothing to do
                     else:
-                        n_loaded = len(state.candles)
-                        # First consume pan offset
-                        pan_consume = min(step, vo)
-                        remaining   = step - pan_consume
-                        new_vo      = vo - pan_consume
-                        new_cci     = cci + remaining
-                        if new_vo == 0 and new_cci >= n_loaded:
-                            state.cursor_col_idx = -1
-                            state.view_offset    = 0
+                        # Rightmost cursor position within the current visible window
+                        right_edge = max(0, n_vis_now - 1)
+                        move       = step
+                        room_right = right_edge - cci  # steps until cursor hits wall
+                        if move <= room_right:
+                            # Cursor moves within window, no pan needed
+                            state.cursor_col_idx = cci + move
                         else:
-                            state.cursor_col_idx = new_cci
-                            state.view_offset    = new_vo
+                            # Cursor reaches right edge, leftover steps become pan
+                            move -= room_right
+                            state.cursor_col_idx = right_edge
+                            new_vo = max(0, vo - move)
+                            if new_vo == 0:
+                                # Fully unscrolled — snap to live
+                                state.cursor_col_idx = -1
+                                state.view_offset    = 0
+                            else:
+                                state.view_offset = new_vo
             elif key == 27:  # Escape — snap back to live
                 with state.lock:
                     state.cursor_col_idx = -1

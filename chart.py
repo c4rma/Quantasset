@@ -126,7 +126,8 @@ C_HEADER    = 5
 C_VOL_BULL  = 6   # blue
 C_VOL_BEAR  = 7   # white/dim
 C_ASSET_SEL = 9
-C_PRICE_LBL = 10
+C_PRICE_LBL  = 10   # price label badge (white on blue)
+C_PRICE_LINE = 19   # price dashed line (yellow)
 C_CURSOR    = 11
 C_VP_NORM   = 12   # volume profile bar (dim)
 C_VP_POC    = 13   # point of control (brightest level)
@@ -584,13 +585,67 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
     t.start()
     state.ws_thread = t
 
-    # For 1m interval, automatically preload 48h of history so VP/VWAP
-    # values are always computed over the full session.
+    # Auto-preload history so VP/VWAP values are based on full session data.
+    # 1m: preload 48h (covers two full futures sessions).
+    # All other intervals: preload 500 candles.
+    with state.lock:
+        state.history_loading = True
     if cur_resolution() == 60:
-        with state.lock:
-            state.history_loading = True
         threading.Thread(
             target=preload_48h, args=(my_session,), daemon=True).start()
+    else:
+        threading.Thread(
+            target=preload_500, args=(my_session,), daemon=True).start()
+
+
+def preload_500(session: int):
+    """
+    Background: fetch until we have at least 500 candles loaded.
+    Used for all intervals except 1m (which uses preload_48h).
+    """
+    TARGET = 500
+    for _ in range(10):   # max 10 fetches
+        with state.lock:
+            if state.session != session:
+                state.history_loading = False
+                return
+            n        = len(state.candles)
+            if n >= TARGET:
+                state.history_loading = False
+                state.error = ""
+                return
+            oldest_ts = state.candles[0].ts if state.candles else 0
+            my_feed   = state.feed
+            asset     = state.asset
+
+        if oldest_ts == 0:
+            break
+
+        with state.lock:
+            state.error = f"Preloading... {n}/{TARGET}"
+
+        candles = (fetch_kraken(asset, before_ts=oldest_ts)
+                   if my_feed == "kraken"
+                   else fetch_phemex(asset, before_ts=oldest_ts))
+        candles = [c for c in candles if c.ts < oldest_ts]
+        if not candles:
+            break
+
+        with state.lock:
+            if state.session != session:
+                state.history_loading = False
+                return
+            new_dq = collections.deque(candles, maxlen=MAX_CANDLES)
+            for c in state.candles:
+                new_dq.append(c)
+            state.candles = new_dq
+
+        time.sleep(0.2)
+
+    with state.lock:
+        if state.session == session:
+            state.history_loading = False
+            state.error = ""
 
 
 def preload_48h(session: int):
@@ -706,7 +761,8 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_VOL_BULL,  bull_fg,             -1)
     curses.init_pair(C_VOL_BEAR,  bear_fg,             -1)
     curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
-    curses.init_pair(C_PRICE_LBL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_PRICE_LBL,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
+    curses.init_pair(C_PRICE_LINE, curses.COLOR_YELLOW, -1)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
     curses.init_pair(C_LINE,      curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
@@ -910,7 +966,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     badge = f" {feed.upper()} "
     db.puts(0, cols - len(badge) - 22, badge, C_ASSET_SEL, curses.A_BOLD)
 
-    now_str = datetime.now().strftime("%H:%M:%S")
+    now_str = datetime.now().strftime("%m/%d/%Y  %H:%M:%S")
     # Countdown: seconds remaining until next 1-min candle close
     now_epoch   = int(time.time())
     secs_left   = cur_resolution() - (now_epoch % cur_resolution())
@@ -925,7 +981,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -940,9 +996,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         chg   = lc.c - lc.o
         pct   = chg / lc.o * 100 if lc.o else 0
         arrow = "+" if bull else "-"
-        # Cursor time: directly from the selected candle's timestamp (local time)
+        # Cursor time: always show full date + time
         if in_cursor_mode and selected:
-            ts_lbl = datetime.fromtimestamp(selected.ts).strftime("%H:%M:%S")
+            ts_lbl = datetime.fromtimestamp(selected.ts).strftime("%m/%d/%Y  %H:%M:%S")
         else:
             ts_lbl = ""
         cursor_tag = f"  [{ts_lbl}]" if in_cursor_mode else ""
@@ -968,34 +1024,46 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             db.put(gr, chart_r, "+", C_AXIS)
             db.puts(gr, chart_r + 1, f"{lbl:<{PRICE_W}}", C_LABEL)
 
-    if not in_cursor_mode and last_price and lo_p < last_price < hi_p:
-        pr = chart_top + p2r(last_price)
-        if chart_top <= pr < chart_bot:
-            for c2 in range(chart_r):
-                if db.buf[pr][c2][0] == " ":
-                    db.put(pr, c2, "-", C_PRICE_LBL)
-            db.puts(pr, chart_r,     ">", C_PRICE_LBL, curses.A_BOLD)
-            db.puts(pr, chart_r + 1, f"{price_fmt(last_price, asset):<{PRICE_W}}",
-                    C_PRICE_LBL, curses.A_BOLD)
-
-    if in_cursor_mode and selected and lo_p < selected.c < hi_p:
-        pr = chart_top + p2r(selected.c)
-        if chart_top <= pr < chart_bot:
-            for c2 in range(chart_r):
-                if db.buf[pr][c2][0] == " ":
-                    db.put(pr, c2, "-", C_CURSOR)
-            db.puts(pr, chart_r,     ">", C_CURSOR, curses.A_BOLD)
-            db.puts(pr, chart_r + 1, f"{price_fmt(selected.c, asset):<{PRICE_W}}",
-                    C_CURSOR, curses.A_BOLD)
-
     # ── VOLUME PROFILE — current + previous session ─────────────────────────
     if show_vp and visible and chart_h > 0:
         _prev_start, _prev_end, _curr_start = session_bounds()
+        _is_1m = (cur_resolution() == 60)
 
-        # Candle lists for each session
-        prev_sess_candles = [c for c in all_candles
-                             if _prev_start <= c.ts < _prev_end]
+        # Split ALL loaded candles into complete 19:00 CT → 19:00 CT sessions.
+        # Each session boundary is at _curr_start - N*86400.
+        # "Current session" = started at _curr_start (may still be open).
+        # "Previous session" = the one immediately before, for virgin lines.
+        # All older sessions are drawn as historical profiles.
+        import datetime as _dtmod3
+        def _session_boundaries(candles):
+            """Return list of session start timestamps covering all candles,
+            sorted oldest→newest. Each boundary is a 19:00 CT Unix timestamp."""
+            if not candles:
+                return []
+            oldest = candles[0].ts
+            boundaries = []
+            t = _curr_start
+            while t > oldest - 86400:
+                boundaries.append(t)
+                t -= 86400
+            return sorted(boundaries)
+
+        _boundaries    = _session_boundaries(all_candles)
+        # Build session candle lists: each session is [boundary, next_boundary)
+        _all_sessions  = []
+        for _si, _sb in enumerate(_boundaries):
+            _se = _boundaries[_si + 1] if _si + 1 < len(_boundaries) else float("inf")
+            _sc = [c for c in all_candles if _sb <= c.ts < _se]
+            if _sc:
+                _all_sessions.append((_sb, _sc))
+
+        # Current session = last boundary; previous = second-to-last
         session_candles   = [c for c in all_candles if c.ts >= _curr_start]
+        prev_sess_candles = ([c for c in all_candles
+                              if _prev_start <= c.ts < _curr_start]
+                             if len(_boundaries) >= 2 else [])
+        # Historical sessions = everything older than prev session
+        hist_sessions = _all_sessions[:-2] if len(_all_sessions) >= 2 else []
 
         # ── shared VP compute function ────────────────────────────────────────
         # Strategy:
@@ -1069,32 +1137,28 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
             return max(0, min(chart_h - 1, r))
 
-        def draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p, alpha_dim=False):
+        def draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p,
+                         alpha_dim=False, col_start=0):
             """
-            Render VP bars.
-            - Session buckets (fixed s_lo/s_hi) are re-binned into the VISIBLE
-              row grid so bars fill the screen proportionally.
-            - Only buckets whose price falls within the visible range are shown.
-            - Bar width is normalised to the max volume among VISIBLE rows only,
-              so the profile always fills VP_MAX_W at the busiest visible level.
+            Render VP bars anchored to col_start (the session's first visible column).
+            Bars grow rightward from col_start up to VP_MAX_W columns wide.
+            Only buckets whose price falls within the visible range are shown.
+            Bar width normalised to visible-row max so the profile always fills well.
             """
             s_range = s_hi - s_lo
             if s_range <= 0:
                 return
 
-            # Re-bin: for each session bucket, compute its price and check if
-            # it falls within the visible window. Only include visible ones.
             row_vol = [0.0] * chart_h
             for b, vol in enumerate(vp):
                 price = s_lo + (b / (VP_BUCKETS - 1)) * s_range
-                # Skip buckets outside visible range
                 if price < lo_p or price > hi_p:
                     continue
                 row = price_to_row(price)
                 if 0 <= row < chart_h:
                     row_vol[row] += vol
 
-            mrv = max(row_vol) or 1.0   # normalise to visible max
+            mrv      = max(row_vol) or 1.0
             VP_MAX_W = max(4, chart_w // 10 if alpha_dim else chart_w // 5)
             poc_row  = price_to_row(poc_p)
             vah_row  = price_to_row(vah_p)
@@ -1116,15 +1180,15 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     pair, attrs, char = C_VP_NORM, curses.A_NORMAL, "-"
                 else:
                     pair, attrs, char = C_VP_NORM, curses.A_DIM, "-"
-                for c2 in range(bar_w):
-                    if 0 <= c2 < chart_r:
-                        db.put(row, c2, char, pair, attrs)
+                for c2 in range(col_start, min(chart_r, col_start + bar_w)):
+                    db.put(row, c2, char, pair, attrs)
 
-        def draw_level_line(price, char, pair, attrs, label, label_suffix=""):
-            """Draw a full-width horizontal line and axis label."""
+        def draw_level_line(price, char, pair, attrs, label,
+                            label_suffix="", col_start=0):
+            """Draw a horizontal line from col_start to the right edge + axis label."""
             row = chart_top + price_to_row(price)
             if not (chart_top <= row < chart_bot): return
-            for c2 in range(chart_r):
+            for c2 in range(col_start, chart_r):
                 if db.buf[row][c2][0] in (" ", ".", "-", char):
                     db.put(row, c2, char, pair, attrs)
             db.puts(row, chart_r, "+", pair, attrs)
@@ -1156,63 +1220,119 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 lbl = f"p{label} {price_fmt(price, asset)}"
                 db.puts(row, chart_r + 1, f"{lbl:<{PRICE_W}}", pair, attrs)
 
+        # ── Compute session column boundaries in visible window ───────────────
+        start_col_base = chart_r - n_vis   # column of oldest visible candle
+
+        # Column where the PREVIOUS session's first visible candle appears
+        prev_col_start = chart_r  # off-screen by default
+        for _i, _vc in enumerate(visible):
+            if _vc.ts >= _prev_start:
+                prev_col_start = start_col_base + _i
+                break
+
+        # Column where the CURRENT session starts (19:00 boundary)
+        curr_col_start = chart_r  # off-screen if current session not yet visible
+        for _i, _vc in enumerate(visible):
+            if _vc.ts >= _curr_start:
+                curr_col_start = start_col_base + _i
+                break
+
+        # Candles in visible[] belonging to the current session
+        curr_vis_candles = [c for c in visible if c.ts >= _curr_start]
+        curr_col_offset  = chart_r - len(curr_vis_candles)
+
         # ── PREVIOUS SESSION VP ───────────────────────────────────────────────
         prev_result = compute_vp(prev_sess_candles)
         if prev_result:
             pvp, p_slo, p_shi, p_poc, p_vah, p_val = prev_result
-            draw_vp_bars(pvp, p_slo, p_shi, p_poc, p_vah, p_val, alpha_dim=True)
 
-            # Find the column index where the current session starts in visible[]
-            curr_start_col = chart_r  # default: off right edge
-            for _i, _vc in enumerate(visible):
-                if _vc.ts >= _curr_start:
-                    curr_start_col = (chart_r - n_vis) + _i
-                    break
+            # Bars anchored to the previous session's first visible column
+            draw_vp_bars(pvp, p_slo, p_shi, p_poc, p_vah, p_val,
+                         alpha_dim=True, col_start=max(0, prev_col_start))
 
-            # Candles in visible[] that belong to current session
-            curr_vis_candles = [c for c in visible if c.ts >= _curr_start]
-            curr_col_offset  = chart_r - len(curr_vis_candles)
+            # Prev-session level lines only over prev-session columns
+            for _px, _ch, _pr in [
+                (p_vah, "~", C_VP_VA),
+                (p_val, "~", C_VP_VA),
+                (p_poc, "=", C_VP_POC),
+            ]:
+                _row = chart_top + price_to_row(_px)
+                if not (chart_top <= _row < chart_bot): continue
+                for c2 in range(max(0, prev_col_start),
+                                min(chart_r, curr_col_start)):
+                    if db.buf[_row][c2][0] in (" ", ".", "-", _ch):
+                        db.put(_row, c2, _ch, _pr, curses.A_DIM)
 
-            # Draw previous session fixed lines (over prev-session columns only)
-            prev_end_col = curr_start_col - 1
-            for c2 in range(chart_r - n_vis, min(chart_r, prev_end_col + 1)):
-                # Draw prev POC/VAH/VAL only over prev-session area
-                pass  # handled by virgin_line extending from prev_end_col
-
-            # Virgin POC/VAH/VAL — extend into current session until touched
+            # Virgin POC/VAH/VAL — extend from curr session start until touched
             virgin_line(p_poc, "=", C_VP_POC, curses.A_DIM,
-                        "POC", curr_start_col, curr_vis_candles, curr_col_offset)
+                        "POC", curr_col_start, curr_vis_candles, curr_col_offset)
             virgin_line(p_vah, "~", C_VP_VA, curses.A_DIM,
-                        "VAH", curr_start_col, curr_vis_candles, curr_col_offset)
+                        "VAH", curr_col_start, curr_vis_candles, curr_col_offset)
             virgin_line(p_val, "~", C_VP_VA, curses.A_DIM,
-                        "VAL", curr_start_col, curr_vis_candles, curr_col_offset)
+                        "VAL", curr_col_start, curr_vis_candles, curr_col_offset)
 
-            # Draw prev-session lines over their own columns (solid, dim)
-            for _px, _lbl in [(p_vah, "pVAH"), (p_val, "pVAL"), (p_poc, "pPOC")]:
-                row = chart_top + price_to_row(_px)
-                if not (chart_top <= row < chart_bot): continue
-                _ch = "=" if _lbl == "pPOC" else "~"
-                _pr = C_VP_POC if _lbl == "pPOC" else C_VP_VA
-                for c2 in range(chart_r - n_vis, min(chart_r, curr_start_col)):
-                    if db.buf[row][c2][0] in (" ", ".", "-", _ch):
-                        db.put(row, c2, _ch, _pr, curses.A_DIM)
+        # ── HISTORICAL SESSIONS VP (older than prev session) ─────────────────
+        # Draw each historical session's profile anchored to its own start col.
+        # No virgin lines for these — just bars and dim level markers.
+        for _h_start, _h_candles in hist_sessions:
+            _h_result = compute_vp(_h_candles)
+            if not _h_result:
+                continue
+            _hvp, _h_slo, _h_shi, _h_poc, _h_vah, _h_val = _h_result
+            # Find start column for this historical session
+            _h_col_start = chart_r
+            for _hi, _hc in enumerate(visible):
+                if _hc.ts >= _h_start:
+                    _h_col_start = start_col_base + _hi
+                    break
+            if _h_col_start >= chart_r:
+                continue  # this session is off-screen
+            # Find end column (next session boundary)
+            _h_col_end = chart_r
+            for _hi, _hc in enumerate(visible):
+                if _hc.ts >= _h_start + 86400:
+                    _h_col_end = start_col_base + _hi
+                    break
+            draw_vp_bars(_hvp, _h_slo, _h_shi, _h_poc, _h_vah, _h_val,
+                         alpha_dim=True, col_start=max(0, _h_col_start))
+            # Dim level lines over historical session columns only
+            for _hpx, _hch, _hpr in [
+                (_h_vah, "~", C_VP_VA), (_h_val, "~", C_VP_VA),
+                (_h_poc, "=", C_VP_POC),
+            ]:
+                _hr = chart_top + price_to_row(_hpx)
+                if not (chart_top <= _hr < chart_bot): continue
+                for c2 in range(max(0, _h_col_start), min(chart_r, _h_col_end)):
+                    if db.buf[_hr][c2][0] in (" ", ".", "-", _hch):
+                        db.put(_hr, c2, _hch, _hpr, curses.A_DIM)
 
         # ── CURRENT SESSION VP ────────────────────────────────────────────────
         curr_result = compute_vp(session_candles)
         if curr_result:
             vp, c_slo, c_shi, poc_price, vah_price, val_price = curr_result
-            draw_vp_bars(vp, c_slo, c_shi, poc_price, vah_price, val_price, alpha_dim=False)
-            draw_level_line(vah_price, "~", C_VP_VA, curses.A_BOLD, "VAH")
-            draw_level_line(val_price, "~", C_VP_VA, curses.A_BOLD, "VAL")
-            draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC")
+            # Bars and lines anchored to the current session's start column
+            draw_vp_bars(vp, c_slo, c_shi, poc_price, vah_price, val_price,
+                         alpha_dim=False, col_start=max(0, curr_col_start))
+            draw_level_line(vah_price, "~", C_VP_VA, curses.A_BOLD, "VAH",
+                            col_start=max(0, curr_col_start))
+            draw_level_line(val_price, "~", C_VP_VA, curses.A_BOLD, "VAL",
+                            col_start=max(0, curr_col_start))
+            draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC",
+                            col_start=max(0, curr_col_start))
 
     # ── VWAP + STANDARD DEVIATION BANDS — current + previous session ────────
     if show_vwap and visible and chart_h > 0:
         _pstart, _pend, _cstart = session_bounds()
+        _is_1m_vwap = (cur_resolution() == 60)
 
-        # All candles for each session (not just visible — for accurate VWAP)
-        prev_vwap_candles = [c for c in all_candles if _pstart <= c.ts < _pend]
-        session_all       = [c for c in all_candles if c.ts >= _cstart]
+        if _is_1m_vwap:
+            # 1m: session-anchored VWAP (19:00 CT)
+            prev_vwap_candles = [c for c in all_candles if _pstart <= c.ts < _pend]
+            session_all       = [c for c in all_candles if c.ts >= _cstart]
+        else:
+            # Other intervals: VWAP over all loaded candles
+            prev_vwap_candles = []
+            session_all       = list(all_candles)
 
         def build_vwap_map(candles):
             """
@@ -1413,6 +1533,45 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── SEPARATOR ─────────────────────────────────────────────────────────────
     db.puts(chart_bot, 0, "-" * chart_r + "+", C_AXIS)
 
+    # ── LIVE PRICE LINE (drawn after candles so it's always visible) ──────────
+    # Overwrites VP bars, VWAP lines, etc. but never erases candle characters.
+    # The axis label always renders on top with a contrasting background.
+    _CANDLE_CHARS = {"#", "|"}   # never overwrite these
+    # ── PRICE / CURSOR LINE (drawn last — always on top) ─────────────────────
+    # The axis label overwrites everything at that row unconditionally so it's
+    # always readable even when VWAP/VP labels land on the same price level.
+    if not in_cursor_mode and last_price and lo_p < last_price < hi_p:
+        pr = chart_top + p2r(last_price)
+        if chart_top <= pr < chart_bot:
+            # Full highlighted row — every cell gets yellow-on-black reversed
+            # so the line is a solid bright band across the entire chart width
+            _pl_attrs = curses.A_BOLD | curses.A_REVERSE
+            for c2 in range(chart_r):
+                _cur_ch = db.buf[pr][c2][0]
+                # Keep candle body chars but apply highlight attrs over them
+                _draw_ch = _cur_ch if _cur_ch not in (" ", "-", ".") else "-"
+                db.put(pr, c2, _draw_ch, C_PRICE_LINE, _pl_attrs)
+            # Right axis label — white-on-blue bold, full width
+            lbl_str = f" {price_fmt(last_price, asset):<{PRICE_W - 1}}"
+            db.put(pr, chart_r, ">", C_PRICE_LBL, curses.A_BOLD | curses.A_REVERSE)
+            for _ci, _ch in enumerate(lbl_str):
+                db.put(pr, chart_r + 1 + _ci, _ch, C_PRICE_LBL, curses.A_BOLD)
+            # Left-edge floating badge
+            _badge = f"{price_fmt(last_price, asset)}"
+            for _ci, _ch in enumerate(_badge):
+                db.put(pr, _ci, _ch, C_PRICE_LBL, curses.A_BOLD)
+
+    if in_cursor_mode and selected and lo_p < selected.c < hi_p:
+        pr = chart_top + p2r(selected.c)
+        if chart_top <= pr < chart_bot:
+            for c2 in range(chart_r):
+                if db.buf[pr][c2][0] not in _CANDLE_CHARS:
+                    db.put(pr, c2, "-", C_CURSOR, curses.A_BOLD)
+            lbl_str = f" {price_fmt(selected.c, asset):<{PRICE_W - 1}}"
+            db.put(pr, chart_r, ">", C_CURSOR, curses.A_BOLD)
+            for _ci, _ch in enumerate(lbl_str):
+                db.put(pr, chart_r + 1 + _ci, _ch, C_CURSOR, curses.A_BOLD)
+
     # ── VOLUME ────────────────────────────────────────────────────────────────
     # vol_top is now the bottom border of the time axis box.
     # VOL bars live in vol_top+1 … vol_bot.
@@ -1451,13 +1610,22 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 # Use candle.ts directly — fromtimestamp converts UTC epoch to local time
                 dt = datetime.fromtimestamp(candle.ts)
                 if dt.minute % 15 == 0 and lbl_col - last_label_col >= MIN_LABEL_GAP:
-                    lbl = dt.strftime("%H:%M")
+                    # At midnight show the date; otherwise show HH:MM
+                    if dt.hour == 0 and dt.minute == 0:
+                        lbl = dt.strftime("%m/%d/%Y")
+                    else:
+                        lbl = dt.strftime("%H:%M")
                     db.puts(time_row, lbl_col, lbl, C_LABEL, curses.A_BOLD)
                     last_label_col = lbl_col
 
-            # Cursor label — from selected candle's actual ts
+            # Cursor label — include date when not today
             if in_cursor_mode and selected and 0 <= cursor_col <= chart_r - 5:
-                lbl = datetime.fromtimestamp(selected.ts).strftime("%H:%M")
+                _c_dt   = datetime.fromtimestamp(selected.ts)
+                _today  = datetime.now().date()
+                if _c_dt.date() == _today:
+                    lbl = _c_dt.strftime("%H:%M")
+                else:
+                    lbl = _c_dt.strftime("%m/%d/%Y %H:%M")
                 db.puts(time_row, cursor_col, lbl, C_CURSOR, curses.A_BOLD)
 
     # Bottom border of the time axis box (top of VOL pane)
@@ -1499,6 +1667,179 @@ def take_screenshot(db: "DoubleBuffer"):
     with open(fn, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return fn
+
+
+# ── jump-to dialog ────────────────────────────────────────────────────────────
+def jump_to_dialog(stdscr, db: "DoubleBuffer", rows: int, cols: int) -> str:
+    """
+    Draw a small input box in the centre of the screen and collect a
+    date/time string from the user.  Returns the entered string (stripped)
+    or "" if the user cancelled with Escape.
+    Uses raw curses input so the main nodelay loop doesn't interfere.
+    """
+    prompt  = " Jump to (YYYY-MM-DD HH:MM or HH:MM):  "
+    box_w   = len(prompt) + 20
+    box_h   = 3
+    box_y   = rows // 2 - box_h // 2
+    box_x   = max(0, cols // 2 - box_w // 2)
+
+    # Temporarily switch to blocking input with echo
+    curses.curs_set(1)
+    curses.echo()
+    stdscr.nodelay(False)
+
+    # Draw box
+    for r in range(box_h):
+        stdscr.addstr(box_y + r, box_x,
+                      " " * min(box_w, cols - box_x),
+                      curses.color_pair(C_CURSOR) | curses.A_BOLD)
+    stdscr.addstr(box_y + 1, box_x, prompt,
+                  curses.color_pair(C_CURSOR) | curses.A_BOLD)
+    stdscr.refresh()
+
+    # Collect input character by character
+    input_buf = []
+    input_x   = box_x + len(prompt)
+    while True:
+        try:
+            ch = stdscr.get_wch()
+        except Exception:
+            break
+        if isinstance(ch, str):
+            code = ord(ch)
+        else:
+            code = ch
+        if code in (27,):                      # Escape — cancel
+            input_buf = []
+            break
+        elif code in (10, 13, curses.KEY_ENTER):  # Enter — confirm
+            break
+        elif code in (curses.KEY_BACKSPACE, 127, 8):
+            if input_buf:
+                input_buf.pop()
+                # Erase last char on screen
+                stdscr.addstr(box_y + 1, input_x + len(input_buf), " ",
+                              curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        elif 32 <= code <= 126 and len(input_buf) < 20:
+            input_buf.append(chr(code))
+            stdscr.addstr(box_y + 1, input_x + len(input_buf) - 1,
+                          chr(code), curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        stdscr.refresh()
+
+    # Restore non-blocking + no echo
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    return "".join(input_buf).strip()
+
+
+def parse_jump_target(s: str) -> int:
+    """
+    Parse user input into a UTC Unix timestamp.
+    Accepts: YYYY-MM-DD HH:MM   or   HH:MM (assumes today local time).
+    Returns 0 on parse failure.
+    """
+    s = s.strip()
+    fmts = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%m/%d/%Y %H:%M",
+        "%d/%m/%Y %H:%M",
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return int(dt.timestamp())
+        except ValueError:
+            pass
+    # Try HH:MM — assume today local
+    try:
+        t = datetime.strptime(s, "%H:%M")
+        now = datetime.now()
+        dt  = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        return int(dt.timestamp())
+    except ValueError:
+        pass
+    return 0
+
+
+def jump_to_ts(target_ts: int, session: int):
+    """
+    Background: ensure target_ts is in loaded history, then position the
+    viewport so the target candle is visible and the cursor is on it.
+    Fetches history backwards if the target is older than what's loaded.
+    """
+    with state.lock:
+        if state.session != session:
+            return
+        asset   = state.asset
+        my_feed = state.feed
+
+    # Fetch back until we have the target timestamp
+    MAX_FETCHES = 20
+    for _ in range(MAX_FETCHES):
+        with state.lock:
+            if state.session != session:
+                return
+            candles  = list(state.candles)
+            n        = len(candles)
+            oldest   = candles[0].ts  if n else 0
+            newest   = candles[-1].ts if n else 0
+
+        if oldest <= target_ts <= newest:
+            break   # target is already loaded
+
+        if target_ts < oldest:
+            # Need to fetch older data
+            with state.lock:
+                state.error = f"Fetching history..."
+            new_c = (fetch_kraken(asset, before_ts=oldest)
+                     if my_feed == "kraken"
+                     else fetch_phemex(asset, before_ts=oldest))
+            new_c = [c for c in new_c if c.ts < oldest]
+            if not new_c:
+                break
+            with state.lock:
+                if state.session != session: return
+                new_dq = collections.deque(new_c, maxlen=MAX_CANDLES)
+                for c in state.candles:
+                    new_dq.append(c)
+                state.candles = new_dq
+            time.sleep(0.2)
+        else:
+            break   # target is in the future — nothing to fetch
+
+    # Now position the viewport
+    with state.lock:
+        if state.session != session:
+            return
+        candles = list(state.candles)
+        n       = len(candles)
+
+    if n == 0:
+        return
+
+    # Find the index of the candle closest to target_ts
+    best_idx  = 0
+    best_diff = abs(candles[0].ts - target_ts)
+    for i, c in enumerate(candles):
+        diff = abs(c.ts - target_ts)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx  = i
+
+    # Place the target candle at the RIGHT edge of the viewport so it's
+    # immediately visible, with the cursor on it (rightmost column = n_vis-1).
+    # view_offset = n - best_idx - 1 puts target at the right edge.
+    # cursor_col_idx = state.n_vis - 1 puts cursor on that rightmost candle.
+    new_vo  = max(0, n - best_idx - 1)
+    with state.lock:
+        if state.session != session: return
+        n_vis_cur = max(1, state.n_vis)
+        state.view_offset    = new_vo
+        state.cursor_col_idx = n_vis_cur - 1
+        state.error          = ""
 
 # ── main loop ────────────────────────────────────────────────────────────────
 def main(stdscr):
@@ -1568,6 +1909,24 @@ def main(stdscr):
                 # Brief flash in footer — handled next draw frame
                 with state.lock:
                     state.error = f"Screenshot: {os.path.basename(fn)}"
+            elif key in (ord("g"), ord("G")):
+                # Temporarily pause and open jump-to dialog
+                user_input = jump_to_dialog(stdscr, db, rows, cols)
+                if user_input:
+                    target_ts = parse_jump_target(user_input)
+                    if target_ts > 0:
+                        with state.lock:
+                            cur_sess = state.session
+                        threading.Thread(
+                            target=jump_to_ts,
+                            args=(target_ts, cur_sess),
+                            daemon=True).start()
+                    else:
+                        with state.lock:
+                            state.error = "Invalid date. Use YYYY-MM-DD HH:MM or HH:MM"
+                # Force full redraw after dialog closes
+                db.prev = None
+                stdscr.clear()
             elif key in (curses.KEY_LEFT,
                           curses.KEY_SLEFT,   # Shift+Left (most terminals)
                           541, 545,            # Ctrl+Left (xterm / Windows)

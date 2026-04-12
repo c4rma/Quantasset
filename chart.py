@@ -174,6 +174,7 @@ class ChartState:
         self.interval_idx  = 0       # index into INTERVALS list
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
+        self.show_help    = False   # help overlay visible
         self.n_vis        = 0       # visible candle count, set by draw()
 
 state = ChartState()
@@ -864,6 +865,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         interval_idx      = state.interval_idx
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
+        show_help         = state.show_help
 
     all_candles = candles_snap + ([live] if live else [])
 
@@ -981,7 +983,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1652,6 +1654,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
+    # ── HELP OVERLAY (drawn last, on top of everything) ──────────────
+    if show_help:
+        draw_help_overlay(db, rows, cols)
+
 
 # ── screenshot ────────────────────────────────────────────────────────────────
 def take_screenshot(db: "DoubleBuffer"):
@@ -1841,6 +1847,101 @@ def jump_to_ts(target_ts: int, session: int):
         state.cursor_col_idx = n_vis_cur - 1
         state.error          = ""
 
+
+# ── help dialog ───────────────────────────────────────────────────────────────
+HELP_SECTIONS = [
+    ("ASSETS & FEED", [
+        ("[E]",        "Switch to ETH/USDT"),
+        ("[B]",        "Switch to BTC/USDT"),
+        ("[F]",        "Cycle data feed  (PHEMEX ↔ KRAKEN)"),
+        ("[I]",        "Cycle interval   (1m → 3m → 15m → 1H → 4H → 1D)"),
+    ]),
+    ("NAVIGATION", [
+        ("[←] [→]",   "Move cursor 1 candle at a time"),
+        ("[[] []]",   "Move cursor 10 candles at a time"),
+        ("[{] [}]",   "Move cursor 50 candles at a time"),
+        ("[Shift+←/→]","Move cursor 10 candles (if terminal supports)"),
+        ("[Ctrl+←/→]", "Move cursor 50 candles (if terminal supports)"),
+        ("[Esc]",      "Snap back to live (exit cursor mode)"),
+        ("[G]",        "Jump to date/time  (YYYY-MM-DD HH:MM or HH:MM)"),
+    ]),
+    ("CHART DISPLAY", [
+        ("[L]",        "Toggle chart mode  (CANDLE ↔ LINE)"),
+        ("[C]",        "Toggle candle colors  (B/W ↔ R/G)"),
+        ("[W]",        "Toggle VWAP + standard deviation bands"),
+        ("[V]",        "Toggle Volume Profile overlay"),
+    ]),
+    ("INDICATORS", [
+        ("VWAP",       "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
+        ("±0.5σ",      "0.5 std dev band  (shaded cyan region around VWAP)"),
+        ("±2σ",        "2 std dev lines   (yellow)"),
+        ("±2.5σ",      "2.5 std dev lines (dim yellow)"),
+        ("POC",        "Point of Control  (highest volume price, yellow)"),
+        ("VAH/VAL",    "Value Area High/Low  (70% of session volume, magenta)"),
+        ("pPOC/pVAH/pVAL", "Previous session levels — extend as virgin lines"),
+        ("S",          "Period separator  (19:00 CT session open)"),
+    ]),
+    ("UTILITIES", [
+        ("[P]",        "Screenshot → screenshots/quantasset_YYYYMMDD_HHMMSS.txt"),
+        ("[H] / [?]",  "Toggle this help box"),
+        ("[Q]",        "Quit ChartHacker"),
+    ]),
+]
+
+# Pre-build help lines once at module level
+def _build_help_lines():
+    lines = []
+    lines.append("  C H A R T H A C K E R  —  Key Reference")
+    lines.append("")
+    for section, entries in HELP_SECTIONS:
+        lines.append(f"  ── {section} " + "─" * max(0, 44 - len(section)))
+        for key, desc in entries:
+            lines.append(f"    {key:<18}  {desc}")
+        lines.append("")
+    lines.append("  [H] / [?] / [Esc]  Close help")
+    return lines
+
+HELP_LINES = _build_help_lines()
+HELP_BOX_W = max((len(l) for l in HELP_LINES), default=40) + 4
+
+
+def draw_help_overlay(db: "DoubleBuffer", rows: int, cols: int):
+    """
+    Render the help box into the double buffer each frame so the live
+    chart keeps updating behind it. Closed by toggling state.show_help.
+    """
+    box_w  = min(cols - 4, HELP_BOX_W)
+    box_h  = min(rows - 4, len(HELP_LINES) + 3)   # +1 title +2 pad
+    box_y  = (rows - box_h) // 2
+    box_x  = (cols - box_w) // 2
+
+    # Background
+    for r in range(box_h):
+        for c in range(box_w):
+            db.put(box_y + r, box_x + c, " ", C_CURSOR)
+
+    # Title bar
+    title = "  ChartHacker — Help  "
+    title_pad = f"{title:^{box_w}}"
+    for ci, ch in enumerate(title_pad[:box_w]):
+        db.put(box_y, box_x + ci, ch, C_ASSET_SEL, curses.A_BOLD)
+
+    # Content lines
+    content_rows = box_h - 2   # exclude title row and bottom pad
+    for li, line in enumerate(HELP_LINES[:content_rows]):
+        row = box_y + 1 + li
+        text = line[:box_w - 2].ljust(box_w - 2)
+        if line.startswith("  ──"):
+            pair, attrs = C_VWAP, curses.A_BOLD
+        elif line.startswith("  C H A R T"):
+            pair, attrs = C_VP_POC, curses.A_BOLD
+        elif line.startswith("  [H]"):
+            pair, attrs = C_AXIS, curses.A_DIM
+        else:
+            pair, attrs = C_CURSOR, curses.A_NORMAL
+        for ci, ch in enumerate(text):
+            db.put(row, box_x + 1 + ci, ch, pair, attrs)
+
 # ── main loop ────────────────────────────────────────────────────────────────
 def main(stdscr):
     curses.curs_set(0)
@@ -1904,6 +2005,9 @@ def main(stdscr):
                     state.show_vwap = not state.show_vwap
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("h"), ord("H"), ord("?")):
+                with state.lock:
+                    state.show_help = not state.show_help
             elif key in (ord("p"), ord("P"), curses.KEY_PRINT):
                 fn = take_screenshot(db)
                 # Brief flash in footer — handled next draw frame
@@ -1987,10 +2091,13 @@ def main(stdscr):
                                 state.view_offset    = 0
                             else:
                                 state.view_offset = new_vo
-            elif key == 27:  # Escape — snap back to live
+            elif key == 27:  # Escape — close help if open, else snap live
                 with state.lock:
-                    state.cursor_col_idx = -1
-                    state.view_offset    = 0
+                    if state.show_help:
+                        state.show_help = False
+                    else:
+                        state.cursor_col_idx = -1
+                        state.view_offset    = 0
 
 
             if new_asset:

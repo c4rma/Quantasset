@@ -143,6 +143,8 @@ C_G_USDJPY  = 25
 C_G_XAUUSD  = 26
 C_G_NAS100  = 27
 C_G_SHADE   = 28
+C_BTD_BUY   = 29   # Big Trade buy signal (green)
+C_BTD_SELL  = 30   # Big Trade sell signal (red)
 C_VWAP      = 16   # VWAP line
 C_VWAP_BAND = 17   # 0.5σ shaded band
 C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
@@ -200,6 +202,9 @@ class ChartState:
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
         self.show_help    = False   # help overlay visible
+        self.show_btd     = True    # Big Trade Detector overlay
+        self.btd_lookback = 50      # lookback bars for BTD baseline
+        self.btd_sigma    = 3.0     # sensitivity (sigma multiplier)
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -812,6 +817,9 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_G_XAUUSD, 3,                    -1)
     curses.init_pair(C_G_NAS100, curses.COLOR_BLUE,    -1)
     curses.init_pair(C_G_SHADE,  8,                    -1)
+    # BTD uses cyan/magenta — independent of the candle color scheme
+    curses.init_pair(C_BTD_BUY,  curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_BTD_SELL, curses.COLOR_MAGENTA,  -1)
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
@@ -1108,6 +1116,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
         show_help         = state.show_help
+        show_btd          = state.show_btd
+        btd_lookback      = state.btd_lookback
+        btd_sigma         = state.btd_sigma
         global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
@@ -1231,7 +1242,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [M]global  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]global  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1702,6 +1713,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     _axis_lbl(_vw_last + 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
                     _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
 
+
     # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────────
     # Mark each candle column whose local timestamp crosses the 19:00 session
     # open. Draws a dim `:` column behind candles.
@@ -1822,6 +1834,112 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             for _ci, _ch in enumerate(lbl_str):
                 db.put(pr, chart_r + 1 + _ci, _ch, C_CURSOR, curses.A_BOLD)
 
+
+    # ── BIG TRADE DETECTOR ───────────────────────────────────────────────────
+    # Intrabar buy/sell volume intensity z-score anomaly detection.
+    # Cooldown: after a signal fires, suppress the same side for 3 candles
+    # to prevent double-prints on consecutive high-volume candles.
+    # Colors: cyan buys / magenta sells — independent of candle color scheme.
+    # Visibility tiers:
+    #   T1 (>σ):     solid block █ bold — clearly distinct from candle chars
+    #   T2 (>σ+1.5): double block ██ bold
+    #   T3 (>σ+3.0): triple block ███ reversed — maximum contrast
+    BTD_COOLDOWN = 3   # candles to suppress after a signal
+    if show_btd and n_all >= btd_lookback + 2:
+        _clist   = all_candles
+        _buy_iv  = []
+        _sell_iv = []
+        for _c in _clist:
+            _rng = _c.h - _c.l
+            if _rng > 0:
+                _buy_iv.append((_c.c - _c.l) / _rng * _c.v)
+                _sell_iv.append((_c.h - _c.c) / _rng * _c.v)
+            else:
+                _buy_iv.append(0.0)
+                _sell_iv.append(0.0)
+
+        _sc = chart_r - n_vis
+        _last_buy_signal  = -999   # index of last buy signal (for cooldown)
+        _last_sell_signal = -999   # index of last sell signal
+
+        for _i, _c in enumerate(visible):
+            _col = _sc + _i
+            if not (0 <= _col < chart_r):
+                continue
+            _ci = left_idx + _i
+            if _ci < btd_lookback:
+                continue
+
+            _wb = _buy_iv[max(0, _ci - btd_lookback) : _ci]
+            _ws = _sell_iv[max(0, _ci - btd_lookback) : _ci]
+            if len(_wb) < 2:
+                continue
+
+            _n   = len(_wb)
+            _mb  = sum(_wb) / _n
+            _ms  = sum(_ws) / _n
+            _sdb = (sum((x - _mb) ** 2 for x in _wb) / (_n - 1)) ** 0.5
+            _sds = (sum((x - _ms) ** 2 for x in _ws) / (_n - 1)) ** 0.5
+
+            _cb = _buy_iv[_ci]
+            _cs = _sell_iv[_ci]
+
+            _t1b = _mb + _sdb * btd_sigma
+            _t2b = _mb + _sdb * (btd_sigma + 1.5)
+            _t3b = _mb + _sdb * (btd_sigma + 3.0)
+            _t1s = _ms + _sds * btd_sigma
+            _t2s = _ms + _sds * (btd_sigma + 1.5)
+            _t3s = _ms + _sds * (btd_sigma + 3.0)
+
+            # Rows: buys just below wick low, sells just above wick high
+            _row_b = min(chart_bot - 1, chart_top + p2r(_c.l) + 1)
+            _row_s = max(chart_top,     chart_top + p2r(_c.h) - 1)
+
+            _rev = curses.A_BOLD | curses.A_REVERSE   # highlighted block attr
+
+            # ── Buy signal (cyan highlighted block below wick low) ────────────
+            if (_cb > _t1b
+                    and chart_top <= _row_b < chart_bot
+                    and _ci - _last_buy_signal >= BTD_COOLDOWN):
+                _last_buy_signal = _ci
+                if _cb > _t3b:
+                    # T3: 3-wide × 2-tall — unmissable
+                    for _dx in range(-1, 2):
+                        if 0 <= _col + _dx < chart_r:
+                            db.put(_row_b, _col + _dx, "#", C_BTD_BUY, _rev)
+                            if _row_b + 1 < chart_bot:
+                                db.put(_row_b + 1, _col + _dx, "#", C_BTD_BUY, _rev)
+                elif _cb > _t2b:
+                    # T2: 1-wide × 2-tall reversed
+                    db.put(_row_b, _col, "#", C_BTD_BUY, _rev)
+                    if _row_b + 1 < chart_bot:
+                        db.put(_row_b + 1, _col, "#", C_BTD_BUY, _rev)
+                else:
+                    # T1: single reversed block
+                    db.put(_row_b, _col, "#", C_BTD_BUY, _rev)
+
+            # ── Sell signal (magenta highlighted block above wick high) ────────
+            if (_cs > _t1s
+                    and chart_top <= _row_s < chart_bot
+                    and _ci - _last_sell_signal >= BTD_COOLDOWN):
+                _last_sell_signal = _ci
+                if _cs > _t3s:
+                    # T3: 3-wide × 2-tall
+                    for _dx in range(-1, 2):
+                        if 0 <= _col + _dx < chart_r:
+                            db.put(_row_s, _col + _dx, "#", C_BTD_SELL, _rev)
+                            if _row_s - 1 >= chart_top:
+                                db.put(_row_s - 1, _col + _dx, "#", C_BTD_SELL, _rev)
+                elif _cs > _t2s:
+                    # T2: 1-wide × 2-tall reversed
+                    db.put(_row_s, _col, "#", C_BTD_SELL, _rev)
+                    if _row_s - 1 >= chart_top:
+                        db.put(_row_s - 1, _col, "#", C_BTD_SELL, _rev)
+                else:
+                    # T1: single reversed block
+                    db.put(_row_s, _col, "#", C_BTD_SELL, _rev)
+
+
     # ── VOLUME ────────────────────────────────────────────────────────────────
     # vol_top is now the bottom border of the time axis box.
     # VOL bars live in vol_top+1 … vol_bot.
@@ -1898,7 +2016,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         # Count session candles for VP/VWAP diagnostic
         _sb = session_bounds()
         _n_sess = sum(1 for c in all_candles if c.ts >= _sb[2])
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [Q] Quit"
+        btd_tag  = "T:ON" if show_btd else "T:OFF"
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [Q] Quit"
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
@@ -2332,6 +2451,7 @@ HELP_SECTIONS = [
         ("[C]",        "Toggle candle colors  (B/W ↔ R/G)"),
         ("[W]",        "Toggle VWAP + standard deviation bands"),
         ("[V]",        "Toggle Volume Profile overlay"),
+        ("[T]",        "Toggle Big Trade Detector  (volume anomaly circles)"),
     ]),
     ("INDICATORS", [
         ("VWAP",       "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
@@ -2465,6 +2585,11 @@ def main(stdscr):
             elif key in (ord("w"), ord("W")):
                 with state.lock:
                     state.show_vwap = not state.show_vwap
+                db.prev = None
+                stdscr.clear()
+            elif key in (ord("t"), ord("T")):
+                with state.lock:
+                    state.show_btd = not state.show_btd
                 db.prev = None
                 stdscr.clear()
             elif key in (ord("m"), ord("M")):

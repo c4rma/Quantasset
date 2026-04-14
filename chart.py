@@ -133,9 +133,34 @@ C_VP_NORM   = 12   # volume profile bar (dim)
 C_VP_POC    = 13   # point of control (brightest level)
 C_VP_VA     = 14   # value area high/low lines
 C_LINE      = 15   # line chart
+# Global mode asset colors (pairs 20-27)
+C_G_BTC     = 20
+C_G_ETH     = 21
+C_G_USOIL   = 22
+C_G_ZB      = 23
+C_G_SPX     = 24
+C_G_USDJPY  = 25
+C_G_XAUUSD  = 26
+C_G_NAS100  = 27
+C_G_SHADE   = 28
 C_VWAP      = 16   # VWAP line
 C_VWAP_BAND = 17   # 0.5σ shaded band
 C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
+
+# Global mode assets:
+#   (label, phemex_symbol, kraken_pair, yahoo_symbol, color_pair)
+# BTC/ETH → Phemex (primary) / Kraken (fallback)
+# TradFi (indices, commodities, forex) → Yahoo Finance (free, no auth)
+GLOBAL_ASSETS = [
+    ("BTC",    "BTCUSDT",  "XBT/USD",  "BTC-USD",  C_G_BTC),
+    ("ETH",    "ETHUSDT",  "ETH/USD",  "ETH-USD",  C_G_ETH),
+    ("XAUUSD", None,       "XAU/USD",  "GC=F",     C_G_XAUUSD),
+    ("USDJPY", None,       None,       "JPY=X",    C_G_USDJPY),
+    ("USOIL",  None,       None,       "CL=F",     C_G_USOIL),
+    ("SPX500", None,       None,       "^GSPC",    C_G_SPX),
+    ("NAS100", None,       None,       "^NDX",     C_G_NAS100),
+    ("DXY",    None,       None,       "DX-Y.NYB", C_G_ZB),
+]
 
 # ── data structures ────────────────────────────────────────────────────────────
 class Candle:
@@ -176,6 +201,13 @@ class ChartState:
         self.chart_mode    = "candle" # "candle" | "line"
         self.show_help    = False   # help overlay visible
         self.n_vis        = 0       # visible candle count, set by draw()
+        self.global_mode      = False
+        self.global_data      = {}
+        self.global_ts        = []
+        self.global_loading   = False
+        self.global_view_off  = 0   # pan: data-points hidden off right
+        self.global_cursor    = -1  # cursor column in global chart (-1=live)
+        self.global_n_vis     = 0   # visible columns last drawn, set by draw_global()
 
 state = ChartState()
 
@@ -769,6 +801,16 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VP_POC,    curses.COLOR_YELLOW, -1)
     curses.init_pair(C_VP_VA,     curses.COLOR_MAGENTA,-1)
+    # Global mode asset line colors
+    curses.init_pair(C_G_BTC,    curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_G_ETH,    curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_G_USOIL,  curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_G_ZB,     curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_G_SPX,    curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_G_USDJPY, curses.COLOR_RED,     -1)
+    curses.init_pair(C_G_XAUUSD, 3,                    -1)
+    curses.init_pair(C_G_NAS100, curses.COLOR_BLUE,    -1)
+    curses.init_pair(C_G_SHADE,  8,                    -1)
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
@@ -849,6 +891,202 @@ def session_bounds():
     prev_end   = curr_start
     return prev_start, prev_end, curr_start
 
+
+# ── Global mode data fetching ─────────────────────────────────────────────────
+def fetch_global_asset_phemex(symbol: str, resolution: int = 60,
+                               limit: int = 300) -> list:
+    """Fetch close prices from Phemex kline endpoint. Does not raise on HTTP errors."""
+    path_  = "/exchange/public/md/v2/kline/last"
+    query_ = f"symbol={symbol}&resolution={resolution}&limit={limit}"
+    url_   = f"{PHEMEX_REST_URL}{path_}?{query_}"
+    hdrs_  = _phemex_headers(path_, query_)
+    try:
+        r = requests.get(url_, headers=hdrs_, timeout=10)
+        # Don't raise_for_status — read JSON regardless to get Phemex error code
+        try:
+            data = r.json()
+        except Exception:
+            return []
+        code = data.get("code", -1)
+        if code != 0:
+            return []   # symbol unsupported — caller will try Kraken
+        rows = data.get("data", {}).get("rows", [])
+        if not rows:
+            return []
+        return [(row[0], float(row[6])) for row in reversed(rows)]
+    except Exception:
+        return []
+
+
+def fetch_global_asset_yahoo(symbol: str, resolution: int = 60,
+                              limit: int = 300) -> list:
+    """
+    Fetch OHLC from Yahoo Finance — free, no auth required.
+    Maps ChartHacker resolution (seconds) to Yahoo interval/range params.
+    Returns [(unix_ts, close), ...] oldest-first.
+    """
+    # Map resolution in seconds → Yahoo interval string + range
+    if resolution <= 60:
+        interval, yrange = "1m", "1d"
+    elif resolution <= 300:
+        interval, yrange = "5m", "5d"
+    elif resolution <= 900:
+        interval, yrange = "15m", "5d"
+    elif resolution <= 3600:
+        interval, yrange = "1h", "1mo"
+    elif resolution <= 14400:
+        interval, yrange = "1h", "3mo"
+    else:
+        interval, yrange = "1d", "1y"
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    params  = {"interval": interval, "range": yrange}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=12)
+        try:
+            data = r.json()
+        except Exception:
+            return []
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return []
+        chart  = result[0]
+        ts_raw = chart.get("timestamp", [])
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        if not ts_raw or not closes:
+            return []
+        pairs = []
+        for ts, cl in zip(ts_raw, closes):
+            if cl is not None and cl > 0:
+                pairs.append((int(ts), float(cl)))
+        return pairs[-limit:]
+    except Exception:
+        return []
+
+
+def fetch_global_asset_kraken(pair: str, interval: int = 1,
+                               limit: int = 300) -> list:
+    """Fetch close prices from Kraken for a given pair."""
+    url_ = f"{KRAKEN_REST_URL}/0/public/OHLC"
+    try:
+        r = requests.get(url_, params={"pair": pair, "interval": interval},
+                         timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            return []
+        result = data.get("result", {})
+        rows   = next((v for k, v in result.items() if k != "last"), [])
+        return [(row[0], float(row[4])) for row in rows[-limit:]]
+    except Exception:
+        return []
+
+
+def load_global_data(session: int):
+    """
+    Fetch today's (00:00–23:59 CT) data for all GLOBAL_ASSETS in parallel.
+    Uses ThreadPoolExecutor so all 8 assets fetch simultaneously (~5-10s total).
+    """
+    import concurrent.futures
+    import datetime as _dt
+
+    # Today's CT range: 00:00 CT to now
+    _now    = datetime.now()
+    _today0 = datetime(_now.year, _now.month, _now.day, 0, 0, 0)
+    today_start_ts = int(_today0.timestamp())
+
+    resolution      = 60            # always 1m for global — finer detail
+    kraken_interval = 1
+
+    def _fetch_one(args):
+        label, phemex_sym, kraken_pair, yahoo_sym, _color = args
+        with state.lock:
+            if not state.global_mode:
+                return label, []
+        data = []
+        if phemex_sym:
+            data = fetch_global_asset_phemex(phemex_sym, resolution=resolution, limit=1440)
+        if not data and kraken_pair:
+            data = fetch_global_asset_kraken(kraken_pair, interval=kraken_interval, limit=1440)
+        if not data and yahoo_sym:
+            data = fetch_global_asset_yahoo(yahoo_sym, resolution=resolution, limit=1440)
+        # Filter to today only
+        data = [(ts, cl) for ts, cl in data if ts >= today_start_ts]
+        return label, data
+
+    with state.lock:
+        state.error = "Global: fetching all assets..."
+
+    raw = {}
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GLOBAL_ASSETS)) as ex:
+        futures = {ex.submit(_fetch_one, asset): asset[0] for asset in GLOBAL_ASSETS}
+        for fut in concurrent.futures.as_completed(futures):
+            label, data = fut.result()
+            if data:
+                raw[label] = data
+            else:
+                errors.append(label)
+
+    if not raw:
+        with state.lock:
+            state.global_loading = False
+            state.error = "Global: no data loaded — check connection"
+        return
+
+    # Build a common minute-aligned timestamp grid for today
+    # Use the asset with the most data points as the reference grid
+    ref_pairs = max(raw.values(), key=len)
+    all_ts    = sorted(set(ts for ts, _ in ref_pairs))
+
+    aligned = {}
+    for label, pairs in raw.items():
+        d      = dict(pairs)
+        last   = 0.0
+        closes = []
+        for ts in all_ts:
+            if ts in d and d[ts] > 0:
+                last = d[ts]
+            closes.append(last)
+        aligned[label] = closes
+
+    n_ok  = len(raw)
+    n_tot = len(GLOBAL_ASSETS)
+    msg   = f"Global: {n_ok}/{n_tot} loaded" + (f"  skip: {', '.join(errors)}" if errors else "")
+    with state.lock:
+        if not state.global_mode:
+            state.global_loading = False
+            return
+        state.global_ts      = all_ts
+        state.global_data    = aligned
+        state.global_loading = False
+        state.error          = msg
+
+
+def _global_refresh_loop(session: int):
+    """Reload global data every 60s while global_mode is active."""
+    while True:
+        with state.lock:
+            if not state.global_mode:
+                return
+        load_global_data(session)
+        # Wait 60s, checking every second if mode was exited
+        for _ in range(60):
+            time.sleep(1)
+            with state.lock:
+                if not state.global_mode:
+                    return
+
+
+def start_global(session: int):
+    """Trigger an immediate global data load, then start the refresh loop."""
+    with state.lock:
+        state.global_loading = True
+        state.global_data    = {}
+        state.global_ts      = []
+    threading.Thread(target=_global_refresh_loop, args=(session,), daemon=True).start()
+
 # ── draw frame ────────────────────────────────────────────────────────────────
 def draw(win, db: DoubleBuffer, rows: int, cols: int):
     with state.lock:
@@ -866,8 +1104,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
         show_help         = state.show_help
+        global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
+
+    # In global mode, skip the normal chart and render the performance view
+    if global_mode:
+        draw_global(db, rows, cols)
+        return
 
     # ── layout ────────────────────────────────────────────────────────────────
     HEADER_H = 3
@@ -983,7 +1227,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [I]{ivl_label}  [L]ine  [M]global  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1848,6 +2092,216 @@ def jump_to_ts(target_ts: int, session: int):
         state.error          = ""
 
 
+
+# ── Global performance chart renderer ────────────────────────────────────────
+def draw_global(db: "DoubleBuffer", rows: int, cols: int):
+    """
+    Comparative performance chart for today (00:00–23:59 CT).
+    All data auto-fits into the terminal — no scrolling needed.
+    Each asset normalised to 0% at the first data point of the day.
+    Asia session (00:00–02:00 CT) is shaded.
+    """
+    with state.lock:
+        g_ts     = list(state.global_ts)
+        g_data   = {k: list(v) for k, v in state.global_data.items()}
+        loading  = state.global_loading
+        gerr     = state.error
+        g_v_off  = state.global_view_off
+        g_cursor = state.global_cursor
+
+    # ── layout ────────────────────────────────────────────────────────────────
+    HEADER_H = 2
+    LEGEND_W = 32
+    FOOTER_H = 1
+    TIME_H   = 1
+    chart_top = HEADER_H
+    chart_bot = rows - FOOTER_H - TIME_H - 1
+    chart_h   = max(1, chart_bot - chart_top)
+    chart_r   = max(10, cols - LEGEND_W - 2)
+    time_row  = chart_bot
+    footer_row= rows - 1
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    for r in range(HEADER_H):
+        db.puts(r, 0, " " * cols, C_HEADER, curses.A_BOLD)
+    db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker  —  GLOBAL", C_HEADER, curses.A_BOLD)
+    now_str = datetime.now().strftime("%m/%d/%Y  %H:%M:%S")
+    db.puts(0, max(0, cols - len(now_str) - 2), now_str, C_LABEL, curses.A_BOLD)
+    db.puts(1, 2, "[M] Exit   [R] Refresh   [Q] Quit   Today 00:00–now CT", C_HEADER)
+
+    # ── Loading / error state ─────────────────────────────────────────────────
+    if loading or not g_ts:
+        msg = "Fetching global data (parallel)..." if loading else "No data — press [R] to retry"
+        db.puts(chart_top + chart_h // 2, max(0, cols // 2 - len(msg) // 2),
+                msg, C_AXIS, curses.A_BOLD)
+        if gerr and not loading:
+            db.puts(chart_top + chart_h // 2 + 1,
+                    max(0, cols // 2 - len(gerr) // 2),
+                    gerr[:cols - 2], C_BEAR, curses.A_BOLD)
+        db.puts(footer_row, 0, " GLOBAL MODE  [R] Retry  [M] Exit".ljust(cols)[:cols],
+                C_ASSET_SEL, curses.A_BOLD)
+        return
+
+    n_total = len(g_ts)
+    if n_total == 0:
+        return
+
+    # ── Viewport: pan with g_v_off (0 = rightmost/live end) ──────────────────
+    g_v_off  = max(0, min(n_total - 1, g_v_off))
+    with state.lock:
+        state.global_view_off = g_v_off
+
+    right_idx = n_total - g_v_off
+    # Auto-fit: all data → chart_r cols when not panned; fewer when panned
+    view_n    = right_idx              # data points to show (up to right_idx)
+    step      = max(1.0, view_n / chart_r)
+
+    col_ts     = []
+    col_closes = {label: [] for label in g_data}
+    for col in range(chart_r):
+        raw_idx = int(col * step)
+        idx     = min(right_idx - 1, max(0, raw_idx))
+        col_ts.append(g_ts[idx])
+        for label, closes in g_data.items():
+            col_closes[label].append(closes[idx] if idx < len(closes) else 0.0)
+
+    # ── Normalise to % change from the FIRST visible column ──────────────────
+    pct_series = {}
+    raw_series = {}   # actual close prices per column for each asset
+    for label, col_cl in col_closes.items():
+        base = next((v for v in col_cl if v > 0), 0.0)
+        if base == 0:
+            continue
+        pct_series[label] = [(v / base - 1.0) * 100.0 if v > 0 else 0.0
+                             for v in col_cl]
+        raw_series[label] = col_cl
+
+    if not pct_series:
+        db.puts(chart_top + chart_h // 2, cols // 2 - 10,
+                "No pct data", C_AXIS, curses.A_BOLD)
+        return
+
+    # ── Y range ───────────────────────────────────────────────────────────────
+    all_vals = [v for pcts in pct_series.values() for v in pcts]
+    y_min = min(all_vals);  y_max = max(all_vals)
+    y_span = y_max - y_min or 0.01
+    pad    = y_span * 0.08
+    y_min -= pad;  y_max += pad;  y_span = y_max - y_min
+
+    def pct_to_row(pct):
+        frac = (pct - y_min) / y_span
+        return max(chart_top, min(chart_bot - 1,
+               chart_top + int((1.0 - frac) * (chart_h - 1))))
+
+    # ── Asia session shading (00:00–02:00 CT) ─────────────────────────────────
+    for col, ts in enumerate(col_ts):
+        if not (0 <= col < chart_r):
+            continue
+        dt = datetime.fromtimestamp(ts)
+        if 0 <= dt.hour < 2:
+            for r in range(chart_top, chart_bot):
+                if db.buf[r][col][0] == " ":
+                    db.put(r, col, " ", C_G_SHADE, curses.A_DIM)
+
+    # ── Zero line ─────────────────────────────────────────────────────────────
+    zero_row = pct_to_row(0.0)
+    for col in range(chart_r):
+        if db.buf[zero_row][col][0] == " ":
+            db.put(zero_row, col, "-", C_AXIS, curses.A_DIM)
+
+    # ── Y-axis ────────────────────────────────────────────────────────────────
+    for r in range(chart_top, chart_bot + 1):
+        db.put(r, chart_r, "|", C_AXIS)
+    n_ylbl = max(2, chart_h // 5)
+    for yi in range(n_ylbl + 1):
+        pct = y_min + (yi / n_ylbl) * y_span
+        row = pct_to_row(pct)
+        if chart_top <= row < chart_bot:
+            db.puts(row, chart_r + 1, f"{pct:+.2f}%", C_LABEL)
+
+    # ── Time axis ─────────────────────────────────────────────────────────────
+    db.puts(time_row, 0, "-" * chart_r + "+", C_AXIS)
+    lbl_every = max(1, chart_r // 10)
+    for col in range(0, chart_r, lbl_every):
+        if col < len(col_ts) and col + 4 < chart_r:
+            dt  = datetime.fromtimestamp(col_ts[col])
+            lbl = dt.strftime("%H:%M")
+            db.puts(time_row, col, lbl, C_LABEL)
+
+    # ── Asset lines ───────────────────────────────────────────────────────────
+    final_pcts   = {}
+    final_prices = {}
+    in_cursor_g  = (g_cursor >= 0)
+    for label, pcts in pct_series.items():
+        color_pair = next((c for l, _p, _k, _y, c in GLOBAL_ASSETS if l == label), C_LABEL)
+        prev_r = None
+        for col, pct in enumerate(pcts):
+            if not (0 <= col < chart_r):
+                continue
+            is_sel = in_cursor_g and col == g_cursor
+            row    = pct_to_row(pct)
+            char   = "+" if is_sel else "*"
+            attrs  = curses.A_BOLD | curses.A_REVERSE if is_sel else curses.A_BOLD
+            db.put(row, col, char, color_pair, attrs)
+            if prev_r is not None and abs(row - prev_r) > 1:
+                for r in range(min(row, prev_r) + 1, max(row, prev_r)):
+                    if db.buf[r][col][0] in (" ", "-"):
+                        db.put(r, col, "|", color_pair, curses.A_DIM)
+            prev_r = row
+        # Cursor or live end values for labels
+        ref_col = g_cursor if in_cursor_g and 0 <= g_cursor < len(pcts) else len(pcts) - 1
+        if pcts and ref_col >= 0:
+            final_pcts[label]   = pcts[ref_col]
+            final_prices[label] = raw_series.get(label, [0.0] * len(pcts))[ref_col]
+
+    # ── Cursor crosshair ──────────────────────────────────────────────────────
+    if in_cursor_g and 0 <= g_cursor < chart_r:
+        for r in range(chart_top, chart_bot):
+            if db.buf[r][g_cursor][0] in (" ", "-"):
+                db.put(r, g_cursor, ":", C_AXIS, curses.A_DIM)
+        if g_cursor < len(col_ts):
+            cur_lbl = datetime.fromtimestamp(col_ts[g_cursor]).strftime("%H:%M")
+            db.puts(time_row, max(0, g_cursor - 2), cur_lbl, C_CURSOR, curses.A_BOLD)
+
+    # ── Legend: each label placed at its line's actual row on the right axis ──
+    # Compute desired row for each asset, then resolve collisions by nudging.
+    legend_x   = chart_r + 1
+    label_rows = {}   # label → desired axis row
+    for label, pct in final_pcts.items():
+        label_rows[label] = pct_to_row(pct)
+
+    # Resolve collisions: sort by desired row, nudge duplicates ±1
+    used_rows  = {}   # row → label already placed
+    placed     = {}   # label → final row
+    for label in sorted(label_rows, key=lambda l: label_rows[l]):
+        desired = label_rows[label]
+        row     = desired
+        # Search outward for a free row
+        for delta in [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]:
+            candidate = desired + delta
+            if chart_top <= candidate < chart_bot and candidate not in used_rows:
+                row = candidate
+                break
+        used_rows[row] = label
+        placed[label]  = row
+
+    for label, row in placed.items():
+        pct        = final_pcts[label]
+        color_pair = next((c for l, _p, _k, _y, c in GLOBAL_ASSETS if l == label), C_LABEL)
+        price      = final_prices.get(label, 0.0)
+        price_str  = f"(${price:,.2f})" if price > 0 else ""
+        lbl        = f"{label:<7}{pct:+.2f}% {price_str}"
+        true_row   = label_rows[label]
+        if chart_top <= true_row < chart_bot:
+            db.put(true_row, chart_r, "+", color_pair, curses.A_BOLD)
+        if chart_top <= row < chart_bot:
+            db.puts(row, legend_x, lbl, color_pair, curses.A_BOLD)
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    db.puts(footer_row, 0,
+            f" GLOBAL  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  "  [R] refresh  [M] exit  [Q] quit".ljust(cols)[:cols],
+            C_ASSET_SEL, curses.A_BOLD)
+
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [
     ("ASSETS & FEED", [
@@ -2005,6 +2459,23 @@ def main(stdscr):
                     state.show_vwap = not state.show_vwap
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("m"), ord("M")):
+                with state.lock:
+                    state.global_mode = not state.global_mode
+                    _enter_global = state.global_mode
+                    _g_sess = state.session
+                    _has_data = bool(state.global_data)
+                if _enter_global:   # always refresh on entry
+                    start_global(_g_sess)
+                db.prev = None
+                stdscr.clear()
+            elif key in (ord("r"), ord("R")):
+                # Refresh global data if in global mode
+                with state.lock:
+                    _in_global = state.global_mode
+                    _g_sess = state.session
+                if _in_global:
+                    start_global(_g_sess)
             elif key in (ord("h"), ord("H"), ord("?")):
                 with state.lock:
                     state.show_help = not state.show_help
@@ -2043,18 +2514,19 @@ def main(stdscr):
                 else:
                     step = 1
                 with state.lock:
-                    cci = state.cursor_col_idx
-                    if cci < 0:
-                        # Enter cursor mode at rightmost, then apply step
-                        state.cursor_col_idx = max(0, len(state.candles) - 1)
-                        cci = state.cursor_col_idx
-                    # Move cursor left by step; overflow into pan
-                    move = step
-                    if cci >= move:
-                        state.cursor_col_idx -= move
+                    if state.global_mode:
+                        pass  # scrolling disabled in global mode
                     else:
-                        state.view_offset    += move - cci
-                        state.cursor_col_idx  = 0
+                        cci = state.cursor_col_idx
+                        if cci < 0:
+                            state.cursor_col_idx = max(0, len(state.candles) - 1)
+                            cci = state.cursor_col_idx
+                        move = step
+                        if cci >= move:
+                            state.cursor_col_idx -= move
+                        else:
+                            state.view_offset    += move - cci
+                            state.cursor_col_idx  = 0
             elif key in (curses.KEY_RIGHT,
                          curses.KEY_SRIGHT,   # Shift+Right
                          560, 564,             # Ctrl+Right (xterm / Windows)
@@ -2066,6 +2538,9 @@ def main(stdscr):
                 else:
                     step = 1
                 with state.lock:
+                    if state.global_mode:
+                        pass  # scrolling disabled in global mode
+                        continue
                     cci        = state.cursor_col_idx
                     vo         = state.view_offset
                     n_vis_now  = state.n_vis   # actual visible cols from last draw
@@ -2091,7 +2566,7 @@ def main(stdscr):
                                 state.view_offset    = 0
                             else:
                                 state.view_offset = new_vo
-            elif key == 27:  # Escape — close help if open, else snap live
+            elif key == 27:  # Escape — close help / snap live / reset global pan
                 with state.lock:
                     if state.show_help:
                         state.show_help = False

@@ -208,6 +208,7 @@ class ChartState:
         self.global_view_off  = 0   # pan: data-points hidden off right
         self.global_cursor    = -1  # cursor column in global chart (-1=live)
         self.global_n_vis     = 0   # visible columns last drawn, set by draw_global()
+        self.global_next_refresh = 0.0  # unix timestamp of next auto-refresh
 
 state = ChartState()
 
@@ -1060,16 +1061,20 @@ def load_global_data(session: int, initial: bool = False):
         state.error          = msg
 
 
+GLOBAL_REFRESH_SECS = 30
+
 def _global_refresh_loop(session: int):
     """Initial load then refresh every 30s while global_mode is active."""
-    # First load: show loading screen
     with state.lock:
         if not state.global_mode:
             return
     load_global_data(session, initial=True)
-    # Subsequent refreshes: keep existing data on screen, update silently
     while True:
-        for _ in range(30):   # 30s interval
+        # Set the next-refresh timestamp for the countdown display
+        next_at = time.time() + GLOBAL_REFRESH_SECS
+        with state.lock:
+            state.global_next_refresh = next_at
+        for _ in range(GLOBAL_REFRESH_SECS):
             time.sleep(1)
             with state.lock:
                 if not state.global_mode:
@@ -1078,6 +1083,8 @@ def _global_refresh_loop(session: int):
             if not state.global_mode:
                 return
         load_global_data(session, initial=False)
+        with state.lock:
+            state.global_next_refresh = time.time() + GLOBAL_REFRESH_SECS
 
 
 def start_global(session: int):
@@ -2104,7 +2111,8 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
         loading  = state.global_loading
         gerr     = state.error
         g_v_off  = state.global_view_off
-        g_cursor = state.global_cursor
+        g_cursor     = state.global_cursor
+        g_next_ref   = state.global_next_refresh
 
     # ── layout ────────────────────────────────────────────────────────────────
     HEADER_H = 2
@@ -2124,7 +2132,10 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
     db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker  —  GLOBAL", C_HEADER, curses.A_BOLD)
     now_str = datetime.now().strftime("%m/%d/%Y  %H:%M:%S")
     db.puts(0, max(0, cols - len(now_str) - 2), now_str, C_LABEL, curses.A_BOLD)
-    db.puts(1, 2, "[M] Exit   [R] Refresh   [Q] Quit   Today 00:00–now CT", C_HEADER)
+    # Refresh countdown
+    _secs_left = max(0, int(g_next_ref - time.time())) if g_next_ref > 0 else 0
+    _cd_str    = f"  refresh in {_secs_left}s" if not loading else ""
+    db.puts(1, 2, f"[M] Exit   [R] Refresh{_cd_str}   [P] Screenshot   [Q] Quit   Today 00:00-now CT", C_HEADER)
 
     # ── Loading / error state ─────────────────────────────────────────────────
     if loading or not g_ts:
@@ -2296,7 +2307,7 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
 
     # ── Footer ────────────────────────────────────────────────────────────────
     db.puts(footer_row, 0,
-            f" GLOBAL  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  "  [R] refresh  [M] exit  [Q] quit".ljust(cols)[:cols],
+            (f" GLOBAL  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit").ljust(cols)[:cols],
             C_ASSET_SEL, curses.A_BOLD)
 
 # ── help dialog ───────────────────────────────────────────────────────────────

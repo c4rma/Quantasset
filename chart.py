@@ -983,21 +983,23 @@ def fetch_global_asset_kraken(pair: str, interval: int = 1,
         return []
 
 
-def load_global_data(session: int):
+def load_global_data(session: int, initial: bool = False):
     """
-    Fetch today's (00:00–23:59 CT) data for all GLOBAL_ASSETS in parallel.
-    Uses ThreadPoolExecutor so all 8 assets fetch simultaneously (~5-10s total).
+    Fetch today's data for all GLOBAL_ASSETS in parallel.
+    initial=True shows the loading screen; background refreshes keep existing data visible.
     """
     import concurrent.futures
-    import datetime as _dt
 
-    # Today's CT range: 00:00 CT to now
-    _now    = datetime.now()
-    _today0 = datetime(_now.year, _now.month, _now.day, 0, 0, 0)
+    _now           = datetime.now()
+    _today0        = datetime(_now.year, _now.month, _now.day, 0, 0, 0)
     today_start_ts = int(_today0.timestamp())
+    resolution     = 60
+    kraken_interval= 1
 
-    resolution      = 60            # always 1m for global — finer detail
-    kraken_interval = 1
+    if initial:
+        with state.lock:
+            state.global_loading = True
+            state.error = "Global: fetching all assets..."
 
     def _fetch_one(args):
         label, phemex_sym, kraken_pair, yahoo_sym, _color = args
@@ -1011,14 +1013,10 @@ def load_global_data(session: int):
             data = fetch_global_asset_kraken(kraken_pair, interval=kraken_interval, limit=1440)
         if not data and yahoo_sym:
             data = fetch_global_asset_yahoo(yahoo_sym, resolution=resolution, limit=1440)
-        # Filter to today only
         data = [(ts, cl) for ts, cl in data if ts >= today_start_ts]
         return label, data
 
-    with state.lock:
-        state.error = "Global: fetching all assets..."
-
-    raw = {}
+    raw    = {}
     errors = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(GLOBAL_ASSETS)) as ex:
         futures = {ex.submit(_fetch_one, asset): asset[0] for asset in GLOBAL_ASSETS}
@@ -1032,11 +1030,9 @@ def load_global_data(session: int):
     if not raw:
         with state.lock:
             state.global_loading = False
-            state.error = "Global: no data loaded — check connection"
+            state.error = "Global: no data — check connection"
         return
 
-    # Build a common minute-aligned timestamp grid for today
-    # Use the asset with the most data points as the reference grid
     ref_pairs = max(raw.values(), key=len)
     all_ts    = sorted(set(ts for ts, _ in ref_pairs))
 
@@ -1051,9 +1047,9 @@ def load_global_data(session: int):
             closes.append(last)
         aligned[label] = closes
 
-    n_ok  = len(raw)
+    n_ok = len(raw)
     n_tot = len(GLOBAL_ASSETS)
-    msg   = f"Global: {n_ok}/{n_tot} loaded" + (f"  skip: {', '.join(errors)}" if errors else "")
+    msg   = f"Global: {n_ok}/{n_tot} assets" + (f"  skip:{','.join(errors)}" if errors else "")
     with state.lock:
         if not state.global_mode:
             state.global_loading = False
@@ -1065,26 +1061,27 @@ def load_global_data(session: int):
 
 
 def _global_refresh_loop(session: int):
-    """Reload global data every 60s while global_mode is active."""
+    """Initial load then refresh every 30s while global_mode is active."""
+    # First load: show loading screen
+    with state.lock:
+        if not state.global_mode:
+            return
+    load_global_data(session, initial=True)
+    # Subsequent refreshes: keep existing data on screen, update silently
     while True:
-        with state.lock:
-            if not state.global_mode:
-                return
-        load_global_data(session)
-        # Wait 60s, checking every second if mode was exited
-        for _ in range(60):
+        for _ in range(30):   # 30s interval
             time.sleep(1)
             with state.lock:
                 if not state.global_mode:
                     return
+        with state.lock:
+            if not state.global_mode:
+                return
+        load_global_data(session, initial=False)
 
 
 def start_global(session: int):
-    """Trigger an immediate global data load, then start the refresh loop."""
-    with state.lock:
-        state.global_loading = True
-        state.global_data    = {}
-        state.global_ts      = []
+    """Start the global refresh loop (handles initial load + 30s auto-refresh)."""
     threading.Thread(target=_global_refresh_loop, args=(session,), daemon=True).start()
 
 # ── draw frame ────────────────────────────────────────────────────────────────

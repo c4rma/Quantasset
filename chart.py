@@ -203,8 +203,8 @@ class ChartState:
         self.chart_mode    = "candle" # "candle" | "line"
         self.show_help    = False   # help overlay visible
         self.show_btd     = True    # Big Trade Detector overlay
-        self.btd_lookback = 50      # lookback bars for BTD baseline
-        self.btd_sigma    = 3.0     # sensitivity (sigma multiplier)
+        self.btd_lookback = 10      # lookback bars (matches TV default)
+        self.btd_sigma    = 3.0     # sensitivity sigma (matches TV default)
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -1844,7 +1844,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     #   T1 (>σ):     solid block █ bold — clearly distinct from candle chars
     #   T2 (>σ+1.5): double block ██ bold
     #   T3 (>σ+3.0): triple block ███ reversed — maximum contrast
-    BTD_COOLDOWN = 3   # candles to suppress after a signal
+    BTD_COOLDOWN = 1   # suppress only immediate repeat (same candle index)
     if show_btd and n_all >= btd_lookback + 2:
         _clist   = all_candles
         _buy_iv  = []

@@ -143,8 +143,17 @@ C_G_USDJPY  = 25
 C_G_XAUUSD  = 26
 C_G_NAS100  = 27
 C_G_SHADE   = 28
-C_BTD_BUY   = 29   # Big Trade buy signal (green)
-C_BTD_SELL  = 30   # Big Trade sell signal (red)
+C_BTD_BUY   = 29   # Big Trade buy signal
+C_BTD_SELL  = 30   # Big Trade sell signal
+# Session indicator border colors
+C_SESS_NDO  = 31   # NDO         00:00-03:30  dark blue
+C_SESS_MORN = 32   # Morning     08:30-10:30  cyan
+C_SESS_EXCL = 33   # Exclusion   09:00-10:00  red (Wed/Thu)
+C_SESS_LUNCH= 34   # Lunchtime   11:30-13:30  yellow
+C_SESS_PWR  = 35   # Power Hour  14:00-15:00  magenta
+C_SESS_EOD  = 36   # EOD/EEOD    18:30-00:00  green
+# Alert color
+C_ALERT     = 37   # alert box / triggered
 C_VWAP      = 16   # VWAP line
 C_VWAP_BAND = 17   # 0.5σ shaded band
 C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
@@ -205,6 +214,11 @@ class ChartState:
         self.show_btd     = True    # Big Trade Detector overlay
         self.btd_lookback = 10      # lookback bars (matches TV default)
         self.btd_sigma    = 3.0     # sensitivity sigma (matches TV default)
+        self.show_sessions = True   # Sessions indicator
+        # Alerts: list of dicts with keys:
+        #   name, condition, value, message, triggered, active, sound
+        self.alerts        = []     # list of alert dicts
+        self.alert_triggered = []   # recently fired alerts for display
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -820,6 +834,14 @@ def init_colors(scheme: str = "bw"):
     # BTD uses cyan/magenta — independent of the candle color scheme
     curses.init_pair(C_BTD_BUY,  curses.COLOR_CYAN,    -1)
     curses.init_pair(C_BTD_SELL, curses.COLOR_MAGENTA,  -1)
+    # Session border colors
+    curses.init_pair(C_SESS_NDO,  curses.COLOR_BLUE,    -1)
+    curses.init_pair(C_SESS_MORN, curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_SESS_EXCL, curses.COLOR_RED,     -1)
+    curses.init_pair(C_SESS_LUNCH,curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_SESS_PWR,  curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_SESS_EOD,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_ALERT,     curses.COLOR_YELLOW,  curses.COLOR_RED)
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
@@ -885,19 +907,44 @@ class DoubleBuffer:
 def session_bounds():
     """
     Return (prev_start, prev_end, curr_start) as Unix timestamps.
-    Sessions run 19:00 CT → 19:00 CT.
-    prev_end == curr_start.
+    Anchor adapts to interval:
+      1m/3m/15m/1H → daily   (19:00 CT boundaries)
+      4H           → weekly  (Sunday 19:00 CT)
+      1D           → monthly (1st of month 00:00 local)
     """
     import datetime as _dt
-    now = datetime.now()
-    # floor to today 19:00
-    today_open = datetime(now.year, now.month, now.day, 19, 0, 0)
-    if now < today_open:
-        curr_start = (today_open - _dt.timedelta(days=1)).timestamp()
+    now        = datetime.now()
+    resolution = cur_resolution()
+
+    if resolution >= 86400:
+        # 1D → monthly anchor: 1st of current month
+        curr_start = datetime(now.year, now.month, 1, 0, 0, 0).timestamp()
+        # Previous month
+        if now.month == 1:
+            prev_dt = datetime(now.year - 1, 12, 1, 0, 0, 0)
+        else:
+            prev_dt = datetime(now.year, now.month - 1, 1, 0, 0, 0)
+        prev_start = prev_dt.timestamp()
+        prev_end   = curr_start
+    elif resolution >= 14400:
+        # 4H → weekly anchor: most recent Sunday 19:00 CT
+        days_since_sun = (now.weekday() + 1) % 7  # Sun=0
+        this_sun = datetime(now.year, now.month, now.day, 19, 0, 0) -                    _dt.timedelta(days=days_since_sun)
+        if now < this_sun:
+            this_sun -= _dt.timedelta(weeks=1)
+        curr_start = this_sun.timestamp()
+        prev_start = (this_sun - _dt.timedelta(weeks=1)).timestamp()
+        prev_end   = curr_start
     else:
-        curr_start = today_open.timestamp()
-    prev_start = curr_start - 86400   # exactly 24 hours earlier
-    prev_end   = curr_start
+        # Daily anchor: 19:00 CT
+        today_open = datetime(now.year, now.month, now.day, 19, 0, 0)
+        if now < today_open:
+            curr_start = (today_open - _dt.timedelta(days=1)).timestamp()
+        else:
+            curr_start = today_open.timestamp()
+        prev_start = curr_start - 86400
+        prev_end   = curr_start
+
     return prev_start, prev_end, curr_start
 
 
@@ -1119,6 +1166,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         show_btd          = state.show_btd
         btd_lookback      = state.btd_lookback
         btd_sigma         = state.btd_sigma
+        show_sessions     = state.show_sessions
+        alerts            = list(state.alerts)
+        alert_triggered   = list(state.alert_triggered)
         global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
@@ -1714,6 +1764,96 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
 
 
+    # ── SESSIONS INDICATOR ───────────────────────────────────────────────────
+    # Shades session windows with colored top/bottom borders.
+    # All times in CT (local time). Exclusion window only on Wed/Thu.
+    # Sessions: NDO, Morning, Exclusion, Lunchtime, Power Hour, EOD/EEOD
+    if show_sessions and visible and chart_h > 0:
+        import datetime as _dtmod_sess
+        # Session definitions: (name, start_hhmm, end_hhmm, color, days_filter)
+        # days_filter=None → every day; [2,3] → Wed(2)/Thu(3) only
+        SESSIONS = [
+            ("NDO",   (0,  0), (3, 30), C_SESS_NDO,   None),
+            ("Morn",  (8, 30), (10,30), C_SESS_MORN,  None),
+            ("Excl",  (9,  0), (10, 0), C_SESS_EXCL,  [2, 3]),
+            ("Lunch", (11,30), (13,30), C_SESS_LUNCH,  None),
+            ("PWR",   (14, 0), (15, 0), C_SESS_PWR,   None),
+            ("EOD",   (18,30), (23,59), C_SESS_EOD,   None),
+        ]
+
+        _sc_sess = chart_r - n_vis
+
+        # For each session, find contiguous column ranges within visible window
+        for _sname, _sstart, _send, _scol, _sdays in SESSIONS:
+            _sh, _sm = _sstart;  _eh, _em = _send
+            _in_sess = False
+            _sess_col_start = None
+
+            for _i, _candle in enumerate(visible):
+                _col = _sc_sess + _i
+                if not (0 <= _col < chart_r):
+                    continue
+                _dt = datetime.fromtimestamp(_candle.ts)
+                _wday = _dt.weekday()  # Mon=0 … Sun=6
+
+                # Check day filter
+                if _sdays and _wday not in _sdays:
+                    if _in_sess:
+                        _in_sess = False
+                        _sess_col_start = None
+                    continue
+
+                # Check time range
+                _mins = _dt.hour * 60 + _dt.minute
+                _s_mins = _sh * 60 + _sm
+                _e_mins = _eh * 60 + _em
+                _now_in = _s_mins <= _mins < _e_mins
+
+                if _now_in and not _in_sess:
+                    _in_sess = True
+                    _sess_col_start = _col
+                elif not _now_in and _in_sess:
+                    # Session ended — draw top/bottom border lines for this range
+                    _in_sess = False
+                    _end_col = _col - 1
+                    for _bc in range(_sess_col_start, _end_col + 1):
+                        if 0 <= _bc < chart_r:
+                            if db.buf[chart_top][_bc][0] in (" ", "-", ":"):
+                                db.put(chart_top, _bc, "-", _scol, curses.A_BOLD)
+                            if db.buf[chart_bot - 1][_bc][0] in (" ", "-", ":"):
+                                db.put(chart_bot - 1, _bc, "-", _scol, curses.A_BOLD)
+                    # Left border
+                    if 0 <= _sess_col_start < chart_r:
+                        for _r in range(chart_top, chart_bot):
+                            if db.buf[_r][_sess_col_start][0] in (" ", ":"):
+                                db.put(_r, _sess_col_start, "|", _scol, curses.A_BOLD)
+                    # Right border
+                    if 0 <= _end_col < chart_r:
+                        for _r in range(chart_top, chart_bot):
+                            if db.buf[_r][_end_col][0] in (" ", ":"):
+                                db.put(_r, _end_col, "|", _scol, curses.A_BOLD)
+                    # Session label at top-left of window
+                    if 0 <= _sess_col_start < chart_r - len(_sname):
+                        db.puts(chart_top, _sess_col_start + 1,
+                                _sname, _scol, curses.A_BOLD)
+                    _sess_col_start = None
+
+            # Handle session still open at right edge of visible window
+            if _in_sess and _sess_col_start is not None:
+                _end_col = chart_r - 1
+                for _bc in range(_sess_col_start, _end_col + 1):
+                    if 0 <= _bc < chart_r:
+                        if db.buf[chart_top][_bc][0] in (" ", "-", ":"):
+                            db.put(chart_top, _bc, "-", _scol, curses.A_BOLD)
+                        if db.buf[chart_bot - 1][_bc][0] in (" ", "-", ":"):
+                            db.put(chart_bot - 1, _bc, "-", _scol, curses.A_BOLD)
+                if 0 <= _sess_col_start < chart_r:
+                    for _r in range(chart_top, chart_bot):
+                        if db.buf[_r][_sess_col_start][0] in (" ", ":"):
+                            db.put(_r, _sess_col_start, "|", _scol, curses.A_BOLD)
+                if 0 <= _sess_col_start < chart_r - len(_sname):
+                    db.puts(chart_top, _sess_col_start + 1, _sname, _scol, curses.A_BOLD)
+
     # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────────
     # Mark each candle column whose local timestamp crosses the 19:00 session
     # open. Draws a dim `:` column behind candles.
@@ -2017,9 +2157,87 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         _sb = session_bounds()
         _n_sess = sum(1 for c in all_candles if c.ts >= _sb[2])
         btd_tag  = "T:ON" if show_btd else "T:OFF"
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [Q] Quit"
+        sess_tag = "S:ON" if show_sessions else "S:OFF"
+        n_alerts = len(alerts)
+        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [Q] Quit"
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
+
+    # ── ALERT EVALUATION ─────────────────────────────────────────────────────
+    # Check each active alert against current market data each frame.
+    # Conditions: price_above, price_below, price_cross_up, price_cross_down,
+    #   vwap_cross_up, vwap_cross_down, sd2_above, sd2_below,
+    #   sd25_above, sd25_below, btd_buy, btd_sell
+    # Multi-condition alerts require ALL conditions to be true simultaneously.
+    if alerts and visible and last_price > 0:
+        _cur_price = last_price
+        _prev_price = visible[-2].c if len(visible) >= 2 else _cur_price
+
+        # Get current VWAP and SD values if available
+        _vw_now = 0.0;  _sd_now = 0.0
+        # (reuse _vwap_map if it was computed this frame — best-effort)
+
+        _newly_triggered = []
+        for _alt in alerts:
+            if not _alt.get("active", True):
+                continue
+            _conds = _alt.get("conditions", [])
+            _all_met = True
+            for _cond in _conds:
+                _ctype = _cond.get("type", "")
+                _cval  = float(_cond.get("value", 0.0))
+                if _ctype == "price_above":
+                    _met = _cur_price > _cval
+                elif _ctype == "price_below":
+                    _met = _cur_price < _cval
+                elif _ctype == "price_cross_up":
+                    _met = _prev_price <= _cval < _cur_price
+                elif _ctype == "price_cross_down":
+                    _met = _prev_price >= _cval > _cur_price
+                else:
+                    _met = False
+                if not _met:
+                    _all_met = False
+                    break
+
+            if _all_met and not _alt.get("_last_state", False):
+                # Newly triggered
+                _alt["_last_state"] = True
+                _newly_triggered.append(_alt)
+            elif not _all_met:
+                _alt["_last_state"] = False
+
+        if _newly_triggered:
+            with state.lock:
+                for _ta in _newly_triggered:
+                    state.alert_triggered.insert(0, {
+                        "name": _ta.get("name", "Alert"),
+                        "message": _ta.get("message", "Condition met"),
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                    })
+                    # Keep only last 20 triggered alerts
+                    state.alert_triggered = state.alert_triggered[:20]
+                # Play terminal bell for sound alert
+                if any(a.get("sound", True) for a in _newly_triggered):
+                    print("", end="", flush=True)
+
+    # ── ALERT OVERLAY (triggered alert popup) ────────────────────────────────
+    if alert_triggered:
+        _latest = alert_triggered[0]
+        _abox_w = min(cols - 4, 54)
+        _abox_y = chart_top + 1
+        _abox_x = max(0, cols // 2 - _abox_w // 2)
+        # Title
+        db.puts(_abox_y, _abox_x,
+                f" *** ALERT: {_latest['name']} @ {_latest['time']} ***".ljust(_abox_w)[:_abox_w],
+                C_ALERT, curses.A_BOLD | curses.A_REVERSE)
+        # Message
+        db.puts(_abox_y + 1, _abox_x,
+                f" {_latest['message'][:_abox_w - 2]}".ljust(_abox_w)[:_abox_w],
+                C_ALERT, curses.A_BOLD)
+        db.puts(_abox_y + 2, _abox_x,
+                f" [A] Alert list  [Esc] Dismiss".ljust(_abox_w)[:_abox_w],
+                C_AXIS, curses.A_DIM)
 
     # ── HELP OVERLAY (drawn last, on top of everything) ──────────────
     if show_help:
@@ -2428,6 +2646,208 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
     db.puts(footer_row, 0,
             (f" GLOBAL  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit").ljust(cols)[:cols],
             C_ASSET_SEL, curses.A_BOLD)
+
+
+# ── Alert system ──────────────────────────────────────────────────────────────
+ALERT_CONDITIONS = [
+    ("price_cross_up",   "Price crosses up"),
+    ("price_cross_down", "Price crosses down"),
+    ("price_above",      "Price above"),
+    ("price_below",      "Price below"),
+]
+
+def alert_create_dialog(stdscr, rows: int, cols: int) -> dict | None:
+    """
+    Interactive dialog to create a new alert.
+    Returns alert dict or None if cancelled.
+    """
+    curses.curs_set(1);  curses.echo();  stdscr.nodelay(False)
+
+    box_w = min(cols - 4, 60)
+    box_h = 14
+    box_y = rows // 2 - box_h // 2
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    def _box_clear():
+        for r in range(box_h):
+            stdscr.addstr(box_y + r, box_x, " " * box_w,
+                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+
+    def _prompt(row, label, default=""):
+        stdscr.addstr(box_y + row, box_x + 1, f"{label:<20}",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+        stdscr.addstr(box_y + row, box_x + 22, " " * (box_w - 23),
+                      curses.color_pair(C_CURSOR))
+        stdscr.move(box_y + row, box_x + 22)
+        stdscr.refresh()
+        buf = []
+        while True:
+            try: ch = stdscr.get_wch()
+            except: break
+            code = ord(ch) if isinstance(ch, str) else ch
+            if code in (10, 13): break
+            if code == 27: return None
+            if code in (curses.KEY_BACKSPACE, 127, 8):
+                if buf: buf.pop()
+                stdscr.addstr(box_y + row, box_x + 22,
+                              "".join(buf).ljust(box_w - 23)[:box_w - 23],
+                              curses.color_pair(C_CURSOR))
+                stdscr.move(box_y + row, box_x + 22 + len(buf))
+            elif 32 <= code <= 126 and len(buf) < box_w - 24:
+                buf.append(chr(code))
+                stdscr.addch(box_y + row, box_x + 22 + len(buf) - 1,
+                             chr(code), curses.color_pair(C_CURSOR))
+            stdscr.refresh()
+        return "".join(buf).strip() or default
+
+    _box_clear()
+    stdscr.addstr(box_y, box_x,
+                  " Create Alert ".center(box_w),
+                  curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+
+    # Condition selector
+    stdscr.addstr(box_y + 2, box_x + 1, "Condition:",
+                  curses.color_pair(C_LABEL) | curses.A_BOLD)
+    cond_idx = 0
+    while True:
+        for ci, (_, clabel) in enumerate(ALERT_CONDITIONS):
+            attr = (curses.color_pair(C_ASSET_SEL) | curses.A_BOLD
+                    if ci == cond_idx else curses.color_pair(C_CURSOR))
+            stdscr.addstr(box_y + 3 + ci, box_x + 3,
+                          f"{'>' if ci == cond_idx else ' '} {clabel:<30}", attr)
+        stdscr.refresh()
+        try: k = stdscr.get_wch()
+        except: break
+        kc = ord(k) if isinstance(k, str) else k
+        if kc == curses.KEY_UP:    cond_idx = (cond_idx - 1) % len(ALERT_CONDITIONS)
+        elif kc == curses.KEY_DOWN: cond_idx = (cond_idx + 1) % len(ALERT_CONDITIONS)
+        elif kc in (10, 13):        break
+        elif kc == 27:
+            curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+            return None
+
+    cond_type = ALERT_CONDITIONS[cond_idx][0]
+    _box_clear()
+    stdscr.addstr(box_y, box_x,
+                  " Create Alert ".center(box_w),
+                  curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+    stdscr.addstr(box_y + 1, box_x + 1,
+                  f"Condition: {ALERT_CONDITIONS[cond_idx][1]}",
+                  curses.color_pair(C_LABEL) | curses.A_BOLD)
+
+    val_str = _prompt(3, "Value (price):", str(round(state.last_price, 2)))
+    if val_str is None:
+        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+        return None
+    try:    val = float(val_str)
+    except: val = state.last_price
+
+    name = _prompt(5, "Alert name:", f"Alert @ {val_str}")
+    if name is None:
+        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+        return None
+
+    msg = _prompt(7, "Message:", f"{ALERT_CONDITIONS[cond_idx][1]} {val_str}")
+    if msg is None:
+        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+        return None
+
+    # Sound toggle
+    snd = True
+    while True:
+        stdscr.addstr(box_y + 9, box_x + 1,
+                      f"Sound alert: {'[ON] ' if snd else '     '} ON  {'     ' if snd else '[OFF]'} OFF",
+                      curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        stdscr.addstr(box_y + 11, box_x + 1,
+                      "  ← → toggle    Enter confirm    Esc cancel  ",
+                      curses.color_pair(C_AXIS) | curses.A_DIM)
+        stdscr.refresh()
+        try: k = stdscr.get_wch()
+        except: break
+        kc = ord(k) if isinstance(k, str) else k
+        if kc in (curses.KEY_LEFT, curses.KEY_RIGHT): snd = not snd
+        elif kc in (10, 13): break
+        elif kc == 27:
+            curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+            return None
+
+    curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+    return {
+        "name":      name or f"Alert @ {val}",
+        "conditions": [{"type": cond_type, "value": val}],
+        "message":   msg or f"Price {cond_type} {val}",
+        "active":    True,
+        "sound":     snd,
+        "_last_state": False,
+    }
+
+
+def alert_list_dialog(stdscr, rows: int, cols: int):
+    """Show list of active alerts with delete option."""
+    stdscr.nodelay(False)
+    box_w = min(cols - 4, 64)
+    box_h = min(rows - 4, 22)
+    box_y = rows // 2 - box_h // 2
+    box_x = max(0, cols // 2 - box_w // 2)
+    sel   = 0
+
+    while True:
+        with state.lock:
+            _alts = list(state.alerts)
+            _trig = list(state.alert_triggered)
+
+        for r in range(box_h):
+            stdscr.addstr(box_y + r, box_x, " " * box_w,
+                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+
+        stdscr.addstr(box_y, box_x,
+                      " Alert List — [D] delete  [N] new  [Esc] close ".center(box_w),
+                      curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+
+        # Active alerts
+        stdscr.addstr(box_y + 1, box_x + 1, "ACTIVE ALERTS:",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+        for ai, alt in enumerate(_alts[:8]):
+            ctype = alt["conditions"][0]["type"] if alt["conditions"] else ""
+            val   = alt["conditions"][0]["value"] if alt["conditions"] else 0
+            lbl   = f"{'>' if ai == sel else ' '} {alt['name'][:28]:<28}  {ctype}  {val}"
+            attr  = (curses.color_pair(C_ASSET_SEL) | curses.A_BOLD
+                     if ai == sel else curses.color_pair(C_CURSOR))
+            stdscr.addstr(box_y + 2 + ai, box_x + 1, lbl[:box_w - 2], attr)
+
+        if not _alts:
+            stdscr.addstr(box_y + 2, box_x + 3, "No active alerts. Press [N] to create one.",
+                          curses.color_pair(C_AXIS) | curses.A_DIM)
+
+        # Triggered history
+        stdscr.addstr(box_y + 11, box_x + 1, "TRIGGERED HISTORY:",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+        for ti, trig in enumerate(_trig[:8]):
+            lbl = f"  {trig['time']}  {trig['name'][:28]}  {trig['message'][:16]}"
+            stdscr.addstr(box_y + 12 + ti, box_x + 1, lbl[:box_w - 2],
+                          curses.color_pair(C_VWAP_SD2))
+
+        stdscr.refresh()
+        try: k = stdscr.getch()
+        except: break
+        if k == 27 or k in (ord("a"), ord("A")): break
+        elif k == curses.KEY_UP:   sel = max(0, sel - 1)
+        elif k == curses.KEY_DOWN: sel = min(max(0, len(_alts) - 1), sel + 1)
+        elif k in (ord("d"), ord("D")):
+            if 0 <= sel < len(_alts):
+                with state.lock:
+                    if sel < len(state.alerts):
+                        state.alerts.pop(sel)
+                sel = max(0, sel - 1)
+        elif k in (ord("n"), ord("N")):
+            stdscr.nodelay(True)
+            new_alt = alert_create_dialog(stdscr, rows, cols)
+            stdscr.nodelay(False)
+            if new_alt:
+                with state.lock:
+                    state.alerts.append(new_alt)
+
+    stdscr.nodelay(True)
 
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [

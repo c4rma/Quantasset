@@ -218,7 +218,18 @@ class ChartState:
         # Alerts: list of dicts with keys:
         #   name, condition, value, message, triggered, active, sound
         self.alerts        = []     # list of alert dicts
-        self.alert_triggered = []   # recently fired alerts for display
+        self.alert_triggered  = []   # recently fired alerts for display
+        self.show_alert_popup = False  # True = show latest alert banner
+        self.show_alert_list  = False  # non-blocking alert list overlay
+        self.alert_list_sel   = 0      # selected row in alert list
+        self.show_econ_cal    = False  # economic calendar overlay
+        self.econ_events      = []     # list of event dicts
+        self.econ_loading     = False
+        self.econ_impact_filter = {1, 2, 3}  # show * ** *** (all by default)
+        # Live trade lines drawn on chart
+        # Each dict: {side, entry, sl, tp, size_phemex, size_xl, status}
+        self.trade_lines    = []    # active/pending trade levels to draw
+        self.trade_monitor  = False # True while trade monitor thread running
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -813,7 +824,7 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_HEADER,    curses.COLOR_WHITE,  curses.COLOR_BLACK)
     curses.init_pair(C_VOL_BULL,  bull_fg,             -1)
     curses.init_pair(C_VOL_BEAR,  bear_fg,             -1)
-    curses.init_pair(C_ASSET_SEL, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_ASSET_SEL, curses.COLOR_WHITE,  curses.COLOR_BLUE)
     curses.init_pair(C_PRICE_LBL,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
     curses.init_pair(C_PRICE_LINE, curses.COLOR_YELLOW, -1)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
@@ -1167,8 +1178,15 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         btd_lookback      = state.btd_lookback
         btd_sigma         = state.btd_sigma
         show_sessions     = state.show_sessions
-        alerts            = list(state.alerts)
         alert_triggered   = list(state.alert_triggered)
+        show_alert_popup  = state.show_alert_popup
+        show_alert_list   = state.show_alert_list
+        alert_list_sel    = state.alert_list_sel
+        show_econ_cal     = state.show_econ_cal
+        econ_events       = list(state.econ_events)
+        econ_loading      = state.econ_loading
+        econ_filter       = set(state.econ_impact_filter)
+        trade_lines       = list(state.trade_lines)
         global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
@@ -1292,7 +1310,34 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         lbl = f" {a}/USDT "
         db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
         col += len(lbl) + 1
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]global  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
+
+    # Current session badge — shows which session is active right now
+    _now_h = datetime.now()
+    _now_m = _now_h.hour * 60 + _now_h.minute
+    _wday  = _now_h.weekday()  # Mon=0 Sun=6
+    _SESS_DEFS = [
+        ("Excl",  9*60,   10*60,  C_SESS_EXCL,  [2,3]),
+        ("NDO",   0,       3*60+30, C_SESS_NDO,  None),
+        ("Morn",  8*60+30, 10*60+30, C_SESS_MORN, None),
+        ("Lunch", 11*60+30,13*60+30, C_SESS_LUNCH,None),
+        ("PWR",   14*60,   15*60,   C_SESS_PWR,  None),
+        ("EOD",   18*60+30,23*60+59, C_SESS_EOD,  None),
+    ]
+    _cur_sess_lbl  = ""
+    _cur_sess_pair = C_HEADER
+    for _sn, _ss, _se, _sc, _sdays in _SESS_DEFS:
+        if _sdays and _wday not in _sdays:
+            continue
+        if _ss <= _now_m < _se:
+            _cur_sess_lbl  = f" {_sn} "
+            _cur_sess_pair = _sc
+            break
+    if _cur_sess_lbl:
+        db.puts(1, col + 1, _cur_sess_lbl, _cur_sess_pair,
+                curses.A_BOLD | curses.A_REVERSE)
+        col += len(_cur_sess_lbl) + 2
+
+    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1765,13 +1810,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
 
     # ── SESSIONS INDICATOR ───────────────────────────────────────────────────
-    # Shades session windows with colored top/bottom borders.
-    # All times in CT (local time). Exclusion window only on Wed/Thu.
-    # Sessions: NDO, Morning, Exclusion, Lunchtime, Power Hour, EOD/EEOD
-    if show_sessions and visible and chart_h > 0:
-        import datetime as _dtmod_sess
-        # Session definitions: (name, start_hhmm, end_hhmm, color, days_filter)
-        # days_filter=None → every day; [2,3] → Wed(2)/Thu(3) only
+    # Shows session windows as price-range boxes with a bottom indicator bar.
+    # Each box spans the session's actual high-low price range.
+    # Bottom bar: a solid colored strip in the time axis row showing session span.
+    # Hidden on 1H, 4H, 1D timeframes.
+    _sess_resolution = cur_resolution()
+    # Sessions only shown on 1m and 3m — on 15m+ a single candle spans 15+ min
+    # which causes sessions to smear across the chart incorrectly.
+    if show_sessions and visible and chart_h > 0 and _sess_resolution <= 180:
         SESSIONS = [
             ("NDO",   (0,  0), (3, 30), C_SESS_NDO,   None),
             ("Morn",  (8, 30), (10,30), C_SESS_MORN,  None),
@@ -1780,84 +1826,75 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             ("PWR",   (14, 0), (15, 0), C_SESS_PWR,   None),
             ("EOD",   (18,30), (23,59), C_SESS_EOD,   None),
         ]
-
         _sc_sess = chart_r - n_vis
 
-        # For each session, find contiguous column ranges within visible window
         for _sname, _sstart, _send, _scol, _sdays in SESSIONS:
             _sh, _sm = _sstart;  _eh, _em = _send
-            _in_sess = False
-            _sess_col_start = None
+            _s_mins = _sh * 60 + _sm;  _e_mins = _eh * 60 + _em
 
-            for _i, _candle in enumerate(visible):
-                _col = _sc_sess + _i
-                if not (0 <= _col < chart_r):
+            # Group candles by calendar date so sessions from different days
+            # don't merge into one giant box
+            from itertools import groupby as _groupby
+            def _date_key(pair):
+                _i, _c = pair
+                return datetime.fromtimestamp(_c.ts).date()
+
+            _indexed = [(i, c) for i, c in enumerate(visible)]
+            for _day, _day_group in _groupby(_indexed, _date_key):
+                _day_candles = list(_day_group)
+                _sess_cols = []
+                _sess_hi   = None
+                _sess_lo   = None
+
+                for _i, _candle in _day_candles:
+                    _col = _sc_sess + _i
+                    if not (0 <= _col < chart_r):
+                        continue
+                    _dt   = datetime.fromtimestamp(_candle.ts)
+                    _wday = _dt.weekday()
+                    if _sdays and _wday not in _sdays:
+                        continue
+                    _mins = _dt.hour * 60 + _dt.minute
+                    if _s_mins <= _mins < _e_mins:
+                        _sess_cols.append(_col)
+                        if _sess_hi is None or _candle.h > _sess_hi:
+                            _sess_hi = _candle.h
+                        if _sess_lo is None or _candle.l < _sess_lo:
+                            _sess_lo = _candle.l
+
+                if not _sess_cols or _sess_hi is None:
                     continue
-                _dt = datetime.fromtimestamp(_candle.ts)
-                _wday = _dt.weekday()  # Mon=0 … Sun=6
 
-                # Check day filter
-                if _sdays and _wday not in _sdays:
-                    if _in_sess:
-                        _in_sess = False
-                        _sess_col_start = None
-                    continue
+                _c0  = _sess_cols[0]
+                _c1  = _sess_cols[-1]
 
-                # Check time range
-                _mins = _dt.hour * 60 + _dt.minute
-                _s_mins = _sh * 60 + _sm
-                _e_mins = _eh * 60 + _em
-                _now_in = _s_mins <= _mins < _e_mins
+                _r_top = max(chart_top,     chart_top + p2r(_sess_hi))
+                _r_bot = min(chart_bot - 1, chart_top + p2r(_sess_lo))
 
-                if _now_in and not _in_sess:
-                    _in_sess = True
-                    _sess_col_start = _col
-                elif not _now_in and _in_sess:
-                    # Session ended — draw top/bottom border lines for this range
-                    _in_sess = False
-                    _end_col = _col - 1
-                    for _bc in range(_sess_col_start, _end_col + 1):
-                        if 0 <= _bc < chart_r:
-                            if db.buf[chart_top][_bc][0] in (" ", "-", ":"):
-                                db.put(chart_top, _bc, "-", _scol, curses.A_BOLD)
-                            if db.buf[chart_bot - 1][_bc][0] in (" ", "-", ":"):
-                                db.put(chart_bot - 1, _bc, "-", _scol, curses.A_BOLD)
-                    # Left border
-                    if 0 <= _sess_col_start < chart_r:
-                        for _r in range(chart_top, chart_bot):
-                            if db.buf[_r][_sess_col_start][0] in (" ", ":"):
-                                db.put(_r, _sess_col_start, "|", _scol, curses.A_BOLD)
-                    # Right border
-                    if 0 <= _end_col < chart_r:
-                        for _r in range(chart_top, chart_bot):
-                            if db.buf[_r][_end_col][0] in (" ", ":"):
-                                db.put(_r, _end_col, "|", _scol, curses.A_BOLD)
-                    # Session label at top-left of window
-                    if 0 <= _sess_col_start < chart_r - len(_sname):
-                        db.puts(chart_top, _sess_col_start + 1,
-                                _sname, _scol, curses.A_BOLD)
-                    _sess_col_start = None
-
-            # Handle session still open at right edge of visible window
-            if _in_sess and _sess_col_start is not None:
-                _end_col = chart_r - 1
-                for _bc in range(_sess_col_start, _end_col + 1):
+                for _bc in range(_c0, _c1 + 1):
                     if 0 <= _bc < chart_r:
-                        if db.buf[chart_top][_bc][0] in (" ", "-", ":"):
-                            db.put(chart_top, _bc, "-", _scol, curses.A_BOLD)
-                        if db.buf[chart_bot - 1][_bc][0] in (" ", "-", ":"):
-                            db.put(chart_bot - 1, _bc, "-", _scol, curses.A_BOLD)
-                if 0 <= _sess_col_start < chart_r:
-                    for _r in range(chart_top, chart_bot):
-                        if db.buf[_r][_sess_col_start][0] in (" ", ":"):
-                            db.put(_r, _sess_col_start, "|", _scol, curses.A_BOLD)
-                if 0 <= _sess_col_start < chart_r - len(_sname):
-                    db.puts(chart_top, _sess_col_start + 1, _sname, _scol, curses.A_BOLD)
+                        db.put(_r_top, _bc, "-", _scol, curses.A_BOLD)
+                if _r_bot != _r_top:
+                    for _bc in range(_c0, _c1 + 1):
+                        if 0 <= _bc < chart_r:
+                            db.put(_r_bot, _bc, "-", _scol, curses.A_BOLD)
+                for _r in range(_r_top, _r_bot + 1):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_c0][0] in (" ", ":", "."):
+                        db.put(_r, _c0, "|", _scol, curses.A_BOLD)
+                for _r in range(_r_top, _r_bot + 1):
+                    if chart_top <= _r < chart_bot and db.buf[_r][_c1][0] in (" ", ":", "."):
+                        db.put(_r, _c1, "|", _scol, curses.A_BOLD)
+                if _c0 + 1 < chart_r:
+                    db.puts(_r_top, _c0 + 1, _sname, _scol, curses.A_BOLD)
+                for _bc in range(_c0, _c1 + 1):
+                    if 0 <= _bc < chart_r:
+                        db.put(time_row, _bc, "=", _scol, curses.A_BOLD | curses.A_REVERSE)
+
 
     # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────────
     # Mark each candle column whose local timestamp crosses the 19:00 session
-    # open. Draws a dim `:` column behind candles.
-    if visible:
+    # open. Draws a dim `:` column behind candles. Hidden on 1D timeframe.
+    if visible and cur_resolution() < 86400:
         start_col_sep = chart_r - n_vis  # same as main start_col
         for i, candle in enumerate(visible):
             col_s = start_col_sep + i
@@ -2108,22 +2145,58 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         db.put(time_row, chart_r, "|", C_AXIS)
 
         if visible:
-            MIN_LABEL_GAP  = 6
+            _res = cur_resolution()
+            # Label frequency and format by interval
+            if _res <= 60:       # 1m  → every 15min
+                _tick_mins = 15;  _lbl_fmt = "%H:%M"; _gap = 6
+            elif _res <= 180:    # 3m  → every 30min
+                _tick_mins = 30;  _lbl_fmt = "%H:%M"; _gap = 5
+            elif _res <= 900:    # 15m → every hour
+                _tick_mins = 60;  _lbl_fmt = "%H:%M"; _gap = 5
+            elif _res <= 3600:   # 1H  → every 6h with date
+                _tick_mins = 360; _lbl_fmt = "%m/%d %H:%M"; _gap = 12
+            elif _res <= 14400:  # 4H  → each candle date
+                _tick_mins = 240; _lbl_fmt = "%m/%d"; _gap = 6
+            else:                # 1D  → weekly grouping
+                _tick_mins = 1440;_lbl_fmt = "%m/%d"; _gap = 6
+
+            MIN_LABEL_GAP  = _gap
             last_label_col = -MIN_LABEL_GAP - 1
+
+            # On 1D every candle IS midnight, so "day break" would fire every
+            # candle.  Only use day-break special treatment on sub-daily intervals.
+            _sub_daily = (_res < 86400)
+
+            # For 1D: label every Nth candle so labels don't collide.
+            # Calculate how many candles fit per label based on label width.
+            _lbl_sample = datetime.now().strftime(_lbl_fmt)
+            _lbl_w      = max(MIN_LABEL_GAP, len(_lbl_sample) + 1)
+            # cols per candle (floating)
+            _cols_per_candle = max(1.0, chart_r / max(1, n_vis))
+            # How many candles between labels
+            _candle_stride = max(1, int(_lbl_w / _cols_per_candle))
 
             for i, candle in enumerate(visible):
                 lbl_col = start_col + i
-                if not (0 <= lbl_col <= chart_r - 5):
+                if not (0 <= lbl_col <= chart_r - 8):
                     continue
-                # Use candle.ts directly — fromtimestamp converts UTC epoch to local time
                 dt = datetime.fromtimestamp(candle.ts)
-                if dt.minute % 15 == 0 and lbl_col - last_label_col >= MIN_LABEL_GAP:
-                    # At midnight show the date; otherwise show HH:MM
-                    if dt.hour == 0 and dt.minute == 0:
-                        lbl = dt.strftime("%m/%d/%Y")
-                    else:
-                        lbl = dt.strftime("%H:%M")
-                    db.puts(time_row, lbl_col, lbl, C_LABEL, curses.A_BOLD)
+                _total_mins = dt.hour * 60 + dt.minute
+
+                _is_day_break = _sub_daily and (
+                    (dt.hour == 0 and dt.minute == 0) or
+                    (i > 0 and datetime.fromtimestamp(visible[i-1].ts).date() != dt.date())
+                )
+
+                if _is_day_break and lbl_col - last_label_col >= 5:
+                    lbl = dt.strftime("%m/%d")
+                    db.puts(time_row, lbl_col, lbl, C_LABEL,
+                            curses.A_BOLD | curses.A_UNDERLINE)
+                    last_label_col = lbl_col
+                elif (i % _candle_stride == 0
+                      and lbl_col - last_label_col >= MIN_LABEL_GAP):
+                    lbl = dt.strftime(_lbl_fmt)
+                    db.puts(time_row, lbl_col, lbl, C_LABEL, curses.A_NORMAL)
                     last_label_col = lbl_col
 
             # Cursor label — include date when not today
@@ -2158,70 +2231,13 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         _n_sess = sum(1 for c in all_candles if c.ts >= _sb[2])
         btd_tag  = "T:ON" if show_btd else "T:OFF"
         sess_tag = "S:ON" if show_sessions else "S:OFF"
-        n_alerts = len(alerts)
+        n_alerts = len(state.alerts)
         footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [Q] Quit"
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
 
-    # ── ALERT EVALUATION ─────────────────────────────────────────────────────
-    # Check each active alert against current market data each frame.
-    # Conditions: price_above, price_below, price_cross_up, price_cross_down,
-    #   vwap_cross_up, vwap_cross_down, sd2_above, sd2_below,
-    #   sd25_above, sd25_below, btd_buy, btd_sell
-    # Multi-condition alerts require ALL conditions to be true simultaneously.
-    if alerts and visible and last_price > 0:
-        _cur_price = last_price
-        _prev_price = visible[-2].c if len(visible) >= 2 else _cur_price
-
-        # Get current VWAP and SD values if available
-        _vw_now = 0.0;  _sd_now = 0.0
-        # (reuse _vwap_map if it was computed this frame — best-effort)
-
-        _newly_triggered = []
-        for _alt in alerts:
-            if not _alt.get("active", True):
-                continue
-            _conds = _alt.get("conditions", [])
-            _all_met = True
-            for _cond in _conds:
-                _ctype = _cond.get("type", "")
-                _cval  = float(_cond.get("value", 0.0))
-                if _ctype == "price_above":
-                    _met = _cur_price > _cval
-                elif _ctype == "price_below":
-                    _met = _cur_price < _cval
-                elif _ctype == "price_cross_up":
-                    _met = _prev_price <= _cval < _cur_price
-                elif _ctype == "price_cross_down":
-                    _met = _prev_price >= _cval > _cur_price
-                else:
-                    _met = False
-                if not _met:
-                    _all_met = False
-                    break
-
-            if _all_met and not _alt.get("_last_state", False):
-                # Newly triggered
-                _alt["_last_state"] = True
-                _newly_triggered.append(_alt)
-            elif not _all_met:
-                _alt["_last_state"] = False
-
-        if _newly_triggered:
-            with state.lock:
-                for _ta in _newly_triggered:
-                    state.alert_triggered.insert(0, {
-                        "name": _ta.get("name", "Alert"),
-                        "message": _ta.get("message", "Condition met"),
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                    })
-                    # Keep only last 20 triggered alerts
-                    state.alert_triggered = state.alert_triggered[:20]
-                # Play terminal bell for sound alert
-                if any(a.get("sound", True) for a in _newly_triggered):
-                    print("", end="", flush=True)
-
-    # ── ALERT OVERLAY (triggered alert popup) ────────────────────────────────
+    # Alert evaluation runs in alert_monitor() background thread
+    # ── ALERT OVERLAY ────────────────────────────────────────────────────────
     if alert_triggered:
         _latest = alert_triggered[0]
         _abox_w = min(cols - 4, 54)
@@ -2238,6 +2254,15 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         db.puts(_abox_y + 2, _abox_x,
                 f" [A] Alert list  [Esc] Dismiss".ljust(_abox_w)[:_abox_w],
                 C_AXIS, curses.A_DIM)
+
+    # ── POSITION TOOLS ───────────────────────────────────────────────
+    # ── ALERT LIST OVERLAY ──────────────────────────────────────────
+    if show_alert_list:
+        draw_alert_list_overlay(db, rows, cols, alert_list_sel)
+
+    # ── ECON CALENDAR OVERLAY ────────────────────────────────────────
+    if show_econ_cal:
+        draw_econ_cal_overlay(db, rows, cols, econ_events, econ_loading, econ_filter)
 
     # ── HELP OVERLAY (drawn last, on top of everything) ──────────────
     if show_help:
@@ -2466,7 +2491,7 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
     # ── Header ────────────────────────────────────────────────────────────────
     for r in range(HEADER_H):
         db.puts(r, 0, " " * cols, C_HEADER, curses.A_BOLD)
-    db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker  —  GLOBAL", C_HEADER, curses.A_BOLD)
+    db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker  —  MACRO", C_HEADER, curses.A_BOLD)
     now_str = datetime.now().strftime("%m/%d/%Y  %H:%M:%S")
     db.puts(0, max(0, cols - len(now_str) - 2), now_str, C_LABEL, curses.A_BOLD)
     # Refresh countdown
@@ -2483,7 +2508,7 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
             db.puts(chart_top + chart_h // 2 + 1,
                     max(0, cols // 2 - len(gerr) // 2),
                     gerr[:cols - 2], C_BEAR, curses.A_BOLD)
-        db.puts(footer_row, 0, " GLOBAL MODE  [R] Retry  [M] Exit".ljust(cols)[:cols],
+        db.puts(footer_row, 0, " MACRO MODE  [R] Retry  [M] Exit".ljust(cols)[:cols],
                 C_ASSET_SEL, curses.A_BOLD)
         return
 
@@ -2644,195 +2669,607 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
 
     # ── Footer ────────────────────────────────────────────────────────────────
     db.puts(footer_row, 0,
-            (f" GLOBAL  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit").ljust(cols)[:cols],
+            (f" MACRO  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit").ljust(cols)[:cols],
             C_ASSET_SEL, curses.A_BOLD)
+
+
+
+# ── Trade dialog ─────────────────────────────────────────────────────────────
+def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
+    """
+    Multi-step dialog to build and submit a copycat trade order.
+    Returns submitted trade dict or None if cancelled.
+    """
+    import subprocess, os
+    stdscr.nodelay(False)
+    curses.curs_set(0)
+
+    box_w = min(cols - 4, 64)
+    box_h = 24
+    box_y = max(0, rows // 2 - box_h // 2)
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    def _draw_box(title="", lines_=None):
+        for r in range(box_h):
+            try:
+                stdscr.addstr(box_y + r, box_x, " " * box_w,
+                              curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(box_y, box_x,
+                          f" Trading — {title} ".center(box_w),
+                          curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+            stdscr.addstr(box_y + box_h - 1, box_x + 1,
+                          "  [↑↓] select   [Enter] next   [Esc] cancel"[:box_w - 2],
+                          curses.color_pair(C_AXIS) | curses.A_DIM)
+        except curses.error:
+            pass
+        if lines_:
+            for li, (txt, pair, attr) in enumerate(lines_):
+                try:
+                    stdscr.addstr(box_y + 2 + li, box_x + 2,
+                                  txt[:box_w - 4],
+                                  curses.color_pair(pair) | attr)
+                except curses.error:
+                    pass
+        stdscr.refresh()
+
+    def _menu(title, options, default=0):
+        idx = default
+        while True:
+            items = []
+            for i, opt in enumerate(options):
+                items.append((f"{'>' if i==idx else ' '} {opt}",
+                              C_ASSET_SEL if i == idx else C_CURSOR,
+                              curses.A_BOLD if i == idx else curses.A_NORMAL))
+            _draw_box(title, items)
+            k = stdscr.getch()
+            if k == 27: return None
+            if k == curses.KEY_UP:   idx = (idx - 1) % len(options)
+            elif k == curses.KEY_DOWN: idx = (idx + 1) % len(options)
+            elif k in (10, 13): return idx
+
+    def _inp(title, prompt, default="", context_lines=None):
+        _draw_box(title, context_lines or [])
+        try:
+            stdscr.addstr(box_y + 2 + len(context_lines or []), box_x + 2,
+                          prompt[:box_w - 4],
+                          curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error:
+            pass
+        result = _input_field(stdscr,
+                              box_y + 3 + len(context_lines or []),
+                              box_x + 4, box_w - 8, default)
+        return result  # None = Esc
+
+    # ── Step 1: Order type ────────────────────────────────────────────────────
+    order_types = ["Buy Market", "Sell Market", "Buy Limit", "Sell Limit"]
+    ot_idx = _menu("Order Type", order_types)
+    if ot_idx is None: stdscr.nodelay(True); return None
+    order_type = order_types[ot_idx]
+    side = "buy" if "Buy" in order_type else "sell"
+    is_limit = "Limit" in order_type
+
+    # ── Step 2: Limit price (only for limit orders) ───────────────────────────
+    limit_price = None
+    if is_limit:
+        cur_p = str(round(state.last_price, 2))
+        lp_str = _inp("Limit Price", f"Limit price (current: {cur_p}):", cur_p)
+        if lp_str is None: stdscr.nodelay(True); return None
+        try: limit_price = float(lp_str)
+        except: limit_price = state.last_price
+
+    entry = limit_price if limit_price else state.last_price
+
+    # ── Step 3: Stop Loss ────────────────────────────────────────────────────
+    ctx = [(f"Order: {order_type}" + (f" @ {limit_price}" if limit_price else ""),
+            C_LABEL, curses.A_BOLD)]
+    sl_type_idx = _menu("Stop Loss Type", ["Points", "Price"], default=0)
+    if sl_type_idx is None: stdscr.nodelay(True); return None
+
+    sl_def = "50" if sl_type_idx == 0 else str(round(
+        entry - 50 if side == "buy" else entry + 50, 2))
+    sl_str = _inp("Stop Loss Value", "SL value:", sl_def, ctx)
+    if sl_str is None: stdscr.nodelay(True); return None
+    try: sl_val = float(sl_str)
+    except: sl_val = 50.0
+    sl_price = (entry - sl_val if side == "buy" else entry + sl_val)                if sl_type_idx == 0 else sl_val
+
+    # ── Step 4: Take Profit ──────────────────────────────────────────────────
+    ctx2 = ctx + [(f"SL: {sl_price:.2f}", C_BTD_SELL, curses.A_BOLD)]
+    tp_type_idx = _menu("Take Profit Type", ["Points", "Price"], default=0)
+    if tp_type_idx is None: stdscr.nodelay(True); return None
+
+    tp_def = "100" if tp_type_idx == 0 else str(round(
+        entry + 100 if side == "buy" else entry - 100, 2))
+    tp_str = _inp("Take Profit Value", "TP value:", tp_def, ctx2)
+    if tp_str is None: stdscr.nodelay(True); return None
+    try: tp_val = float(tp_str)
+    except: tp_val = 100.0
+    tp_price = (entry + tp_val if side == "buy" else entry - tp_val)                if tp_type_idx == 0 else tp_val
+
+    # ── Step 5: Position sizes ────────────────────────────────────────────────
+    ctx3 = ctx2 + [(f"TP: {tp_price:.2f}", C_BTD_BUY, curses.A_BOLD)]
+    sp_str = _inp("Position Size", "Phemex size (contracts):", "1", ctx3)
+    if sp_str is None: stdscr.nodelay(True); return None
+    try: sp = float(sp_str)
+    except: sp = 1.0
+
+    sx_str = _inp("Position Size", "XLTRADE size (lots):", "0.01",
+                  ctx3 + [(f"Phemex: {sp}", C_LABEL, curses.A_NORMAL)])
+    if sx_str is None: stdscr.nodelay(True); return None
+    try: sx = float(sx_str)
+    except: sx = 0.01
+
+    # ── Step 6: Confirm ───────────────────────────────────────────────────────
+    cmd_parts = [side, "market" if not is_limit else "limit"]
+    if is_limit:
+        cmd_parts += ["-p", str(limit_price)]
+    cmd_parts += ["-sp", str(sp), "-sx", str(sx), "-tp", str(tp_price)]
+    cmd_str = "python copycat.py " + " ".join(cmd_parts)
+
+    # Show full order summary with the confirm menu underneath
+    confirm_lines = [
+        (f"  Order:   {order_type}", C_LABEL, curses.A_BOLD),
+        (f"  Entry:   {'MARKET' if not is_limit else f'{limit_price:.2f} (limit)'}",
+         C_LABEL, curses.A_NORMAL),
+        (f"  SL:      {sl_price:.2f}", C_BTD_SELL, curses.A_BOLD),
+        (f"  TP:      {tp_price:.2f}", C_BTD_BUY, curses.A_BOLD),
+        (f"  Phemex:  {sp} contracts", C_LABEL, curses.A_NORMAL),
+        (f"  XLTRADE: {sx} lots", C_LABEL, curses.A_NORMAL),
+        ("", C_LABEL, curses.A_NORMAL),
+        (f"  cmd: {cmd_str[:box_w-8]}", C_AXIS, curses.A_DIM),
+        (f"       {cmd_str[box_w-8:box_w*2-14]}", C_AXIS, curses.A_DIM),
+        ("", C_LABEL, curses.A_NORMAL),
+    ]
+
+    # Custom confirm step: draw summary then ask
+    _draw_box("Confirm Order", confirm_lines)
+    # Draw the two choices below the summary
+    _choice = 0
+    while True:
+        for _ci, _opt in enumerate(["✓ SUBMIT", "✗ Cancel"]):
+            _attr = curses.color_pair(C_ASSET_SEL) | curses.A_BOLD if _ci == _choice                     else curses.color_pair(C_CURSOR)
+            try:
+                stdscr.addstr(box_y + 2 + len(confirm_lines) + _ci,
+                              box_x + 4,
+                              f"{'>' if _ci==_choice else ' '} {_opt}",
+                              _attr)
+            except curses.error:
+                pass
+        stdscr.refresh()
+        _k = stdscr.getch()
+        if _k == 27: stdscr.nodelay(True); return None
+        if _k == curses.KEY_UP: _choice = (_choice - 1) % 2
+        elif _k == curses.KEY_DOWN: _choice = (_choice + 1) % 2
+        elif _k in (10, 13): break
+
+    if _choice == 1:
+        stdscr.nodelay(True); return None
+
+    _draw_box("Submitting...", confirm_lines)
+    stdscr.refresh()
+
+    # ── Submit via copycat ────────────────────────────────────────────────────
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    copycat_py = os.path.join(script_dir, "copycat.py")
+    full_cmd = ["python", copycat_py] + cmd_parts
+
+    try:
+        proc = subprocess.Popen(full_cmd, cwd=script_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=30)
+        ok = proc.returncode == 0
+    except Exception as _e:
+        ok = False
+        err = str(_e).encode()
+
+    if not ok:
+        err_text = err.decode(errors="replace").strip()
+        err_lines = []
+        for _chunk in [err_text[j:j+box_w-6] for j in range(0, max(1,len(err_text)), box_w-6)]:
+            err_lines.append((_chunk, C_BTD_SELL, curses.A_BOLD))
+        err_lines = err_lines[:8]  # max 8 lines
+        if not err_lines:
+            err_lines = [("copycat.py not found or failed — check path", C_BTD_SELL, curses.A_BOLD)]
+        _draw_box("Error — press any key", err_lines)
+        stdscr.getch()
+        stdscr.nodelay(True)
+        return None
+
+    stdscr.nodelay(True)
+    return {
+        "side":         side,
+        "order_type":   order_type,
+        "entry":        entry,
+        "sl":           sl_price,
+        "tp":           tp_price,
+        "size_phemex":  sp,
+        "size_xl":      sx,
+        "limit_price":  limit_price,
+        "status":       "active",
+    }
+
+
+# ── Draw active trade lines ────────────────────────────────────────────────────
+def draw_trade_lines(db, chart_top, chart_bot, chart_r, p2r, trade_lines):
+    """
+    Draw entry, SL, TP horizontal lines for all active trades.
+    Long = green entry/TP, Short = red entry/TP.  SL always red.
+    """
+    for tl in trade_lines:
+        if tl.get("status") not in ("active", "pending"):
+            continue
+        side    = tl["side"]
+        entry   = tl["entry"]
+        sl      = tl["sl"]
+        tp      = tl["tp"]
+        clr     = C_BTD_BUY if side == "buy" else C_BTD_SELL
+        side_lbl= "LONG" if side == "buy" else "SHORT"
+
+        def _row(price):
+            return max(chart_top, min(chart_bot - 1, chart_top + p2r(price)))
+
+        row_e = _row(entry)
+        row_sl= _row(sl)
+        row_tp= _row(tp)
+
+        for col in range(chart_r):
+            if chart_top <= row_e < chart_bot:
+                db.put(row_e,  col, "-", clr,       curses.A_BOLD)
+            if chart_top <= row_sl < chart_bot:
+                db.put(row_sl, col, "-", C_BTD_SELL, curses.A_BOLD)
+            if chart_top <= row_tp < chart_bot:
+                db.put(row_tp, col, "-", clr,       curses.A_BOLD)
+
+        # Labels on right axis
+        lbl_col = max(0, chart_r - 20)
+        if chart_top <= row_tp < chart_bot:
+            db.puts(row_tp, lbl_col, f" TP {tp:.2f}", clr, curses.A_BOLD | curses.A_REVERSE)
+        if chart_top <= row_e < chart_bot:
+            db.puts(row_e, lbl_col,
+                    f" {side_lbl} {entry:.2f}", clr, curses.A_BOLD | curses.A_REVERSE)
+        if chart_top <= row_sl < chart_bot:
+            db.puts(row_sl, lbl_col,
+                    f" SL {sl:.2f}", C_BTD_SELL, curses.A_BOLD | curses.A_REVERSE)
+
+
+# ── Trade monitor thread ───────────────────────────────────────────────────────
+def trade_monitor_loop():
+    """
+    Polls Phemex account positions every 3s.
+    Updates state.trade_lines: adjusts entry/SL/TP from live account data,
+    removes lines for closed/cancelled positions.
+    """
+    while True:
+        time.sleep(3)
+        with state.lock:
+            if not state.trade_lines:
+                continue
+            lines = list(state.trade_lines)
+
+        try:
+            # Fetch open positions from Phemex
+            path_  = "/g-accounts/accountPositions"
+            query_ = "currency=USDT"
+            hdrs_  = _phemex_headers(path_, query_)
+            r = requests.get(f"{PHEMEX_REST_URL}{path_}?{query_}",
+                             headers=hdrs_, timeout=8)
+            data   = r.json()
+            pos    = data.get("data", {}).get("positions", [])
+            # Build lookup: symbol → position info
+            pos_map = {p["symbol"]: p for p in pos if p.get("size", 0) != 0}
+
+            # Also fetch open orders for limit price confirmation
+            opath_  = "/orders/activeList"
+            oquery_ = "symbol=ETHUSDT&currency=USDT"
+            for asset_sym in (PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT"),):
+                oquery_ = f"symbol={asset_sym}"
+            ohdrs_  = _phemex_headers(opath_, oquery_)
+            or_    = requests.get(f"{PHEMEX_REST_URL}{opath_}?{oquery_}",
+                                  headers=ohdrs_, timeout=8)
+            odata_ = or_.json()
+            orders = odata_.get("data", {}).get("rows", [])
+
+        except Exception:
+            continue
+
+        sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
+        pos_info = pos_map.get(sym)
+
+        updated = []
+        for tl in lines:
+            if tl.get("status") == "cancelled":
+                continue  # drop cancelled
+            if pos_info:
+                # Update entry from avgEntryPrice, SL/TP from position fields
+                avg_e  = float(pos_info.get("avgEntryPriceRp", tl["entry"]) or tl["entry"])
+                sl_p   = float(pos_info.get("stopLossPriceRp",  tl["sl"])   or tl["sl"])
+                tp_p   = float(pos_info.get("takeProfitPriceRp",tl["tp"])   or tl["tp"])
+                size_p = float(pos_info.get("size", 0))
+                if size_p == 0:
+                    tl["status"] = "closed"
+                    continue  # position closed — remove line
+                tl["entry"]  = avg_e if avg_e > 0 else tl["entry"]
+                tl["sl"]     = sl_p  if sl_p  > 0 else tl["sl"]
+                tl["tp"]     = tp_p  if tp_p  > 0 else tl["tp"]
+                tl["status"] = "active"
+            updated.append(tl)
+
+        with state.lock:
+            state.trade_lines = updated
 
 
 # ── Alert system ──────────────────────────────────────────────────────────────
 ALERT_CONDITIONS = [
-    ("price_cross_up",   "Price crosses up"),
-    ("price_cross_down", "Price crosses down"),
-    ("price_above",      "Price above"),
-    ("price_below",      "Price below"),
+    ("price_cross_up",   "Price crosses UP through value"),
+    ("price_cross_down", "Price crosses DOWN through value"),
 ]
 
-def alert_create_dialog(stdscr, rows: int, cols: int) -> dict | None:
-    """
-    Interactive dialog to create a new alert.
-    Returns alert dict or None if cancelled.
-    """
-    curses.curs_set(1);  curses.echo();  stdscr.nodelay(False)
+def _input_field(stdscr, row, col, width, default=""):
+    """Collect a single line of input directly via stdscr. Returns string or None on Esc."""
+    buf = list(default)
+    curses.curs_set(1)
+    while True:
+        display = "".join(buf)[-width:]
+        try:
+            stdscr.addstr(row, col, display.ljust(width)[:width],
+                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            stdscr.move(row, col + min(len(buf), width - 1))
+        except curses.error:
+            pass
+        stdscr.refresh()
+        try:
+            ch = stdscr.get_wch()
+        except Exception:
+            continue
+        code = ord(ch) if isinstance(ch, str) else ch
+        if code == 27:
+            curses.curs_set(0)
+            return None
+        if code in (10, 13, curses.KEY_ENTER):
+            curses.curs_set(0)
+            return "".join(buf).strip()
+        if code in (curses.KEY_BACKSPACE, 127, 8) and buf:
+            buf.pop()
+        elif 32 <= code <= 126 and len(buf) < width - 1:
+            buf.append(chr(code))
 
-    box_w = min(cols - 4, 60)
-    box_h = 14
-    box_y = rows // 2 - box_h // 2
+
+def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
+    """Create alert dialog using the same safe pattern as jump_to_dialog."""
+    stdscr.nodelay(False)
+    curses.curs_set(0)
+
+    box_w = min(cols - 4, 62)
+    box_h = 16
+    box_y = max(0, rows // 2 - box_h // 2)
     box_x = max(0, cols // 2 - box_w // 2)
 
-    def _box_clear():
+    def draw_box(cond_idx, step, snd):
         for r in range(box_h):
-            stdscr.addstr(box_y + r, box_x, " " * box_w,
-                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
-
-    def _prompt(row, label, default=""):
-        stdscr.addstr(box_y + row, box_x + 1, f"{label:<20}",
-                      curses.color_pair(C_LABEL) | curses.A_BOLD)
-        stdscr.addstr(box_y + row, box_x + 22, " " * (box_w - 23),
-                      curses.color_pair(C_CURSOR))
-        stdscr.move(box_y + row, box_x + 22)
-        stdscr.refresh()
-        buf = []
-        while True:
-            try: ch = stdscr.get_wch()
-            except: break
-            code = ord(ch) if isinstance(ch, str) else ch
-            if code in (10, 13): break
-            if code == 27: return None
-            if code in (curses.KEY_BACKSPACE, 127, 8):
-                if buf: buf.pop()
-                stdscr.addstr(box_y + row, box_x + 22,
-                              "".join(buf).ljust(box_w - 23)[:box_w - 23],
-                              curses.color_pair(C_CURSOR))
-                stdscr.move(box_y + row, box_x + 22 + len(buf))
-            elif 32 <= code <= 126 and len(buf) < box_w - 24:
-                buf.append(chr(code))
-                stdscr.addch(box_y + row, box_x + 22 + len(buf) - 1,
-                             chr(code), curses.color_pair(C_CURSOR))
-            stdscr.refresh()
-        return "".join(buf).strip() or default
-
-    _box_clear()
-    stdscr.addstr(box_y, box_x,
-                  " Create Alert ".center(box_w),
-                  curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
-
-    # Condition selector
-    stdscr.addstr(box_y + 2, box_x + 1, "Condition:",
-                  curses.color_pair(C_LABEL) | curses.A_BOLD)
-    cond_idx = 0
-    while True:
+            try:
+                stdscr.addstr(box_y + r, box_x, " " * box_w,
+                              curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(box_y, box_x,
+                          " Create Alert ".center(box_w),
+                          curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+        except curses.error:
+            pass
         for ci, (_, clabel) in enumerate(ALERT_CONDITIONS):
             attr = (curses.color_pair(C_ASSET_SEL) | curses.A_BOLD
                     if ci == cond_idx else curses.color_pair(C_CURSOR))
-            stdscr.addstr(box_y + 3 + ci, box_x + 3,
-                          f"{'>' if ci == cond_idx else ' '} {clabel:<30}", attr)
+            marker = ">" if ci == cond_idx else " "
+            try:
+                stdscr.addstr(box_y + 2 + ci, box_x + 2,
+                              f"{marker} {clabel:<40}"[:box_w - 3], attr)
+            except curses.error:
+                pass
+        hints = {
+            0: "  [↑↓] Select condition   [Enter] next   [Esc] cancel",
+            1: "  Enter price value   [Enter] next   [Esc] cancel",
+            2: "  Enter alert name    [Enter] next   [Esc] cancel",
+            3: "  Enter message       [Enter] next   [Esc] cancel",
+            4: "  [←→] toggle sound   [Enter] confirm   [Esc] cancel",
+        }
+        try:
+            stdscr.addstr(box_y + box_h - 1, box_x + 1,
+                          hints.get(step, "")[:box_w - 2],
+                          curses.color_pair(C_AXIS) | curses.A_DIM)
+        except curses.error:
+            pass
         stdscr.refresh()
-        try: k = stdscr.get_wch()
-        except: break
-        kc = ord(k) if isinstance(k, str) else k
-        if kc == curses.KEY_UP:    cond_idx = (cond_idx - 1) % len(ALERT_CONDITIONS)
-        elif kc == curses.KEY_DOWN: cond_idx = (cond_idx + 1) % len(ALERT_CONDITIONS)
-        elif kc in (10, 13):        break
-        elif kc == 27:
-            curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
-            return None
 
-    cond_type = ALERT_CONDITIONS[cond_idx][0]
-    _box_clear()
-    stdscr.addstr(box_y, box_x,
-                  " Create Alert ".center(box_w),
-                  curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
-    stdscr.addstr(box_y + 1, box_x + 1,
-                  f"Condition: {ALERT_CONDITIONS[cond_idx][1]}",
-                  curses.color_pair(C_LABEL) | curses.A_BOLD)
-
-    val_str = _prompt(3, "Value (price):", str(round(state.last_price, 2)))
-    if val_str is None:
-        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
-        return None
-    try:    val = float(val_str)
-    except: val = state.last_price
-
-    name = _prompt(5, "Alert name:", f"Alert @ {val_str}")
-    if name is None:
-        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
-        return None
-
-    msg = _prompt(7, "Message:", f"{ALERT_CONDITIONS[cond_idx][1]} {val_str}")
-    if msg is None:
-        curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
-        return None
-
-    # Sound toggle
-    snd = True
+    # Pre-fill from existing alert if editing
+    _prefill_cond  = 0
+    _prefill_val   = str(round(state.last_price, 2))
+    _prefill_name  = ""
+    _prefill_msg   = ""
+    _prefill_snd   = True
+    if existing:
+        _ec = existing.get("conditions", [{}])[0]
+        _et = _ec.get("type", "")
+        _prefill_cond = next((i for i,(t,_) in enumerate(ALERT_CONDITIONS) if t==_et), 0)
+        _prefill_val  = str(_ec.get("value", round(state.last_price,2)))
+        _prefill_name = existing.get("name", "")
+        _prefill_msg  = existing.get("message", "")
+        _prefill_snd  = existing.get("sound", True)
+    # Step 0: choose condition
+    cond_idx = _prefill_cond
     while True:
-        stdscr.addstr(box_y + 9, box_x + 1,
-                      f"Sound alert: {'[ON] ' if snd else '     '} ON  {'     ' if snd else '[OFF]'} OFF",
-                      curses.color_pair(C_CURSOR) | curses.A_BOLD)
-        stdscr.addstr(box_y + 11, box_x + 1,
-                      "  ← → toggle    Enter confirm    Esc cancel  ",
-                      curses.color_pair(C_AXIS) | curses.A_DIM)
-        stdscr.refresh()
-        try: k = stdscr.get_wch()
-        except: break
+        draw_box(cond_idx, 0, True)
+        try:
+            k = stdscr.get_wch()
+        except Exception:
+            continue
         kc = ord(k) if isinstance(k, str) else k
-        if kc in (curses.KEY_LEFT, curses.KEY_RIGHT): snd = not snd
-        elif kc in (10, 13): break
-        elif kc == 27:
-            curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+        if kc == 27:
+            stdscr.nodelay(True)
             return None
+        if kc == curses.KEY_UP:
+            cond_idx = (cond_idx - 1) % len(ALERT_CONDITIONS)
+        elif kc == curses.KEY_DOWN:
+            cond_idx = (cond_idx + 1) % len(ALERT_CONDITIONS)
+        elif kc in (10, 13):
+            break
 
-    curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+    cond_type, cond_label = ALERT_CONDITIONS[cond_idx]
+
+    # Step 1-4: text fields
+    draw_box(cond_idx, 1, True)
+    try:
+        stdscr.addstr(box_y + 8, box_x + 2,
+                      f"Condition: {cond_label}",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+        stdscr.addstr(box_y + 9, box_x + 2, "Price value: ",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+    except curses.error:
+        pass
+    val_str = _input_field(stdscr, box_y + 9, box_x + 15, 20, _prefill_val)
+    if val_str is None:
+        stdscr.nodelay(True)
+        return None
+    try:
+        val = float(val_str)
+    except ValueError:
+        val = state.last_price
+
+    try:
+        stdscr.addstr(box_y + 10, box_x + 2, "Alert name:  ",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+    except curses.error:
+        pass
+    name = _input_field(stdscr, box_y + 10, box_x + 15,
+                        30, _prefill_name or f"Alert @ {val_str}")
+    if name is None:
+        stdscr.nodelay(True)
+        return None
+
+    try:
+        stdscr.addstr(box_y + 11, box_x + 2, "Message:     ",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+    except curses.error:
+        pass
+    msg = _input_field(stdscr, box_y + 11, box_x + 15,
+                       40, _prefill_msg or f"{cond_label} {val_str}")
+    if msg is None:
+        stdscr.nodelay(True)
+        return None
+
+    # Step 4: sound toggle
+    snd = _prefill_snd
+    while True:
+        draw_box(cond_idx, 4, snd)
+        snd_str = f"  Sound: {'[ON ]' if snd else '[OFF]'}   ← → toggle"
+        try:
+            stdscr.addstr(box_y + 12, box_x + 2, snd_str,
+                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        try:
+            k = stdscr.get_wch()
+        except Exception:
+            continue
+        kc = ord(k) if isinstance(k, str) else k
+        if kc == 27:
+            stdscr.nodelay(True)
+            return None
+        if kc in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            snd = not snd
+        elif kc in (10, 13):
+            break
+
+    stdscr.nodelay(True)
     return {
-        "name":      name or f"Alert @ {val}",
-        "conditions": [{"type": cond_type, "value": val}],
-        "message":   msg or f"Price {cond_type} {val}",
-        "active":    True,
-        "sound":     snd,
+        "name":        name or f"Alert @ {val}",
+        "conditions":  [{"type": cond_type, "value": val}],
+        "message":     msg or f"{cond_label} {val}",
+        "active":      True,
+        "sound":       snd,
         "_last_state": False,
     }
 
 
 def alert_list_dialog(stdscr, rows: int, cols: int):
-    """Show list of active alerts with delete option."""
+    """Show list of active + triggered alerts. [N] new, [D] delete, [Esc] close."""
     stdscr.nodelay(False)
-    box_w = min(cols - 4, 64)
-    box_h = min(rows - 4, 22)
+    sel = 0
+
+    box_w = min(cols - 4, 66)
+    box_h = min(rows - 4, 24)
     box_y = rows // 2 - box_h // 2
     box_x = max(0, cols // 2 - box_w // 2)
-    sel   = 0
 
     while True:
         with state.lock:
             _alts = list(state.alerts)
-            _trig = list(state.alert_triggered)
-
+    
         for r in range(box_h):
-            stdscr.addstr(box_y + r, box_x, " " * box_w,
-                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            try:
+                stdscr.addstr(box_y + r, box_x, " " * box_w,
+                              curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(box_y, box_x,
+                          " Alert List — [D] delete  [N] new  [Esc] close ".center(box_w),
+                          curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+            stdscr.addstr(box_y + 1, box_x + 1, "ACTIVE ALERTS:",
+                          curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error:
+            pass
 
-        stdscr.addstr(box_y, box_x,
-                      " Alert List — [D] delete  [N] new  [Esc] close ".center(box_w),
-                      curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
-
-        # Active alerts
-        stdscr.addstr(box_y + 1, box_x + 1, "ACTIVE ALERTS:",
-                      curses.color_pair(C_LABEL) | curses.A_BOLD)
-        for ai, alt in enumerate(_alts[:8]):
+        for ai, alt in enumerate(_alts[:9]):
             ctype = alt["conditions"][0]["type"] if alt["conditions"] else ""
             val   = alt["conditions"][0]["value"] if alt["conditions"] else 0
-            lbl   = f"{'>' if ai == sel else ' '} {alt['name'][:28]:<28}  {ctype}  {val}"
+            snd   = "♪" if alt.get("sound") else " "
+            lbl   = f"{'>' if ai == sel else ' '} {snd} {alt['name'][:24]:<24} {ctype} {val}"
             attr  = (curses.color_pair(C_ASSET_SEL) | curses.A_BOLD
                      if ai == sel else curses.color_pair(C_CURSOR))
-            stdscr.addstr(box_y + 2 + ai, box_x + 1, lbl[:box_w - 2], attr)
+            try:
+                stdscr.addstr(box_y + 2 + ai, box_x + 1, lbl[:box_w - 2], attr)
+            except curses.error:
+                pass
 
         if not _alts:
-            stdscr.addstr(box_y + 2, box_x + 3, "No active alerts. Press [N] to create one.",
-                          curses.color_pair(C_AXIS) | curses.A_DIM)
+            try:
+                stdscr.addstr(box_y + 2, box_x + 3,
+                              "No active alerts — press [N] to create one",
+                              curses.color_pair(C_AXIS) | curses.A_DIM)
+            except curses.error:
+                pass
 
-        # Triggered history
-        stdscr.addstr(box_y + 11, box_x + 1, "TRIGGERED HISTORY:",
-                      curses.color_pair(C_LABEL) | curses.A_BOLD)
-        for ti, trig in enumerate(_trig[:8]):
-            lbl = f"  {trig['time']}  {trig['name'][:28]}  {trig['message'][:16]}"
-            stdscr.addstr(box_y + 12 + ti, box_x + 1, lbl[:box_w - 2],
-                          curses.color_pair(C_VWAP_SD2))
+        try:
+            stdscr.addstr(box_y + 12, box_x + 1, "TRIGGERED HISTORY:",
+                          curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error:
+            pass
+        for ti, trig in enumerate(_trig[:9]):
+            lbl = f"  {trig['time']}  {trig['name'][:22]}  {trig['message'][:18]}"
+            try:
+                stdscr.addstr(box_y + 13 + ti, box_x + 1,
+                              lbl[:box_w - 2],
+                              curses.color_pair(C_VWAP_SD2))
+            except curses.error:
+                pass
 
         stdscr.refresh()
-        try: k = stdscr.getch()
-        except: break
-        if k == 27 or k in (ord("a"), ord("A")): break
-        elif k == curses.KEY_UP:   sel = max(0, sel - 1)
-        elif k == curses.KEY_DOWN: sel = min(max(0, len(_alts) - 1), sel + 1)
+        try:
+            k = stdscr.getch()
+        except Exception:
+            break
+        if k in (27, ord("a"), ord("A")):
+            break
+        elif k == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif k == curses.KEY_DOWN:
+            sel = min(max(0, len(_alts) - 1), sel + 1)
         elif k in (ord("d"), ord("D")):
             if 0 <= sel < len(_alts):
                 with state.lock:
@@ -2840,14 +3277,148 @@ def alert_list_dialog(stdscr, rows: int, cols: int):
                         state.alerts.pop(sel)
                 sel = max(0, sel - 1)
         elif k in (ord("n"), ord("N")):
-            stdscr.nodelay(True)
             new_alt = alert_create_dialog(stdscr, rows, cols)
-            stdscr.nodelay(False)
             if new_alt:
                 with state.lock:
                     state.alerts.append(new_alt)
+            # Re-enter blocking mode for list
+            stdscr.nodelay(False)
 
     stdscr.nodelay(True)
+
+
+# ── Non-blocking alert list overlay ──────────────────────────────────────────
+def draw_alert_list_overlay(db, rows, cols, sel):
+    """Render alert list into double-buffer (chart stays live behind it)."""
+    with state.lock:
+        _alts = list(state.alerts)
+
+    box_w = min(cols - 4, 68)
+    box_h = min(rows - 4, 26)
+    box_y = rows // 2 - box_h // 2
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    # Background
+    for r in range(box_h):
+        for c in range(box_w):
+            db.put(box_y + r, box_x + c, " ", C_HEADER)
+
+    # Title
+    title = " Alert List   [N] new  [D] delete  [E] edit  [↑↓] select  [A] close "
+    db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
+            curses.A_BOLD | curses.A_REVERSE)
+
+    db.puts(box_y + 1, box_x + 1, "ACTIVE ALERTS:", C_LABEL, curses.A_BOLD)
+    for ai, alt in enumerate(_alts[:9]):
+        ctype = alt["conditions"][0]["type"] if alt["conditions"] else ""
+        val   = alt["conditions"][0].get("value", 0) if alt["conditions"] else 0
+        snd   = "*" if alt.get("sound") else " "
+        lbl   = f"{'>' if ai == sel else ' '} {snd} {alt['name'][:24]:<24} {ctype:<20} @ {val}"
+        pair  = C_ASSET_SEL if ai == sel else C_HEADER
+        attrs = curses.A_BOLD if ai == sel else curses.A_NORMAL
+        db.puts(box_y + 2 + ai, box_x + 1, lbl[:box_w - 2], pair, attrs)
+
+    if not _alts:
+        db.puts(box_y + 2, box_x + 3,
+                "No active alerts — press [N] to create one", C_AXIS, curses.A_DIM)
+
+
+
+
+# ── Economic calendar overlay ─────────────────────────────────────────────────
+def draw_econ_cal_overlay(db, rows, cols, events, loading, impact_filter=None):
+    """Render econ calendar into double-buffer with impact filter checklist."""
+    if impact_filter is None:
+        impact_filter = {1, 2, 3}
+    now_ts = time.time()
+    now_dt = datetime.now()
+
+    box_w = min(cols - 2, 92)
+    box_h = min(rows - 2, 32)
+    box_y = max(0, rows // 2 - box_h // 2)
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    for r in range(box_h):
+        for c in range(box_w):
+            db.put(box_y + r, box_x + c, " ", C_HEADER)
+
+    now_str = now_dt.strftime("%H:%M CT")
+    title   = f" Economic Calendar — US Events  [{now_str}]  [K] close  [R] refresh  [P] screenshot "
+    db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
+            curses.A_BOLD | curses.A_REVERSE)
+
+    # Filter checklist — [1]/[2]/[3] toggle each tier
+    f1 = "[x]" if 1 in impact_filter else "[ ]"
+    f2 = "[x]" if 2 in impact_filter else "[ ]"
+    f3 = "[x]" if 3 in impact_filter else "[ ]"
+    filter_line = (f"  Impact filter:  {f1} *  [1]    {f2} **  [2]    {f3} ***  [3]"
+                   "    (toggle with number keys)")
+    db.puts(box_y + 1, box_x, filter_line[:box_w], C_LABEL, curses.A_BOLD)
+
+    if loading:
+        db.puts(box_y + box_h // 2, box_x + box_w // 2 - 10,
+                "Loading calendar...", C_AXIS, curses.A_BOLD)
+        return
+
+    # Apply filter
+    def _imp_count(ev):
+        imp = ev.get("impact", 1)
+        if isinstance(imp, int):
+            return imp
+        return imp.count("★") or 1
+    filtered = [ev for ev in events if _imp_count(ev) in impact_filter]
+
+    if not filtered:
+        msg = "No matching events — adjust filter with [1][2][3]" if events else "No events — press [R] to refresh"
+        db.puts(box_y + box_h // 2, box_x + box_w // 2 - len(msg) // 2,
+                msg, C_AXIS, curses.A_BOLD)
+        return
+
+    # Header row
+    hdr = f" {'Time':<7} {'Imp':<5} {'Event':<44} {'Actual':<10} {'Fcst':<10} {'Prev':<8}"
+    db.puts(box_y + 2, box_x, hdr[:box_w], C_LABEL, curses.A_BOLD)
+
+    # Find next upcoming event (from filtered list)
+    next_event = next((ev for ev in filtered if ev.get("ts", 0) > now_ts), None)
+
+    # Countdown line
+    if next_event:
+        secs_until = max(0, int(next_event["ts"] - now_ts))
+        mins, secs = divmod(secs_until, 60)
+        hrs,  mins = divmod(mins, 60)
+        cd_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs else f"{mins:02d}:{secs:02d}"
+        cd_lbl = f" ▶ Next: {next_event['name'][:32]}  in {cd_str}"
+        db.puts(box_y + 3, box_x, cd_lbl[:box_w], C_ALERT, curses.A_BOLD)
+
+    # Event rows start at row 4
+    row_offset = 4
+    for ev in filtered:
+        if row_offset >= box_h - 1:
+            break
+        ev_ts     = ev.get("ts", 0)
+        ev_time   = ev.get("time", "")
+        ev_name   = ev.get("name", "")[:42]
+        ev_actual = ev.get("actual", "")
+        ev_fcst   = ev.get("forecast", "")
+        ev_prev   = ev.get("previous", "")
+        imp_n     = _imp_count(ev)
+        imp_str   = ("***" if imp_n >= 3 else "** " if imp_n == 2 else "*  ")
+
+        # Color coding
+        if ev_ts > 0 and ev_ts < now_ts:
+            pair, attrs = C_AXIS, curses.A_DIM
+        elif ev == next_event:
+            pair, attrs = C_ALERT, curses.A_BOLD
+        elif imp_n >= 3:
+            pair, attrs = C_BTD_SELL, curses.A_BOLD   # high impact = red
+        elif imp_n == 2:
+            pair, attrs = C_VWAP_SD2, curses.A_NORMAL  # medium = yellow
+        else:
+            pair, attrs = C_LABEL, curses.A_NORMAL
+
+        lbl = f" {ev_time:<7} {imp_str:<5} {ev_name:<44} {ev_actual:<10} {ev_fcst:<10} {ev_prev:<8}"
+        db.puts(box_y + row_offset, box_x, lbl[:box_w], pair, attrs)
+        row_offset += 1
 
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [
@@ -2883,8 +3454,26 @@ HELP_SECTIONS = [
         ("pPOC/pVAH/pVAL", "Previous session levels — extend as virgin lines"),
         ("S",          "Period separator  (19:00 CT session open)"),
     ]),
+    ("SESSIONS & ALERTS", [
+        ("[S]",        "Toggle Sessions indicator (NDO/Morning/Excl/Lunch/PWR/EOD)"),
+        ("[A]",        "Open/close Alert list overlay (chart stays live)"),
+        ("[N]",        "New alert (only when alert list is open)"),
+        ("[D]",        "Delete selected alert (only when alert list is open)"),
+        ("[↑][↓]",     "Navigate alert list selection"),
+        ("[Esc]",      "Close alert list / calendar / dismiss popup"),
+    ]),
+    ("ECONOMIC CALENDAR", [
+        ("[K]",        "Open/close Economic Calendar  (US events, CT times)"),
+        ("[R]",        "Refresh calendar data (when calendar is open)"),
+    ]),
+    ("GLOBAL / MACRO MODE", [
+        ("[M]",        "Toggle Global performance chart (all 8 assets vs BTC baseline)"),
+        ("[R]",        "Refresh global data (when in global mode)"),
+        ("[P]",        "Screenshot in global mode"),
+    ]),
     ("UTILITIES", [
         ("[P]",        "Screenshot → screenshots/quantasset_YYYYMMDD_HHMMSS.txt"),
+        ("[G]",        "Jump to date/time  (opens input box, YYYY-MM-DD HH:MM or HH:MM)"),
         ("[H] / [?]",  "Toggle this help box"),
         ("[Q]",        "Quit ChartHacker"),
     ]),
@@ -2944,6 +3533,291 @@ def draw_help_overlay(db: "DoubleBuffer", rows: int, cols: int):
         for ci, ch in enumerate(text):
             db.put(row, box_x + 1 + ci, ch, pair, attrs)
 
+
+# ── Alert monitor (background thread) ────────────────────────────────────────
+def alert_monitor():
+    """
+    Polls state.last_price every 100ms and evaluates all active alerts.
+    Runs entirely on live state objects (not draw snapshots) so:
+    - _last_state persists correctly between evaluations
+    - alerts trigger the instant price crosses, not on candle close
+    - sound fires immediately via terminal bell
+    """
+    _prev_price = 0.0
+    while True:
+        time.sleep(0.1)
+        with state.lock:
+            _cur  = state.last_price
+            _alts = state.alerts
+
+        if _cur <= 0 or not _alts:
+            _prev_price = _cur
+            continue
+
+        _newly = []
+        for _alt in _alts:
+            if not _alt.get("active", True):
+                continue
+            _all_met = True
+            for _cond in _alt.get("conditions", []):
+                _ct  = _cond.get("type", "")
+                _cv  = float(_cond.get("value", 0.0))
+                if _ct == "price_above":
+                    _m = _cur > _cv
+                elif _ct == "price_below":
+                    _m = _cur < _cv
+                elif _ct == "price_cross_up":
+                    _m = (_prev_price > 0 and _prev_price <= _cv < _cur)
+                elif _ct == "price_cross_down":
+                    _m = (_prev_price > 0 and _prev_price >= _cv > _cur)
+                else:
+                    _m = False
+                if not _m:
+                    _all_met = False
+                    break
+
+            if _all_met and not _alt.get("_last_state", False):
+                _alt["_last_state"] = True
+                _newly.append(_alt)
+            elif not _all_met:
+                _alt["_last_state"] = False
+
+        if _newly:
+            with state.lock:
+                for _ta in _newly:
+                    state.alert_triggered.insert(0, {
+                        "name":    _ta.get("name", "Alert"),
+                        "message": _ta.get("message", "Condition met"),
+                        "time":    datetime.now().strftime("%H:%M:%S"),
+                    })
+                    # Fire once: remove alert from active list
+                    if _ta in state.alerts:
+                        state.alerts.remove(_ta)
+                state.alert_triggered = state.alert_triggered[:20]
+                state.show_alert_popup = True
+            # Sound alert — winsound on Windows, terminal bell on Unix
+            if any(a.get("sound", True) for a in _newly):
+                try:
+                    import winsound; winsound.Beep(880, 400)
+                except Exception:
+                    try:
+                        import sys, os; os.write(sys.stdout.fileno(), b"\a")
+                    except Exception:
+                        pass
+
+        _prev_price = _cur
+
+
+# ── Economic calendar fetcher ─────────────────────────────────────────────────
+def fetch_econ_calendar():
+    """
+    Fetch today's US economic events from Investing.com.
+    Uses their internal POST API returning JSON with embedded HTML.
+    Impact level read from 'data-img_key' attribute on the impact span
+    ('bull1'=*, 'bull2'=**, 'bull3'=***).
+    Actual/Forecast/Previous from td data attributes (data-actual etc).
+    Times are returned in CT (timeZone=15 = US/Central).
+    """
+    from html.parser import HTMLParser
+    import re as _re
+
+    today    = datetime.now()
+    date_str = today.strftime("%Y-%m-%d")
+
+    headers = {
+        "User-Agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/120.0.0.0 Safari/537.36"),
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer":          "https://www.investing.com/economic-calendar/",
+        "Origin":           "https://www.investing.com",
+        "Content-Type":     "application/x-www-form-urlencoded",
+        "Accept":           "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language":  "en-US,en;q=0.9",
+    }
+    payload = (
+        "country%5B%5D=5"
+        f"&dateFrom={date_str}&dateTo={date_str}"
+        "&timeZone=8&timeFilter=timeOnly&currentTab=today&limit_from=0"
+    )
+
+    try:
+        r    = requests.post(
+            "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData",
+            data=payload, headers=headers, timeout=15)
+        data = r.json()
+        html = data.get("data", "")
+        if not html:
+            return []
+
+        events = []
+
+        from urllib.parse import unquote as _uq
+
+        class _P(HTMLParser):
+            """
+            Parser for Investing.com economic calendar HTML.
+            Each event is a <tr class="js-event-item"> row.
+            Key attributes on the <tr>:
+              data-event-datetime  — UTC datetime string
+            Key <td> classes:
+              first col     → time display
+              event         → contains <a> with event name
+              sentimentix   → contains <i data-img_key="bull1/2/3"> for impact
+              bold/actual   → actual value (text content)
+              fore           → forecast
+              prev           → previous
+            Values may also appear in data-actual / data-forecast / data-previous
+            on the <td> element (URL-encoded).
+            """
+            def __init__(self):
+                super().__init__()
+                self._ev    = None
+                self._field = None
+                self._depth = 0   # td nesting
+
+            def handle_starttag(self, tag, attrs):
+                d   = dict(attrs)
+                cls = d.get("class", "")
+
+                if tag == "tr" and "js-event-item" in cls:
+                    self._ev = {
+                        "time":     d.get("data-event-datetime", ""),
+                        "name":     "",
+                        "impact":   1,
+                        "actual":   "",
+                        "forecast": "",
+                        "previous": "",
+                        "ts":       0,
+                    }
+                    self._field = None
+                    return
+
+                if self._ev is None:
+                    return
+
+                # Impact stars from <i data-img_key="bull1/2/3">
+                imgkey = d.get("data-img_key", "")
+                if imgkey.startswith("bull"):
+                    try: self._ev["impact"] = int(imgkey[-1])
+                    except: pass
+
+                if tag == "td":
+                    # Try data attributes first (URL-encoded)
+                    for _attr, _fld in [("data-actual",   "actual"),
+                                        ("data-forecast",  "forecast"),
+                                        ("data-previous",  "previous")]:
+                        _v = _uq(d.get(_attr, "")).strip().strip("\xa0")
+                        if _v and _v not in ("&nbsp;",):
+                            self._ev[_fld] = _v
+                    # Set field tag for text-content fallback
+                    cls_lower = cls.lower()
+                    if "first" in cls_lower or "js-time" in cls_lower:
+                        self._field = "time_td"
+                    elif "event" in cls_lower:
+                        self._field = "event"
+                    elif "actual" in cls_lower or "bold" in cls_lower:
+                        self._field = "actual"
+                    elif "fore" in cls_lower:
+                        self._field = "forecast"
+                    elif "prev" in cls_lower:
+                        self._field = "previous"
+                    else:
+                        self._field = None
+
+                if tag == "a" and self._field == "event":
+                    self._field = "event_a"
+
+            def handle_data(self, data):
+                data = data.strip().strip("\xa0")
+                if not data or self._ev is None:
+                    return
+                if self._field == "event_a":
+                    if not self._ev["name"]:
+                        self._ev["name"] = data
+                elif self._field == "event":
+                    if not self._ev["name"]:
+                        self._ev["name"] = data
+                elif self._field == "time_td":
+                    if not self._ev["time"] and _re.match(r"\d{1,2}:\d{2}", data):
+                        self._ev["time"] = data
+                elif self._field == "actual":
+                    if not self._ev["actual"]:
+                        self._ev["actual"] = data
+                elif self._field == "forecast":
+                    if not self._ev["forecast"]:
+                        self._ev["forecast"] = data
+                elif self._field == "previous":
+                    if not self._ev["previous"]:
+                        self._ev["previous"] = data
+
+            def handle_endtag(self, tag):
+                if self._ev is None:
+                    return
+                if tag == "a" and self._field == "event_a":
+                    self._field = "event"
+                if tag == "tr" and self._ev.get("name"):
+                    events.append(dict(self._ev))
+                    self._ev    = None
+                    self._field = None
+
+        _P().feed(html)
+
+        # Parse timestamps — data-event-datetime is in UTC ("YYYY/MM/DD HH:MM:SS")
+        # Convert to local time (which IS CT on the trading machine).
+        import calendar as _cal
+        for ev in events:
+            raw = ev.get("time", "")
+            # Try full datetime first
+            m_full = _re.search(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})", raw)
+            m_hm   = _re.search(r"(\d{1,2}):(\d{2})", raw)
+            if m_full:
+                import time as _t
+                yr,mo,dy = int(m_full.group(1)),int(m_full.group(2)),int(m_full.group(3))
+                h,mn,sc  = int(m_full.group(4)),int(m_full.group(5)),int(m_full.group(6))
+                # Build UTC timestamp then convert to local
+                import calendar
+                utc_ts = calendar.timegm((yr,mo,dy,h,mn,sc,0,0,0))
+                local_dt = datetime.fromtimestamp(utc_ts)
+                ev["ts"]   = utc_ts
+                ev["time"] = local_dt.strftime("%H:%M")
+            elif m_hm:
+                # Already local time (fallback)
+                h, mn = int(m_hm.group(1)), int(m_hm.group(2))
+                ev["ts"] = datetime(today.year, today.month, today.day,
+                                    h, mn, 0).timestamp()
+                ev["time"] = f"{h:02d}:{mn:02d}"
+
+        return sorted([e for e in events if e.get("name")],
+                      key=lambda x: x.get("ts", 0))
+
+    except Exception:
+        return []
+
+
+def load_econ_calendar():
+    """Background: fetch calendar and keep it refreshed every 60s while open."""
+    with state.lock:
+        state.econ_loading = True
+    events = fetch_econ_calendar()
+    with state.lock:
+        state.econ_events  = events
+        state.econ_loading = False
+    # Auto-refresh loop: re-fetch every 60s while calendar is open
+    while True:
+        for _ in range(60):
+            time.sleep(1)
+            with state.lock:
+                if not state.show_econ_cal:
+                    return
+        with state.lock:
+            if not state.show_econ_cal:
+                return
+        fresh = fetch_econ_calendar()
+        with state.lock:
+            state.econ_events = fresh
+
+
 # ── main loop ────────────────────────────────────────────────────────────────
 def main(stdscr):
     curses.curs_set(0)
@@ -2955,6 +3829,7 @@ def main(stdscr):
     db = DoubleBuffer(rows, cols)
 
     threading.Thread(target=start_feed, args=(state.asset,), daemon=True).start()
+    threading.Thread(target=alert_monitor, daemon=True).start()
 
     while True:
         # ── Drain all pending keypresses for smooth scrolling on Windows ──────
@@ -3012,6 +3887,81 @@ def main(stdscr):
                     state.show_btd = not state.show_btd
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("s"), ord("S")):
+                with state.lock:
+                    state.show_sessions = not state.show_sessions
+                db.prev = None
+                stdscr.clear()
+            elif key in (ord("x"), ord("X")):
+                # Open trade dialog
+                _trade = trade_dialog(stdscr, rows, cols)
+                if _trade:
+                    with state.lock:
+                        state.trade_lines.append(_trade)
+                        # Start monitor thread if not running
+                        if not state.trade_monitor:
+                            state.trade_monitor = True
+                            threading.Thread(target=trade_monitor_loop,
+                                             daemon=True).start()
+                db.prev = None; stdscr.clearok(True); stdscr.clear()
+            elif key in (ord("z"), ord("Z")):
+                # Clear all trade lines
+                with state.lock:
+                    state.trade_lines = []
+                db.prev = None; stdscr.clear()
+            elif key in (ord("a"), ord("A")):
+                with state.lock:
+                    state.show_alert_list = not state.show_alert_list
+            elif key in (ord("n"), ord("N")):
+                with state.lock:
+                    _al_open = state.show_alert_list
+                if _al_open:
+                    new_alt = alert_create_dialog(stdscr, rows, cols)
+                    if new_alt:
+                        with state.lock:
+                            state.alerts.append(new_alt)
+                    db.prev = None
+                    stdscr.clearok(True)
+                    stdscr.clear()
+            elif key in (ord("d"), ord("D")):
+                with state.lock:
+                    if state.show_alert_list and 0 <= state.alert_list_sel < len(state.alerts):
+                        _del_name = state.alerts[state.alert_list_sel].get("name","")
+                        state.alerts.pop(state.alert_list_sel)
+                        state.alert_list_sel = max(0, state.alert_list_sel - 1)
+                        # Clear related popup if no alerts remain
+                        if not state.alerts:
+                            state.alert_triggered = []
+                            state.show_alert_popup = False
+            elif key in (ord("e"), ord("E")):
+                with state.lock:
+                    _al_open = state.show_alert_list
+                    _sel = state.alert_list_sel
+                    _existing = state.alerts[_sel] if _al_open and 0 <= _sel < len(state.alerts) else None
+                if _existing:
+                    _edited = alert_create_dialog(stdscr, rows, cols, existing=_existing)
+                    if _edited:
+                        with state.lock:
+                            if 0 <= _sel < len(state.alerts):
+                                state.alerts[_sel] = _edited
+                    db.prev = None
+                    stdscr.clearok(True)
+                    stdscr.clear()
+            elif key in (ord("k"), ord("K")):
+                with state.lock:
+                    state.show_econ_cal = not state.show_econ_cal
+                    if state.show_econ_cal and not state.econ_events:
+                        threading.Thread(target=load_econ_calendar, daemon=True).start()
+            elif key in (ord("1"), ord("2"), ord("3")):
+                with state.lock:
+                    if state.show_econ_cal:
+                        _tier = key - ord("0")
+                        if _tier in state.econ_impact_filter:
+                            # Only remove if at least one tier remains
+                            if len(state.econ_impact_filter) > 1:
+                                state.econ_impact_filter.discard(_tier)
+                        else:
+                            state.econ_impact_filter.add(_tier)
             elif key in (ord("m"), ord("M")):
                 with state.lock:
                     state.global_mode = not state.global_mode
@@ -3023,12 +3973,14 @@ def main(stdscr):
                 db.prev = None
                 stdscr.clear()
             elif key in (ord("r"), ord("R")):
-                # Refresh global data if in global mode
                 with state.lock:
                     _in_global = state.global_mode
-                    _g_sess = state.session
+                    _in_econ   = state.show_econ_cal
+                    _g_sess    = state.session
                 if _in_global:
                     start_global(_g_sess)
+                elif _in_econ:
+                    threading.Thread(target=load_econ_calendar, daemon=True).start()
             elif key in (ord("h"), ord("H"), ord("?")):
                 with state.lock:
                     state.show_help = not state.show_help
@@ -3055,6 +4007,17 @@ def main(stdscr):
                 # Force full redraw after dialog closes
                 db.prev = None
                 stdscr.clear()
+            elif key == curses.KEY_UP:
+                with state.lock:
+                    if state.show_alert_list:
+                        state.alert_list_sel = max(0, state.alert_list_sel - 1)
+                    elif state.show_econ_cal:
+                        pass  # TODO: scroll econ cal
+            elif key == curses.KEY_DOWN:
+                with state.lock:
+                    if state.show_alert_list:
+                        n_a = len(state.alerts)
+                        state.alert_list_sel = min(max(0, n_a-1), state.alert_list_sel + 1)
             elif key in (curses.KEY_LEFT,
                           curses.KEY_SLEFT,   # Shift+Left (most terminals)
                           541, 545,            # Ctrl+Left (xterm / Windows)
@@ -3119,13 +4082,21 @@ def main(stdscr):
                                 state.view_offset    = 0
                             else:
                                 state.view_offset = new_vo
-            elif key == 27:  # Escape — close help / snap live / reset global pan
+            elif key == 27:  # Escape — close overlays or snap to live
                 with state.lock:
                     if state.show_help:
                         state.show_help = False
+                    elif state.show_econ_cal:
+                        state.show_econ_cal = False
                     else:
                         state.cursor_col_idx = -1
                         state.view_offset    = 0
+            elif key == ord("."):  # period — dismiss alert popup
+                with state.lock:
+                    if state.alert_triggered:
+                        state.alert_triggered.pop(0)
+                    if not state.alert_triggered:
+                        state.show_alert_popup = False
 
 
             if new_asset:

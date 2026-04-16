@@ -211,6 +211,7 @@ class ChartState:
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
         self.show_help    = False   # help overlay visible
+        self.help_scroll  = 0       # scroll offset in help overlay
         self.show_btd     = True    # Big Trade Detector overlay
         self.btd_lookback = 10      # lookback bars (matches TV default)
         self.btd_sigma    = 3.0     # sensitivity sigma (matches TV default)
@@ -226,10 +227,14 @@ class ChartState:
         self.econ_events      = []     # list of event dicts
         self.econ_loading     = False
         self.econ_impact_filter = {1, 2, 3}  # show * ** *** (all by default)
+        self.econ_date_range  = "today"  # yesterday/today/tomorrow/week
+        self.econ_scroll      = 0        # scroll offset in event list
         # Live trade lines drawn on chart
         # Each dict: {side, entry, sl, tp, size_phemex, size_xl, status}
         self.trade_lines    = []    # active/pending trade levels to draw
         self.trade_monitor  = False # True while trade monitor thread running
+        # Position tool: list of {entry,sl,tp,anchor_idx,side,active}
+        self.pos_tools = []
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -829,7 +834,7 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_PRICE_LINE, curses.COLOR_YELLOW, -1)
     curses.init_pair(C_CURSOR,    curses.COLOR_BLACK,  curses.COLOR_WHITE)
     curses.init_pair(C_LINE,      curses.COLOR_CYAN,   -1)
-    curses.init_pair(C_VP_NORM,   curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_VP_NORM,   curses.COLOR_YELLOW, -1)
     curses.init_pair(C_VP_POC,    curses.COLOR_YELLOW, -1)
     curses.init_pair(C_VP_VA,     curses.COLOR_MAGENTA,-1)
     # Global mode asset line colors
@@ -1174,6 +1179,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
         show_help         = state.show_help
+        help_scroll       = state.help_scroll
         show_btd          = state.show_btd
         btd_lookback      = state.btd_lookback
         btd_sigma         = state.btd_sigma
@@ -1186,7 +1192,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         econ_events       = list(state.econ_events)
         econ_loading      = state.econ_loading
         econ_filter       = set(state.econ_impact_filter)
+        econ_date_range   = state.econ_date_range
+        econ_scroll       = state.econ_scroll
         trade_lines       = list(state.trade_lines)
+        pos_tools         = list(state.pos_tools)
         global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
@@ -1336,6 +1345,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         db.puts(1, col + 1, _cur_sess_lbl, _cur_sess_pair,
                 curses.A_BOLD | curses.A_REVERSE)
         col += len(_cur_sess_lbl) + 2
+    else:
+        db.puts(1, col + 1, " NO SESSION ", C_SESS_EXCL,
+                curses.A_BOLD | curses.A_REVERSE)
+        col += 14
 
     db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [H]elp  [Q]uit", C_HEADER)
 
@@ -2256,17 +2269,45 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 C_AXIS, curses.A_DIM)
 
     # ── POSITION TOOLS ───────────────────────────────────────────────
+    if pos_tools:
+        draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
+                       all_candles, left_idx, n_vis, pos_tools)
+
+    # ── ALERT PRICE LINES ──────────────────────────────────────────
+    # Draw a horizontal line on chart for each active alert price,
+    # but only if no other indicator occupies that row.
+    with state.lock:
+        _alert_lines = list(state.alerts)
+    for _al in _alert_lines:
+        if not _al.get("active"):  continue
+        _conds = _al.get("conditions", [])
+        if not _conds:  continue
+        _av = float(_conds[0].get("value", 0))
+        if _av <= 0:  continue
+        _ar = chart_top + p2r(_av)
+        if not (chart_top <= _ar < chart_bot):  continue
+        # Draw dashed line only on empty/background cells
+        for _ac2 in range(0, chart_r, 2):
+            if db.buf[_ar][_ac2][0] in (" ", ".", ":"):  
+                db.put(_ar, _ac2, "-", C_ALERT, curses.A_DIM)
+        # Label at right axis (only if row is not already occupied)
+        _lbl_col = max(0, chart_r - 16)
+        if db.buf[_ar][_lbl_col][0] in (" ", "-", "."):
+            _al_lbl = f" A:{_av:.2f}"[:16]
+            db.puts(_ar, _lbl_col, _al_lbl, C_ALERT, curses.A_BOLD)
+
     # ── ALERT LIST OVERLAY ──────────────────────────────────────────
     if show_alert_list:
         draw_alert_list_overlay(db, rows, cols, alert_list_sel)
 
     # ── ECON CALENDAR OVERLAY ────────────────────────────────────────
     if show_econ_cal:
-        draw_econ_cal_overlay(db, rows, cols, econ_events, econ_loading, econ_filter)
+        draw_econ_cal_overlay(db, rows, cols, econ_events, econ_loading,
+                              econ_filter, econ_date_range, econ_scroll)
 
     # ── HELP OVERLAY (drawn last, on top of everything) ──────────────
     if show_help:
-        draw_help_overlay(db, rows, cols)
+        draw_help_overlay(db, rows, cols, help_scroll)
 
 
 # ── screenshot ────────────────────────────────────────────────────────────────
@@ -2806,7 +2847,8 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     cmd_parts = [side, "market" if not is_limit else "limit"]
     if is_limit:
         cmd_parts += ["-p", str(limit_price)]
-    cmd_parts += ["-sp", str(sp), "-sx", str(sx), "-tp", str(tp_price)]
+    cmd_parts += ["-sp", f"{float(sp):.2f}", "-sx", f"{float(sx):.2f}",
+                  "-tp", f"{float(tp_price):.2f}"]
     cmd_str = "python copycat.py " + " ".join(cmd_parts)
 
     # Show full order summary with the confirm menu underneath
@@ -2829,7 +2871,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     # Draw the two choices below the summary
     _choice = 0
     while True:
-        for _ci, _opt in enumerate(["✓ SUBMIT", "✗ Cancel"]):
+        for _ci, _opt in enumerate(["[Y] SUBMIT", "[N] Cancel"]):
             _attr = curses.color_pair(C_ASSET_SEL) | curses.A_BOLD if _ci == _choice                     else curses.color_pair(C_CURSOR)
             try:
                 stdscr.addstr(box_y + 2 + len(confirm_lines) + _ci,
@@ -2852,9 +2894,15 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     stdscr.refresh()
 
     # ── Submit via copycat ────────────────────────────────────────────────────
+    import sys as _sys
     script_dir = os.path.dirname(os.path.abspath(__file__))
     copycat_py = os.path.join(script_dir, "copycat.py")
-    full_cmd = ["python", copycat_py] + cmd_parts
+    if not os.path.exists(copycat_py):
+        with state.lock:
+            state.error = f"Trade failed: copycat.py not found at {copycat_py}"
+        stdscr.nodelay(True)
+        return None
+    full_cmd = [_sys.executable, copycat_py] + cmd_parts
 
     try:
         proc = subprocess.Popen(full_cmd, cwd=script_dir,
@@ -2867,15 +2915,13 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         err = str(_e).encode()
 
     if not ok:
-        err_text = err.decode(errors="replace").strip()
-        err_lines = []
-        for _chunk in [err_text[j:j+box_w-6] for j in range(0, max(1,len(err_text)), box_w-6)]:
-            err_lines.append((_chunk, C_BTD_SELL, curses.A_BOLD))
-        err_lines = err_lines[:8]  # max 8 lines
-        if not err_lines:
-            err_lines = [("copycat.py not found or failed — check path", C_BTD_SELL, curses.A_BOLD)]
-        _draw_box("Error — press any key", err_lines)
-        stdscr.getch()
+        err_text = err.decode(errors="replace").strip() or "copycat.py not found or failed"
+        # Store error in state — chart keeps running, error shown in footer
+        with state.lock:
+            # Store full error lines for footer display
+            _elines = [l.strip() for l in err_text.splitlines() if l.strip()]
+            _short  = _elines[-1] if _elines else err_text
+            state.error = f"Trade failed: {_short[:120]}"
         stdscr.nodelay(True)
         return None
 
@@ -2891,6 +2937,122 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         "limit_price":  limit_price,
         "status":       "active",
     }
+
+
+
+# ── Position Tool ──────────────────────────────────────────────────────────────
+C_POS_ENTRY = C_LABEL
+C_POS_TP    = C_BTD_BUY
+C_POS_SL    = C_BTD_SELL
+
+def pos_tool_dialog(stdscr, rows: int, cols: int, anchor_price: float) -> dict | None:
+    """Ask user for Entry/SL/TP prices. Returns tool dict or None."""
+    stdscr.nodelay(False)
+    curses.curs_set(0)
+    box_w = min(cols - 4, 52)
+    box_h = 14
+    box_y = max(0, rows // 2 - box_h // 2)
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    def _clr(title):
+        for r in range(box_h):
+            try: stdscr.addstr(box_y + r, box_x, " " * box_w,
+                               curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            except curses.error: pass
+        try:
+            stdscr.addstr(box_y, box_x,
+                          f" Position Tool — {title} ".center(box_w),
+                          curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+            stdscr.addstr(box_y + box_h - 1, box_x + 1,
+                          "  [Enter] confirm   [Esc] cancel"[:box_w-2],
+                          curses.color_pair(C_AXIS) | curses.A_DIM)
+        except curses.error: pass
+        stdscr.refresh()
+
+    def _inp(title, label, default):
+        _clr(title)
+        try: stdscr.addstr(box_y + 3, box_x + 2, label,
+                           curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error: pass
+        return _input_field(stdscr, box_y + 4, box_x + 4, box_w - 8, str(default))
+
+    ep = _inp("Entry Price", "Entry price (default=candle open):", f"{anchor_price:.2f}")
+    if ep is None: stdscr.nodelay(True); return None
+    try:    entry = float(ep)
+    except: entry = anchor_price
+
+    tp_s = _inp("Take Profit", "TP price (green):", f"{entry + 50:.2f}")
+    if tp_s is None: stdscr.nodelay(True); return None
+    try:    tp = float(tp_s)
+    except: tp = entry + 50
+
+    sl_s = _inp("Stop Loss", "SL price (red):", f"{entry - 15:.2f}")
+    if sl_s is None: stdscr.nodelay(True); return None
+    try:    sl = float(sl_s)
+    except: sl = entry - 25
+
+    stdscr.nodelay(True)
+    return {"entry": entry, "tp": tp, "sl": sl, "active": True,
+            "_anchor_idx": 0, "_stop_idx": None}
+
+
+def draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
+                   all_candles, left_idx, n_vis, pos_tools):
+    """Draw entry/SL/TP lines. Entry=white, TP=green, SL=red. Stop at hit."""
+    if not pos_tools:
+        return
+    start_col = chart_r - n_vis
+
+    def _row(price):
+        return max(chart_top, min(chart_bot - 1, chart_top + p2r(price)))
+
+    for pt in pos_tools:
+        if not pt.get("active"):
+            continue
+        entry = pt["entry"];  tp = pt["tp"];  sl = pt["sl"]
+        anchor_ci = pt.get("_anchor_idx", 0)
+
+        # Find where TP or SL was hit
+        stop_ci = pt.get("_stop_idx")
+        if stop_ci is None:
+            for ci in range(anchor_ci, len(all_candles)):
+                c = all_candles[ci]
+                hit_tp = (tp > entry and c.h >= tp) or (tp < entry and c.l <= tp)
+                hit_sl = (sl < entry and c.l <= sl) or (sl > entry and c.h >= sl)
+                if hit_tp or hit_sl:
+                    pt["_stop_idx"] = ci
+                    stop_ci = ci
+                    break
+
+        end_ci  = stop_ci if stop_ci is not None else len(all_candles) - 1
+        col_s   = max(0, start_col + (anchor_ci - left_idx))
+        col_e   = min(chart_r - 1, start_col + (end_ci - left_idx))
+
+        if col_s > col_e:
+            continue
+
+        row_e = _row(entry);  row_t = _row(tp);  row_s = _row(sl)
+
+        for col in range(col_s, col_e + 1):
+            if not (0 <= col < chart_r):
+                continue
+            if chart_top <= row_e < chart_bot:
+                db.put(row_e, col, "-", C_POS_ENTRY, curses.A_BOLD)
+            if chart_top <= row_t < chart_bot:
+                db.put(row_t, col, "-", C_POS_TP, curses.A_BOLD)
+            if chart_top <= row_s < chart_bot:
+                db.put(row_s, col, "-", C_POS_SL, curses.A_BOLD)
+
+        lbl_col = min(col_e + 1, chart_r - 18)
+        if chart_top <= row_t < chart_bot:
+            db.puts(row_t, lbl_col, f" TP {tp:.2f}", C_POS_TP,
+                    curses.A_BOLD | curses.A_REVERSE)
+        if chart_top <= row_e < chart_bot:
+            db.puts(row_e, lbl_col, f" Entry {entry:.2f}", C_POS_ENTRY,
+                    curses.A_BOLD | curses.A_REVERSE)
+        if chart_top <= row_s < chart_bot:
+            db.puts(row_s, lbl_col, f" SL {sl:.2f}", C_POS_SL,
+                    curses.A_BOLD | curses.A_REVERSE)
 
 
 # ── Draw active trade lines ────────────────────────────────────────────────────
@@ -3326,15 +3488,20 @@ def draw_alert_list_overlay(db, rows, cols, sel):
 
 
 # ── Economic calendar overlay ─────────────────────────────────────────────────
-def draw_econ_cal_overlay(db, rows, cols, events, loading, impact_filter=None):
-    """Render econ calendar into double-buffer with impact filter checklist."""
+def draw_econ_cal_overlay(db, rows, cols, events, loading,
+                          impact_filter=None, date_range="today", scroll=0):
+    """
+    Render econ calendar overlay into double-buffer.
+    Features: impact filter, date range selector, scrollable list,
+    color-coded rows, countdown to next event.
+    """
     if impact_filter is None:
         impact_filter = {1, 2, 3}
     now_ts = time.time()
     now_dt = datetime.now()
 
-    box_w = min(cols - 2, 92)
-    box_h = min(rows - 2, 32)
+    box_w = min(cols - 2, 96)
+    box_h = min(rows - 2, 34)
     box_y = max(0, rows // 2 - box_h // 2)
     box_x = max(0, cols // 2 - box_w // 2)
 
@@ -3343,82 +3510,103 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading, impact_filter=None):
             db.put(box_y + r, box_x + c, " ", C_HEADER)
 
     now_str = now_dt.strftime("%H:%M CT")
-    title   = f" Economic Calendar — US Events  [{now_str}]  [K] close  [R] refresh  [P] screenshot "
+    title   = f" Economic Calendar — US Events  [{now_str}]  [K]close  [R]refresh  [P]shot "
     db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
             curses.A_BOLD | curses.A_REVERSE)
 
-    # Filter checklist — [1]/[2]/[3] toggle each tier
+    # ── Row 1: Date range selector ─────────────────────────────────────────────
+    ranges = [("yesterday","Yest"), ("today","Today"), ("tomorrow","Tmrw"), ("week","Week")]
+    rsel_x = box_x + 2
+    db.puts(box_y + 1, rsel_x - 1, "Range:", C_LABEL, curses.A_BOLD)
+    rsel_x += 6
+    for rkey, rlbl in ranges:
+        badge = f" {rlbl} "
+        pair  = C_ASSET_SEL if rkey == date_range else C_HEADER
+        db.puts(box_y + 1, rsel_x, badge, pair, curses.A_BOLD)
+        rsel_x += len(badge) + 1
+
+    # ── Row 2: Impact filter ───────────────────────────────────────────────────
     f1 = "[x]" if 1 in impact_filter else "[ ]"
     f2 = "[x]" if 2 in impact_filter else "[ ]"
     f3 = "[x]" if 3 in impact_filter else "[ ]"
-    filter_line = (f"  Impact filter:  {f1} *  [1]    {f2} **  [2]    {f3} ***  [3]"
-                   "    (toggle with number keys)")
-    db.puts(box_y + 1, box_x, filter_line[:box_w], C_LABEL, curses.A_BOLD)
+    fl = f"  Filter: {f1} * [1]   {f2} ** [2]   {f3} *** [3]   [Y]est [T]oday [W]eek [N]ext"
+    db.puts(box_y + 2, box_x, fl[:box_w], C_LABEL, curses.A_BOLD)
 
     if loading:
         db.puts(box_y + box_h // 2, box_x + box_w // 2 - 10,
                 "Loading calendar...", C_AXIS, curses.A_BOLD)
         return
 
-    # Apply filter
+    # ── Impact filter helper ───────────────────────────────────────────────────
     def _imp_count(ev):
         imp = ev.get("impact", 1)
-        if isinstance(imp, int):
-            return imp
-        return imp.count("★") or 1
+        return imp if isinstance(imp, int) else (imp.count("★") or 1)
+
     filtered = [ev for ev in events if _imp_count(ev) in impact_filter]
 
     if not filtered:
-        msg = "No matching events — adjust filter with [1][2][3]" if events else "No events — press [R] to refresh"
-        db.puts(box_y + box_h // 2, box_x + box_w // 2 - len(msg) // 2,
-                msg, C_AXIS, curses.A_BOLD)
+        msg = ("No matching events — adjust filter [1][2][3]"
+               if events else "No events — press [R] to refresh")
+        db.puts(box_y + box_h // 2, box_x + max(0, box_w // 2 - len(msg) // 2),
+                msg[:box_w], C_AXIS, curses.A_BOLD)
         return
 
-    # Header row
-    hdr = f" {'Time':<7} {'Imp':<5} {'Event':<44} {'Actual':<10} {'Fcst':<10} {'Prev':<8}"
-    db.puts(box_y + 2, box_x, hdr[:box_w], C_LABEL, curses.A_BOLD)
+    # ── Header ─────────────────────────────────────────────────────────────────
+    hdr = f" {'Time':<7} {'Imp':<5} {'Event':<42} {'Actual':<10} {'Fcst':<10} {'Prev':<8}"
+    db.puts(box_y + 3, box_x, hdr[:box_w], C_LABEL, curses.A_BOLD | curses.A_UNDERLINE)
 
-    # Find next upcoming event (from filtered list)
+    # ── Countdown to next event ────────────────────────────────────────────────
     next_event = next((ev for ev in filtered if ev.get("ts", 0) > now_ts), None)
-
-    # Countdown line
     if next_event:
         secs_until = max(0, int(next_event["ts"] - now_ts))
-        mins, secs = divmod(secs_until, 60)
-        hrs,  mins = divmod(mins, 60)
-        cd_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs else f"{mins:02d}:{secs:02d}"
-        cd_lbl = f" ▶ Next: {next_event['name'][:32]}  in {cd_str}"
-        db.puts(box_y + 3, box_x, cd_lbl[:box_w], C_ALERT, curses.A_BOLD)
+        h_, r_ = divmod(secs_until, 3600)
+        m_, s_ = divmod(r_, 60)
+        cd_str = f"{h_:02d}:{m_:02d}:{s_:02d}" if h_ else f"{m_:02d}:{s_:02d}"
+        cd_lbl = f" ▶ Next: {next_event['name'][:38]}  in {cd_str}"
+        db.puts(box_y + 4, box_x, cd_lbl[:box_w], C_ALERT, curses.A_BOLD | curses.A_REVERSE)
+        ev_start = 5
+    else:
+        ev_start = 4
 
-    # Event rows start at row 4
-    row_offset = 4
-    for ev in filtered:
-        if row_offset >= box_h - 1:
-            break
+    # ── Scrollable event list ──────────────────────────────────────────────────
+    max_rows   = box_h - ev_start - 1   # leave 1 row for scroll hint
+    n_filtered = len(filtered)
+    scroll     = max(0, min(scroll, max(0, n_filtered - max_rows)))
+    visible_evs = filtered[scroll: scroll + max_rows]
+
+    # Scroll indicator
+    if n_filtered > max_rows:
+        db.puts(box_y + box_h - 1, box_x + 2,
+                f" ↑↓ scroll  {scroll+1}-{min(scroll+max_rows, n_filtered)}/{n_filtered} "
+                "  [<][>] also scrolls ",
+                C_AXIS, curses.A_DIM)
+
+    for li, ev in enumerate(visible_evs):
+        row_y     = box_y + ev_start + li
         ev_ts     = ev.get("ts", 0)
         ev_time   = ev.get("time", "")
-        ev_name   = ev.get("name", "")[:42]
-        ev_actual = ev.get("actual", "")
-        ev_fcst   = ev.get("forecast", "")
-        ev_prev   = ev.get("previous", "")
+        ev_name   = ev.get("name", "")[:40]
+        ev_actual = ev.get("actual", "")[:9]
+        ev_fcst   = ev.get("forecast", "")[:9]
+        ev_prev   = ev.get("previous", "")[:7]
         imp_n     = _imp_count(ev)
-        imp_str   = ("***" if imp_n >= 3 else "** " if imp_n == 2 else "*  ")
+        imp_str   = "***" if imp_n >= 3 else "** " if imp_n == 2 else "*  "
 
-        # Color coding
+        # Color by state: past=dim, next=gold+reversed, high=red, med=yellow, low=white
         if ev_ts > 0 and ev_ts < now_ts:
             pair, attrs = C_AXIS, curses.A_DIM
         elif ev == next_event:
-            pair, attrs = C_ALERT, curses.A_BOLD
+            pair, attrs = C_ALERT, curses.A_BOLD | curses.A_REVERSE
         elif imp_n >= 3:
-            pair, attrs = C_BTD_SELL, curses.A_BOLD   # high impact = red
+            pair, attrs = C_BTD_SELL, curses.A_BOLD
         elif imp_n == 2:
-            pair, attrs = C_VWAP_SD2, curses.A_NORMAL  # medium = yellow
+            pair, attrs = C_VWAP_SD2, curses.A_BOLD
         else:
             pair, attrs = C_LABEL, curses.A_NORMAL
 
-        lbl = f" {ev_time:<7} {imp_str:<5} {ev_name:<44} {ev_actual:<10} {ev_fcst:<10} {ev_prev:<8}"
-        db.puts(box_y + row_offset, box_x, lbl[:box_w], pair, attrs)
-        row_offset += 1
+        lbl = (f" {ev_time:<7} {imp_str:<5} {ev_name:<42}"
+               f" {ev_actual:<10} {ev_fcst:<10} {ev_prev:<8}")
+        db.puts(row_y, box_x, lbl[:box_w], pair, attrs)
 
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [
@@ -3463,8 +3651,23 @@ HELP_SECTIONS = [
         ("[Esc]",      "Close alert list / calendar / dismiss popup"),
     ]),
     ("ECONOMIC CALENDAR", [
-        ("[K]",        "Open/close Economic Calendar  (US events, CT times)"),
-        ("[R]",        "Refresh calendar data (when calendar is open)"),
+        ("[K]",        "Open/close Economic Calendar  (US events)"),
+        ("[R]",        "Refresh data (when calendar open)"),
+        ("[Y]",        "Switch to Yesterday events"),
+        ("[T]",        "Switch to Today events  (default)"),
+        ("[N]ext",     "Switch to Tomorrow events"),
+        ("[W]eek",     "Switch to This Week events"),
+        ("[1][2][3]",  "Toggle * / ** / *** impact filter"),
+        ("[↑][↓]",     "Scroll event list"),
+        ("[P]",        "Screenshot of calendar"),
+    ]),
+    ("TRADING  [X]", [
+        ("[X]",        "Open trade dialog (Buy/Sell Market or Limit)"),
+        ("[Z]",        "Clear all trade lines from chart"),
+        ("Sizes",      "Enter Phemex contracts + XLTRADE lots"),
+        ("SL/TP",      "Enter as points or exact price"),
+        ("Submit",     "Runs copycat.py — lines appear on chart immediately"),
+        ("Monitor",    "Trade lines auto-update from Phemex position data"),
     ]),
     ("GLOBAL / MACRO MODE", [
         ("[M]",        "Toggle Global performance chart (all 8 assets vs BTC baseline)"),
@@ -3496,15 +3699,20 @@ HELP_LINES = _build_help_lines()
 HELP_BOX_W = max((len(l) for l in HELP_LINES), default=40) + 4
 
 
-def draw_help_overlay(db: "DoubleBuffer", rows: int, cols: int):
+def draw_help_overlay(db: "DoubleBuffer", rows: int, cols: int, scroll: int = 0):
     """
-    Render the help box into the double buffer each frame so the live
-    chart keeps updating behind it. Closed by toggling state.show_help.
+    Render the help box into the double buffer. Scrollable with ↑↓.
+    Chart continues live behind it.
     """
-    box_w  = min(cols - 4, HELP_BOX_W)
-    box_h  = min(rows - 4, len(HELP_LINES) + 3)   # +1 title +2 pad
-    box_y  = (rows - box_h) // 2
-    box_x  = (cols - box_w) // 2
+    box_w    = min(cols - 4, HELP_BOX_W)
+    box_h    = min(rows - 4, 36)   # fixed visible height
+    box_y    = max(0, (rows - box_h) // 2)
+    box_x    = max(0, (cols - box_w) // 2)
+    n_lines  = len(HELP_LINES)
+    max_rows = box_h - 3   # title + bottom hint
+
+    # Clamp scroll
+    scroll = max(0, min(scroll, max(0, n_lines - max_rows)))
 
     # Background
     for r in range(box_h):
@@ -3512,21 +3720,25 @@ def draw_help_overlay(db: "DoubleBuffer", rows: int, cols: int):
             db.put(box_y + r, box_x + c, " ", C_CURSOR)
 
     # Title bar
-    title = "  ChartHacker — Help  "
-    title_pad = f"{title:^{box_w}}"
-    for ci, ch in enumerate(title_pad[:box_w]):
+    title = "  C H A R T H A C K E R  —  Key Reference  "
+    for ci, ch in enumerate(f"{title:^{box_w}}"[:box_w]):
         db.put(box_y, box_x + ci, ch, C_ASSET_SEL, curses.A_BOLD)
 
-    # Content lines
-    content_rows = box_h - 2   # exclude title row and bottom pad
-    for li, line in enumerate(HELP_LINES[:content_rows]):
-        row = box_y + 1 + li
+    # Scroll hint at bottom
+    pct = int(scroll / max(1, n_lines - max_rows) * 100)
+    hint = f" ↑↓ scroll  {scroll+1}-{min(scroll+max_rows,n_lines)}/{n_lines}  {pct}%  [H] close "
+    db.puts(box_y + box_h - 1, box_x + 1, hint[:box_w - 2], C_AXIS, curses.A_DIM)
+
+    # Content lines with scroll offset
+    visible = HELP_LINES[scroll: scroll + max_rows]
+    for li, line in enumerate(visible):
+        row  = box_y + 1 + li
         text = line[:box_w - 2].ljust(box_w - 2)
         if line.startswith("  ──"):
             pair, attrs = C_VWAP, curses.A_BOLD
-        elif line.startswith("  C H A R T"):
+        elif line.startswith("  C H A R T") or line.strip().startswith("—"):
             pair, attrs = C_VP_POC, curses.A_BOLD
-        elif line.startswith("  [H]"):
+        elif "  [H]" in line:
             pair, attrs = C_AXIS, curses.A_DIM
         else:
             pair, attrs = C_CURSOR, curses.A_NORMAL
@@ -3609,37 +3821,40 @@ def alert_monitor():
 
 
 # ── Economic calendar fetcher ─────────────────────────────────────────────────
-def fetch_econ_calendar():
+def fetch_econ_calendar(date_range="today"):
     """
-    Fetch today's US economic events from Investing.com.
-    Uses their internal POST API returning JSON with embedded HTML.
-    Impact level read from 'data-img_key' attribute on the impact span
-    ('bull1'=*, 'bull2'=**, 'bull3'=***).
-    Actual/Forecast/Previous from td data attributes (data-actual etc).
-    Times are returned in CT (timeZone=15 = US/Central).
+    Fetch US economic events from Investing.com economic calendar.
+    Uses their public getCalendarFilteredData endpoint.
+    Actual/Forecast/Previous parsed from the HTML table cell text content.
+    date_range: yesterday/today/tomorrow/week
     """
     from html.parser import HTMLParser
-    import re as _re
+    import re as _re, calendar as _cal
 
-    today    = datetime.now()
-    date_str = today.strftime("%Y-%m-%d")
+    today   = datetime.now()
+    import datetime as _dt2
+    if date_range == "yesterday":
+        _target = today - _dt2.timedelta(days=1)
+    elif date_range == "tomorrow":
+        _target = today + _dt2.timedelta(days=1)
+    else:
+        _target = today
+    date_str = _target.strftime("%Y-%m-%d")
+    _week_end = (_target + _dt2.timedelta(days=6)).strftime("%Y-%m-%d")                 if date_range == "week" else date_str
 
     headers = {
-        "User-Agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                             "Chrome/120.0.0.0 Safari/537.36"),
+        "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         "X-Requested-With": "XMLHttpRequest",
         "Referer":          "https://www.investing.com/economic-calendar/",
-        "Origin":           "https://www.investing.com",
+        "Accept":           "application/json, text/javascript, */*",
         "Content-Type":     "application/x-www-form-urlencoded",
-        "Accept":           "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language":  "en-US,en;q=0.9",
     }
-    payload = (
-        "country%5B%5D=5"
-        f"&dateFrom={date_str}&dateTo={date_str}"
-        "&timeZone=8&timeFilter=timeOnly&currentTab=today&limit_from=0"
-    )
+    # currentTab changes based on range so server doesn't override dates
+    _tab = {"yesterday": "yesterday", "tomorrow": "tomorrow",
+            "week": "thisWeek", "today": "today"}.get(date_range, "today")
+    payload = (f"country%5B%5D=5&dateFrom={date_str}&dateTo={_week_end}"
+               f"&timeZone=8&timeFilter=timeOnly&currentTab={_tab}&limit_from=0")
+    CT_OFFSET = -5 * 3600   # UTC to CDT (UTC-5) for April/summer
 
     try:
         r    = requests.post(
@@ -3652,154 +3867,90 @@ def fetch_econ_calendar():
 
         events = []
 
-        from urllib.parse import unquote as _uq
-
         class _P(HTMLParser):
-            """
-            Parser for Investing.com economic calendar HTML.
-            Each event is a <tr class="js-event-item"> row.
-            Key attributes on the <tr>:
-              data-event-datetime  — UTC datetime string
-            Key <td> classes:
-              first col     → time display
-              event         → contains <a> with event name
-              sentimentix   → contains <i data-img_key="bull1/2/3"> for impact
-              bold/actual   → actual value (text content)
-              fore           → forecast
-              prev           → previous
-            Values may also appear in data-actual / data-forecast / data-previous
-            on the <td> element (URL-encoded).
-            """
             def __init__(self):
                 super().__init__()
                 self._ev    = None
                 self._field = None
-                self._depth = 0   # td nesting
 
             def handle_starttag(self, tag, attrs):
                 d   = dict(attrs)
                 cls = d.get("class", "")
-
                 if tag == "tr" and "js-event-item" in cls:
                     self._ev = {
                         "time":     d.get("data-event-datetime", ""),
-                        "name":     "",
-                        "impact":   1,
-                        "actual":   "",
-                        "forecast": "",
-                        "previous": "",
-                        "ts":       0,
+                        "name":     "", "impact": 1,
+                        "actual":   "", "forecast": "", "previous": "", "ts": 0,
                     }
                     self._field = None
                     return
-
                 if self._ev is None:
                     return
-
-                # Impact stars from <i data-img_key="bull1/2/3">
                 imgkey = d.get("data-img_key", "")
                 if imgkey.startswith("bull"):
                     try: self._ev["impact"] = int(imgkey[-1])
                     except: pass
-
                 if tag == "td":
-                    # Try data attributes first (URL-encoded)
-                    for _attr, _fld in [("data-actual",   "actual"),
-                                        ("data-forecast",  "forecast"),
-                                        ("data-previous",  "previous")]:
-                        _v = _uq(d.get(_attr, "")).strip().strip("\xa0")
-                        if _v and _v not in ("&nbsp;",):
-                            self._ev[_fld] = _v
-                    # Set field tag for text-content fallback
-                    cls_lower = cls.lower()
-                    if "first" in cls_lower or "js-time" in cls_lower:
-                        self._field = "time_td"
-                    elif "event" in cls_lower:
-                        self._field = "event"
-                    elif "actual" in cls_lower or "bold" in cls_lower:
-                        self._field = "actual"
-                    elif "fore" in cls_lower:
-                        self._field = "forecast"
-                    elif "prev" in cls_lower:
-                        self._field = "previous"
-                    else:
-                        self._field = None
-
+                    cls_l = cls.lower()
+                    if   "first"   in cls_l or "js-time" in cls_l: self._field = "time_td"
+                    elif "event"   in cls_l:                         self._field = "event"
+                    elif "actual"  in cls_l or "bold" in cls_l:     self._field = "actual"
+                    elif "fore"    in cls_l:                         self._field = "forecast"
+                    elif "prev"    in cls_l:                         self._field = "previous"
+                    else:                                             self._field = None
                 if tag == "a" and self._field == "event":
                     self._field = "event_a"
 
             def handle_data(self, data):
-                data = data.strip().strip("\xa0")
+                data = data.strip().strip(" ")
                 if not data or self._ev is None:
                     return
-                if self._field == "event_a":
-                    if not self._ev["name"]:
-                        self._ev["name"] = data
-                elif self._field == "event":
-                    if not self._ev["name"]:
-                        self._ev["name"] = data
-                elif self._field == "time_td":
-                    if not self._ev["time"] and _re.match(r"\d{1,2}:\d{2}", data):
-                        self._ev["time"] = data
-                elif self._field == "actual":
-                    if not self._ev["actual"]:
-                        self._ev["actual"] = data
-                elif self._field == "forecast":
-                    if not self._ev["forecast"]:
-                        self._ev["forecast"] = data
-                elif self._field == "previous":
-                    if not self._ev["previous"]:
-                        self._ev["previous"] = data
+                if   self._field == "event_a"  and not self._ev["name"]:     self._ev["name"]     = data
+                elif self._field == "event"     and not self._ev["name"]:     self._ev["name"]     = data
+                elif self._field == "time_td"   and not self._ev["time"] and _re.match(r"\d{1,2}:\d{2}", data):
+                    self._ev["time"] = data
+                elif self._field == "actual"    and not self._ev["actual"]:   self._ev["actual"]   = data
+                elif self._field == "forecast"  and not self._ev["forecast"]: self._ev["forecast"] = data
+                elif self._field == "previous"  and not self._ev["previous"]: self._ev["previous"] = data
 
             def handle_endtag(self, tag):
-                if self._ev is None:
-                    return
-                if tag == "a" and self._field == "event_a":
-                    self._field = "event"
+                if self._ev is None: return
+                if tag == "a" and self._field == "event_a": self._field = "event"
                 if tag == "tr" and self._ev.get("name"):
                     events.append(dict(self._ev))
-                    self._ev    = None
-                    self._field = None
+                    self._ev = None
 
         _P().feed(html)
 
-        # Parse timestamps — data-event-datetime is in UTC ("YYYY/MM/DD HH:MM:SS")
-        # Convert to local time (which IS CT on the trading machine).
-        import calendar as _cal
         for ev in events:
-            raw = ev.get("time", "")
-            # Try full datetime first
+            raw    = ev.get("time", "")
             m_full = _re.search(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})", raw)
             m_hm   = _re.search(r"(\d{1,2}):(\d{2})", raw)
             if m_full:
-                import time as _t
                 yr,mo,dy = int(m_full.group(1)),int(m_full.group(2)),int(m_full.group(3))
                 h,mn,sc  = int(m_full.group(4)),int(m_full.group(5)),int(m_full.group(6))
-                # Build UTC timestamp then convert to local
-                import calendar
-                utc_ts = calendar.timegm((yr,mo,dy,h,mn,sc,0,0,0))
-                local_dt = datetime.fromtimestamp(utc_ts)
-                ev["ts"]   = utc_ts
-                ev["time"] = local_dt.strftime("%H:%M")
+                utc_ts   = _cal.timegm((yr,mo,dy,h,mn,sc,0,0,0))
+                ct_ts    = utc_ts + CT_OFFSET
+                ev["ts"] = ct_ts
+                ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
             elif m_hm:
-                # Already local time (fallback)
-                h, mn = int(m_hm.group(1)), int(m_hm.group(2))
-                ev["ts"] = datetime(today.year, today.month, today.day,
-                                    h, mn, 0).timestamp()
-                ev["time"] = f"{h:02d}:{mn:02d}"
+                h, mn  = int(m_hm.group(1)), int(m_hm.group(2))
+                base   = datetime(_target.year,_target.month,_target.day,h,mn,0).timestamp()
+                ct_ts  = base + CT_OFFSET
+                ev["ts"]   = ct_ts
+                ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
 
         return sorted([e for e in events if e.get("name")],
                       key=lambda x: x.get("ts", 0))
-
     except Exception:
         return []
-
 
 def load_econ_calendar():
     """Background: fetch calendar and keep it refreshed every 60s while open."""
     with state.lock:
         state.econ_loading = True
-    events = fetch_econ_calendar()
+        _dr = state.econ_date_range
+    events = fetch_econ_calendar(date_range=_dr)
     with state.lock:
         state.econ_events  = events
         state.econ_loading = False
@@ -3813,7 +3964,9 @@ def load_econ_calendar():
         with state.lock:
             if not state.show_econ_cal:
                 return
-        fresh = fetch_econ_calendar()
+        with state.lock:
+            _dr2 = state.econ_date_range
+        fresh = fetch_econ_calendar(date_range=_dr2)
         with state.lock:
             state.econ_events = fresh
 
@@ -3877,16 +4030,34 @@ def main(stdscr):
                     state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
                 db.prev = None
                 stdscr.clear()
+            elif key in (ord("t"), ord("T")) if False else False:
+                pass  # placeholder — T handled below with context check
             elif key in (ord("w"), ord("W")):
                 with state.lock:
-                    state.show_vwap = not state.show_vwap
-                db.prev = None
-                stdscr.clear()
+                    _cal_open_w = state.show_econ_cal
+                if _cal_open_w:
+                    with state.lock:
+                        state.econ_date_range = "week"
+                        state.econ_scroll = 0
+                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                else:
+                    with state.lock:
+                        state.show_vwap = not state.show_vwap
+                    db.prev = None
+                    stdscr.clear()
             elif key in (ord("t"), ord("T")):
                 with state.lock:
-                    state.show_btd = not state.show_btd
-                db.prev = None
-                stdscr.clear()
+                    _cal_open_t = state.show_econ_cal
+                if _cal_open_t:
+                    with state.lock:
+                        state.econ_date_range = "today"
+                        state.econ_scroll = 0
+                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                else:
+                    with state.lock:
+                        state.show_btd = not state.show_btd
+                    db.prev = None
+                    stdscr.clear()
             elif key in (ord("s"), ord("S")):
                 with state.lock:
                     state.show_sessions = not state.show_sessions
@@ -3905,17 +4076,60 @@ def main(stdscr):
                                              daemon=True).start()
                 db.prev = None; stdscr.clearok(True); stdscr.clear()
             elif key in (ord("z"), ord("Z")):
-                # Clear all trade lines
+                # Clear all trade lines AND position tools
                 with state.lock:
                     state.trade_lines = []
+                    state.pos_tools   = []
                 db.prev = None; stdscr.clear()
+            elif key == ord("\\"):
+                # Position tool — open dialog anchored to current cursor candle
+                with state.lock:
+                    _cci  = state.cursor_col_idx
+                    _lo   = state.view_offset
+                    _nv   = state.n_vis
+                    _nall = len(state.candles)
+                    _clist = list(state.candles)
+                # anchor = index of candle at cursor position
+                if _cci >= 0:
+                    _anchor = max(0, _nall - _lo - _nv + _cci)
+                else:
+                    _anchor = max(0, _nall - 1 - _lo)
+                _anchor = min(_anchor, _nall - 1)
+                _ac = _clist[_anchor] if _clist else None
+                if _ac:
+                    _pt = pos_tool_dialog(stdscr, rows, cols, _ac.o)
+                    if _pt:
+                        _pt["_anchor_idx"] = min(_anchor, _nall-1)
+                        _tp_dir = "price_cross_up" if _pt["tp"] > _pt["entry"] else "price_cross_down"
+                        _sl_dir = "price_cross_down" if _pt["sl"] < _pt["entry"] else "price_cross_up"
+                        with state.lock:
+                            state.pos_tools.append(_pt)
+                            state.alerts.append({
+                                "name": f"TP {_pt['tp']:.2f}",
+                                "conditions": [{"type": _tp_dir, "value": _pt["tp"]}],
+                                "message": f"TP hit at {_pt['tp']:.2f}",
+                                "active": True, "sound": True, "_last_state": False,
+                            })
+                            state.alerts.append({
+                                "name": f"SL {_pt['sl']:.2f}",
+                                "conditions": [{"type": _sl_dir, "value": _pt["sl"]}],
+                                "message": f"SL hit at {_pt['sl']:.2f}",
+                                "active": True, "sound": True, "_last_state": False,
+                            })
+                db.prev = None; stdscr.clearok(True); stdscr.clear()
             elif key in (ord("a"), ord("A")):
                 with state.lock:
                     state.show_alert_list = not state.show_alert_list
             elif key in (ord("n"), ord("N")):
                 with state.lock:
-                    _al_open = state.show_alert_list
-                if _al_open:
+                    _al_open  = state.show_alert_list
+                    _cal_open = state.show_econ_cal
+                if _cal_open:
+                    with state.lock:
+                        state.econ_date_range = "tomorrow"
+                        state.econ_scroll = 0
+                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                elif _al_open:
                     new_alt = alert_create_dialog(stdscr, rows, cols)
                     if new_alt:
                         with state.lock:
@@ -3962,6 +4176,15 @@ def main(stdscr):
                                 state.econ_impact_filter.discard(_tier)
                         else:
                             state.econ_impact_filter.add(_tier)
+            elif key in (ord("y"), ord("Y")):
+                with state.lock:
+                    _cal_open_y = state.show_econ_cal
+                if _cal_open_y:
+                    with state.lock:
+                        state.econ_date_range = "yesterday"
+                        state.econ_scroll = 0
+                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+
             elif key in (ord("m"), ord("M")):
                 with state.lock:
                     state.global_mode = not state.global_mode
@@ -3984,6 +4207,8 @@ def main(stdscr):
             elif key in (ord("h"), ord("H"), ord("?")):
                 with state.lock:
                     state.show_help = not state.show_help
+                    if not state.show_help:
+                        state.help_scroll = 0
             elif key in (ord("p"), ord("P"), curses.KEY_PRINT):
                 fn = take_screenshot(db)
                 # Brief flash in footer — handled next draw frame
@@ -4009,15 +4234,21 @@ def main(stdscr):
                 stdscr.clear()
             elif key == curses.KEY_UP:
                 with state.lock:
-                    if state.show_alert_list:
+                    if state.show_help:
+                        state.help_scroll = max(0, state.help_scroll - 1)
+                    elif state.show_alert_list:
                         state.alert_list_sel = max(0, state.alert_list_sel - 1)
                     elif state.show_econ_cal:
-                        pass  # TODO: scroll econ cal
+                        state.econ_scroll = max(0, state.econ_scroll - 1)
             elif key == curses.KEY_DOWN:
                 with state.lock:
                     if state.show_alert_list:
                         n_a = len(state.alerts)
                         state.alert_list_sel = min(max(0, n_a-1), state.alert_list_sel + 1)
+                    elif state.show_help:
+                        state.help_scroll = state.help_scroll + 1
+                    elif state.show_econ_cal:
+                        state.econ_scroll = state.econ_scroll + 1
             elif key in (curses.KEY_LEFT,
                           curses.KEY_SLEFT,   # Shift+Left (most terminals)
                           541, 545,            # Ctrl+Left (xterm / Windows)
@@ -4086,6 +4317,7 @@ def main(stdscr):
                 with state.lock:
                     if state.show_help:
                         state.show_help = False
+                        state.help_scroll = 0
                     elif state.show_econ_cal:
                         state.show_econ_cal = False
                     else:

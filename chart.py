@@ -1204,6 +1204,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         econ_events       = list(state.econ_events)
         econ_loading      = state.econ_loading
         econ_filter       = set(state.econ_impact_filter)
+        alerts_snap       = list(state.alerts)
+        triggered_snap    = list(state.alert_triggered)
         econ_date_range   = state.econ_date_range
         econ_scroll       = state.econ_scroll
         trade_lines       = list(state.trade_lines)
@@ -1262,8 +1264,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     left_idx  = max(0, right_idx - chart_w)
     visible   = all_candles[left_idx:right_idx] if all_candles else []
     n_vis     = len(visible)
-    with state.lock:
-        state.n_vis = n_vis   # expose to key handler
+    # n_vis written after draw completes (deferred to avoid mid-draw lock)
+    # Use a module-level variable instead
+    _deferred_n_vis = n_vis
 
     # Clamp cursor_col_idx to actual visible window
     if cursor_col_idx < 0:
@@ -1271,10 +1274,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     else:
         cursor_col_idx = max(0, min(n_vis - 1, cursor_col_idx))
 
-    # Write clamped values back (draw() is the single authority on clamping)
-    with state.lock:
-        state.view_offset    = view_offset
-        state.cursor_col_idx = cursor_col_idx
+    # Write clamped values back after drawing (deferred to avoid mid-draw lock)
+    _deferred_view_offset    = view_offset
+    _deferred_cursor_col_idx = cursor_col_idx
 
     if visible and cursor_col_idx >= 0:
         cursor_idx = cursor_col_idx
@@ -1703,12 +1705,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                             col_start=max(0, curr_col_start))
             draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC",
                             col_start=max(0, curr_col_start))
-            # Write VP levels to state for alert_monitor
-            with state.lock:
-                _lvl = state.indicator_levels
-                _lvl["vah"] = vah_price
-                _lvl["val"] = val_price
-                _lvl["poc"] = poc_price
+            # VP levels stored for deferred write after draw()
+            _deferred_vp = {"vah": vah_price, "val": val_price, "poc": poc_price}
 
     # ── VWAP + STANDARD DEVIATION BANDS — current + previous session ────────
     if show_vwap and visible and chart_h > 0:
@@ -2257,9 +2255,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     # ── FOOTER ────────────────────────────────────────────────────────────────
     if 0 <= footer_row < rows:
-        with state.lock:
-            _cci = state.cursor_col_idx
-            _vo  = state.view_offset
+        _cci = cursor_col_idx  # already in snapshot
+        _vo  = view_offset     # already in snapshot
         cinfo = f"  cur:{_cci} pan:{_vo}" if in_cursor_mode else ""
         auth_tag = f"/{('auth' if PHEMEX_API_KEY else 'no-auth')}" if feed == "phemex" else ""
         err_str  = f"  ! {error}" if error and visible else ""
@@ -2280,8 +2277,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     # Alert evaluation runs in alert_monitor() background thread
     # ── ALERT OVERLAY ────────────────────────────────────────────────────────
-    if alert_triggered:
-        _latest = alert_triggered[0]
+    if triggered_snap:
+        _latest = triggered_snap[0]
         _abox_w = min(cols - 4, 54)
         _abox_y = chart_top + 1
         _abox_x = max(0, cols // 2 - _abox_w // 2)
@@ -2309,8 +2306,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── ALERT PRICE LINES ──────────────────────────────────────────
     # Draw a horizontal line on chart for each active alert price,
     # but only if no other indicator occupies that row.
-    with state.lock:
-        _alert_lines = list(state.alerts)
+    _alert_lines = alerts_snap  # already snapshotted at top of draw()
     for _al in _alert_lines:
         if not _al.get("active"):  continue
         _conds = _al.get("conditions", [])
@@ -2345,6 +2341,16 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── HELP OVERLAY (drawn last, on top of everything) ──────────────
     if show_help:
         draw_help_overlay(db, rows, cols, help_scroll)
+
+
+    # Return deferred state updates to avoid mid-draw lock contention
+    _rv = {
+        "n_vis":          n_vis,
+        "view_offset":    _deferred_view_offset    if "_deferred_view_offset"    in vars() else None,
+        "cursor_col_idx": _deferred_cursor_col_idx if "_deferred_cursor_col_idx" in vars() else None,
+        "vp_levels":      _deferred_vp             if "_deferred_vp"             in vars() else None,
+    }
+    return {k: v for k, v in _rv.items() if v is not None}
 
 
 # ── screenshot ────────────────────────────────────────────────────────────────
@@ -3039,6 +3045,14 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         "status":       "active",
     }
 
+
+    # Return deferred state updates
+    return {
+        "n_vis": n_vis,
+        "view_offset": _deferred_view_offset if "_deferred_view_offset" in dir() else None,
+        "cursor_col_idx": _deferred_cursor_col_idx if "_deferred_cursor_col_idx" in dir() else None,
+        "vp_levels": _deferred_vp if "_deferred_vp" in dir() else None,
+    }
 
 
 # ── Position Tool ──────────────────────────────────────────────────────────────
@@ -4990,12 +5004,21 @@ def main(stdscr):
             stdscr.clearok(True)
             stdscr.clear()
 
-        draw(stdscr, db, rows, cols)
-        db.flush(stdscr)   # writes changed cells via addch()
-        # noutrefresh + doupdate = atomic frame push, no intermediate states
+        _result = draw(stdscr, db, rows, cols)
+
+        # ── Apply deferred state writes (AFTER draw completes) ───────────────
+        if _result:
+            with state.lock:
+                state.n_vis          = _result.get("n_vis", state.n_vis)
+                state.view_offset    = _result.get("view_offset", state.view_offset)
+                state.cursor_col_idx = _result.get("cursor_col_idx", state.cursor_col_idx)
+                _vp = _result.get("vp_levels")
+                if _vp:
+                    state.indicator_levels.update(_vp)
+
+        db.flush(stdscr)
         stdscr.noutrefresh()
         curses.doupdate()
-        # No explicit sleep needed — stdscr.timeout(50) provides frame pacing
 
 if __name__ == "__main__":
     curses.wrapper(main)

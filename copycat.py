@@ -47,10 +47,17 @@ load_env()
 PHEMEX_API_KEY    = os.environ.get('PHEMEX_API_KEY', '')
 PHEMEX_API_SECRET = os.environ.get('PHEMEX_API_SECRET', '')
 PHEMEX_BASE_URL   = 'https://api.phemex.com'
-PHEMEX_SYMBOL     = 'ETHUSDT'
 
+# Active trading symbols — set at runtime by parse_args based on [eth|btc] argument
+PHEMEX_SYMBOL = 'ETHUSDT'
+MT5_SYMBOL    = 'ETHUSD.nx'
+
+# Symbol map for each asset
+ASSET_SYMBOLS = {
+    'eth': {'phemex': 'ETHUSDT',  'mt5': 'ETHUSD.nx'},
+    'btc': {'phemex': 'BTCUSDT',  'mt5': 'BTCUSD.nx'},
+}
 MT5_FILES_PATH = os.environ.get('MT5_FILES_PATH', '')
-MT5_SYMBOL     = 'ETHUSD.nx'
 BRIDGE_URL     = os.environ.get('BRIDGE_URL', '').rstrip('/')
 BRIDGE_TOKEN   = os.environ.get('BRIDGE_TOKEN', '')
 
@@ -674,6 +681,14 @@ async def cmd_trade(direction, order_type, limit_price, phemex_size, xltrade_siz
             errors.append(f"Phemex: {e}")
 
         print(f"  Sending to {YLW}XLTRADE{RST}...", end=' ', flush=True)
+        # Pre-clear stale response file before sending
+        if MT5_FILES_PATH:
+            resp_path = os.path.join(MT5_FILES_PATH, 'bj_response.txt')
+            if os.path.exists(resp_path):
+                try:
+                    os.remove(resp_path)
+                except Exception:
+                    pass
         xltrade_resp, xltrade_err = mt5_send(xltrade_signal, timeout=20)
         if xltrade_err:
             print(f"{RED}✗ {xltrade_err}{RST}")
@@ -688,7 +703,7 @@ async def cmd_trade(direction, order_type, limit_price, phemex_size, xltrade_siz
 
     print()
     if not errors:
-        ok(f"{side.upper()} {phemex_size} ETH (Phemex) / {xltrade_size} lots (XLTRADE) — both brokers filled")
+        ok(f"{side.upper()} {phemex_size} {PHEMEX_SYMBOL} (Phemex) / {xltrade_size} lots (XLTRADE) — both brokers filled")
     else:
         warn("Completed with errors:")
         for e in errors:
@@ -1014,17 +1029,21 @@ USAGE = f"""
 {DIM}Confidential — Fund Intellectual Property{RST}
 
 {BLD}Usage:{RST}
-  python copycat.py buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
-  python copycat.py buy   market -os -sp <phemex_size> -sx <xltrade_size>
-  python copycat.py buy   limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
-  python copycat.py sell  market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
-  python copycat.py sell  market -os -sp <phemex_size> -sx <xltrade_size>
-  python copycat.py sell  limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
-  python copycat.py positions
-  python copycat.py positions --refresh
-  python copycat.py orders
-  python copycat.py balance
-  python copycat.py -f
+  python copycat.py [eth|btc] buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py [eth|btc] buy   market -os -sp <phemex_size> -sx <xltrade_size>
+  python copycat.py [eth|btc] buy   limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py [eth|btc] sell  market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py [eth|btc] sell  market -os -sp <phemex_size> -sx <xltrade_size>
+  python copycat.py [eth|btc] sell  limit  -p <price> -sp <phemex_size> -sx <xltrade_size> -tp <tp>
+  python copycat.py [eth|btc] positions
+  python copycat.py [eth|btc] positions --refresh
+  python copycat.py [eth|btc] orders
+  python copycat.py [eth|btc] balance
+  python copycat.py [eth|btc] -f
+
+{BLD}Asset:{RST}
+  eth  — ETHUSDT on Phemex / ETHUSD.nx on XLTRADE (default if omitted)
+  btc  — BTCUSDT on Phemex / BTCUSD.nx on XLTRADE
 
 {BLD}On-sides (-os):{RST}
   Market order with fixed 1:2 R:R. No -tp needed.
@@ -1032,10 +1051,10 @@ USAGE = f"""
   XLTRADE: SL = fill ± $17.60  |  TP = fill ± $32.60
 
 {BLD}Examples:{RST}
-  python copycat.py buy market -sp 0.33 -sx 0.27 -tp 2400.00
-  python copycat.py buy market -os -sp 0.33 -sx 0.27
-  python copycat.py sell market -os -sp 0.33 -sx 0.27
-  python copycat.py buy limit -p 2130.00 -sp 0.33 -sx 0.27 -tp 2400.00
+  python copycat.py eth buy market -sp 0.33 -sx 0.27 -tp 2400.00
+  python copycat.py btc buy market -sp 0.01 -sx 0.01 -tp 85000.00
+  python copycat.py eth buy market -os -sp 0.33 -sx 0.27
+  python copycat.py eth buy limit -p 2130.00 -sp 0.33 -sx 0.27 -tp 2400.00
 """
 
 # ── Command: orders ───────────────────────────────────────────────────────────
@@ -1148,7 +1167,22 @@ async def cmd_orders():
             warn(e)
 
 def parse_args():
+    global PHEMEX_SYMBOL, MT5_SYMBOL
     args = sys.argv[1:]
+
+    if not args:
+        print(USAGE)
+        sys.exit(0)
+
+    # ── Asset selection (first argument) ──────────────────────────────────────
+    if args[0].lower() in ASSET_SYMBOLS:
+        asset = args[0].lower()
+        PHEMEX_SYMBOL = ASSET_SYMBOLS[asset]['phemex']
+        MT5_SYMBOL    = ASSET_SYMBOLS[asset]['mt5']
+        args = args[1:]  # shift remaining args
+    else:
+        # Default to ETH if no asset specified (backward compatible)
+        asset = 'eth'
 
     if not args:
         print(USAGE)

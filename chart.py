@@ -89,7 +89,7 @@ def cur_label():
 
 MAX_CANDLES   = 3000    # 48h × 60 = 2880 candles at 1m, plus headroom
 REST_LIMIT    = 500     # fetch up to 500 candles per request
-REFRESH_DELAY = 0.04    # ~25 fps (slightly faster for smoother scroll)
+REFRESH_DELAY = 0.05   # ~20 fps — reduces CPU and terminal write pressure
 
 # Interval table: label → (phemex_resolution_secs, kraken_interval_mins, ws_interval_mins)
 INTERVALS = [
@@ -3542,16 +3542,27 @@ def _input_field(stdscr, row, col, width, default=""):
 
 
 def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
-    """Create alert dialog using the same safe pattern as jump_to_dialog."""
+    """Create alert dialog — scrollable condition list, fixed-size box."""
     stdscr.nodelay(False)
     curses.curs_set(0)
 
-    box_w = min(cols - 4, 62)
-    box_h = 16
-    box_y = max(0, rows // 2 - box_h // 2)
-    box_x = max(0, cols // 2 - box_w // 2)
+    n_conds  = len(ALERT_CONDITIONS)
+    # Box: title + header + visible_conds + hint = fixed height
+    VISIBLE  = min(10, n_conds)   # max conditions shown at once
+    box_w    = min(cols - 4, 62)
+    box_h    = VISIBLE + 5        # title + blank + VISIBLE + blank + hint
+    box_y    = max(0, rows // 2 - box_h // 2)
+    box_x    = max(0, cols // 2 - box_w // 2)
+    scroll   = 0                   # top of visible window
 
     def draw_box(cond_idx, step, snd):
+        nonlocal scroll
+        # Keep selected item in view
+        if cond_idx < scroll:
+            scroll = cond_idx
+        elif cond_idx >= scroll + VISIBLE:
+            scroll = cond_idx - VISIBLE + 1
+
         for r in range(box_h):
             try:
                 stdscr.addstr(box_y + r, box_x, " " * box_w,
@@ -3559,26 +3570,44 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
             except curses.error:
                 pass
         try:
+            title = f" Create Alert  ({cond_idx+1}/{n_conds}) "
             stdscr.addstr(box_y, box_x,
-                          " Create Alert ".center(box_w),
+                          title.center(box_w),
                           curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
         except curses.error:
             pass
-        for ci, (_, clabel) in enumerate(ALERT_CONDITIONS):
+
+        # Draw only the visible slice
+        for vi in range(VISIBLE):
+            ci = scroll + vi
+            if ci >= n_conds:
+                break
+            _, clabel = ALERT_CONDITIONS[ci]
             attr = (curses.color_pair(C_ASSET_SEL) | curses.A_BOLD
                     if ci == cond_idx else curses.color_pair(C_CURSOR))
             marker = ">" if ci == cond_idx else " "
             try:
-                stdscr.addstr(box_y + 2 + ci, box_x + 2,
+                stdscr.addstr(box_y + 2 + vi, box_x + 2,
                               f"{marker} {clabel:<40}"[:box_w - 3], attr)
             except curses.error:
                 pass
+
+        # Scroll indicators
+        if scroll > 0:
+            try: stdscr.addstr(box_y + 2, box_x + box_w - 2, "↑",
+                               curses.color_pair(C_AXIS))
+            except curses.error: pass
+        if scroll + VISIBLE < n_conds:
+            try: stdscr.addstr(box_y + 1 + VISIBLE, box_x + box_w - 2, "↓",
+                               curses.color_pair(C_AXIS))
+            except curses.error: pass
+
         hints = {
-            0: "  [↑↓] Select condition   [Enter] next   [Esc] cancel",
+            0: "  [↑↓] Select   [Enter] next   [Esc] cancel",
             1: "  Enter price value   [Enter] next   [Esc] cancel",
             2: "  Enter alert name    [Enter] next   [Esc] cancel",
             3: "  Enter message       [Enter] next   [Esc] cancel",
-            4: "  [←→] toggle sound   [Enter] confirm   [Esc] cancel",
+            4: "  [←→] sound toggle  [Enter] confirm  [Esc] cancel",
         }
         try:
             stdscr.addstr(box_y + box_h - 1, box_x + 1,
@@ -3624,16 +3653,24 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
     cond_type, cond_label = ALERT_CONDITIONS[cond_idx]
 
     # Step 1-4: text fields
-    draw_box(cond_idx, 1, True)
+    # Re-draw box with fields below the visible conditions area
+    _frow = box_y + 2 + VISIBLE  # first field row = after condition list
+    for r in range(box_h):
+        try: stdscr.addstr(box_y + r, box_x, " " * box_w,
+                           curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        except curses.error: pass
     try:
-        stdscr.addstr(box_y + 8, box_x + 2,
-                      f"Condition: {cond_label}",
+        stdscr.addstr(box_y, box_x, " Create Alert ".center(box_w),
+                      curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+        stdscr.addstr(_frow, box_x + 2,
+                      f"Condition: {cond_label}"[:box_w-4],
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
-        stdscr.addstr(box_y + 9, box_x + 2, "Price value: ",
+        stdscr.addstr(_frow + 1, box_x + 2, "Price value: ",
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
     except curses.error:
         pass
-    val_str = _input_field(stdscr, box_y + 9, box_x + 15, 20, _prefill_val)
+    stdscr.refresh()
+    val_str = _input_field(stdscr, _frow + 1, box_x + 15, 20, _prefill_val)
     if val_str is None:
         stdscr.nodelay(True)
         return None
@@ -3643,22 +3680,22 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
         val = state.last_price
 
     try:
-        stdscr.addstr(box_y + 10, box_x + 2, "Alert name:  ",
+        stdscr.addstr(_frow + 2, box_x + 2, "Alert name:  ",
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
     except curses.error:
         pass
-    name = _input_field(stdscr, box_y + 10, box_x + 15,
+    name = _input_field(stdscr, _frow + 2, box_x + 15,
                         30, _prefill_name or f"Alert @ {val_str}")
     if name is None:
         stdscr.nodelay(True)
         return None
 
     try:
-        stdscr.addstr(box_y + 11, box_x + 2, "Message:     ",
+        stdscr.addstr(_frow + 3, box_x + 2, "Message:     ",
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
     except curses.error:
         pass
-    msg = _input_field(stdscr, box_y + 11, box_x + 15,
+    msg = _input_field(stdscr, _frow + 3, box_x + 15,
                        40, _prefill_msg or f"{cond_label} {val_str}")
     if msg is None:
         stdscr.nodelay(True)
@@ -3670,7 +3707,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
         draw_box(cond_idx, 4, snd)
         snd_str = f"  Sound: {'[ON ]' if snd else '[OFF]'}   ← → toggle"
         try:
-            stdscr.addstr(box_y + 12, box_x + 2, snd_str,
+            stdscr.addstr(_frow + 4, box_x + 2, snd_str,
                           curses.color_pair(C_CURSOR) | curses.A_BOLD)
         except curses.error:
             pass
@@ -4944,8 +4981,11 @@ def main(stdscr):
             stdscr.clear()
 
         draw(stdscr, db, rows, cols)
-        db.flush(stdscr)
-        stdscr.refresh()
+        db.flush(stdscr)   # writes changed cells via addch()
+        # noutrefresh marks the window dirty without pushing to terminal;
+        # doupdate pushes everything in one atomic operation — no flicker.
+        stdscr.noutrefresh()
+        curses.doupdate()
         time.sleep(REFRESH_DELAY)
 
 if __name__ == "__main__":

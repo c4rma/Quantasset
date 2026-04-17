@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
 # copycat.py — Blackjack Trade Copier CLI
-# Confidential — Fund Intellectual Property
+# Proprietary — Fund Intellectual Property
 #
 # Usage:
 #   python copycat.py buy   market <size> -tp <tp>
@@ -1026,7 +1026,7 @@ async def cmd_flatten():
 # ── Argument parser ───────────────────────────────────────────────────────────
 USAGE = f"""
 {BLD}{CYN}COPYCAT — Blackjack Trade Copier{RST}
-{DIM}Confidential — Fund Intellectual Property{RST}
+{DIM}Proprietary — Fund Intellectual Property{RST}
 
 {BLD}Usage:{RST}
   python copycat.py [eth|btc] buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>

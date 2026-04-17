@@ -235,6 +235,10 @@ class ChartState:
         # Each dict: {side, entry, sl, tp, size_phemex, size_xl, status}
         self.trade_lines    = []    # active/pending trade levels to draw
         self.trade_monitor  = False # True while trade monitor thread running
+        # Indicator levels written by draw() for alert_monitor to read
+        self.indicator_levels = {}  # {vwap, sd_p05, sd_m05, sd_p2, sd_m2, sd_p25, sd_m25, vah, val, poc}
+        self.btd_buy_fired   = False  # set True when BTD buy fires on candle close
+        self.btd_sell_fired  = False  # set True when BTD sell fires on candle close
         # Position tool: list of {entry,sl,tp,anchor_idx,side,active}
         self.pos_tools = []
         # Horizontal line drawings: [{price, label, alert, active}]
@@ -1699,6 +1703,12 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                             col_start=max(0, curr_col_start))
             draw_level_line(poc_price, "=", C_VP_POC, curses.A_BOLD, "POC",
                             col_start=max(0, curr_col_start))
+            # Write VP levels to state for alert_monitor
+            with state.lock:
+                _lvl = state.indicator_levels
+                _lvl["vah"] = vah_price
+                _lvl["val"] = val_price
+                _lvl["poc"] = poc_price
 
     # ── VWAP + STANDARD DEVIATION BANDS — current + previous session ────────
     if show_vwap and visible and chart_h > 0:
@@ -1825,12 +1835,12 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                                     f"{label + ' ' + price_fmt(price, asset):<{PRICE_W}}",
                                     pair, attrs)
                     _axis_lbl(_vw_last,                "VW",  C_VWAP)
-                    _axis_lbl(_vw_last + 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
-                    _axis_lbl(_vw_last - 0.5*_sd_last, ".5s", C_VWAP_BAND, curses.A_DIM)
-                    _axis_lbl(_vw_last + 2.0*_sd_last, "2s",  C_VWAP_SD2)
-                    _axis_lbl(_vw_last - 2.0*_sd_last, "2s",  C_VWAP_SD2)
-                    _axis_lbl(_vw_last + 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
-                    _axis_lbl(_vw_last - 2.5*_sd_last, "2.5s",C_VWAP_SD2, curses.A_DIM)
+                    _axis_lbl(_vw_last + 0.5*_sd_last, "+.5s", C_VWAP_BAND, curses.A_DIM)
+                    _axis_lbl(_vw_last - 0.5*_sd_last, "-.5s", C_VWAP_BAND, curses.A_DIM)
+                    _axis_lbl(_vw_last + 2.0*_sd_last, "+2s",  C_VWAP_SD2)
+                    _axis_lbl(_vw_last - 2.0*_sd_last, "-2s",  C_VWAP_SD2)
+                    _axis_lbl(_vw_last + 2.5*_sd_last, "+2.5s",C_VWAP_SD2, curses.A_DIM)
+                    _axis_lbl(_vw_last - 2.5*_sd_last, "-2.5s",C_VWAP_SD2, curses.A_DIM)
 
 
     # ── SESSIONS INDICATOR ───────────────────────────────────────────────────
@@ -2103,6 +2113,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     and chart_top <= _row_b < chart_bot
                     and _ci - _last_buy_signal >= BTD_COOLDOWN):
                 _last_buy_signal = _ci
+                # Signal on live candle → notify alert_monitor
+                if _ci >= len(all_candles) - 1:
+                    state.btd_buy_fired  = True
+                    state.btd_sell_fired = False
                 if _cb > _t3b:
                     # T3: 3-wide × 2-tall — unmissable
                     for _dx in range(-1, 2):
@@ -2124,6 +2138,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     and chart_top <= _row_s < chart_bot
                     and _ci - _last_sell_signal >= BTD_COOLDOWN):
                 _last_sell_signal = _ci
+                # Signal on live candle → notify alert_monitor
+                if _ci >= len(all_candles) - 1:
+                    state.btd_sell_fired  = True
+                    state.btd_buy_fired   = False
                 if _cs > _t3s:
                     # T3: 3-wide × 2-tall
                     for _dx in range(-1, 2):
@@ -2544,7 +2562,9 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
     chart_top = HEADER_H
     chart_bot = rows - FOOTER_H - TIME_H - 1
     chart_h   = max(1, chart_bot - chart_top)
-    chart_r   = max(10, cols - LEGEND_W - 2)
+    # Adaptive legend width: shrink if terminal too narrow
+    _eff_legend = min(LEGEND_W, max(0, cols - 20))
+    chart_r   = max(10, cols - _eff_legend - 2)
     time_row  = chart_bot
     footer_row= rows - 1
 
@@ -2682,7 +2702,15 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
         ref_col = g_cursor if in_cursor_g and 0 <= g_cursor < len(pcts) else len(pcts) - 1
         if pcts and ref_col >= 0:
             final_pcts[label]   = pcts[ref_col]
-            final_prices[label] = raw_series.get(label, [0.0] * len(pcts))[ref_col]
+            # Try live ticker from Phemex for current price
+            _base_price = raw_series.get(label, [0.0] * len(pcts))[ref_col]
+            # Use live last_price for ETH/BTC if watching that asset
+            with state.lock:
+                _is_live_asset = (label in ("ETH","BTC") and
+                                  label[:3] == state.asset and
+                                  state.last_price > 0)
+                _live_p = state.last_price if _is_live_asset else 0.0
+            final_prices[label] = _live_p if _live_p > 0 else _base_price
 
     # ── Cursor crosshair ──────────────────────────────────────────────────────
     if in_cursor_g and 0 <= g_cursor < chart_r:
@@ -2715,10 +2743,16 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
         used_rows[row] = label
         placed[label]  = row
 
+    # Fetch live ticker prices for crypto assets directly from state
+    _live_price_map = {}
+    with state.lock:
+        _live_price_map["ETH"] = state.last_price if state.asset == "ETH" else 0.0
+        _live_price_map["BTC"] = state.last_price if state.asset == "BTC" else 0.0
+
     for label, row in placed.items():
         pct        = final_pcts[label]
         color_pair = next((c for l, _p, _k, _y, c in GLOBAL_ASSETS if l == label), C_LABEL)
-        price      = final_prices.get(label, 0.0)
+        price      = _live_price_map.get(label) or final_prices.get(label, 0.0)
         price_str  = f"(${price:,.2f})" if price > 0 else ""
         lbl        = f"{label:<7}{pct:+.2f}% {price_str}"
         true_row   = label_rows[label]
@@ -3333,7 +3367,8 @@ def trade_monitor_loop():
             query_ = "currency=USDT"
             r = requests.get(f"{PHEMEX_REST_URL}{path_}?{query_}",
                              headers=_phemex_headers(path_, query_), timeout=8)
-            pos_data = r.json().get("data", {}).get("positions", []) or []
+            _pjson = r.json() or {}
+            pos_data = (_pjson.get("data") or {}).get("positions", []) or []
 
             # ── Fetch active orders (limit orders waiting to fill) ─────────────
             # Try g-orders (USDT perp) first, fallback to orders
@@ -3343,9 +3378,9 @@ def trade_monitor_loop():
                                headers=_phemex_headers(opath_, oquery_), timeout=8)
             _ord_json = or_.json()
             # g-orders returns data.rows, legacy returns data directly
-            _od = _ord_json.get("data", {})
-            ord_data = (_od.get("rows") or _od if isinstance(_od, list) else
-                        _od.get("rows", [])) or []
+            _od = (_ord_json or {}).get("data") or {}
+            ord_data = (_od.get("rows") if isinstance(_od, dict) else
+                        (_od if isinstance(_od, list) else [])) or []
 
         except Exception as _me:
             # Store monitor error briefly so it shows in footer
@@ -3438,7 +3473,9 @@ def trade_monitor_loop():
                 }
                 new_lines.append(tl)
                 if price > 0 and _id not in existing_alerts:
-                    _dir = "price_cross_up" if side == "buy" else "price_cross_down"
+                    # Alert direction based on price relative to current
+                    _lp  = state.last_price
+                    _dir = "price_cross_up" if price > _lp else "price_cross_down"
                     with state.lock:
                         state.alerts.append({
                             "_trade_id": _id,
@@ -3456,8 +3493,22 @@ def trade_monitor_loop():
 
 # ── Alert system ──────────────────────────────────────────────────────────────
 ALERT_CONDITIONS = [
-    ("price_cross_up",   "Price crosses UP through value"),
-    ("price_cross_down", "Price crosses DOWN through value"),
+    ("price_cross_up",      "Price crosses UP through value"),
+    ("price_cross_down",    "Price crosses DOWN through value"),
+    ("touch_vwap",          "Price touches VWAP"),
+    ("touch_sd_plus05",     "Price touches +0.5 SD"),
+    ("touch_sd_minus05",    "Price touches -0.5 SD"),
+    ("touch_sd_plus2",      "Price touches +2 SD"),
+    ("touch_sd_minus2",     "Price touches -2 SD"),
+    ("touch_sd_plus25",     "Price touches +2.5 SD"),
+    ("touch_sd_minus25",    "Price touches -2.5 SD"),
+    ("touch_vah",           "Price touches VAH"),
+    ("touch_val",           "Price touches VAL"),
+    ("touch_poc",           "Price touches POC"),
+    ("big_trade_buy",       "Big Buy signal (any tier, candle close)"),
+    ("big_trade_sell",      "Big Sell signal (any tier, candle close)"),
+    ("over_ext_up",         "Over-Extension Up (price >= +2sd + Big Sell)"),
+    ("over_ext_down",       "Over-Extension Down (price <= -2sd + Big Buy)"),
 ]
 
 def _input_field(stdscr, row, col, width, default=""):
@@ -3935,6 +3986,33 @@ HELP_SECTIONS = [
         ("[T]",        "Toggle Big Trade Detector  (volume anomaly circles)"),
     ]),
     ("INDICATORS", [
+        ("VWAP",       "Volume Weighted Avg Price (session-anchored 19:00 CT)"),
+        ("+.5s/-.5s",  "±0.5 std dev band (cyan shading)"),
+        ("+2s/-2s",    "±2 std dev lines (yellow)"),
+        ("+2.5s/-2.5s","±2.5 std dev lines (dim yellow)"),
+        ("POC",        "Point of Control (highest volume price, yellow)"),
+        ("VAH/VAL",    "Value Area High/Low (70% of session volume, magenta)"),
+        ("pPOC/pVAH/pVAL","Previous session levels — extend as virgin lines"),
+        ("S",          "Period separator (19:00 CT session open)"),
+    ]),
+    ("ALERT CONDITIONS", [
+        ("Price Cross", "Alert when price crosses a set level up or down"),
+        ("Indicator",   "Alert when price touches VWAP/SD/VAH/VAL/POC (no line drawn)"),
+        ("Big Trade",   "Alert on any BTD signal candle close (no line drawn)"),
+        ("Over-Ext Up", "Price >= +2sd AND Big Sell closes (no line drawn)"),
+        ("Over-Ext Dn", "Price <= -2sd AND Big Buy closes (no line drawn)"),
+        ("Auto-delete", "Price cross alerts delete after firing; others persist"),
+    ]),
+    ("DRAWINGS", [
+        ("[`]",        "Toggle Drawings list (backtick key)"),
+        ("[|]",        "Draw horizontal line (pipe = Shift+backslash)"),
+        ("[\\]",       "Position tool (backslash) — entry/SL/TP lines"),
+        ("[N]",        "New line (when drawings list open)"),
+        ("[D]",        "Delete selected line"),
+        ("[E]",        "Edit selected line"),
+        ("[Z]",        "Clear all trade lines and position tools"),
+    ]),
+    ("EXTRA", [
         ("VWAP",       "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
         ("±0.5σ",      "0.5 std dev band  (shaded cyan region around VWAP)"),
         ("±2σ",        "2 std dev lines   (yellow)"),
@@ -4102,6 +4180,42 @@ def alert_monitor():
                     _m = (_prev_price > 0 and _prev_price <= _cv < _cur)
                 elif _ct == "price_cross_down":
                     _m = (_prev_price > 0 and _prev_price >= _cv > _cur)
+                # ── Indicator touch alerts (no line drawn) ──────────────────
+                elif _ct.startswith("touch_"):
+                    with state.lock:
+                        _lvls = dict(state.indicator_levels)
+                    _tgt_map = {
+                        "touch_vwap":   _lvls.get("vwap", 0),
+                        "touch_sd_plus05": _lvls.get("sd_p05", 0),
+                        "touch_sd_minus05": _lvls.get("sd_m05", 0),
+                        "touch_sd_plus2":  _lvls.get("sd_p2", 0),
+                        "touch_sd_minus2": _lvls.get("sd_m2", 0),
+                        "touch_sd_plus25": _lvls.get("sd_p25", 0),
+                        "touch_sd_minus25":_lvls.get("sd_m25", 0),
+                        "touch_vah":    _lvls.get("vah", 0),
+                        "touch_val":    _lvls.get("val", 0),
+                        "touch_poc":    _lvls.get("poc", 0),
+                    }
+                    _tgt = _tgt_map.get(_ct, 0)
+                    # "Touch" = price within 0.1% of target level
+                    _m = (_tgt > 0 and abs(_cur - _tgt) / _tgt < 0.001)
+                # ── BTD + Over-Extension alerts (candle close based) ────────
+                elif _ct == "big_trade_buy":
+                    with state.lock:
+                        _m = state.btd_buy_fired
+                elif _ct == "big_trade_sell":
+                    with state.lock:
+                        _m = state.btd_sell_fired
+                elif _ct == "over_ext_up":
+                    with state.lock:
+                        _sd2u = state.indicator_levels.get("sd_p2", 0)
+                        _bsell = state.btd_sell_fired
+                    _m = (_sd2u > 0 and _cur >= _sd2u and _bsell)
+                elif _ct == "over_ext_down":
+                    with state.lock:
+                        _sd2d = state.indicator_levels.get("sd_m2", 0)
+                        _bbuy = state.btd_buy_fired
+                    _m = (_sd2d > 0 and _cur <= _sd2d and _bbuy)
                 else:
                     _m = False
                 if not _m:
@@ -4122,8 +4236,16 @@ def alert_monitor():
                         "message": _ta.get("message", "Condition met"),
                         "time":    datetime.now().strftime("%H:%M:%S"),
                     })
-                    # Fire once: remove alert from active list
-                    if _ta in state.alerts:
+                    # Price-cross alerts fire once and delete themselves
+                    # BTD/Over-ext/Indicator-touch alerts PERSIST (remain active)
+                    _ct0 = _ta.get("conditions", [{}])[0].get("type", "")
+                    _auto_delete = _ct0 in ("price_cross_up", "price_cross_down",
+                                            "touch_vwap", "touch_sd_plus05",
+                                            "touch_sd_minus05", "touch_sd_plus2",
+                                            "touch_sd_minus2", "touch_sd_plus25",
+                                            "touch_sd_minus25", "touch_vah",
+                                            "touch_val", "touch_poc")
+                    if _auto_delete and _ta in state.alerts:
                         state.alerts.remove(_ta)
                 state.alert_triggered = state.alert_triggered[:20]
                 state.show_alert_popup = True
@@ -4374,7 +4496,8 @@ def main(stdscr):
                 stdscr.clear()
                 continue
             if key in (ord("q"), ord("Q")):
-                curses.endwin()
+                try: curses.endwin()
+                except: pass
                 return
 
             new_asset = None
@@ -4440,7 +4563,8 @@ def main(stdscr):
             elif key in (ord("x"), ord("X")):
                 # Open trade dialog
                 _trade = trade_dialog(stdscr, rows, cols)
-                curses.flushinp()   # clear keys typed during dialog
+                try: curses.flushinp()
+                except: pass
                 stdscr.nodelay(True)
                 if _trade:
                     with state.lock:
@@ -4583,9 +4707,21 @@ def main(stdscr):
                             state.show_alert_popup = False
             elif key in (ord("e"), ord("E")):
                 with state.lock:
+                    _hl_edit_open = state.show_hline_list
+                    _hl_edit_sel  = state.hline_sel
+                    _hl_existing  = (state.hlines[_hl_edit_sel]
+                                     if _hl_edit_open and 0 <= _hl_edit_sel < len(state.hlines)
+                                     else None)
                     _al_open = state.show_alert_list
                     _sel = state.alert_list_sel
                     _existing = state.alerts[_sel] if _al_open and 0 <= _sel < len(state.alerts) else None
+                if _hl_existing:
+                    _hl_new = hline_dialog(stdscr, rows, cols, _hl_existing["price"])
+                    curses.flushinp(); stdscr.nodelay(True)
+                    if _hl_new:
+                        with state.lock:
+                            state.hlines[_hl_edit_sel] = _hl_new
+                    db.prev = None; stdscr.clearok(True); stdscr.clear()
                 if _existing:
                     _edited = alert_create_dialog(stdscr, rows, cols, existing=_existing)
                     if _edited:
@@ -4678,7 +4814,10 @@ def main(stdscr):
                         state.econ_scroll = max(0, state.econ_scroll - 1)
             elif key == curses.KEY_DOWN:
                 with state.lock:
-                    if state.show_alert_list:
+                    if state.show_hline_list:
+                        state.hline_sel = min(max(0, len(state.hlines)-1),
+                                              state.hline_sel + 1)
+                    elif state.show_alert_list:
                         n_a = len(state.alerts)
                         state.alert_list_sel = min(max(0, n_a-1), state.alert_list_sel + 1)
                     elif state.show_help:

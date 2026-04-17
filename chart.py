@@ -162,15 +162,17 @@ C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
 #   (label, phemex_symbol, kraken_pair, yahoo_symbol, color_pair)
 # BTC/ETH → Phemex (primary) / Kraken (fallback)
 # TradFi (indices, commodities, forex) → Yahoo Finance (free, no auth)
+# Phemex CFD symbols tried first for TradFi assets (more reliable intraday data)
+# Yahoo Finance used as fallback — note Yahoo CL=F can show roll artifacts
 GLOBAL_ASSETS = [
-    ("BTC",    "BTCUSDT",  "XBT/USD",  "BTC-USD",  C_G_BTC),
-    ("ETH",    "ETHUSDT",  "ETH/USD",  "ETH-USD",  C_G_ETH),
-    ("XAUUSD", None,       "XAU/USD",  "GC=F",     C_G_XAUUSD),
-    ("USDJPY", None,       None,       "JPY=X",    C_G_USDJPY),
-    ("USOIL",  None,       None,       "CL=F",     C_G_USOIL),
-    ("SPX500", None,       None,       "^GSPC",    C_G_SPX),
-    ("NAS100", None,       None,       "^NDX",     C_G_NAS100),
-    ("DXY",    None,       None,       "DX-Y.NYB", C_G_ZB),
+    ("BTC",    "BTCUSDT",     "XBT/USD",  "BTC-USD",   C_G_BTC),
+    ("ETH",    "ETHUSDT",     "ETH/USD",  "ETH-USD",   C_G_ETH),
+    ("XAUUSD", "XAUUSDT",     "XAU/USD",  "GC=F",      C_G_XAUUSD),
+    ("USDJPY", "uUSDJPYUSDT", None,       "JPY=X",     C_G_USDJPY),
+    ("USOIL",  "XTIUSDT",     None,       "CL=F",      C_G_USOIL),
+    ("SPX500", "SP500USDT",   None,       "^GSPC",     C_G_SPX),
+    ("NAS100", "NAS100USDT",  None,       "^NDX",      C_G_NAS100),
+    ("DXY",    "uDXYUSDT",    None,       "DX-Y.NYB",  C_G_ZB),
 ]
 
 # ── data structures ────────────────────────────────────────────────────────────
@@ -235,6 +237,10 @@ class ChartState:
         self.trade_monitor  = False # True while trade monitor thread running
         # Position tool: list of {entry,sl,tp,anchor_idx,side,active}
         self.pos_tools = []
+        # Horizontal line drawings: [{price, label, alert, active}]
+        self.hlines     = []
+        self.show_hline_list = False
+        self.hline_sel       = 0
         self.n_vis        = 0       # visible candle count, set by draw()
         self.global_mode      = False
         self.global_data      = {}
@@ -985,7 +991,9 @@ def fetch_global_asset_phemex(symbol: str, resolution: int = 60,
         rows = data.get("data", {}).get("rows", [])
         if not rows:
             return []
-        return [(row[0], float(row[6])) for row in reversed(rows)]
+        # row layout: [ts, interval, open, high, low, close, vol, turnover]
+        # index 5 = close price for Phemex linear/CFD symbols
+        return [(int(row[0]), float(row[5])) for row in reversed(rows)]
     except Exception:
         return []
 
@@ -1196,6 +1204,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         econ_scroll       = state.econ_scroll
         trade_lines       = list(state.trade_lines)
         pos_tools         = list(state.pos_tools)
+        hlines            = list(state.hlines)
+        show_hline_list   = state.show_hline_list
+        hline_sel         = state.hline_sel
         global_mode       = state.global_mode
 
     all_candles = candles_snap + ([live] if live else [])
@@ -2268,6 +2279,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 f" [A] Alert list  [Esc] Dismiss".ljust(_abox_w)[:_abox_w],
                 C_AXIS, curses.A_DIM)
 
+    # ── HORIZONTAL LINES ─────────────────────────────────────────────
+    if hlines:
+        draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines)
+
     # ── POSITION TOOLS ───────────────────────────────────────────────
     if pos_tools:
         draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
@@ -2295,6 +2310,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         if db.buf[_ar][_lbl_col][0] in (" ", "-", "."):
             _al_lbl = f" A:{_av:.2f}"[:16]
             db.puts(_ar, _lbl_col, _al_lbl, C_ALERT, curses.A_BOLD)
+
+    # ── HLINE LIST OVERLAY ──────────────────────────────────────────
+    if show_hline_list:
+        draw_hline_list_overlay(db, rows, cols, hlines, hline_sel)
 
     # ── ALERT LIST OVERLAY ──────────────────────────────────────────
     if show_alert_list:
@@ -2709,9 +2728,15 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
             db.puts(row, legend_x, lbl, color_pair, curses.A_BOLD)
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    db.puts(footer_row, 0,
-            (f" MACRO  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"  f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit").ljust(cols)[:cols],
-            C_ASSET_SEL, curses.A_BOLD)
+    with state.lock:
+        _macro_err = state.error
+    _macro_footer_base = (f" MACRO  {n_total} pts  {len(pct_series)}/{len(GLOBAL_ASSETS)} assets"
+                          f"  next refresh:{_secs_left}s  [R] refresh  [P] shot  [M] exit  [Q] quit")
+    if _macro_err:
+        _macro_footer = _macro_footer_base + f"  | {_macro_err}"
+    else:
+        _macro_footer = _macro_footer_base
+    db.puts(footer_row, 0, _macro_footer.ljust(cols)[:cols], C_ASSET_SEL, curses.A_BOLD)
 
 
 
@@ -2725,8 +2750,8 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     stdscr.nodelay(False)
     curses.curs_set(0)
 
-    box_w = min(cols - 4, 64)
-    box_h = 24
+    box_w = min(cols - 4, 80)
+    box_h = 26
     box_y = max(0, rows // 2 - box_h // 2)
     box_x = max(0, cols // 2 - box_w // 2)
 
@@ -2861,8 +2886,9 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         (f"  Phemex:  {sp} contracts", C_LABEL, curses.A_NORMAL),
         (f"  XLTRADE: {sx} lots", C_LABEL, curses.A_NORMAL),
         ("", C_LABEL, curses.A_NORMAL),
-        (f"  cmd: {cmd_str[:box_w-8]}", C_AXIS, curses.A_DIM),
-        (f"       {cmd_str[box_w-8:box_w*2-14]}", C_AXIS, curses.A_DIM),
+        (f"  {cmd_str[:box_w-6]}", C_AXIS, curses.A_DIM),
+        (f"  {cmd_str[box_w-6:(box_w-6)*2]}", C_AXIS, curses.A_DIM),
+        (f"  {cmd_str[(box_w-6)*2:(box_w-6)*3]}", C_AXIS, curses.A_DIM),
         ("", C_LABEL, curses.A_NORMAL),
     ]
 
@@ -2897,6 +2923,8 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     import sys as _sys
     script_dir = os.path.dirname(os.path.abspath(__file__))
     copycat_py = os.path.join(script_dir, "copycat.py")
+    log_path   = os.path.join(script_dir, "trade_debug.log")
+
     if not os.path.exists(copycat_py):
         with state.lock:
             state.error = f"Trade failed: copycat.py not found at {copycat_py}"
@@ -2904,26 +2932,65 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         return None
     full_cmd = [_sys.executable, copycat_py] + cmd_parts
 
-    try:
-        proc = subprocess.Popen(full_cmd, cwd=script_dir,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-        out, err = proc.communicate(timeout=30)
-        ok = proc.returncode == 0
-    except Exception as _e:
-        ok = False
-        err = str(_e).encode()
+    # Always log the full command and output for debugging
+    import datetime as _dt_trade
+    _ts_str = _dt_trade.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    try:
+        _env = dict(os.environ)
+        _env["PYTHONIOENCODING"] = "utf-8"
+        # Use stdin=PIPE so copycat can receive interactive prompts if needed
+        proc = subprocess.Popen(
+            full_cmd, cwd=script_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge stdout+stderr
+            stdin=subprocess.PIPE,
+            env=_env,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        # Send 'y' to any confirmation prompts copycat may show
+        out_bytes, _ = proc.communicate(input=b"y\n", timeout=60)
+        ok = proc.returncode == 0
+        out_text = out_bytes.decode("utf-8", errors="replace")
+        err_text = ""
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out_text = ""
+        err_text = "copycat timed out after 60s"
+        ok = False
+    except Exception as _e:
+        out_text = ""
+        err_text = str(_e)
+        ok = False
+
+    # Write full debug log
+    try:
+        with open(log_path, "a", encoding="utf-8") as _lf:
+            _lf.write(f"\n{'='*60}\n")
+            _lf.write(f"[{_ts_str}] TRADE SUBMITTED\n")
+            _lf.write(f"CMD: {' '.join(full_cmd)}\n")
+            _lf.write(f"CWD: {script_dir}\n")
+            _lf.write(f"EXIT: {proc.returncode if hasattr(proc,'returncode') else 'N/A'}\n")
+            _lf.write(f"OUTPUT:\n{out_text}\n")
+            if err_text:
+                _lf.write(f"ERROR:\n{err_text}\n")
+    except Exception:
+        pass
+
+    combined = (out_text + "\n" + err_text).strip()
     if not ok:
-        err_text = err.decode(errors="replace").strip() or "copycat.py not found or failed"
-        # Store error in state — chart keeps running, error shown in footer
+        _elines = [l.strip() for l in combined.splitlines() if l.strip()]
+        _short  = _elines[-1] if _elines else "copycat failed — see trade_debug.log"
         with state.lock:
-            # Store full error lines for footer display
-            _elines = [l.strip() for l in err_text.splitlines() if l.strip()]
-            _short  = _elines[-1] if _elines else err_text
-            state.error = f"Trade failed: {_short[:120]}"
+            state.error = f"Trade failed: {_short[:180]}  [full log: trade_debug.log]"
         stdscr.nodelay(True)
         return None
+
+    # Show output summary in footer even on success
+    _elines_ok = [l.strip() for l in combined.splitlines() if l.strip()]
+    _summary   = _elines_ok[-1] if _elines_ok else "submitted"
+    with state.lock:
+        state.error = f"Trade OK: {_summary[:120]}"
 
     stdscr.nodelay(True)
     return {
@@ -2991,9 +3058,32 @@ def pos_tool_dialog(stdscr, rows: int, cols: int, anchor_price: float) -> dict |
     try:    sl = float(sl_s)
     except: sl = entry - 25
 
+    # Ask whether to create alerts
+    _clr("Create Alerts?")
+    try:
+        stdscr.addstr(box_y + 3, box_x + 2,
+                      f"Create TP/SL alerts automatically?",
+                      curses.color_pair(C_LABEL) | curses.A_BOLD)
+    except curses.error:
+        pass
+    _alert_choice = 0
+    while True:
+        for _ci2, _opt2 in enumerate(["Yes — create TP+SL alerts", "No  — lines only"]):
+            _attr2 = curses.color_pair(C_ASSET_SEL) | curses.A_BOLD                      if _ci2 == _alert_choice else curses.color_pair(C_CURSOR)
+            try: stdscr.addstr(box_y + 5 + _ci2, box_x + 4,
+                               f"{'>' if _ci2==_alert_choice else ' '} {_opt2}", _attr2)
+            except curses.error: pass
+        stdscr.refresh()
+        _ka = stdscr.getch()
+        if _ka == 27: stdscr.nodelay(True); return None
+        if _ka == curses.KEY_UP: _alert_choice = (_alert_choice - 1) % 2
+        elif _ka == curses.KEY_DOWN: _alert_choice = (_alert_choice + 1) % 2
+        elif _ka in (10, 13): break
+    create_alerts = (_alert_choice == 0)
+
     stdscr.nodelay(True)
     return {"entry": entry, "tp": tp, "sl": sl, "active": True,
-            "_anchor_idx": 0, "_stop_idx": None}
+            "_anchor_idx": 0, "_stop_idx": None, "create_alerts": create_alerts}
 
 
 def draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
@@ -3055,6 +3145,127 @@ def draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
                     curses.A_BOLD | curses.A_REVERSE)
 
 
+
+# ── Horizontal Line Tool ──────────────────────────────────────────────────────
+def hline_dialog(stdscr, rows: int, cols: int, default_price: float) -> dict | None:
+    """Ask for price, label, and optional alert. Returns hline dict or None."""
+    stdscr.nodelay(False)
+    curses.curs_set(0)
+    box_w = min(cols - 4, 52)
+    box_h = 16
+    box_y = max(0, rows // 2 - box_h // 2)
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    def _clr(title):
+        for r in range(box_h):
+            try: stdscr.addstr(box_y + r, box_x, " " * box_w,
+                               curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            except curses.error: pass
+        try:
+            stdscr.addstr(box_y, box_x,
+                          f" Horizontal Line — {title} ".center(box_w),
+                          curses.color_pair(C_ALERT) | curses.A_BOLD | curses.A_REVERSE)
+            stdscr.addstr(box_y + box_h - 1, box_x + 1,
+                          "  [Enter] confirm   [Esc] cancel"[:box_w - 2],
+                          curses.color_pair(C_AXIS) | curses.A_DIM)
+        except curses.error: pass
+        stdscr.refresh()
+
+    def _inp(title, label, default=""):
+        _clr(title)
+        try: stdscr.addstr(box_y + 3, box_x + 2, label,
+                           curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error: pass
+        return _input_field(stdscr, box_y + 4, box_x + 4, box_w - 8, str(default))
+
+    # Price
+    ps = _inp("Price", "Price level:", f"{default_price:.2f}")
+    if ps is None: stdscr.nodelay(True); return None
+    try:    price = float(ps)
+    except: price = default_price
+
+    # Label (optional)
+    ls = _inp("Label", "Label (optional, Enter to skip):", "")
+    if ls is None: stdscr.nodelay(True); return None
+    label = ls.strip()
+
+    # Alert?
+    _clr("Create Alert?")
+    try: stdscr.addstr(box_y + 3, box_x + 2, f"Create alert at {price:.2f}?",
+                       curses.color_pair(C_LABEL) | curses.A_BOLD)
+    except curses.error: pass
+    _ac = 1  # default No
+    while True:
+        for _ci, _o in enumerate(["Yes — create alert", "No  — line only"]):
+            _attr = curses.color_pair(C_ASSET_SEL) | curses.A_BOLD                     if _ci == _ac else curses.color_pair(C_CURSOR)
+            try: stdscr.addstr(box_y + 5 + _ci, box_x + 4,
+                               f"{'>' if _ci==_ac else ' '} {_o}", _attr)
+            except curses.error: pass
+        stdscr.refresh()
+        _k = stdscr.getch()
+        if _k == 27: stdscr.nodelay(True); return None
+        if _k == curses.KEY_UP: _ac = (_ac - 1) % 2
+        elif _k == curses.KEY_DOWN: _ac = (_ac + 1) % 2
+        elif _k in (10, 13): break
+
+    stdscr.nodelay(True)
+    return {"price": price, "label": label, "alert": (_ac == 0), "active": True}
+
+
+def draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines):
+    """Draw all active horizontal lines across the full chart width."""
+    for hl in hlines:
+        if not hl.get("active"):
+            continue
+        price = hl["price"]
+        label = hl.get("label", "")
+        row   = chart_top + p2r(price)
+        if not (chart_top <= row < chart_bot):
+            continue
+        for col in range(chart_r):
+            if db.buf[row][col][0] in (" ", ".", ":"):
+                db.put(row, col, "-", C_VWAP, curses.A_DIM)
+        # Label at right
+        lbl_str = f" {label} {price:.2f}" if label else f" {price:.2f}"
+        lbl_col = max(0, chart_r - len(lbl_str) - 1)
+        if db.buf[row][lbl_col][0] in (" ", "-"):
+            db.puts(row, lbl_col, lbl_str[:chart_r - lbl_col],
+                    C_VWAP, curses.A_BOLD | curses.A_REVERSE)
+
+
+def draw_hline_list_overlay(db, rows, cols, hlines, sel):
+    """Non-blocking drawing list overlay."""
+    box_w = min(cols - 4, 60)
+    box_h = min(rows - 4, 20)
+    box_y = rows // 2 - box_h // 2
+    box_x = max(0, cols // 2 - box_w // 2)
+
+    for r in range(box_h):
+        for c in range(box_w):
+            db.put(box_y + r, box_x + c, " ", C_HEADER)
+
+    title = " Drawings  [N]new  [D]del  [E]edit  [UpDn]sel  [`]close "
+    db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
+            curses.A_BOLD | curses.A_REVERSE)
+    db.puts(box_y + 1, box_x + 1,
+            f" Price        Alrt  Label"[:box_w - 2], C_LABEL, curses.A_BOLD)
+
+    if not hlines:
+        db.puts(box_y + 3, box_x + 3, "No lines — press [N] to draw one",
+                C_AXIS, curses.A_DIM)
+    for hi, hl in enumerate(hlines[:box_h - 4]):
+        pair  = C_ASSET_SEL if hi == sel else C_HEADER
+        attrs = curses.A_BOLD if hi == sel else curses.A_NORMAL
+        mrk   = ">" if hi == sel else " "
+        lbl   = hl.get("label", "")
+        alrt  = "[A]" if hl.get("alert") else "   "
+        lbl_s = f"{mrk} {hl['price']:>10.2f}  {alrt}  {lbl[:25]}"
+        db.puts(box_y + 2 + hi, box_x + 1, lbl_s[:box_w - 2], pair, attrs)
+
+    db.puts(box_y + box_h - 1, box_x + 1,
+            f" {len(hlines)} line(s)   [N]new  [D]del  [E]edit  [`]close"[:box_w - 2],
+            C_AXIS, curses.A_DIM)
+
 # ── Draw active trade lines ────────────────────────────────────────────────────
 def draw_trade_lines(db, chart_top, chart_bot, chart_r, p2r, trade_lines):
     """
@@ -3101,67 +3312,146 @@ def draw_trade_lines(db, chart_top, chart_bot, chart_r, p2r, trade_lines):
 # ── Trade monitor thread ───────────────────────────────────────────────────────
 def trade_monitor_loop():
     """
-    Polls Phemex account positions every 3s.
-    Updates state.trade_lines: adjusts entry/SL/TP from live account data,
-    removes lines for closed/cancelled positions.
+    Always-on background monitor that:
+    1. Polls Phemex positions + active orders every 3s continuously.
+    2. Auto-creates trade lines for any open position or pending order found,
+       including SL/TP levels if available.
+    3. Creates a one-shot alert at the entry/limit price of new detections.
+    4. Removes lines when position closes or order cancels.
+    Never stops — runs for the life of the application.
     """
+    _known_ids: set = set()   # track which positions/orders we've already plotted
+
     while True:
         time.sleep(3)
-        with state.lock:
-            if not state.trade_lines:
-                continue
-            lines = list(state.trade_lines)
 
         try:
-            # Fetch open positions from Phemex
+            sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
+
+            # ── Fetch open positions ───────────────────────────────────────────
             path_  = "/g-accounts/accountPositions"
             query_ = "currency=USDT"
-            hdrs_  = _phemex_headers(path_, query_)
             r = requests.get(f"{PHEMEX_REST_URL}{path_}?{query_}",
-                             headers=hdrs_, timeout=8)
-            data   = r.json()
-            pos    = data.get("data", {}).get("positions", [])
-            # Build lookup: symbol → position info
-            pos_map = {p["symbol"]: p for p in pos if p.get("size", 0) != 0}
+                             headers=_phemex_headers(path_, query_), timeout=8)
+            pos_data = r.json().get("data", {}).get("positions", []) or []
 
-            # Also fetch open orders for limit price confirmation
-            opath_  = "/orders/activeList"
-            oquery_ = "symbol=ETHUSDT&currency=USDT"
-            for asset_sym in (PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT"),):
-                oquery_ = f"symbol={asset_sym}"
-            ohdrs_  = _phemex_headers(opath_, oquery_)
-            or_    = requests.get(f"{PHEMEX_REST_URL}{opath_}?{oquery_}",
-                                  headers=ohdrs_, timeout=8)
-            odata_ = or_.json()
-            orders = odata_.get("data", {}).get("rows", [])
+            # ── Fetch active orders (limit orders waiting to fill) ─────────────
+            # Try g-orders (USDT perp) first, fallback to orders
+            opath_  = "/g-orders/activeList"
+            oquery_ = f"symbol={sym}&currency=USDT"
+            or_ = requests.get(f"{PHEMEX_REST_URL}{opath_}?{oquery_}",
+                               headers=_phemex_headers(opath_, oquery_), timeout=8)
+            _ord_json = or_.json()
+            # g-orders returns data.rows, legacy returns data directly
+            _od = _ord_json.get("data", {})
+            ord_data = (_od.get("rows") or _od if isinstance(_od, list) else
+                        _od.get("rows", [])) or []
 
-        except Exception:
+        except Exception as _me:
+            # Store monitor error briefly so it shows in footer
+            with state.lock:
+                state.error = f"Monitor: {type(_me).__name__}: {str(_me)[:60]}"
             continue
 
-        sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
-        pos_info = pos_map.get(sym)
-
-        updated = []
-        for tl in lines:
-            if tl.get("status") == "cancelled":
-                continue  # drop cancelled
-            if pos_info:
-                # Update entry from avgEntryPrice, SL/TP from position fields
-                avg_e  = float(pos_info.get("avgEntryPriceRp", tl["entry"]) or tl["entry"])
-                sl_p   = float(pos_info.get("stopLossPriceRp",  tl["sl"])   or tl["sl"])
-                tp_p   = float(pos_info.get("takeProfitPriceRp",tl["tp"])   or tl["tp"])
-                size_p = float(pos_info.get("size", 0))
-                if size_p == 0:
-                    tl["status"] = "closed"
-                    continue  # position closed — remove line
-                tl["entry"]  = avg_e if avg_e > 0 else tl["entry"]
-                tl["sl"]     = sl_p  if sl_p  > 0 else tl["sl"]
-                tl["tp"]     = tp_p  if tp_p  > 0 else tl["tp"]
-                tl["status"] = "active"
-            updated.append(tl)
-
         with state.lock:
-            state.trade_lines = updated
+            existing_lines = {tl.get("_id"): tl for tl in state.trade_lines
+                              if tl.get("_id")}
+            existing_alerts = {a.get("_trade_id") for a in state.alerts
+                               if a.get("_trade_id")}
+
+        new_lines  = []
+        active_ids = set()
+
+        # ── Process open positions ─────────────────────────────────────────────
+        for p in pos_data:
+            if p.get("symbol") != sym:
+                continue
+            size = float(p.get("size", 0) or 0)
+            if size == 0:
+                continue
+            pos_side  = p.get("posSide", "Long")
+            side      = "buy" if pos_side == "Long" else "sell"
+            entry     = float(p.get("avgEntryPriceRp", 0) or 0)
+            sl        = float(p.get("stopLossPriceRp",  0) or 0)
+            tp        = float(p.get("takeProfitPriceRp", 0) or 0)
+            _id       = f"pos_{sym}_{pos_side}"
+            active_ids.add(_id)
+
+            if _id in existing_lines:
+                # Update in-place
+                tl = existing_lines[_id]
+                if entry > 0: tl["entry"] = entry
+                if sl    > 0: tl["sl"]    = sl
+                if tp    > 0: tl["tp"]    = tp
+                tl["status"] = "active"
+                new_lines.append(tl)
+            else:
+                # New position detected — create line
+                tl = {
+                    "_id": _id, "side": side, "order_type": f"{pos_side} Position",
+                    "entry": entry if entry > 0 else state.last_price,
+                    "sl": sl, "tp": tp,
+                    "size_phemex": size, "size_xl": 0,
+                    "limit_price": None, "status": "active",
+                }
+                new_lines.append(tl)
+                # Alert at entry if not already set
+                if entry > 0 and _id not in existing_alerts:
+                    _dir = "price_cross_up" if side == "buy" else "price_cross_down"
+                    with state.lock:
+                        state.alerts.append({
+                            "_trade_id": _id,
+                            "name": f"{pos_side} @ {entry:.2f}",
+                            "conditions": [{"type": _dir, "value": entry}],
+                            "message": f"Position {pos_side} filled @ {entry:.2f}",
+                            "active": True, "sound": True, "_last_state": False,
+                        })
+
+        # ── Process pending limit orders ───────────────────────────────────────
+        for o in ord_data:
+            ord_side  = o.get("side", "")
+            ord_type  = o.get("ordType") or o.get("orderType", "")
+            price     = float(o.get("priceRp") or o.get("price") or 0)
+            sl        = float(o.get("stopLossRp") or o.get("stopLoss") or 0)
+            tp_v      = float(o.get("takeProfitRp") or o.get("takeProfit") or 0)
+            cl_id     = o.get("clOrdID") or o.get("orderID") or o.get("id", "")
+            status    = o.get("ordStatus") or o.get("status", "")
+            if status in ("Filled", "Canceled", "Rejected"):
+                continue
+            _id = f"ord_{cl_id}"
+            active_ids.add(_id)
+            side = "buy" if ord_side == "Buy" else "sell"
+
+            if _id in existing_lines:
+                tl = existing_lines[_id]
+                if price > 0: tl["entry"] = price
+                if sl    > 0: tl["sl"]    = sl
+                if tp_v  > 0: tl["tp"]    = tp_v
+                new_lines.append(tl)
+            else:
+                tl = {
+                    "_id": _id, "side": side, "order_type": f"Limit {ord_side}",
+                    "entry": price if price > 0 else state.last_price,
+                    "sl": sl, "tp": tp_v,
+                    "size_phemex": float(o.get("orderQtyRq") or o.get("qty") or 0), "size_xl": 0,
+                    "limit_price": price, "status": "pending",
+                }
+                new_lines.append(tl)
+                if price > 0 and _id not in existing_alerts:
+                    _dir = "price_cross_up" if side == "buy" else "price_cross_down"
+                    with state.lock:
+                        state.alerts.append({
+                            "_trade_id": _id,
+                            "name": f"Limit {ord_side} @ {price:.2f}",
+                            "conditions": [{"type": _dir, "value": price}],
+                            "message": f"Limit order filled @ {price:.2f}",
+                            "active": True, "sound": True, "_last_state": False,
+                        })
+
+        # ── Keep manual lines that aren't from monitor (no _id set by monitor) ─
+        with state.lock:
+            manual = [tl for tl in state.trade_lines if not tl.get("_id")]
+            state.trade_lines = new_lines + manual
 
 
 # ── Alert system ──────────────────────────────────────────────────────────────
@@ -3552,7 +3842,7 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading,
         return
 
     # ── Header ─────────────────────────────────────────────────────────────────
-    hdr = f" {'Time':<7} {'Imp':<5} {'Event':<42} {'Actual':<10} {'Fcst':<10} {'Prev':<8}"
+    hdr = f" {'Time':<7} {'Imp':<5} {'Event':<55}"
     db.puts(box_y + 3, box_x, hdr[:box_w], C_LABEL, curses.A_BOLD | curses.A_UNDERLINE)
 
     # ── Countdown to next event ────────────────────────────────────────────────
@@ -3581,18 +3871,31 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading,
                 "  [<][>] also scrolls ",
                 C_AXIS, curses.A_DIM)
 
+    _last_day_shown = None
+    _row_y_offset   = 0   # extra rows used by day separators
     for li, ev in enumerate(visible_evs):
-        row_y     = box_y + ev_start + li
+        row_y = box_y + ev_start + li + _row_y_offset
+        if row_y >= box_y + box_h - 1:
+            break
         ev_ts     = ev.get("ts", 0)
         ev_time   = ev.get("time", "")
-        ev_name   = ev.get("name", "")[:40]
-        ev_actual = ev.get("actual", "")[:9]
-        ev_fcst   = ev.get("forecast", "")[:9]
-        ev_prev   = ev.get("previous", "")[:7]
+        ev_name   = ev.get("name", "")[:52]
         imp_n     = _imp_count(ev)
         imp_str   = "***" if imp_n >= 3 else "** " if imp_n == 2 else "*  "
 
-        # Color by state: past=dim, next=gold+reversed, high=red, med=yellow, low=white
+        # Day separator for week view
+        if date_range == "week" and ev_ts > 0:
+            _ev_day = datetime.fromtimestamp(ev_ts).strftime("%A %b %d")
+            if _ev_day != _last_day_shown:
+                _last_day_shown = _ev_day
+                _sep = f" --- {_ev_day} ---"
+                db.puts(row_y, box_x, _sep.ljust(box_w)[:box_w], C_VWAP, curses.A_BOLD)
+                _row_y_offset += 1
+                row_y = box_y + ev_start + li + _row_y_offset
+                if row_y >= box_y + box_h - 1:
+                    break
+
+        # Color by state
         if ev_ts > 0 and ev_ts < now_ts:
             pair, attrs = C_AXIS, curses.A_DIM
         elif ev == next_event:
@@ -3604,8 +3907,7 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading,
         else:
             pair, attrs = C_LABEL, curses.A_NORMAL
 
-        lbl = (f" {ev_time:<7} {imp_str:<5} {ev_name:<42}"
-               f" {ev_actual:<10} {ev_fcst:<10} {ev_prev:<8}")
+        lbl = f" {ev_time:<7} {imp_str:<5} {ev_name:<55}"
         db.puts(row_y, box_x, lbl[:box_w], pair, attrs)
 
 # ── help dialog ───────────────────────────────────────────────────────────────
@@ -3647,8 +3949,26 @@ HELP_SECTIONS = [
         ("[A]",        "Open/close Alert list overlay (chart stays live)"),
         ("[N]",        "New alert (only when alert list is open)"),
         ("[D]",        "Delete selected alert (only when alert list is open)"),
-        ("[↑][↓]",     "Navigate alert list selection"),
-        ("[Esc]",      "Close alert list / calendar / dismiss popup"),
+        ("[E]",        "Edit selected alert (only when alert list is open)"),
+        ("[.]",        "Dismiss alert popup"),
+        ("[↑][↓]",     "Navigate alert list / drawings list / econ calendar"),
+        ("[Esc]",      "Close calendar / dismiss popup / snap to live"),
+    ]),
+    ("DRAWINGS", [
+        ("[`]",       "Toggle Drawings list (backtick key)"),
+        ("[|]",        "Draw horizontal line (pipe key  Shift+\\)"),
+        ("[N]",        "New line (when drawings list open)"),
+        ("[D]",        "Delete selected line (when drawings list open)"),
+        ("[↑][↓]",     "Navigate drawings list"),
+        ("Line+Alert", "Optional alert created at line price"),
+    ]),
+    ("POSITION TOOL", [
+        ("[\\]",       "Open position tool (backslash key)"),
+        ("Entry",      "Defaults to cursor candle open price"),
+        ("SL",         "Defaults to entry - 15 pts"),
+        ("TP",         "Defaults to entry + 50 pts"),
+        ("Alerts",     "Optional TP/SL alerts auto-created"),
+        ("[Z]",        "Clear all position tools and trade lines"),
     ]),
     ("ECONOMIC CALENDAR", [
         ("[K]",        "Open/close Economic Calendar  (US events)"),
@@ -3823,9 +4143,9 @@ def alert_monitor():
 # ── Economic calendar fetcher ─────────────────────────────────────────────────
 def fetch_econ_calendar(date_range="today"):
     """
-    Fetch US economic events from Investing.com economic calendar.
-    Uses their public getCalendarFilteredData endpoint.
-    Actual/Forecast/Previous parsed from the HTML table cell text content.
+    Fetch US economic events by scraping Investing.com's economic calendar page.
+    Parses the datatable-v2 HTML table which contains actual/forecast/previous
+    as plain text in <td> cells. Times returned are in ET; convert to CT (-1h).
     date_range: yesterday/today/tomorrow/week
     """
     from html.parser import HTMLParser
@@ -3839,27 +4159,44 @@ def fetch_econ_calendar(date_range="today"):
         _target = today + _dt2.timedelta(days=1)
     else:
         _target = today
-    date_str = _target.strftime("%Y-%m-%d")
-    _week_end = (_target + _dt2.timedelta(days=6)).strftime("%Y-%m-%d")                 if date_range == "week" else date_str
+
+    # Investing.com page URL with date param
+    date_fmt = _target.strftime("%Y-%m-%d")
+    url = f"https://www.investing.com/economic-calendar/"
 
     headers = {
-        "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer":          "https://www.investing.com/economic-calendar/",
-        "Accept":           "application/json, text/javascript, */*",
-        "Content-Type":     "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
     }
-    # currentTab changes based on range so server doesn't override dates
-    _tab = {"yesterday": "yesterday", "tomorrow": "tomorrow",
-            "week": "thisWeek", "today": "today"}.get(date_range, "today")
-    payload = (f"country%5B%5D=5&dateFrom={date_str}&dateTo={_week_end}"
-               f"&timeZone=8&timeFilter=timeOnly&currentTab={_tab}&limit_from=0")
-    CT_OFFSET = -5 * 3600   # UTC to CDT (UTC-5) for April/summer
+
+    # Use the AJAX endpoint which is more reliable
+    payload = (
+        f"country%5B%5D=5"
+        f"&dateFrom={date_fmt}"
+        f"&dateTo={date_fmt}"
+        f"&timeZone=8"       # New York time (ET)
+        f"&timeFilter=timeOnly"
+        f"&currentTab={'today' if date_range in ('today','') else date_range.replace('week','thisWeek')}"
+        f"&limit_from=0"
+    )
+    if date_range == "week":
+        _wend = (_target + _dt2.timedelta(days=6)).strftime("%Y-%m-%d")
+        payload = payload.replace(f"dateTo={date_fmt}", f"dateTo={_wend}")
+        payload = payload.replace("currentTab=week", "currentTab=thisWeek")
+
+    ajax_headers = dict(headers)
+    ajax_headers.update({
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json, text/javascript, */*",
+    })
 
     try:
         r    = requests.post(
             "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData",
-            data=payload, headers=headers, timeout=15)
+            data=payload, headers=ajax_headers, timeout=15)
         data = r.json()
         html = data.get("data", "")
         if not html:
@@ -3872,37 +4209,55 @@ def fetch_econ_calendar(date_range="today"):
                 super().__init__()
                 self._ev    = None
                 self._field = None
+                self._depth = 0
 
             def handle_starttag(self, tag, attrs):
-                d   = dict(attrs)
+                d = dict(attrs)
                 cls = d.get("class", "")
+                row_id = d.get("id", "")
+
+                # New event row: id like "123-456789-US-7"
                 if tag == "tr" and "js-event-item" in cls:
                     self._ev = {
-                        "time":     d.get("data-event-datetime", ""),
-                        "name":     "", "impact": 1,
-                        "actual":   "", "forecast": "", "previous": "", "ts": 0,
+                        "time": d.get("data-event-datetime", ""),
+                        "name": "", "impact": 1,
+                        "actual": "", "forecast": "", "previous": "", "ts": 0,
                     }
                     self._field = None
                     return
+
                 if self._ev is None:
                     return
+
+                # Impact from bull icon
                 imgkey = d.get("data-img_key", "")
                 if imgkey.startswith("bull"):
                     try: self._ev["impact"] = int(imgkey[-1])
                     except: pass
+
                 if tag == "td":
                     cls_l = cls.lower()
-                    if   "first"   in cls_l or "js-time" in cls_l: self._field = "time_td"
-                    elif "event"   in cls_l:                         self._field = "event"
-                    elif "actual"  in cls_l or "bold" in cls_l:     self._field = "actual"
-                    elif "fore"    in cls_l:                         self._field = "forecast"
-                    elif "prev"    in cls_l:                         self._field = "previous"
-                    else:                                             self._field = None
+                    # Map td class to field
+                    if   "js-time"  in cls_l or "first" in cls_l: self._field = "time_td"
+                    elif "event"    in cls_l:                      self._field = "event"
+                    elif "actual"   in cls_l:                      self._field = "actual"
+                    elif "fore"     in cls_l:                      self._field = "forecast"
+                    elif "prev"     in cls_l:                      self._field = "previous"
+                    # Also detect by position using data-* attrs
+                    for attr, fld in [("data-actual","actual"),
+                                      ("data-forecast","forecast"),
+                                      ("data-previous","previous")]:
+                        v = d.get(attr,"").strip().strip("\xa0")
+                        if v and v != "&nbsp;":
+                            self._ev[fld] = v
+                    else:
+                        if self._field is None: self._field = None
+
                 if tag == "a" and self._field == "event":
                     self._field = "event_a"
 
             def handle_data(self, data):
-                data = data.strip().strip(" ")
+                data = data.strip().strip("\xa0")
                 if not data or self._ev is None:
                     return
                 if   self._field == "event_a"  and not self._ev["name"]:     self._ev["name"]     = data
@@ -3922,6 +4277,9 @@ def fetch_econ_calendar(date_range="today"):
 
         _P().feed(html)
 
+        # Convert times: data-event-datetime is UTC from server (timeZone=8 = ET)
+        # ET = UTC-4 (EDT in April). CT = ET - 1h.
+        CT_OFFSET = 14400  # Investing.com timeZone=8 returns data; +14400 aligns to CT
         for ev in events:
             raw    = ev.get("time", "")
             m_full = _re.search(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})", raw)
@@ -3929,20 +4287,21 @@ def fetch_econ_calendar(date_range="today"):
             if m_full:
                 yr,mo,dy = int(m_full.group(1)),int(m_full.group(2)),int(m_full.group(3))
                 h,mn,sc  = int(m_full.group(4)),int(m_full.group(5)),int(m_full.group(6))
-                utc_ts   = _cal.timegm((yr,mo,dy,h,mn,sc,0,0,0))
-                ct_ts    = utc_ts + CT_OFFSET
+                et_ts    = _cal.timegm((yr,mo,dy,h,mn,sc,0,0,0))
+                ct_ts    = et_ts + CT_OFFSET
                 ev["ts"] = ct_ts
                 ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
             elif m_hm:
                 h, mn  = int(m_hm.group(1)), int(m_hm.group(2))
-                base   = datetime(_target.year,_target.month,_target.day,h,mn,0).timestamp()
-                ct_ts  = base + CT_OFFSET
+                et_ts  = datetime(_target.year,_target.month,_target.day,h,mn,0).timestamp()
+                ct_ts  = et_ts + CT_OFFSET
                 ev["ts"]   = ct_ts
                 ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
 
         return sorted([e for e in events if e.get("name")],
                       key=lambda x: x.get("ts", 0))
-    except Exception:
+
+    except Exception as _exc:
         return []
 
 def load_econ_calendar():
@@ -3983,6 +4342,11 @@ def main(stdscr):
 
     threading.Thread(target=start_feed, args=(state.asset,), daemon=True).start()
     threading.Thread(target=alert_monitor, daemon=True).start()
+    # Start trade monitor immediately — auto-plots any existing positions/orders
+    if PHEMEX_API_KEY:
+        with state.lock:
+            state.trade_monitor = True
+        threading.Thread(target=trade_monitor_loop, daemon=True).start()
 
     while True:
         # ── Drain all pending keypresses for smooth scrolling on Windows ──────
@@ -3999,6 +4363,16 @@ def main(stdscr):
         new_interval_idx = -1
 
         for key in keys:
+            if key == curses.KEY_RESIZE:
+                # Force resize handling on next frame
+                new_rows, new_cols = stdscr.getmaxyx()
+                rows, cols = new_rows, new_cols
+                db = DoubleBuffer(rows, cols)
+                db.prev = None
+                curses.resizeterm(rows, cols)
+                stdscr.clearok(True)
+                stdscr.clear()
+                continue
             if key in (ord("q"), ord("Q")):
                 curses.endwin()
                 return
@@ -4066,10 +4440,11 @@ def main(stdscr):
             elif key in (ord("x"), ord("X")):
                 # Open trade dialog
                 _trade = trade_dialog(stdscr, rows, cols)
+                curses.flushinp()   # clear keys typed during dialog
+                stdscr.nodelay(True)
                 if _trade:
                     with state.lock:
                         state.trade_lines.append(_trade)
-                        # Start monitor thread if not running
                         if not state.trade_monitor:
                             state.trade_monitor = True
                             threading.Thread(target=trade_monitor_loop,
@@ -4081,6 +4456,41 @@ def main(stdscr):
                     state.trade_lines = []
                     state.pos_tools   = []
                 db.prev = None; stdscr.clear()
+            elif key in (ord("l"), ord("L")) if state.show_hline_list else False:
+                pass  # L handled by line chart toggle when list closed
+            elif key in (ord("l"), ord("L")):
+                # L = toggle hline list if open, else toggle line chart
+                with state.lock:
+                    _hl_open = state.show_hline_list
+                if _hl_open:
+                    with state.lock:
+                        state.show_hline_list = False
+                else:
+                    with state.lock:
+                        state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
+                    db.prev = None; stdscr.clear()
+            elif key == 96:  # backtick ` = toggle drawings list
+                with state.lock:
+                    state.show_hline_list = not state.show_hline_list
+            elif key == ord("|"):
+                # | (pipe) = open horizontal line drawing tool
+                with state.lock:
+                    _hlp = state.last_price
+                _hl = hline_dialog(stdscr, rows, cols, _hlp)
+                curses.flushinp()
+                stdscr.nodelay(True)
+                if _hl:
+                    with state.lock:
+                        state.hlines.append(_hl)
+                        if _hl.get("alert"):
+                            _hdir = "price_cross_up" if _hl["price"] > state.last_price else "price_cross_down"
+                            state.alerts.append({
+                                "name": _hl.get("label") or f"Line {_hl['price']:.2f}",
+                                "conditions": [{"type": _hdir, "value": _hl["price"]}],
+                                "message": f"Price reached {_hl['price']:.2f}",
+                                "active": True, "sound": True, "_last_state": False,
+                            })
+                db.prev = None; stdscr.clearok(True); stdscr.clear()
             elif key == ord("\\"):
                 # Position tool — open dialog anchored to current cursor candle
                 with state.lock:
@@ -4098,32 +4508,53 @@ def main(stdscr):
                 _ac = _clist[_anchor] if _clist else None
                 if _ac:
                     _pt = pos_tool_dialog(stdscr, rows, cols, _ac.o)
+                    curses.flushinp()
+                    stdscr.nodelay(True)
                     if _pt:
                         _pt["_anchor_idx"] = min(_anchor, _nall-1)
                         _tp_dir = "price_cross_up" if _pt["tp"] > _pt["entry"] else "price_cross_down"
                         _sl_dir = "price_cross_down" if _pt["sl"] < _pt["entry"] else "price_cross_up"
                         with state.lock:
                             state.pos_tools.append(_pt)
-                            state.alerts.append({
-                                "name": f"TP {_pt['tp']:.2f}",
-                                "conditions": [{"type": _tp_dir, "value": _pt["tp"]}],
-                                "message": f"TP hit at {_pt['tp']:.2f}",
-                                "active": True, "sound": True, "_last_state": False,
-                            })
-                            state.alerts.append({
-                                "name": f"SL {_pt['sl']:.2f}",
-                                "conditions": [{"type": _sl_dir, "value": _pt["sl"]}],
-                                "message": f"SL hit at {_pt['sl']:.2f}",
-                                "active": True, "sound": True, "_last_state": False,
-                            })
+                            if _pt.get("create_alerts", True):
+                                state.alerts.append({
+                                    "name": f"TP {_pt['tp']:.2f}",
+                                    "conditions": [{"type": _tp_dir, "value": _pt["tp"]}],
+                                    "message": f"TP hit at {_pt['tp']:.2f}",
+                                    "active": True, "sound": True, "_last_state": False,
+                                })
+                                state.alerts.append({
+                                    "name": f"SL {_pt['sl']:.2f}",
+                                    "conditions": [{"type": _sl_dir, "value": _pt["sl"]}],
+                                    "message": f"SL hit at {_pt['sl']:.2f}",
+                                    "active": True, "sound": True, "_last_state": False,
+                                })
                 db.prev = None; stdscr.clearok(True); stdscr.clear()
             elif key in (ord("a"), ord("A")):
                 with state.lock:
                     state.show_alert_list = not state.show_alert_list
             elif key in (ord("n"), ord("N")):
                 with state.lock:
+                    _hl_open2 = state.show_hline_list
                     _al_open  = state.show_alert_list
                     _cal_open = state.show_econ_cal
+                if _hl_open2:
+                    with state.lock: _hlp2 = state.last_price
+                    _hl2 = hline_dialog(stdscr, rows, cols, _hlp2)
+                    if _hl2:
+                        with state.lock:
+                            state.hlines.append(_hl2)
+                            if _hl2.get("alert"):
+                                _hdir2 = "price_cross_up" if _hl2["price"] > state.last_price else "price_cross_down"
+                            state.alerts.append({
+                                    "name": _hl2.get("label") or f"Line {_hl2['price']:.2f}",
+                                    "conditions": [{"type": _hdir2, "value": _hl2["price"]}],
+                                    "message": f"Price reached {_hl2['price']:.2f}",
+                                    "active": True, "sound": True, "_last_state": False,
+                                })
+                    db.prev = None; stdscr.clearok(True); stdscr.clear()
+                    continue
+                # Fall through to alert/cal N handling below
                 if _cal_open:
                     with state.lock:
                         state.econ_date_range = "tomorrow"
@@ -4139,7 +4570,10 @@ def main(stdscr):
                     stdscr.clear()
             elif key in (ord("d"), ord("D")):
                 with state.lock:
-                    if state.show_alert_list and 0 <= state.alert_list_sel < len(state.alerts):
+                    if state.show_hline_list and 0 <= state.hline_sel < len(state.hlines):
+                        state.hlines.pop(state.hline_sel)
+                        state.hline_sel = max(0, state.hline_sel - 1)
+                    elif state.show_alert_list and 0 <= state.alert_list_sel < len(state.alerts):
                         _del_name = state.alerts[state.alert_list_sel].get("name","")
                         state.alerts.pop(state.alert_list_sel)
                         state.alert_list_sel = max(0, state.alert_list_sel - 1)
@@ -4236,6 +4670,8 @@ def main(stdscr):
                 with state.lock:
                     if state.show_help:
                         state.help_scroll = max(0, state.help_scroll - 1)
+                    elif state.show_hline_list:
+                        state.hline_sel = max(0, state.hline_sel - 1)
                     elif state.show_alert_list:
                         state.alert_list_sel = max(0, state.alert_list_sel - 1)
                     elif state.show_econ_cal:
@@ -4363,6 +4799,9 @@ def main(stdscr):
         if new_rows != rows or new_cols != cols:
             rows, cols = new_rows, new_cols
             db = DoubleBuffer(rows, cols)
+            db.prev = None  # force full redraw on resize
+            curses.resizeterm(rows, cols)
+            stdscr.clearok(True)
             stdscr.clear()
 
         draw(stdscr, db, rows, cols)

@@ -4547,14 +4547,7 @@ def main(stdscr):
 
         for key in keys:
             if key == curses.KEY_RESIZE:
-                # Force resize handling on next frame
-                new_rows, new_cols = stdscr.getmaxyx()
-                rows, cols = new_rows, new_cols
-                db = DoubleBuffer(rows, cols)
-                db.prev = None
-                curses.resizeterm(rows, cols)
-                stdscr.clearok(True)
-                stdscr.clear()
+                # Just note resize — handled at end of loop without clearing
                 continue
             if key in (ord("q"), ord("Q")):
                 try: curses.endwin()
@@ -4577,17 +4570,14 @@ def main(stdscr):
                     state.color_scheme = "rg" if state.color_scheme == "bw" else "bw"
                 init_colors(state.color_scheme)
                 db.prev = None
-                stdscr.clear()
             elif key in (ord("v"), ord("V")):
                 with state.lock:
                     state.show_vp = not state.show_vp
                 db.prev = None
-                stdscr.clear()
             elif key in (ord("l"), ord("L")):
                 with state.lock:
                     state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
                 db.prev = None
-                stdscr.clear()
             elif key in (ord("t"), ord("T")) if False else False:
                 pass  # placeholder — T handled below with context check
             elif key in (ord("w"), ord("W")):
@@ -4602,7 +4592,6 @@ def main(stdscr):
                     with state.lock:
                         state.show_vwap = not state.show_vwap
                     db.prev = None
-                    stdscr.clear()
             elif key in (ord("t"), ord("T")):
                 with state.lock:
                     _cal_open_t = state.show_econ_cal
@@ -4615,12 +4604,10 @@ def main(stdscr):
                     with state.lock:
                         state.show_btd = not state.show_btd
                     db.prev = None
-                    stdscr.clear()
             elif key in (ord("s"), ord("S")):
                 with state.lock:
                     state.show_sessions = not state.show_sessions
                 db.prev = None
-                stdscr.clear()
             elif key in (ord("x"), ord("X")):
                 # Open trade dialog
                 _trade = trade_dialog(stdscr, rows, cols)
@@ -4634,13 +4621,13 @@ def main(stdscr):
                             state.trade_monitor = True
                             threading.Thread(target=trade_monitor_loop,
                                              daemon=True).start()
-                db.prev = None; stdscr.clearok(True); stdscr.clear()
+                db.prev = None
             elif key in (ord("z"), ord("Z")):
                 # Clear all trade lines AND position tools
                 with state.lock:
                     state.trade_lines = []
                     state.pos_tools   = []
-                db.prev = None; stdscr.clear()
+                db.prev = None
             elif key in (ord("l"), ord("L")) if state.show_hline_list else False:
                 pass  # L handled by line chart toggle when list closed
             elif key in (ord("l"), ord("L")):
@@ -4653,7 +4640,7 @@ def main(stdscr):
                 else:
                     with state.lock:
                         state.chart_mode = "line" if state.chart_mode == "candle" else "candle"
-                    db.prev = None; stdscr.clear()
+                    db.prev = None
             elif key == 96:  # backtick ` = toggle drawings list
                 with state.lock:
                     state.show_hline_list = not state.show_hline_list
@@ -4675,7 +4662,7 @@ def main(stdscr):
                                 "message": f"Price reached {_hl['price']:.2f}",
                                 "active": True, "sound": True, "_last_state": False,
                             })
-                db.prev = None; stdscr.clearok(True); stdscr.clear()
+                db.prev = None
             elif key == ord("\\"):
                 # Position tool — open dialog anchored to current cursor candle
                 with state.lock:
@@ -4714,7 +4701,7 @@ def main(stdscr):
                                     "message": f"SL hit at {_pt['sl']:.2f}",
                                     "active": True, "sound": True, "_last_state": False,
                                 })
-                db.prev = None; stdscr.clearok(True); stdscr.clear()
+                db.prev = None
             elif key in (ord("a"), ord("A")):
                 with state.lock:
                     state.show_alert_list = not state.show_alert_list
@@ -4737,7 +4724,7 @@ def main(stdscr):
                                     "message": f"Price reached {_hl2['price']:.2f}",
                                     "active": True, "sound": True, "_last_state": False,
                                 })
-                    db.prev = None; stdscr.clearok(True); stdscr.clear()
+                    db.prev = None
                     continue
                 # Fall through to alert/cal N handling below
                 if _cal_open:
@@ -4751,8 +4738,7 @@ def main(stdscr):
                         with state.lock:
                             state.alerts.append(new_alt)
                     db.prev = None
-                    stdscr.clearok(True)
-                    stdscr.clear()
+                    
             elif key in (ord("d"), ord("D")):
                 with state.lock:
                     if state.show_hline_list and 0 <= state.hline_sel < len(state.hlines):
@@ -4782,7 +4768,7 @@ def main(stdscr):
                     if _hl_new:
                         with state.lock:
                             state.hlines[_hl_edit_sel] = _hl_new
-                    db.prev = None; stdscr.clearok(True); stdscr.clear()
+                    db.prev = None
                 if _existing:
                     _edited = alert_create_dialog(stdscr, rows, cols, existing=_existing)
                     if _edited:
@@ -4790,8 +4776,7 @@ def main(stdscr):
                             if 0 <= _sel < len(state.alerts):
                                 state.alerts[_sel] = _edited
                     db.prev = None
-                    stdscr.clearok(True)
-                    stdscr.clear()
+                    
             elif key in (ord("k"), ord("K")):
                 with state.lock:
                     state.show_econ_cal = not state.show_econ_cal
@@ -4825,7 +4810,6 @@ def main(stdscr):
                 if _enter_global:   # always refresh on entry
                     start_global(_g_sess)
                 db.prev = None
-                stdscr.clear()
             elif key in (ord("r"), ord("R")):
                 with state.lock:
                     _in_global = state.global_mode
@@ -4862,7 +4846,6 @@ def main(stdscr):
                             state.error = "Invalid date. Use YYYY-MM-DD HH:MM or HH:MM"
                 # Force full redraw after dialog closes
                 db.prev = None
-                stdscr.clear()
             elif key == curses.KEY_UP:
                 with state.lock:
                     if state.show_help:
@@ -4999,10 +4982,7 @@ def main(stdscr):
         if new_rows != rows or new_cols != cols:
             rows, cols = new_rows, new_cols
             db = DoubleBuffer(rows, cols)
-            db.prev = None  # force full redraw on resize
-            curses.resizeterm(rows, cols)
-            stdscr.clearok(True)
-            stdscr.clear()
+            # db.prev=None forces full redraw via diff — no blank flash
 
         _result = draw(stdscr, db, rows, cols)
 

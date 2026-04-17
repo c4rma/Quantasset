@@ -2423,7 +2423,7 @@ def jump_to_dialog(stdscr, db: "DoubleBuffer", rows: int, cols: int) -> str:
     # Restore non-blocking + no echo
     curses.noecho()
     curses.curs_set(0)
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
     return "".join(input_buf).strip()
 
 
@@ -2846,7 +2846,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     # ── Step 1: Order type ────────────────────────────────────────────────────
     order_types = ["Buy Market", "Sell Market", "Buy Limit", "Sell Limit"]
     ot_idx = _menu("Order Type", order_types)
-    if ot_idx is None: stdscr.nodelay(True); return None
+    if ot_idx is None: stdscr.timeout(50); return None
     order_type = order_types[ot_idx]
     side = "buy" if "Buy" in order_type else "sell"
     is_limit = "Limit" in order_type
@@ -2856,7 +2856,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     if is_limit:
         cur_p = str(round(state.last_price, 2))
         lp_str = _inp("Limit Price", f"Limit price (current: {cur_p}):", cur_p)
-        if lp_str is None: stdscr.nodelay(True); return None
+        if lp_str is None: stdscr.timeout(50); return None
         try: limit_price = float(lp_str)
         except: limit_price = state.last_price
 
@@ -2866,12 +2866,12 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     ctx = [(f"Order: {order_type}" + (f" @ {limit_price}" if limit_price else ""),
             C_LABEL, curses.A_BOLD)]
     sl_type_idx = _menu("Stop Loss Type", ["Points", "Price"], default=0)
-    if sl_type_idx is None: stdscr.nodelay(True); return None
+    if sl_type_idx is None: stdscr.timeout(50); return None
 
     sl_def = "50" if sl_type_idx == 0 else str(round(
         entry - 50 if side == "buy" else entry + 50, 2))
     sl_str = _inp("Stop Loss Value", "SL value:", sl_def, ctx)
-    if sl_str is None: stdscr.nodelay(True); return None
+    if sl_str is None: stdscr.timeout(50); return None
     try: sl_val = float(sl_str)
     except: sl_val = 50.0
     sl_price = (entry - sl_val if side == "buy" else entry + sl_val)                if sl_type_idx == 0 else sl_val
@@ -2879,12 +2879,12 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     # ── Step 4: Take Profit ──────────────────────────────────────────────────
     ctx2 = ctx + [(f"SL: {sl_price:.2f}", C_BTD_SELL, curses.A_BOLD)]
     tp_type_idx = _menu("Take Profit Type", ["Points", "Price"], default=0)
-    if tp_type_idx is None: stdscr.nodelay(True); return None
+    if tp_type_idx is None: stdscr.timeout(50); return None
 
     tp_def = "100" if tp_type_idx == 0 else str(round(
         entry + 100 if side == "buy" else entry - 100, 2))
     tp_str = _inp("Take Profit Value", "TP value:", tp_def, ctx2)
-    if tp_str is None: stdscr.nodelay(True); return None
+    if tp_str is None: stdscr.timeout(50); return None
     try: tp_val = float(tp_str)
     except: tp_val = 100.0
     tp_price = (entry + tp_val if side == "buy" else entry - tp_val)                if tp_type_idx == 0 else tp_val
@@ -2892,13 +2892,13 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     # ── Step 5: Position sizes ────────────────────────────────────────────────
     ctx3 = ctx2 + [(f"TP: {tp_price:.2f}", C_BTD_BUY, curses.A_BOLD)]
     sp_str = _inp("Position Size", "Phemex size (contracts):", "1", ctx3)
-    if sp_str is None: stdscr.nodelay(True); return None
+    if sp_str is None: stdscr.timeout(50); return None
     try: sp = float(sp_str)
     except: sp = 1.0
 
     sx_str = _inp("Position Size", "XLTRADE size (lots):", "0.01",
                   ctx3 + [(f"Phemex: {sp}", C_LABEL, curses.A_NORMAL)])
-    if sx_str is None: stdscr.nodelay(True); return None
+    if sx_str is None: stdscr.timeout(50); return None
     try: sx = float(sx_str)
     except: sx = 0.01
 
@@ -2942,13 +2942,13 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
                 pass
         stdscr.refresh()
         _k = stdscr.getch()
-        if _k == 27: stdscr.nodelay(True); return None
+        if _k == 27: stdscr.timeout(50); return None
         if _k == curses.KEY_UP: _choice = (_choice - 1) % 2
         elif _k == curses.KEY_DOWN: _choice = (_choice + 1) % 2
         elif _k in (10, 13): break
 
     if _choice == 1:
-        stdscr.nodelay(True); return None
+        stdscr.timeout(50); return None
 
     _draw_box("Submitting...", confirm_lines)
     stdscr.refresh()
@@ -2962,7 +2962,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     if not os.path.exists(copycat_py):
         with state.lock:
             state.error = f"Trade failed: copycat.py not found at {copycat_py}"
-        stdscr.nodelay(True)
+        stdscr.timeout(50)
         return None
     full_cmd = [_sys.executable, copycat_py] + cmd_parts
 
@@ -3017,7 +3017,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
         _short  = _elines[-1] if _elines else "copycat failed — see trade_debug.log"
         with state.lock:
             state.error = f"Trade failed: {_short[:180]}  [full log: trade_debug.log]"
-        stdscr.nodelay(True)
+        stdscr.timeout(50)
         return None
 
     # Show output summary in footer even on success
@@ -3026,7 +3026,7 @@ def trade_dialog(stdscr, rows: int, cols: int) -> dict | None:
     with state.lock:
         state.error = f"Trade OK: {_summary[:120]}"
 
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
     return {
         "side":         side,
         "order_type":   order_type,
@@ -3078,17 +3078,17 @@ def pos_tool_dialog(stdscr, rows: int, cols: int, anchor_price: float) -> dict |
         return _input_field(stdscr, box_y + 4, box_x + 4, box_w - 8, str(default))
 
     ep = _inp("Entry Price", "Entry price (default=candle open):", f"{anchor_price:.2f}")
-    if ep is None: stdscr.nodelay(True); return None
+    if ep is None: stdscr.timeout(50); return None
     try:    entry = float(ep)
     except: entry = anchor_price
 
     tp_s = _inp("Take Profit", "TP price (green):", f"{entry + 50:.2f}")
-    if tp_s is None: stdscr.nodelay(True); return None
+    if tp_s is None: stdscr.timeout(50); return None
     try:    tp = float(tp_s)
     except: tp = entry + 50
 
     sl_s = _inp("Stop Loss", "SL price (red):", f"{entry - 15:.2f}")
-    if sl_s is None: stdscr.nodelay(True); return None
+    if sl_s is None: stdscr.timeout(50); return None
     try:    sl = float(sl_s)
     except: sl = entry - 25
 
@@ -3109,13 +3109,13 @@ def pos_tool_dialog(stdscr, rows: int, cols: int, anchor_price: float) -> dict |
             except curses.error: pass
         stdscr.refresh()
         _ka = stdscr.getch()
-        if _ka == 27: stdscr.nodelay(True); return None
+        if _ka == 27: stdscr.timeout(50); return None
         if _ka == curses.KEY_UP: _alert_choice = (_alert_choice - 1) % 2
         elif _ka == curses.KEY_DOWN: _alert_choice = (_alert_choice + 1) % 2
         elif _ka in (10, 13): break
     create_alerts = (_alert_choice == 0)
 
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
     return {"entry": entry, "tp": tp, "sl": sl, "active": True,
             "_anchor_idx": 0, "_stop_idx": None, "create_alerts": create_alerts}
 
@@ -3214,13 +3214,13 @@ def hline_dialog(stdscr, rows: int, cols: int, default_price: float) -> dict | N
 
     # Price
     ps = _inp("Price", "Price level:", f"{default_price:.2f}")
-    if ps is None: stdscr.nodelay(True); return None
+    if ps is None: stdscr.timeout(50); return None
     try:    price = float(ps)
     except: price = default_price
 
     # Label (optional)
     ls = _inp("Label", "Label (optional, Enter to skip):", "")
-    if ls is None: stdscr.nodelay(True); return None
+    if ls is None: stdscr.timeout(50); return None
     label = ls.strip()
 
     # Alert?
@@ -3237,12 +3237,12 @@ def hline_dialog(stdscr, rows: int, cols: int, default_price: float) -> dict | N
             except curses.error: pass
         stdscr.refresh()
         _k = stdscr.getch()
-        if _k == 27: stdscr.nodelay(True); return None
+        if _k == 27: stdscr.timeout(50); return None
         if _k == curses.KEY_UP: _ac = (_ac - 1) % 2
         elif _k == curses.KEY_DOWN: _ac = (_ac + 1) % 2
         elif _k in (10, 13): break
 
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
     return {"price": price, "label": label, "alert": (_ac == 0), "active": True}
 
 
@@ -3641,7 +3641,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
             continue
         kc = ord(k) if isinstance(k, str) else k
         if kc == 27:
-            stdscr.nodelay(True)
+            stdscr.timeout(50)
             return None
         if kc == curses.KEY_UP:
             cond_idx = (cond_idx - 1) % len(ALERT_CONDITIONS)
@@ -3672,7 +3672,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
     stdscr.refresh()
     val_str = _input_field(stdscr, _frow + 1, box_x + 15, 20, _prefill_val)
     if val_str is None:
-        stdscr.nodelay(True)
+        stdscr.timeout(50)
         return None
     try:
         val = float(val_str)
@@ -3687,7 +3687,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
     name = _input_field(stdscr, _frow + 2, box_x + 15,
                         30, _prefill_name or f"Alert @ {val_str}")
     if name is None:
-        stdscr.nodelay(True)
+        stdscr.timeout(50)
         return None
 
     try:
@@ -3698,7 +3698,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
     msg = _input_field(stdscr, _frow + 3, box_x + 15,
                        40, _prefill_msg or f"{cond_label} {val_str}")
     if msg is None:
-        stdscr.nodelay(True)
+        stdscr.timeout(50)
         return None
 
     # Step 4: sound toggle
@@ -3718,14 +3718,14 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
             continue
         kc = ord(k) if isinstance(k, str) else k
         if kc == 27:
-            stdscr.nodelay(True)
+            stdscr.timeout(50)
             return None
         if kc in (curses.KEY_LEFT, curses.KEY_RIGHT):
             snd = not snd
         elif kc in (10, 13):
             break
 
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
     return {
         "name":        name or f"Alert @ {val}",
         "conditions":  [{"type": cond_type, "value": val}],
@@ -3824,7 +3824,7 @@ def alert_list_dialog(stdscr, rows: int, cols: int):
             # Re-enter blocking mode for list
             stdscr.nodelay(False)
 
-    stdscr.nodelay(True)
+    stdscr.timeout(50)
 
 
 # ── Non-blocking alert list overlay ──────────────────────────────────────────
@@ -4492,8 +4492,11 @@ def load_econ_calendar():
 # ── main loop ────────────────────────────────────────────────────────────────
 def main(stdscr):
     curses.curs_set(0)
-    stdscr.nodelay(True)
     stdscr.keypad(True)
+    # Use timeout instead of nodelay — waits up to 50ms for input then
+    # returns -1. Much gentler on terminals (especially Termux) than
+    # spinning getch() in a busy loop. Gives ~20fps max frame rate.
+    stdscr.timeout(50)
     init_colors(state.color_scheme)
 
     rows, cols = stdscr.getmaxyx()
@@ -4508,15 +4511,22 @@ def main(stdscr):
         threading.Thread(target=trade_monitor_loop, daemon=True).start()
 
     while True:
-        # ── Drain all pending keypresses for smooth scrolling on Windows ──────
+        # ── Read input: timeout(50) blocks up to 50ms then returns -1 ─────────
+        # This replaces the busy nodelay loop — eliminates Termux flicker.
         keys = []
-        while True:
-            k = stdscr.getch()
-            if k == -1:
-                break
+        k = stdscr.getch()   # blocks up to 50ms (our frame sleep)
+        if k != -1:
             keys.append(k)
+            # Drain any additional buffered keys without blocking
+            stdscr.timeout(50)
+            while True:
+                k2 = stdscr.getch()
+                if k2 == -1:
+                    break
+                keys.append(k2)
+            stdscr.timeout(50)   # restore timeout mode
         if not keys:
-            keys = [-1]   # still run draw/refresh even with no input
+            keys = [-1]   # no input — still run draw/refresh
 
         restart_feed = False
         new_interval_idx = -1
@@ -4602,7 +4612,7 @@ def main(stdscr):
                 _trade = trade_dialog(stdscr, rows, cols)
                 try: curses.flushinp()
                 except: pass
-                stdscr.nodelay(True)
+                stdscr.timeout(50)
                 if _trade:
                     with state.lock:
                         state.trade_lines.append(_trade)
@@ -4639,7 +4649,7 @@ def main(stdscr):
                     _hlp = state.last_price
                 _hl = hline_dialog(stdscr, rows, cols, _hlp)
                 curses.flushinp()
-                stdscr.nodelay(True)
+                stdscr.timeout(50)
                 if _hl:
                     with state.lock:
                         state.hlines.append(_hl)
@@ -4670,7 +4680,7 @@ def main(stdscr):
                 if _ac:
                     _pt = pos_tool_dialog(stdscr, rows, cols, _ac.o)
                     curses.flushinp()
-                    stdscr.nodelay(True)
+                    stdscr.timeout(50)
                     if _pt:
                         _pt["_anchor_idx"] = min(_anchor, _nall-1)
                         _tp_dir = "price_cross_up" if _pt["tp"] > _pt["entry"] else "price_cross_down"
@@ -4754,7 +4764,7 @@ def main(stdscr):
                     _existing = state.alerts[_sel] if _al_open and 0 <= _sel < len(state.alerts) else None
                 if _hl_existing:
                     _hl_new = hline_dialog(stdscr, rows, cols, _hl_existing["price"])
-                    curses.flushinp(); stdscr.nodelay(True)
+                    curses.flushinp(); stdscr.timeout(50)
                     if _hl_new:
                         with state.lock:
                             state.hlines[_hl_edit_sel] = _hl_new
@@ -4982,11 +4992,10 @@ def main(stdscr):
 
         draw(stdscr, db, rows, cols)
         db.flush(stdscr)   # writes changed cells via addch()
-        # noutrefresh marks the window dirty without pushing to terminal;
-        # doupdate pushes everything in one atomic operation — no flicker.
+        # noutrefresh + doupdate = atomic frame push, no intermediate states
         stdscr.noutrefresh()
         curses.doupdate()
-        time.sleep(REFRESH_DELAY)
+        # No explicit sleep needed — stdscr.timeout(50) provides frame pacing
 
 if __name__ == "__main__":
     curses.wrapper(main)

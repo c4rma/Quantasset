@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
 # copycat.py — Blackjack Trade Copier CLI
-# Proprietary — Fund Intellectual Property
+# Confidential — Fund Intellectual Property
 #
 # Usage:
 #   python copycat.py buy   market <size> -tp <tp>
@@ -966,49 +966,51 @@ async def cmd_flatten():
         closed    = 0
         cancelled = 0
 
-        # Close all open positions
+        # Close ALL open positions across all symbols
         data = await phemex_request('GET', '/g-accounts/accountPositions', params={'currency': 'USDT'})
         for p in data.get('data', {}).get('positions', []):
-            if p.get('symbol') == PHEMEX_SYMBOL and float(p.get('size', 0)) != 0:
-                pos_side   = p.get('posSide', 'Long')
-                close_side = 'Sell' if pos_side == 'Long' else 'Buy'
-                params = {
-                    'symbol':       PHEMEX_SYMBOL,
-                    'clOrdID':      f'cc_flat_{int(time.time()*1000)}',
-                    'side':         close_side,
-                    'posSide':      pos_side,
-                    'orderQtyRq':   str(abs(float(p.get('size', 0)))),
-                    'ordType':      'Market',
-                    'reduceOnly':   'true',
-                    'timeInForce':  'GoodTillCancel',
-                }
-                result = await phemex_request('PUT', '/g-orders/create', params=params)
-                if isinstance(result, dict) and result.get('code') == 0:
-                    closed += 1
+            size = float(p.get('size') or p.get('cumEntryQtyRq') or 0)
+            if size == 0:
+                continue
+            sym        = p.get('symbol')
+            pos_side   = p.get('posSide', 'Long')
+            close_side = 'Sell' if pos_side == 'Long' else 'Buy'
+            params = {
+                'symbol':      sym,
+                'clOrdID':     f'cc_flat_{int(time.time()*1000)}',
+                'side':        close_side,
+                'posSide':     pos_side,
+                'orderQtyRq':  str(abs(size)),
+                'ordType':     'Market',
+                'reduceOnly':  'true',
+                'timeInForce': 'GoodTillCancel',
+            }
+            result = await phemex_request('PUT', '/g-orders/create', params=params)
+            if isinstance(result, dict) and result.get('code') == 0:
+                closed += 1
 
-        # Cancel all pending orders using bulk cancel
-        cancel_all = await phemex_request('DELETE', '/g-orders/all',
-                                          params={'symbol': PHEMEX_SYMBOL,
-                                                  'untriggered': 'false'})
-        if isinstance(cancel_all, dict):
-            code = cancel_all.get('code')
-            if code == 0:
-                rows = cancel_all.get('data', {})
-                if isinstance(rows, dict):
-                    cancelled = len(rows.get('rows', []) or [])
-                elif isinstance(rows, list):
-                    cancelled = len(rows)
-                else:
-                    cancelled = 1  # cancelled but can't count
-            elif code in (10002, 10016):
-                cancelled = 0  # no orders to cancel
+        # Cancel all pending orders across all symbols
+        for sym in set(ASSET_SYMBOLS[a]['phemex'] for a in ASSET_SYMBOLS):
+            cancel = await phemex_request('DELETE', '/g-orders/all',
+                                          params={'symbol': sym, 'untriggered': 'false'})
+            if isinstance(cancel, dict):
+                code = cancel.get('code')
+                if code == 0:
+                    rows = cancel.get('data', {})
+                    if isinstance(rows, dict):
+                        cancelled += len(rows.get('rows', []) or [])
+                    elif isinstance(rows, list):
+                        cancelled += len(rows)
+                    else:
+                        cancelled += 1
 
         ok(f"Phemex — {closed} position(s) closed, {cancelled} order(s) cancelled")
     except Exception as e:
         print(f"{RED}✗ Error: {e}{RST}")
 
     print(f"  Flattening {YLW}XLTRADE{RST}...", end=' ', flush=True)
-    resp, err = mt5_send(f"FLATTEN|{MT5_SYMBOL}", timeout=15)
+    # Send FLATTEN without a symbol — EA closes everything
+    resp, err = mt5_send("FLATTEN", timeout=15)
     if err:
         print(f"{RED}✗ {err}{RST}")
     elif resp and resp.startswith('OK|FLATTEN'):
@@ -1026,7 +1028,7 @@ async def cmd_flatten():
 # ── Argument parser ───────────────────────────────────────────────────────────
 USAGE = f"""
 {BLD}{CYN}COPYCAT — Blackjack Trade Copier{RST}
-{DIM}Proprietary — Fund Intellectual Property{RST}
+{DIM}Confidential — Fund Intellectual Property{RST}
 
 {BLD}Usage:{RST}
   python copycat.py [eth|btc] buy   market -sp <phemex_size> -sx <xltrade_size> -tp <tp>
@@ -1039,7 +1041,7 @@ USAGE = f"""
   python copycat.py [eth|btc] positions --refresh
   python copycat.py [eth|btc] orders
   python copycat.py [eth|btc] balance
-  python copycat.py [eth|btc] -f
+  python copycat.py -f                                    (closes ALL positions, all assets)
 
 {BLD}Asset:{RST}
   eth  — ETHUSDT on Phemex / ETHUSD.nx on XLTRADE (default if omitted)
@@ -1173,6 +1175,10 @@ def parse_args():
     if not args:
         print(USAGE)
         sys.exit(0)
+
+    # ── Flatten is asset-agnostic — check before asset parsing ───────────────
+    if args[0].lower() == '-f':
+        return ('flatten',)
 
     # ── Asset selection (first argument) ──────────────────────────────────────
     if args[0].lower() in ASSET_SYMBOLS:

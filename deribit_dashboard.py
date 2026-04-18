@@ -15,6 +15,8 @@ import time
 import argparse
 from datetime import datetime, timezone, timedelta
 
+import subprocess
+
 try:
     import websockets
 except ImportError:
@@ -107,6 +109,29 @@ async def fetch_eth_price():
     except Exception:
         pass
     return None
+
+# ── Sentiment alert ───────────────────────────────────────────────────────────
+_prev_sentiment = {}  # {'ETH': 'NEUTRAL', 'BTC': 'BULLISH', ...}
+
+def _get_sentiment(ratio):
+    if ratio >= 1.02:    return 'BEARISH'
+    elif ratio <= 0.98:  return 'BULLISH'
+    else:                return 'NEUTRAL'
+
+def _play_alert():
+    """Play sentiment.wav non-blocking from the same folder as this script."""
+    wav = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sentiment.wav')
+    if not os.path.exists(wav):
+        return
+    try:
+        if sys.platform == 'win32':
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        else:
+            subprocess.Popen(['aplay', wav],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 WIDTH = 62
@@ -232,6 +257,12 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
         move(ROWS[f'{ccy}_sentiment'])
         erase_line()
         sys.stdout.write(f"    {'Sentiment':<20} {sentiment}")
+
+        # Check for sentiment change and play alert
+        label = _get_sentiment(ratio)
+        if _prev_sentiment.get(ccy) is not None and _prev_sentiment[ccy] != label:
+            _play_alert()
+        _prev_sentiment[ccy] = label
 
         put_bar  = f"{RED}{'█' * put_bars}{RST}"
         call_bar = f"{GRN}{'█' * call_bars}{RST}"

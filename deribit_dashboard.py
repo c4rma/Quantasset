@@ -159,7 +159,7 @@ def draw_static():
     mark('ts');        p()
     p()
 
-    p(f"  {BLD}{'─'*4} MARKET {'─'*(WIDTH-10)}{RST}")
+    p(f"  {BLD}{'─'*4} MARKET {'─'*(WIDTH-13)}{RST}")
     mark('eth_price'); p(f"    {'ETH Perp (Phemex)':<24}")
     mark('session');   p(f"    {'Session':<24}")
     p()

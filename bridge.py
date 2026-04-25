@@ -30,6 +30,11 @@ import json
 import socket
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in its own thread — prevents trade calls blocking on positions polls."""
+    daemon_threads = True
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 def load_env():
@@ -177,10 +182,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _handle_phemex(self, body):
         """Proxy a Phemex API request from the phone through the PC's IP."""
-        import hmac as _hmac, hashlib as _hashlib, time as _time
-        method = body.get('method', 'GET')
-        path   = body.get('path', '')
-        params = body.get('params') or {}
+        import hmac as _hmac, hashlib as _hashlib, time as _time, httpx as _httpx
+        method   = body.get('method', 'GET')
+        path     = body.get('path', '')
+        params   = body.get('params') or {}
         req_body = body.get('body')
 
         if not path:
@@ -190,37 +195,47 @@ class BridgeHandler(BaseHTTPRequestHandler):
         log(f"← PHX  {self.client_address[0]}  {method} {path}")
 
         try:
-            import urllib.request as _req
-            import urllib.parse   as _parse
-
             phemex_key    = os.environ.get('PHEMEX_API_KEY', '')
             phemex_secret = os.environ.get('PHEMEX_API_SECRET', '')
             base_url      = 'https://api.phemex.com'
 
             query    = '&'.join(f'{k}={v}' for k, v in params.items()) if params else ''
             body_str = json.dumps(req_body) if req_body else ''
+            url      = f"{base_url}{path}" + (f"?{query}" if query else '')
 
-            # Sign the request
-            expiry = str(int(_time.time()) + 60)
-            if method == 'PUT' and params and not req_body:
-                msg = path + query + expiry
+            # Public endpoints don't need signing
+            PUBLIC_PATHS = {'/md/v3/ticker/24hr'}
+            if path in PUBLIC_PATHS:
+                headers = {'Content-Type': 'application/json'}
             else:
-                msg = path + query + expiry + body_str
-            sig = _hmac.new(phemex_secret.encode(), msg.encode(), _hashlib.sha256).hexdigest()
+                expiry = str(int(_time.time()) + 60)
+                if method == 'PUT' and params and not req_body:
+                    msg = path + query + expiry
+                else:
+                    msg = path + query + expiry + body_str
+                sig = _hmac.new(phemex_secret.encode(), msg.encode(), _hashlib.sha256).hexdigest()
+                headers = {
+                    'x-phemex-access-token':      phemex_key,
+                    'x-phemex-request-expiry':    expiry,
+                    'x-phemex-request-signature': sig,
+                    'Content-Type':               'application/json',
+                }
 
-            headers = {
-                'x-phemex-access-token':      phemex_key,
-                'x-phemex-request-expiry':    expiry,
-                'x-phemex-request-signature': sig,
-                'Content-Type':               'application/json',
-            }
+            with _httpx.Client(timeout=20) as client:
+                if method == 'GET':
+                    r = client.get(url, headers=headers)
+                elif method == 'PUT':
+                    r = client.put(url, headers=headers,
+                                   content=body_str.encode() if body_str else None)
+                elif method == 'POST':
+                    r = client.post(url, headers=headers, content=body_str.encode())
+                elif method == 'DELETE':
+                    r = client.delete(url, headers=headers)
+                else:
+                    self.send_json(400, {'error': f'Unsupported method: {method}'})
+                    return
 
-            url = f"{base_url}{path}" + (f"?{query}" if query else '')
-            data = body_str.encode() if body_str else None
-            request = _req.Request(url, data=data, headers=headers, method=method)
-            with _req.urlopen(request, timeout=12) as r:
-                resp_data = json.loads(r.read())
-
+            resp_data = r.json()
             log(f"→ PHX  code={resp_data.get('code')} msg={resp_data.get('msg','')}", GRN)
             self.send_json(200, {'resp': resp_data})
 
@@ -267,7 +282,7 @@ def main():
         print(f"{YLW}⚠ BRIDGE_TOKEN not set — requests will not be authenticated{RST}")
 
     local_ip = get_local_ip()
-    server   = HTTPServer(('0.0.0.0', BRIDGE_PORT), BridgeHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', BRIDGE_PORT), BridgeHandler)
 
     print(f"""
 {CYN}{'─'*54}

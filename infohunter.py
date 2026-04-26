@@ -38,9 +38,9 @@ from rich.text import Text
 REFRESH_INTERVAL_SECONDS = 15
 WINDOW_HOURS             = 12
 MAX_HEADLINES            = 2000
-AI_BATCH_SIZE            = 20       # headlines per Ollama call
-AI_RESCORE_INTERVAL      = 20       # seconds between AI passes (catches new arrivals fast)
-AI_SCORE_ALL             = True     # score every headline when AI is enabled, not just ambiguous
+AI_BATCH_SIZE            = 8        # headlines per Ollama call (small models overflow above ~10)
+AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
+AI_SCORE_ALL             = True     # score every headline when AI enabled
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -257,31 +257,56 @@ def rule_score(title: str, summary: str, category: str) -> tuple[int, str, list[
 # ─────────────────────────────────────────────────────────────────────────────
 
 AI_SYSTEM = (
-    "You are a senior macro trader classifying financial news by market impact.\n\n"
+    "You are a financial news impact classifier. Output ONLY valid JSON — no prose, no markdown.\n"
     "HIGH:   CB rate decisions, NFP/CPI/GDP prints, market crashes, wars, strait/chokepoint attacks, "
     "oil tanker attacks, pipeline sabotage, nuclear threats, OPEC surprises, bank failures, "
     "stablecoin depegs, major crypto hacks, sovereign defaults, pandemic declarations.\n"
     "MEDIUM: Fed-speak, PMI data, earnings beats/misses, M&A, geopolitical tension without immediate "
     "market impact, regulatory proposals, layoffs without systemic implications.\n"
     "LOW:    Routine company news, analyst opinions, price target changes, recaps, lifestyle.\n\n"
-    "Return ONLY a JSON array, no other text:\n"
-    '[{"id":"<id>","impact":"HIGH"|"MEDIUM"|"LOW","reason":"<5 words>"}]'
+    "Respond with a JSON array ONLY — no prose, no markdown, no explanation before or after.\n"
+    '[{"id":"abc123","impact":"HIGH","reason":"FOMC rate hike"},{"id":"def456","impact":"LOW","reason":"routine note"}]'
 )
 
 
 def _parse_ai_response(raw: str) -> dict[str, tuple[str, str]]:
-    """Parse JSON array from AI response, stripping markdown fences."""
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-    # Some models wrap in an extra object; try to find the array
-    m = re.search(r"\[.*\]", raw, re.DOTALL)
-    if m:
-        raw = m.group(0)
-    data = json.loads(raw)
+    """
+    Robustly extract a JSON array from AI output.
+    Handles: markdown fences, prose preamble, nested objects, partial output.
+    """
+    # Strip markdown fences
+    raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+
+    # Find the first "[" and the matching closing "]" by bracket counting
+    # (avoids the greedy-regex trap of matching [..."id"...] across items)
+    start = raw.find("[")
+    if start == -1:
+        raise ValueError(f"No JSON array found in AI response: {raw[:200]!r}")
+
+    depth = 0
+    end   = -1
+    for i, ch in enumerate(raw[start:], start):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end == -1:
+        raise ValueError(f"Unclosed JSON array in AI response: {raw[start:start+200]!r}")
+
+    array_str = raw[start:end]
+    data = json.loads(array_str)
+
     result = {}
     for item in data:
-        hid    = item.get("id", "")
-        impact = item.get("impact", "").upper()
-        reason = item.get("reason", "")
+        if not isinstance(item, dict):
+            continue
+        hid    = str(item.get("id", "")).strip()
+        impact = str(item.get("impact", "")).upper().strip()
+        reason = str(item.get("reason", "")).strip()
         if hid and impact in ("HIGH", "MEDIUM", "LOW"):
             result[hid] = (impact, reason)
     return result
@@ -330,11 +355,11 @@ def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> d
         return {}
     payload = []
     for h in headlines:
-        entry = {"id": h.id, "title": h.title, "source": h.source, "category": h.category}
+        entry = {"id": h.id, "title": h.title}
         if h.summary:
-            entry["summary"] = h.summary[:300]   # cap to keep prompt size sane
+            entry["summary"] = h.summary[:120]  # small models have limited context
         payload.append(entry)
-    prompt = "Score each headline:\n\n" + json.dumps(payload, ensure_ascii=False)
+    prompt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
         if AI_BACKEND == "anthropic":
             raw = _ai_via_anthropic(prompt)
@@ -932,6 +957,28 @@ class InfoHunter(App):
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _silence_ollama_logs() -> None:
+    """
+    Ollama prints GIN HTTP server logs to stdout/stderr which bleed into
+    the Textual UI. We redirect both at the OS file-descriptor level so
+    nothing can sneak through, even from C extensions.
+    """
+    import sys, os
+    if AI_BACKEND != "ollama":
+        return
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        # Flush before redirecting
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Duplicate the real stdout so Textual can still use it internally
+        # (Textual writes to the terminal via its own fd, not sys.stdout)
+        os.dup2(devnull_fd, 2)   # silence stderr (GIN logs go here)
+        os.close(devnull_fd)
+    except Exception:
+        pass  # non-fatal — worst case logs still show but app still works
+
+
 if __name__ == "__main__":
     import sys
 
@@ -949,9 +996,12 @@ if __name__ == "__main__":
 
     if AI_BACKEND == "ollama":
         print(f"[InfoHunter] AI scoring: ENABLED  (Ollama / {OLLAMA_MODEL} @ {OLLAMA_HOST})")
+        print(f"[InfoHunter] TIP: Start Ollama silently with:  ollama serve 2>/dev/null &")
     elif AI_BACKEND == "anthropic" and AI_ENABLED:
         print("[InfoHunter] AI scoring: ENABLED  (claude-haiku)")
     else:
         print("[InfoHunter] AI scoring: DISABLED")
         print("[InfoHunter] To enable: set INFOHUNTER_AI=ollama (or anthropic + ANTHROPIC_API_KEY)")
+
+    _silence_ollama_logs()
     InfoHunter().run()

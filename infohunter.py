@@ -16,6 +16,7 @@ import os
 import re
 import requests
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -37,8 +38,9 @@ from rich.text import Text
 REFRESH_INTERVAL_SECONDS = 15
 WINDOW_HOURS             = 12
 MAX_HEADLINES            = 2000
-AI_BATCH_SIZE            = 12
-AI_RESCORE_INTERVAL      = 60
+AI_BATCH_SIZE            = 20       # headlines per Ollama call
+AI_RESCORE_INTERVAL      = 20       # seconds between AI passes (catches new arrivals fast)
+AI_SCORE_ALL             = True     # score every headline when AI is enabled, not just ambiguous
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -323,13 +325,15 @@ def _ai_via_ollama(prompt: str) -> str:
     return resp.json()["message"]["content"]
 
 
-def ai_rescore_batch(headlines: list) -> dict[str, tuple[str, str]]:
+def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> dict[str, tuple[str, str]]:
     if not AI_ENABLED or not headlines:
         return {}
-    payload = [
-        {"id": h.id, "title": h.title, "source": h.source, "category": h.category}
-        for h in headlines
-    ]
+    payload = []
+    for h in headlines:
+        entry = {"id": h.id, "title": h.title, "source": h.source, "category": h.category}
+        if h.summary:
+            entry["summary"] = h.summary[:300]   # cap to keep prompt size sane
+        payload.append(entry)
     prompt = "Score each headline:\n\n" + json.dumps(payload, ensure_ascii=False)
     try:
         if AI_BACKEND == "anthropic":
@@ -338,8 +342,14 @@ def ai_rescore_batch(headlines: list) -> dict[str, tuple[str, str]]:
             raw = _ai_via_ollama(prompt)
         else:
             return {}
-        return _parse_ai_response(raw)
-    except Exception:
+        result = _parse_ai_response(raw)
+        if store:
+            store.last_ai_error = ""
+        return result
+    except Exception as exc:
+        err = str(exc)[:120]
+        if store:
+            store.last_ai_error = err
         return {}
 
 
@@ -434,8 +444,9 @@ def fetch_source(source: dict) -> list[Headline]:
 
 class HeadlineStore:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock      = threading.Lock()
         self._data: dict[str, Headline] = {}
+        self.last_ai_error: str = ""   # surface errors in the UI
 
     def add_many(self, items: list[Headline]) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
@@ -456,11 +467,12 @@ class HeadlineStore:
                     self._data[hid].ai_scored = True
                     self._data[hid].ai_reason = reason
 
-    def get_unscored_batch(self, n: int) -> list[Headline]:
+    def get_unscored(self) -> list[Headline]:
+        """Return ALL un-AI-scored headlines, newest first."""
         with self._lock:
             candidates = [h for h in self._data.values() if not h.ai_scored]
-        candidates.sort(key=lambda h: (0 if 2 <= h.score <= 10 else 1, -h.score))
-        return candidates[:n]
+        candidates.sort(key=lambda h: h.timestamp, reverse=True)
+        return candidates
 
     def get_sorted(
         self,
@@ -734,6 +746,13 @@ class InfoHunter(App):
         self.set_interval(AI_RESCORE_INTERVAL,      self.ai_rescore)
         self.set_interval(1,                        self._tick)
 
+    def on_worker_state_changed(self, event) -> None:
+        # Kick off AI scoring as soon as the first fetch worker finishes
+        from textual.worker import WorkerState
+        if event.state == WorkerState.SUCCESS and event.worker.name == "fetch_all":
+            if AI_ENABLED:
+                self.ai_rescore()
+
     # ── Workers ───────────────────────────────────────────────────────────────
 
     @work(thread=True, exclusive=False)
@@ -754,12 +773,25 @@ class InfoHunter(App):
     def ai_rescore(self) -> None:
         if not AI_ENABLED:
             return
-        batch = self.store.get_unscored_batch(AI_BATCH_SIZE)
-        if not batch:
+        unscored = self.store.get_unscored()
+        if not unscored:
             return
-        updates = ai_rescore_batch(batch)
-        if updates:
-            self.store.apply_ai_scores(updates)
+
+        # Chunk into batches and score them in parallel (max 3 concurrent calls)
+        batches = [unscored[i:i + AI_BATCH_SIZE] for i in range(0, len(unscored), AI_BATCH_SIZE)]
+        any_updates = False
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(ai_rescore_batch, batch, self.store): batch for batch in batches}
+            for future in as_completed(futures):
+                try:
+                    updates = future.result(timeout=90)
+                    if updates:
+                        self.store.apply_ai_scores(updates)
+                        any_updates = True
+                        self.call_from_thread(self._rebuild_table)
+                except Exception:
+                    pass
+        if any_updates:
             self.call_from_thread(self._rebuild_table)
 
     # ── Table ─────────────────────────────────────────────────────────────────
@@ -809,14 +841,25 @@ class InfoHunter(App):
     def _update_status(self) -> None:
         try:
             c      = self.store.counts()
-            ai_bit = f"  [dim]AI:{c['ai']}[/dim]" if AI_ENABLED else ""
+            if AI_ENABLED:
+                err = self.store.last_ai_error
+                if err:
+                    ai_bit = f"  [bold red]AI ERR: {_esc(err[:60])}[/bold red]"
+                else:
+                    pending = c['total'] - c['ai']
+                    ai_bit = (
+                        f"  [dim]AI:{c['ai']}✦[/dim]"
+                        + (f"  [yellow]pending:{pending}[/yellow]" if pending else "")
+                    )
+            else:
+                ai_bit = ""
             self.query_one("#status-bar", Static).update(
                 f" {c['total']} headlines (12h)  │ "
                 f"[bold red]HIGH:{c['high']}[/bold red]  "
                 f"[yellow]MED:{c['medium']}[/yellow]  "
                 f"LOW:{c['low']}{ai_bit}  │  "
                 f"Showing:{len(self._rows)}  │  "
-                f"Refresh in:{self._countdown}s"
+                f"Next refresh:{self._countdown}s"
             )
         except Exception:
             pass

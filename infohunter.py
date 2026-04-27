@@ -15,6 +15,7 @@ import json
 import os
 import re
 import requests
+import subprocess
 import threading
 
 from datetime import datetime, timezone, timedelta
@@ -57,17 +58,19 @@ USER_AGENT = (
 #   ollama pull qwen2.5:3b        # ~2 GB — good balance of speed + quality for 11 GB RAM
 #   Then set AI_BACKEND = "ollama" below.
 #
-# Recommended models by RAM budget:
-#   qwen2.5:3b      ~2 GB  — fast, good reasoning, best for 11 GB
-#   qwen2.5:7b      ~5 GB  — better quality, fits in 11 GB
-#   llama3.2:3b     ~2 GB  — solid alt to qwen at same size
-#   mistral:7b      ~5 GB  — strong reasoning, fits in 11 GB
-#   phi3.5          ~2 GB  — Microsoft, very fast on ARM
+# Recommended models (Termux/Android — pick the smallest that works):
+#   tinyllama       ~638 MB RAM  — DEFAULT, always fits, fast on ARM, good for classification
+#   qwen2.5:0.5b    ~395 MB RAM  — smallest Qwen, very fast
+#   phi3:mini       ~2.3 GB RAM  — much better reasoning if RAM allows
+#   qwen2.5:3b      ~2 GB  RAM  — good quality (use if tinyllama gives poor results)
+#   qwen2.5:7b      ~5 GB  RAM  — best quality, only if you have 8+ GB free
+#
+# To switch:  export OLLAMA_MODEL=phi3:mini
 #
 AI_BACKEND         = os.environ.get("INFOHUNTER_AI", "none")   # "ollama" | "anthropic" | "none"
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 OLLAMA_HOST        = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL       = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL       = os.environ.get("OLLAMA_MODEL", "tinyllama")
 AI_ENABLED         = AI_BACKEND in ("ollama", "anthropic") and (
     AI_BACKEND != "anthropic" or bool(ANTHROPIC_API_KEY)
 )
@@ -952,33 +955,54 @@ class InfoHunter(App):
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _silence_ollama_logs() -> None:
+def _restart_ollama_silently() -> bool:
     """
-    Ollama on Termux/Android writes GIN HTTP logs to BOTH stdout and stderr,
-    which bleed into the Textual terminal UI.
+    Kill any existing Ollama process and relaunch it with stdout+stderr captured,
+    so GIN HTTP logs cannot bleed into the Textual terminal.
 
-    Strategy:
-      - Textual renders by writing directly to /dev/tty (the real terminal),
-        NOT to fd 1 (stdout). So we can safely redirect fd 1 and fd 2 to
-        /dev/null without breaking the UI.
-      - We flush and redirect at the OS level so even C extensions can't
-        sneak output through.
+    Ollama is a separate OS process — dup2() on Python's fds has no effect on it.
+    The only reliable fix is to own the Ollama process ourselves.
+
+    Returns True if Ollama is ready after the restart.
     """
-    import sys, os
+    import subprocess, time, sys, os
     if AI_BACKEND != "ollama":
-        return
+        return False
+
+    devnull = open(os.devnull, "w")
+
+    # Kill any existing ollama serve process
     try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull_fd, 1)   # silence stdout (Ollama GIN logs on Android)
-        os.dup2(devnull_fd, 2)   # silence stderr
-        os.close(devnull_fd)
-        # Also redirect Python-level streams
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
+        subprocess.run(["pkill", "-f", "ollama serve"],
+                       stdout=devnull, stderr=devnull, timeout=5)
+        time.sleep(1)
     except Exception:
-        pass  # non-fatal
+        pass
+
+    # Relaunch with all output captured — this process is now ours
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=devnull,
+            stderr=devnull,
+            stdin=subprocess.DEVNULL,
+        )
+        # Wait for server to be ready (up to 15 seconds)
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=2)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                pass
+        return False
+    except FileNotFoundError:
+        print("[InfoHunter] ERROR: 'ollama' not found in PATH. Install it first.")
+        return False
+    except Exception as e:
+        print(f"[InfoHunter] Could not start Ollama: {e}")
+        return False
 
 
 if __name__ == "__main__":
@@ -997,27 +1021,30 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if AI_BACKEND == "ollama":
-        print(f"[InfoHunter] AI scoring: ENABLED  (Ollama / {OLLAMA_MODEL} @ {OLLAMA_HOST})")
-        print(f"[InfoHunter] TIP: Start Ollama silently:  ollama serve 2>/dev/null &")
-        # Health-check: verify Ollama is reachable and model is loaded
-        try:
-            hc = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-            models = [m["name"] for m in hc.json().get("models", [])]
-            loaded = any(OLLAMA_MODEL.split(":")[0] in m for m in models)
-            if not loaded:
-                print(f"[InfoHunter] WARNING: model '{OLLAMA_MODEL}' not found in Ollama.")
-                print(f"[InfoHunter]   Available: {models or '(none)'}")
-                print(f"[InfoHunter]   Run:  ollama pull {OLLAMA_MODEL}")
-                print(f"[InfoHunter]   Continuing with AI disabled until model is available.")
-        except Exception as e:
-            print(f"[InfoHunter] WARNING: Cannot reach Ollama at {OLLAMA_HOST} — {e}")
-            print(f"[InfoHunter]   Run:  ollama serve 2>/dev/null &")
-            print(f"[InfoHunter]   Continuing with rule-based scoring only.")
+        print(f"[InfoHunter] AI scoring: ENABLED  (Ollama / {OLLAMA_MODEL})")
+        print(f"[InfoHunter] Restarting Ollama silently (this captures its logs)…")
+        ready = _restart_ollama_silently()
+        if ready:
+            # Verify the model is available
+            try:
+                hc     = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+                models = [m["name"] for m in hc.json().get("models", [])]
+                loaded = any(OLLAMA_MODEL.split(":")[0] in m for m in models)
+                if loaded:
+                    print(f"[InfoHunter] Ollama ready. Model '{OLLAMA_MODEL}' loaded. Starting…")
+                else:
+                    avail = ", ".join(models) if models else "(none)"
+                    print(f"[InfoHunter] WARNING: '{OLLAMA_MODEL}' not in Ollama. Available: {avail}")
+                    print(f"[InfoHunter]   Run:  ollama pull {OLLAMA_MODEL}")
+                    print(f"[InfoHunter] Tip: tinyllama is the fastest — ollama pull tinyllama")
+                    print(f"[InfoHunter] Falling back to rule-based scoring.")
+            except Exception:
+                print(f"[InfoHunter] Ollama reachable but could not verify model. Continuing…")
+        else:
+            print(f"[InfoHunter] WARNING: Ollama did not start in time. Falling back to rules.")
     elif AI_BACKEND == "anthropic" and AI_ENABLED:
         print("[InfoHunter] AI scoring: ENABLED  (claude-haiku)")
     else:
-        print("[InfoHunter] AI scoring: DISABLED")
-        print("[InfoHunter] To enable: set INFOHUNTER_AI=ollama (or anthropic + ANTHROPIC_API_KEY)")
+        print("[InfoHunter] AI scoring: DISABLED  (set INFOHUNTER_AI=ollama to enable)")
 
-    _silence_ollama_logs()
     InfoHunter().run()

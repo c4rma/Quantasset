@@ -35,7 +35,7 @@ from rich.text import Text
 # ─────────────────────────────────────────────────────────────────────────────
 
 REFRESH_INTERVAL_SECONDS = 15
-WINDOW_HOURS             = 6 if AI_ENABLED else 12  # AI mode: 6h to keep load manageable
+WINDOW_HOURS             = 12  # overridden to 6h when AI is enabled (set after AI_ENABLED is defined)
 MAX_HEADLINES            = 2000
 AI_BATCH_SIZE            = 8        # headlines per Ollama call (small models overflow above ~10)
 AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
@@ -71,6 +71,7 @@ OLLAMA_MODEL       = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 AI_ENABLED         = AI_BACKEND in ("ollama", "anthropic") and (
     AI_BACKEND != "anthropic" or bool(ANTHROPIC_API_KEY)
 )
+WINDOW_HOURS             = 6 if AI_ENABLED else 12  # 6h in AI mode
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEWS SOURCES

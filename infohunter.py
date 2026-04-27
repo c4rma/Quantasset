@@ -39,8 +39,8 @@ REFRESH_INTERVAL_SECONDS = 15
 WINDOW_HOURS             = 12  # overridden to 6h when AI is enabled (set after AI_ENABLED is defined)
 MAX_HEADLINES            = 2000
 AI_BATCH_SIZE            = 1        # Ollama: score one at a time; Anthropic: batched
-AI_MAX_PER_PASS          = 20       # max headlines to score per ai_rescore() call
-AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
+AI_MAX_PER_PASS          = 10       # max headlines per ai_rescore() pass (keeps CPU free)
+AI_RESCORE_INTERVAL      = 45       # seconds between AI passes (longer = cooler phone)
 AI_SCORE_ALL             = True     # score every headline when AI enabled
 AI_DEBUG_LOG             = os.path.expanduser("~/infohunter_ai_debug.log")  # set to "" to disable
 USER_AGENT = (
@@ -750,6 +750,8 @@ class HelpScreen(Screen):
 class InfoHunter(App):
     TITLE     = "InfoHunter"
     SUB_TITLE = "Quantasset Market Intelligence"
+    COMMANDS: set = set()   # disable built-in command palette (causes ScreenStackError on mobile)
+    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     Screen { background: $background; }
@@ -857,6 +859,7 @@ class InfoHunter(App):
             to_score = unscored[:AI_MAX_PER_PASS]
             if AI_BACKEND == "ollama":
                 # One headline at a time for Ollama — avoids timeout on slow mobile
+                import time as _time
                 for h in to_score:
                     if self.store.last_ai_error:
                         break
@@ -864,6 +867,7 @@ class InfoHunter(App):
                     if updates:
                         self.store.apply_ai_scores(updates)
                         self.call_from_thread(self._rebuild_table)
+                    _time.sleep(2)  # breathe between calls — prevents CPU/thermal throttle
             else:
                 # Anthropic: batch all at once
                 updates = ai_rescore_batch(to_score, self.store)

@@ -52,10 +52,19 @@ python infohunter.py
 **Android / Termux setup (OnePlus 7T Pro, 11 GB RAM):**
 ```bash
 pkg update && pkg install ollama
-ollama serve &              # start server in background
-ollama pull qwen2.5:3b     # ~2 GB — leaves plenty of headroom
+
+# Pull the model (one-time setup):
+ollama pull tinyllama        # 638 MB — default, always fits, fast on ARM
+# OR for better quality if RAM allows:
+ollama pull phi3:mini        # ~2.3 GB
+ollama pull qwen2.5:3b       # ~2 GB
+
+# DO NOT run 'ollama serve' manually — InfoHunter manages it:
 export INFOHUNTER_AI=ollama
+export OLLAMA_MODEL=tinyllama   # or phi3:mini, qwen2.5:3b etc.
 python infohunter.py
+# InfoHunter will kill any existing Ollama, relaunch it silently (no log bleed),
+# verify the model is loaded, then start the UI.
 
 # Optional: use a larger model if you have RAM to spare
 export OLLAMA_MODEL=qwen2.5:7b
@@ -65,11 +74,11 @@ export OLLAMA_MODEL=qwen2.5:7b
 
 | Model | RAM | Notes |
 |-------|-----|-------|
-| `qwen2.5:3b` | ~2 GB | Best speed/quality ratio, default |
-| `phi3.5` | ~2 GB | Microsoft, very fast on ARM |
-| `llama3.2:3b` | ~2 GB | Meta, solid general reasoning |
-| `qwen2.5:7b` | ~5 GB | Better nuance, fits in 11 GB |
-| `mistral:7b` | ~5 GB | Strong reasoning, fits in 11 GB |
+| `tinyllama` | ~1 GB | **Default** — always fits, fast on ARM, good for classification |
+| `qwen2.5:0.5b` | ~500 MB | Smallest Qwen, extremely fast |
+| `phi3:mini` | ~2.3 GB | Much better reasoning, recommended upgrade |
+| `qwen2.5:3b` | ~2 GB | Good quality if you have RAM headroom |
+| `qwen2.5:7b` | ~5 GB | Best quality, only if 8+ GB free |
 
 #### Option B — Anthropic Claude (paid, most accurate)
 ```powershell
@@ -190,7 +199,55 @@ Key constants at the top of `infohunter.py`:
 
 ## Changelog
 
-### v1.4 — Current
+### v1.10 — Current
+- **Fixed**: Complete AI scoring rewrite — abandoned batch JSON approach entirely for Ollama; now scores **one headline at a time** asking for a single word (HIGH/MEDIUM/LOW); this solves every previous failure mode simultaneously:
+  - No more 90s timeouts (each call asks for ≤8 tokens, returns in a few seconds)
+  - No more JSON parsing failures or model copying the example
+  - No more context window overflow
+  - Works on tinyllama, phi3:mini, qwen2.5 — any model
+- **Changed**: `num_predict=8` (was 512) — model only needs to output one word; stops immediately
+- **Changed**: Timeout raised to 120s per headline to handle slow ARM inference
+- **Added**: Debug log now shows one compact line per headline: `HH:MM:SS [HIGH  ] raw='HIGH' title=...` making it easy to monitor scoring in real time with `tail -f ~/infohunter_ai_debug.log`
+- **Changed**: Anthropic backend still uses batch JSON (it's fast and reliable); Ollama always uses one-at-a-time
+
+### v1.9
+- **Fixed**: AI scoring silently doing nothing — root causes were (1) `exclusive=True` on the worker meant any call while a previous pass was running got silently dropped, especially on slow mobile hardware; replaced with a manual `_ai_running` mutex flag so calls queue correctly; (2) `last_ai_error` was never cleared between passes, so a single transient error permanently stopped all future scoring; now cleared at the start of each pass
+- **Fixed**: `tinyllama` ignoring the system prompt — tinyllama doesn't reliably honour the `system` role in `/api/chat`; switched to `/api/generate` with the system instructions embedded directly in the prompt, which works on all Ollama models including the smallest ones
+- **Added**: AI debug log at `~/infohunter_ai_debug.log` — logs raw Ollama prompt/response and any exceptions so failures are always visible; set `AI_DEBUG_LOG = ""` to disable
+- **Changed**: `num_predict` reduced to 512 (enough for 8 headlines), added `stop` tokens to prevent runaway generation
+
+### v1.8
+- **Fixed**: Ollama GIN logs still bleeding into terminal — `dup2()` on Python's file descriptors has no effect on a *separate* Ollama process that was already started; the only real fix is for InfoHunter to **own** the Ollama process by killing the existing one and relaunching it with `stdout`/`stderr` captured via `subprocess.Popen`. No more log pollution regardless of how Ollama was originally started
+- **Fixed**: HTTP 500 on every `/api/chat` request — `qwen2.5:3b` (~2 GB model weights + Android OS overhead) was exceeding available memory mid-inference; changed default model to **`tinyllama`** (638 MB, ~1 GB RAM total), which comfortably fits on any Android device
+- **Fixed**: App never loads when Ollama returns 500s — the AI worker was blocking app startup; now fully non-blocking: startup sequence is (1) restart Ollama silently, (2) verify model, (3) launch UI immediately, (4) score headlines in background
+- **Changed**: Ollama startup is now managed by InfoHunter — you no longer need to run `ollama serve` manually; InfoHunter kills any existing instance and relaunches it with logs captured
+- **Changed**: Default Ollama model changed from `qwen2.5:3b` → `tinyllama` (much smaller, always fits in RAM)
+
+### v1.7
+- **Fixed**: App not loading at all — parallel Ollama requests (3 concurrent threads) caused HTTP 500 crashes because Ollama on mobile is single-threaded and cannot handle concurrent inference; replaced `ThreadPoolExecutor` with strict sequential processing (one batch at a time)
+- **Fixed**: Ollama log output still bleeding into terminal on Android/Termux — Ollama on Android writes to **stdout** (fd 1), not just stderr; now redirects both fd 1 and fd 2 to `/dev/null` before Textual launches (safe because Textual renders via `/dev/tty` directly, not fd 1)
+- **Fixed**: Script hangs on startup when Ollama isn't running — added pre-launch health check that hits `/api/tags`, verifies the model is loaded, and prints a clear warning + continues with rule-based scoring if Ollama is unreachable (instead of hanging)
+- **Added**: AI scoring pass now stops early if Ollama returns errors, rather than hammering it with more requests
+- **Added**: 6-hour headline window when AI is enabled (vs 12h normally) — reduces the number of headlines that need scoring on startup, making AI mode viable on mobile hardware
+- **Changed**: Max batches per AI pass capped at 5 (40 headlines) to prevent the worker from blocking the app for too long on a slow mobile CPU
+
+### v1.6
+- **Fixed**: Ollama GIN HTTP server logs bleeding into the terminal UI — stderr is now silenced at the OS file-descriptor level before Textual launches, so log lines can no longer corrupt the display
+- **Fixed**: AI response parsing failing for `qwen2.5:3b` and similar small models that add prose preamble, trailing text, or markdown fences around JSON — replaced greedy regex with bracket-counting parser that reliably extracts the array regardless of surrounding text
+- **Fixed**: Prompt overflowing small model context windows — batch size reduced from 20 → 8 headlines per call; summary truncated to 120 chars; `source`/`category` fields removed from payload (title + summary is sufficient for classification)
+- **Fixed**: System prompt too verbose for instruction-following on 3B models — rewritten to be terse and JSON-first with a concrete output example
+- **Added**: Start Ollama silently in Termux with `ollama serve 2>/dev/null &` (shown in startup tip)
+
+### v1.5
+- **Fixed**: AI scoring never actually ran on most headlines — `get_unscored_batch` only returned 12 ambiguous headlines per 60s pass, meaning hundreds of headlines would take many minutes to score (if ever). Replaced with `get_unscored()` which returns ALL unscored headlines, processed in parallel batches via `ThreadPoolExecutor` (3 concurrent calls)
+- **Fixed**: AI worker silently swallowed all exceptions — errors are now surfaced in the status bar in red so you can see if Ollama isn't responding
+- **Fixed**: Payload sent to AI did not include summary — now includes up to 300 chars of summary per headline, giving the model full context
+- **Fixed**: AI only ran on "ambiguous" rule scores (2–10) — now scores every headline when `INFOHUNTER_AI` is set, so every entry gets `✦`
+- **Fixed**: AI worker only fired on a timer — now also triggers immediately after each fetch cycle via `on_worker_state_changed`, so new headlines are scored within seconds of arrival
+- **Changed**: `AI_RESCORE_INTERVAL` lowered from 60s → 20s; `AI_BATCH_SIZE` raised from 12 → 20
+- **Added**: Status bar now shows count of AI-scored headlines (`✦`) and pending count in yellow while scoring is in progress
+
+### v1.4
 - **Fixed**: Search (`S` key) caused full freeze/deadlock when closing — replaced `@work(thread=True)` + `push_screen_wait` pattern with `push_screen(callback=...)` which runs entirely on the main thread with no blocking; ESC and Enter both close correctly
 - **Added**: Pluggable AI backend system — set `INFOHUNTER_AI=ollama` for free local scoring via Ollama (no API costs), or `INFOHUNTER_AI=anthropic` for Claude Haiku
 - **Added**: Full Ollama support with configurable host (`OLLAMA_HOST`) and model (`OLLAMA_MODEL`); recommended models for 11 GB RAM: `qwen2.5:3b`, `phi3.5`, `llama3.2:3b`, `qwen2.5:7b`

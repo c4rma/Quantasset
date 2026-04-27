@@ -16,7 +16,6 @@ import os
 import re
 import requests
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -36,7 +35,7 @@ from rich.text import Text
 # ─────────────────────────────────────────────────────────────────────────────
 
 REFRESH_INTERVAL_SECONDS = 15
-WINDOW_HOURS             = 12
+WINDOW_HOURS             = 6 if AI_ENABLED else 12  # AI mode: 6h to keep load manageable
 MAX_HEADLINES            = 2000
 AI_BATCH_SIZE            = 8        # headlines per Ollama call (small models overflow above ~10)
 AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
@@ -802,22 +801,17 @@ class InfoHunter(App):
         if not unscored:
             return
 
-        # Chunk into batches and score them in parallel (max 3 concurrent calls)
+        # Sequential batching — Ollama (especially on mobile) is single-threaded;
+        # concurrent requests cause HTTP 500 crashes. Process one batch at a time.
         batches = [unscored[i:i + AI_BATCH_SIZE] for i in range(0, len(unscored), AI_BATCH_SIZE)]
-        any_updates = False
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(ai_rescore_batch, batch, self.store): batch for batch in batches}
-            for future in as_completed(futures):
-                try:
-                    updates = future.result(timeout=90)
-                    if updates:
-                        self.store.apply_ai_scores(updates)
-                        any_updates = True
-                        self.call_from_thread(self._rebuild_table)
-                except Exception:
-                    pass
-        if any_updates:
-            self.call_from_thread(self._rebuild_table)
+        # Cap at 5 batches per pass (40 headlines max) to avoid blocking too long
+        for batch in batches[:5]:
+            if self.store.last_ai_error:
+                break  # stop if Ollama is erroring — wait for next interval
+            updates = ai_rescore_batch(batch, self.store)
+            if updates:
+                self.store.apply_ai_scores(updates)
+                self.call_from_thread(self._rebuild_table)
 
     # ── Table ─────────────────────────────────────────────────────────────────
 
@@ -959,24 +953,31 @@ class InfoHunter(App):
 
 def _silence_ollama_logs() -> None:
     """
-    Ollama prints GIN HTTP server logs to stdout/stderr which bleed into
-    the Textual UI. We redirect both at the OS file-descriptor level so
-    nothing can sneak through, even from C extensions.
+    Ollama on Termux/Android writes GIN HTTP logs to BOTH stdout and stderr,
+    which bleed into the Textual terminal UI.
+
+    Strategy:
+      - Textual renders by writing directly to /dev/tty (the real terminal),
+        NOT to fd 1 (stdout). So we can safely redirect fd 1 and fd 2 to
+        /dev/null without breaking the UI.
+      - We flush and redirect at the OS level so even C extensions can't
+        sneak output through.
     """
     import sys, os
     if AI_BACKEND != "ollama":
         return
     try:
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        # Flush before redirecting
         sys.stdout.flush()
         sys.stderr.flush()
-        # Duplicate the real stdout so Textual can still use it internally
-        # (Textual writes to the terminal via its own fd, not sys.stdout)
-        os.dup2(devnull_fd, 2)   # silence stderr (GIN logs go here)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 1)   # silence stdout (Ollama GIN logs on Android)
+        os.dup2(devnull_fd, 2)   # silence stderr
         os.close(devnull_fd)
+        # Also redirect Python-level streams
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
     except Exception:
-        pass  # non-fatal — worst case logs still show but app still works
+        pass  # non-fatal
 
 
 if __name__ == "__main__":
@@ -996,7 +997,21 @@ if __name__ == "__main__":
 
     if AI_BACKEND == "ollama":
         print(f"[InfoHunter] AI scoring: ENABLED  (Ollama / {OLLAMA_MODEL} @ {OLLAMA_HOST})")
-        print(f"[InfoHunter] TIP: Start Ollama silently with:  ollama serve 2>/dev/null &")
+        print(f"[InfoHunter] TIP: Start Ollama silently:  ollama serve 2>/dev/null &")
+        # Health-check: verify Ollama is reachable and model is loaded
+        try:
+            hc = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+            models = [m["name"] for m in hc.json().get("models", [])]
+            loaded = any(OLLAMA_MODEL.split(":")[0] in m for m in models)
+            if not loaded:
+                print(f"[InfoHunter] WARNING: model '{OLLAMA_MODEL}' not found in Ollama.")
+                print(f"[InfoHunter]   Available: {models or '(none)'}")
+                print(f"[InfoHunter]   Run:  ollama pull {OLLAMA_MODEL}")
+                print(f"[InfoHunter]   Continuing with AI disabled until model is available.")
+        except Exception as e:
+            print(f"[InfoHunter] WARNING: Cannot reach Ollama at {OLLAMA_HOST} — {e}")
+            print(f"[InfoHunter]   Run:  ollama serve 2>/dev/null &")
+            print(f"[InfoHunter]   Continuing with rule-based scoring only.")
     elif AI_BACKEND == "anthropic" and AI_ENABLED:
         print("[InfoHunter] AI scoring: ENABLED  (claude-haiku)")
     else:

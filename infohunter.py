@@ -38,7 +38,8 @@ from rich.text import Text
 REFRESH_INTERVAL_SECONDS = 15
 WINDOW_HOURS             = 12  # overridden to 6h when AI is enabled (set after AI_ENABLED is defined)
 MAX_HEADLINES            = 2000
-AI_BATCH_SIZE            = 8        # headlines per Ollama call (small models overflow above ~10)
+AI_BATCH_SIZE            = 1        # Ollama: score one at a time; Anthropic: batched
+AI_MAX_PER_PASS          = 20       # max headlines to score per ai_rescore() call
 AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
 AI_SCORE_ALL             = True     # score every headline when AI enabled
 AI_DEBUG_LOG             = os.path.expanduser("~/infohunter_ai_debug.log")  # set to "" to disable
@@ -260,63 +261,99 @@ def rule_score(title: str, summary: str, category: str) -> tuple[int, str, list[
 # AI RESCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
-AI_SYSTEM = (
-    "You are a financial news impact classifier. Output ONLY valid JSON — no prose, no markdown.\n"
-    "HIGH:   CB rate decisions, NFP/CPI/GDP prints, market crashes, wars, strait/chokepoint attacks, "
-    "oil tanker attacks, pipeline sabotage, nuclear threats, OPEC surprises, bank failures, "
-    "stablecoin depegs, major crypto hacks, sovereign defaults, pandemic declarations.\n"
-    "MEDIUM: Fed-speak, PMI data, earnings beats/misses, M&A, geopolitical tension without immediate "
-    "market impact, regulatory proposals, layoffs without systemic implications.\n"
-    "LOW:    Routine company news, analyst opinions, price target changes, recaps, lifestyle.\n\n"
-    "Respond with a JSON array ONLY — no prose, no markdown, no explanation before or after.\n"
-    '[{"id":"abc123","impact":"HIGH","reason":"FOMC rate hike"},{"id":"def456","impact":"LOW","reason":"routine note"}]'
+# ── AI prompt — single-headline mode ─────────────────────────────────────────
+# We score ONE headline at a time and ask for a single word answer.
+# This is the only approach that works reliably on tiny models (tinyllama etc.)
+# on slow mobile hardware: minimal prompt, minimal output, fast, no JSON parsing.
+
+_OLLAMA_PROMPT_TEMPLATE = """You are a financial market news classifier.
+Reply with exactly one word: HIGH, MEDIUM, or LOW.
+
+HIGH = moves markets now: central bank decisions, NFP/CPI/GDP data, war/invasion, oil tanker or pipeline attacks, strait blockades, OPEC decisions, bank failures, stablecoin depegs, major crypto hacks, sovereign defaults.
+MEDIUM = noteworthy: Fed speeches, PMI, earnings, M&A, geopolitical tension, regulatory proposals.
+LOW = routine: analyst notes, price targets, recaps, lifestyle, sports.
+
+Headline: {title}
+Summary: {summary}
+Impact (one word):"""
+
+_ANTHROPIC_SYSTEM = (
+    "You are a financial news impact classifier. "
+    "Classify the headline as HIGH, MEDIUM, or LOW market impact. "
+    "HIGH: CB rate decisions, NFP/CPI/GDP, crashes, wars, strait/pipeline attacks, OPEC, "
+    "bank failures, stablecoin depegs, major hacks, sovereign defaults. "
+    "MEDIUM: Fed-speak, PMI, earnings, M&A, geopolitical tension, regulatory proposals. "
+    "LOW: Routine news, analyst opinions, recaps, lifestyle. "
+    "Reply with a JSON array: "
+    '[{"id":"ID","impact":"HIGH","reason":"brief reason"},...]'
 )
 
 
-def _parse_ai_response(raw: str) -> dict[str, tuple[str, str]]:
+def _parse_one_word(raw: str) -> str:
+    """Extract HIGH / MEDIUM / LOW from a one-word model response."""
+    for word in re.split(r"[\s\.,;:!\-]+", raw.upper()):
+        if word in ("HIGH", "MEDIUM", "LOW"):
+            return word
+    return ""
+
+
+def _score_one_ollama(headline) -> tuple[str, str]:
     """
-    Robustly extract a JSON array from AI output.
-    Handles: markdown fences, prose preamble, nested objects, partial output.
+    Score a single headline via Ollama /api/generate.
+    Returns (impact, reason). Falls back to "" on failure.
     """
-    # Strip markdown fences
-    raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+    summary = (headline.summary or "")[:150]
+    prompt  = _OLLAMA_PROMPT_TEMPLATE.format(
+        title=headline.title[:200],
+        summary=summary if summary else "(none)",
+    )
+    try:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": 8,      # we only need one word — stop FAST
+                    "stop": ["\n", ".", ",", " "],
+                },
+            },
+            timeout=120,   # mobile ARM can be slow — give it 2 minutes per headline
+        )
+        resp.raise_for_status()
+        raw    = resp.json().get("response", "").strip()
+        impact = _parse_one_word(raw)
+        if AI_DEBUG_LOG:
+            try:
+                with open(AI_DEBUG_LOG, "a") as f:
+                    f.write(f"{datetime.now().strftime('%H:%M:%S')} "
+                            f"[{impact or '?':6s}] raw={raw!r:12s} "
+                            f"title={headline.title[:60]}\n")
+            except Exception:
+                pass
+        return impact, ""
+    except Exception as exc:
+        if AI_DEBUG_LOG:
+            try:
+                with open(AI_DEBUG_LOG, "a") as f:
+                    import traceback
+                    f.write(f"\n--- EXCEPTION {datetime.now().isoformat()} ---\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+        raise
 
-    # Find the first "[" and the matching closing "]" by bracket counting
-    # (avoids the greedy-regex trap of matching [..."id"...] across items)
-    start = raw.find("[")
-    if start == -1:
-        raise ValueError(f"No JSON array found in AI response: {raw[:200]!r}")
 
-    depth = 0
-    end   = -1
-    for i, ch in enumerate(raw[start:], start):
-        if ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-
-    if end == -1:
-        raise ValueError(f"Unclosed JSON array in AI response: {raw[start:start+200]!r}")
-
-    array_str = raw[start:end]
-    data = json.loads(array_str)
-
-    result = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        hid    = str(item.get("id", "")).strip()
-        impact = str(item.get("impact", "")).upper().strip()
-        reason = str(item.get("reason", "")).strip()
-        if hid and impact in ("HIGH", "MEDIUM", "LOW"):
-            result[hid] = (impact, reason)
-    return result
-
-
-def _ai_via_anthropic(prompt: str) -> str:
+def _ai_via_anthropic_batch(headlines: list) -> dict[str, tuple[str, str]]:
+    """Anthropic supports batching — send all at once as a JSON array."""
+    payload = [
+        {"id": h.id, "title": h.title,
+         **({"summary": h.summary[:150]} if h.summary else {})}
+        for h in headlines
+    ]
+    prompt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -327,71 +364,54 @@ def _ai_via_anthropic(prompt: str) -> str:
         json={
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1024,
-            "system": AI_SYSTEM,
+            "system": _ANTHROPIC_SYSTEM,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=20,
     )
     resp.raise_for_status()
-    return resp.json()["content"][0]["text"]
-
-
-def _ai_via_ollama(prompt: str) -> str:
-    """
-    Use /api/generate (not /api/chat) — it works reliably on ALL Ollama models
-    including tinyllama, which often ignores system role in /api/chat.
-    We embed the system instructions directly in the prompt.
-    """
-    combined = (
-        f"{AI_SYSTEM}\n\n"
-        f"Headlines to classify:\n{prompt}\n\n"
-        f"JSON array output only:"
-    )
-    resp = requests.post(
-        f"{OLLAMA_HOST}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": combined,
-            "stream": False,
-            "options": {
-                "temperature": 0.05,   # near-deterministic
-                "num_predict": 512,    # enough for 8 headlines, not runaway
-                "stop": ["\n\n", "```"],  # stop at double newline or code fence end
-            },
-        },
-        timeout=90,
-    )
-    resp.raise_for_status()
-    raw = resp.json().get("response", "")
-    if AI_DEBUG_LOG:
-        try:
-            with open(AI_DEBUG_LOG, "a") as f:
-                f.write(f"\n--- {datetime.now().isoformat()} ---\n")
-                f.write(f"PROMPT (last 200): ...{combined[-200:]}\n")
-                f.write(f"RESPONSE: {raw[:500]}\n")
-        except Exception:
-            pass
-    return raw
+    raw = resp.json()["content"][0]["text"].strip()
+    raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+    start = raw.find("[")
+    if start == -1:
+        return {}
+    depth, end = 0, -1
+    for i, ch in enumerate(raw[start:], start):
+        depth += (ch == "[") - (ch == "]")
+        if depth == 0:
+            end = i + 1
+            break
+    if end == -1:
+        return {}
+    result = {}
+    for item in json.loads(raw[start:end]):
+        hid    = str(item.get("id", "")).strip()
+        impact = str(item.get("impact", "")).upper().strip()
+        reason = str(item.get("reason", "")).strip()
+        if hid and impact in ("HIGH", "MEDIUM", "LOW"):
+            result[hid] = (impact, reason)
+    return result
 
 
 def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> dict[str, tuple[str, str]]:
+    """
+    Score a batch of headlines.
+    - Anthropic: single API call with full batch.
+    - Ollama: one headline at a time (tiny models need this).
+    """
     if not AI_ENABLED or not headlines:
         return {}
-    payload = []
-    for h in headlines:
-        entry = {"id": h.id, "title": h.title}
-        if h.summary:
-            entry["summary"] = h.summary[:120]  # small models have limited context
-        payload.append(entry)
-    prompt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
         if AI_BACKEND == "anthropic":
-            raw = _ai_via_anthropic(prompt)
+            result = _ai_via_anthropic_batch(headlines)
         elif AI_BACKEND == "ollama":
-            raw = _ai_via_ollama(prompt)
+            result = {}
+            for h in headlines:
+                impact, reason = _score_one_ollama(h)
+                if impact:
+                    result[h.id] = (impact, reason)
         else:
             return {}
-        result = _parse_ai_response(raw)
         if store:
             store.last_ai_error = ""
         return result
@@ -399,14 +419,6 @@ def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> d
         err = str(exc)[:120]
         if store:
             store.last_ai_error = err
-        if AI_DEBUG_LOG:
-            try:
-                with open(AI_DEBUG_LOG, "a") as f:
-                    import traceback
-                    f.write(f"\n--- EXCEPTION {datetime.now().isoformat()} ---\n")
-                    f.write(traceback.format_exc())
-            except Exception:
-                pass
         return {}
 
 
@@ -841,11 +853,20 @@ class InfoHunter(App):
                 return
             # Clear stale errors so a recovered Ollama can retry
             self.store.last_ai_error = ""
-            batches = [unscored[i:i + AI_BATCH_SIZE] for i in range(0, len(unscored), AI_BATCH_SIZE)]
-            for batch in batches:
-                updates = ai_rescore_batch(batch, self.store)
-                if self.store.last_ai_error:
-                    break  # Ollama error — stop this pass, retry next interval
+            # Score up to AI_MAX_PER_PASS headlines this pass
+            to_score = unscored[:AI_MAX_PER_PASS]
+            if AI_BACKEND == "ollama":
+                # One headline at a time for Ollama — avoids timeout on slow mobile
+                for h in to_score:
+                    if self.store.last_ai_error:
+                        break
+                    updates = ai_rescore_batch([h], self.store)
+                    if updates:
+                        self.store.apply_ai_scores(updates)
+                        self.call_from_thread(self._rebuild_table)
+            else:
+                # Anthropic: batch all at once
+                updates = ai_rescore_batch(to_score, self.store)
                 if updates:
                     self.store.apply_ai_scores(updates)
                     self.call_from_thread(self._rebuild_table)

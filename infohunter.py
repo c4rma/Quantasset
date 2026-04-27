@@ -41,6 +41,7 @@ MAX_HEADLINES            = 2000
 AI_BATCH_SIZE            = 8        # headlines per Ollama call (small models overflow above ~10)
 AI_RESCORE_INTERVAL      = 20       # seconds between AI passes
 AI_SCORE_ALL             = True     # score every headline when AI enabled
+AI_DEBUG_LOG             = os.path.expanduser("~/infohunter_ai_debug.log")  # set to "" to disable
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -336,21 +337,41 @@ def _ai_via_anthropic(prompt: str) -> str:
 
 
 def _ai_via_ollama(prompt: str) -> str:
+    """
+    Use /api/generate (not /api/chat) — it works reliably on ALL Ollama models
+    including tinyllama, which often ignores system role in /api/chat.
+    We embed the system instructions directly in the prompt.
+    """
+    combined = (
+        f"{AI_SYSTEM}\n\n"
+        f"Headlines to classify:\n{prompt}\n\n"
+        f"JSON array output only:"
+    )
     resp = requests.post(
-        f"{OLLAMA_HOST}/api/chat",
+        f"{OLLAMA_HOST}/api/generate",
         json={
             "model": OLLAMA_MODEL,
+            "prompt": combined,
             "stream": False,
-            "options": {"temperature": 0.1, "num_predict": 1024},
-            "messages": [
-                {"role": "system", "content": AI_SYSTEM},
-                {"role": "user",   "content": prompt},
-            ],
+            "options": {
+                "temperature": 0.05,   # near-deterministic
+                "num_predict": 512,    # enough for 8 headlines, not runaway
+                "stop": ["\n\n", "```"],  # stop at double newline or code fence end
+            },
         },
-        timeout=60,   # local models can be slower
+        timeout=90,
     )
     resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    raw = resp.json().get("response", "")
+    if AI_DEBUG_LOG:
+        try:
+            with open(AI_DEBUG_LOG, "a") as f:
+                f.write(f"\n--- {datetime.now().isoformat()} ---\n")
+                f.write(f"PROMPT (last 200): ...{combined[-200:]}\n")
+                f.write(f"RESPONSE: {raw[:500]}\n")
+        except Exception:
+            pass
+    return raw
 
 
 def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> dict[str, tuple[str, str]]:
@@ -378,6 +399,14 @@ def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> d
         err = str(exc)[:120]
         if store:
             store.last_ai_error = err
+        if AI_DEBUG_LOG:
+            try:
+                with open(AI_DEBUG_LOG, "a") as f:
+                    import traceback
+                    f.write(f"\n--- EXCEPTION {datetime.now().isoformat()} ---\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
         return {}
 
 
@@ -749,6 +778,7 @@ class InfoHunter(App):
         self._rows:  list[Headline] = []
         self._refresh_ts     = "—"
         self._countdown      = REFRESH_INTERVAL_SECONDS
+        self._ai_running     = False
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -797,25 +827,30 @@ class InfoHunter(App):
         self.call_from_thread(self._set_fetch, f"✓ {ts}")
         self.call_from_thread(self._rebuild_table)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=False)
     def ai_rescore(self) -> None:
         if not AI_ENABLED:
             return
-        unscored = self.store.get_unscored()
-        if not unscored:
+        # Simple mutex — if a scoring pass is already running, skip
+        if getattr(self, "_ai_running", False):
             return
-
-        # Sequential batching — Ollama (especially on mobile) is single-threaded;
-        # concurrent requests cause HTTP 500 crashes. Process one batch at a time.
-        batches = [unscored[i:i + AI_BATCH_SIZE] for i in range(0, len(unscored), AI_BATCH_SIZE)]
-        # Cap at 5 batches per pass (40 headlines max) to avoid blocking too long
-        for batch in batches[:5]:
-            if self.store.last_ai_error:
-                break  # stop if Ollama is erroring — wait for next interval
-            updates = ai_rescore_batch(batch, self.store)
-            if updates:
-                self.store.apply_ai_scores(updates)
-                self.call_from_thread(self._rebuild_table)
+        self._ai_running = True
+        try:
+            unscored = self.store.get_unscored()
+            if not unscored:
+                return
+            # Clear stale errors so a recovered Ollama can retry
+            self.store.last_ai_error = ""
+            batches = [unscored[i:i + AI_BATCH_SIZE] for i in range(0, len(unscored), AI_BATCH_SIZE)]
+            for batch in batches:
+                updates = ai_rescore_batch(batch, self.store)
+                if self.store.last_ai_error:
+                    break  # Ollama error — stop this pass, retry next interval
+                if updates:
+                    self.store.apply_ai_scores(updates)
+                    self.call_from_thread(self._rebuild_table)
+        finally:
+            self._ai_running = False
 
     # ── Table ─────────────────────────────────────────────────────────────────
 

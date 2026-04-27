@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
 InfoHunter — Quantasset Terminal News Aggregator
-Real-time financial headlines, ranked by market impact via rules + AI scoring.
+Real-time financial headlines, ranked by market impact using a rule-based scoring engine.
 Usage:  python infohunter.py
 Deps:   pip install feedparser textual requests
-AI key: set ANTHROPIC_API_KEY env var for AI re-scoring (optional but recommended)
 """
 
-import asyncio
 import feedparser
 import hashlib
 import html
-import json
 import os
 import re
 import requests
-import subprocess
 import threading
 
 from datetime import datetime, timezone, timedelta
@@ -36,52 +32,13 @@ from rich.text import Text
 # ─────────────────────────────────────────────────────────────────────────────
 
 REFRESH_INTERVAL_SECONDS = 15
-WINDOW_HOURS             = 12  # overridden to 6h when AI is enabled (set after AI_ENABLED is defined)
+WINDOW_HOURS             = 12
 MAX_HEADLINES            = 2000
-AI_BATCH_SIZE            = 1        # Ollama: score one at a time; Anthropic: batched
-AI_MAX_PER_PASS          = 10       # max headlines per ai_rescore() pass (keeps CPU free)
-AI_RESCORE_INTERVAL      = 45       # seconds between AI passes (longer = cooler phone)
-AI_SCORE_ALL             = True     # score every headline when AI enabled
-AI_DEBUG_LOG             = os.path.expanduser("~/infohunter_ai_debug.log")  # set to "" to disable
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-# ── AI backend selection ─────────────────────────────────────────────────────
-# Options:
-#   "ollama"     — local Ollama server (free, runs on your machine/phone via Termux)
-#   "anthropic"  — Claude Haiku via API (paid, most accurate)
-#   "none"       — disable AI scoring entirely
-#
-# Ollama setup (Termux on Android):
-#   pkg install ollama
-#   ollama serve &
-#   ollama pull qwen2.5:3b        # ~2 GB — good balance of speed + quality for 11 GB RAM
-#   Then set AI_BACKEND = "ollama" below.
-#
-# Recommended models (Termux/Android — pick the smallest that works):
-#   tinyllama       ~638 MB RAM  — DEFAULT, always fits, fast on ARM, good for classification
-#   qwen2.5:0.5b    ~395 MB RAM  — smallest Qwen, very fast
-#   phi3:mini       ~2.3 GB RAM  — much better reasoning if RAM allows
-#   qwen2.5:3b      ~2 GB  RAM  — good quality (use if tinyllama gives poor results)
-#   qwen2.5:7b      ~5 GB  RAM  — best quality, only if you have 8+ GB free
-#
-# To switch:  export OLLAMA_MODEL=phi3:mini
-#
-AI_BACKEND         = os.environ.get("INFOHUNTER_AI", "none")   # "ollama" | "anthropic" | "none"
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-OLLAMA_HOST        = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL       = os.environ.get("OLLAMA_MODEL", "tinyllama")
-AI_ENABLED         = AI_BACKEND in ("ollama", "anthropic") and (
-    AI_BACKEND != "anthropic" or bool(ANTHROPIC_API_KEY)
-)
-WINDOW_HOURS             = 6 if AI_ENABLED else 12  # 6h in AI mode
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEWS SOURCES
-# ─────────────────────────────────────────────────────────────────────────────
-
 SOURCES = [
     {"name": "Reuters Business",     "url": "https://feeds.reuters.com/reuters/businessNews",       "category": "MACRO"},
     {"name": "Reuters Finance",      "url": "https://feeds.reuters.com/reuters/financialNews",      "category": "MACRO"},
@@ -261,166 +218,6 @@ def rule_score(title: str, summary: str, category: str) -> tuple[int, str, list[
 # AI RESCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── AI prompt — single-headline mode ─────────────────────────────────────────
-# We score ONE headline at a time and ask for a single word answer.
-# This is the only approach that works reliably on tiny models (tinyllama etc.)
-# on slow mobile hardware: minimal prompt, minimal output, fast, no JSON parsing.
-
-_OLLAMA_PROMPT_TEMPLATE = """You are a financial market news classifier.
-Reply with exactly one word: HIGH, MEDIUM, or LOW.
-
-HIGH = moves markets now: central bank decisions, NFP/CPI/GDP data, war/invasion, oil tanker or pipeline attacks, strait blockades, OPEC decisions, bank failures, stablecoin depegs, major crypto hacks, sovereign defaults.
-MEDIUM = noteworthy: Fed speeches, PMI, earnings, M&A, geopolitical tension, regulatory proposals.
-LOW = routine: analyst notes, price targets, recaps, lifestyle, sports.
-
-Headline: {title}
-Summary: {summary}
-Impact (one word):"""
-
-_ANTHROPIC_SYSTEM = (
-    "You are a financial news impact classifier. "
-    "Classify the headline as HIGH, MEDIUM, or LOW market impact. "
-    "HIGH: CB rate decisions, NFP/CPI/GDP, crashes, wars, strait/pipeline attacks, OPEC, "
-    "bank failures, stablecoin depegs, major hacks, sovereign defaults. "
-    "MEDIUM: Fed-speak, PMI, earnings, M&A, geopolitical tension, regulatory proposals. "
-    "LOW: Routine news, analyst opinions, recaps, lifestyle. "
-    "Reply with a JSON array: "
-    '[{"id":"ID","impact":"HIGH","reason":"brief reason"},...]'
-)
-
-
-def _parse_one_word(raw: str) -> str:
-    """Extract HIGH / MEDIUM / LOW from a one-word model response."""
-    for word in re.split(r"[\s\.,;:!\-]+", raw.upper()):
-        if word in ("HIGH", "MEDIUM", "LOW"):
-            return word
-    return ""
-
-
-def _score_one_ollama(headline) -> tuple[str, str]:
-    """
-    Score a single headline via Ollama /api/generate.
-    Returns (impact, reason). Falls back to "" on failure.
-    """
-    summary = (headline.summary or "")[:150]
-    prompt  = _OLLAMA_PROMPT_TEMPLATE.format(
-        title=headline.title[:200],
-        summary=summary if summary else "(none)",
-    )
-    try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.0,
-                    "num_predict": 8,      # we only need one word — stop FAST
-                    "stop": ["\n", ".", ",", " "],
-                },
-            },
-            timeout=120,   # mobile ARM can be slow — give it 2 minutes per headline
-        )
-        resp.raise_for_status()
-        raw    = resp.json().get("response", "").strip()
-        impact = _parse_one_word(raw)
-        if AI_DEBUG_LOG:
-            try:
-                with open(AI_DEBUG_LOG, "a") as f:
-                    f.write(f"{datetime.now().strftime('%H:%M:%S')} "
-                            f"[{impact or '?':6s}] raw={raw!r:12s} "
-                            f"title={headline.title[:60]}\n")
-            except Exception:
-                pass
-        return impact, ""
-    except Exception as exc:
-        if AI_DEBUG_LOG:
-            try:
-                with open(AI_DEBUG_LOG, "a") as f:
-                    import traceback
-                    f.write(f"\n--- EXCEPTION {datetime.now().isoformat()} ---\n")
-                    f.write(traceback.format_exc())
-            except Exception:
-                pass
-        raise
-
-
-def _ai_via_anthropic_batch(headlines: list) -> dict[str, tuple[str, str]]:
-    """Anthropic supports batching — send all at once as a JSON array."""
-    payload = [
-        {"id": h.id, "title": h.title,
-         **({"summary": h.summary[:150]} if h.summary else {})}
-        for h in headlines
-    ]
-    prompt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1024,
-            "system": _ANTHROPIC_SYSTEM,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=20,
-    )
-    resp.raise_for_status()
-    raw = resp.json()["content"][0]["text"].strip()
-    raw = re.sub(r"```(?:json)?|```", "", raw).strip()
-    start = raw.find("[")
-    if start == -1:
-        return {}
-    depth, end = 0, -1
-    for i, ch in enumerate(raw[start:], start):
-        depth += (ch == "[") - (ch == "]")
-        if depth == 0:
-            end = i + 1
-            break
-    if end == -1:
-        return {}
-    result = {}
-    for item in json.loads(raw[start:end]):
-        hid    = str(item.get("id", "")).strip()
-        impact = str(item.get("impact", "")).upper().strip()
-        reason = str(item.get("reason", "")).strip()
-        if hid and impact in ("HIGH", "MEDIUM", "LOW"):
-            result[hid] = (impact, reason)
-    return result
-
-
-def ai_rescore_batch(headlines: list, store: "HeadlineStore | None" = None) -> dict[str, tuple[str, str]]:
-    """
-    Score a batch of headlines.
-    - Anthropic: single API call with full batch.
-    - Ollama: one headline at a time (tiny models need this).
-    """
-    if not AI_ENABLED or not headlines:
-        return {}
-    try:
-        if AI_BACKEND == "anthropic":
-            result = _ai_via_anthropic_batch(headlines)
-        elif AI_BACKEND == "ollama":
-            result = {}
-            for h in headlines:
-                impact, reason = _score_one_ollama(h)
-                if impact:
-                    result[h.id] = (impact, reason)
-        else:
-            return {}
-        if store:
-            store.last_ai_error = ""
-        return result
-    except Exception as exc:
-        err = str(exc)[:120]
-        if store:
-            store.last_ai_error = err
-        return {}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA MODEL
@@ -438,8 +235,6 @@ class Headline:
     url:        str
     summary:    str       = ""
     tags:       list[str] = field(default_factory=list)
-    ai_scored:  bool      = False
-    ai_reason:  str       = ""
 
     @property
     def ts_str(self) -> str:
@@ -515,7 +310,6 @@ class HeadlineStore:
     def __init__(self):
         self._lock      = threading.Lock()
         self._data: dict[str, Headline] = {}
-        self.last_ai_error: str = ""   # surface errors in the UI
 
     def add_many(self, items: list[Headline]) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
@@ -527,21 +321,6 @@ class HeadlineStore:
                     added += 1
             self._data = {k: v for k, v in self._data.items() if v.timestamp >= cutoff}
         return added
-
-    def apply_ai_scores(self, updates: dict[str, tuple[str, str]]) -> None:
-        with self._lock:
-            for hid, (impact, reason) in updates.items():
-                if hid in self._data:
-                    self._data[hid].impact    = impact
-                    self._data[hid].ai_scored = True
-                    self._data[hid].ai_reason = reason
-
-    def get_unscored(self) -> list[Headline]:
-        """Return ALL un-AI-scored headlines, newest first."""
-        with self._lock:
-            candidates = [h for h in self._data.values() if not h.ai_scored]
-        candidates.sort(key=lambda h: h.timestamp, reverse=True)
-        return candidates
 
     def get_sorted(
         self,
@@ -567,9 +346,8 @@ class HeadlineStore:
             total  = len(self._data)
             high   = sum(1 for h in self._data.values() if h.impact == "HIGH")
             medium = sum(1 for h in self._data.values() if h.impact == "MEDIUM")
-            ai_cnt = sum(1 for h in self._data.values() if h.ai_scored)
         return {"total": total, "high": high, "medium": medium,
-                "low": total - high - medium, "ai": ai_cnt}
+                "low": total - high - medium}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -622,16 +400,13 @@ class DetailScreen(Screen):
         title_e  = _esc(h.title)
         source_e = _esc(h.source)
 
-        ai_line = f"\n[dim]AI note:[/dim]  {_esc(h.ai_reason)}" if h.ai_scored else ""
-
         content = (
             f"[bold]{title_e}[/bold]\n\n"
             f"[{imp}]⬥ IMPACT: {h.impact}  (score: {h.score})[/{imp}]   "
             f"[{cat}]▸ {h.category}[/{cat}]\n\n"
             f"[dim]Source:[/dim]  {source_e}\n"
             f"[dim]Time:[/dim]    {h.date_str}  {h.ts_str}\n"
-            f"[dim]Tags:[/dim]    {tags_str}"
-            f"{ai_line}\n\n"
+            f"[dim]Tags:[/dim]    {tags_str}\n\n"
             f"[dim]Summary:[/dim]\n{summary}\n\n"
             f"[dim]URL:[/dim]\n{url_e}\n\n"
             f"[dim italic]ESC or Q to return[/dim italic]"
@@ -695,15 +470,6 @@ class HelpScreen(Screen):
     BINDINGS = [Binding("escape,q,h,question_mark", "dismiss", "Close")]
 
     def compose(self) -> ComposeResult:
-        if AI_BACKEND == "ollama" and AI_ENABLED:
-            ai_status = f"[green]✓ ACTIVE[/green]  Ollama / {OLLAMA_MODEL}"
-        elif AI_BACKEND == "anthropic" and AI_ENABLED:
-            ai_status = "[green]✓ ACTIVE[/green]  claude-haiku (Anthropic API)"
-        else:
-            ai_status = (
-                "[dim]DISABLED — set env var INFOHUNTER_AI=ollama  "
-                "(or INFOHUNTER_AI=anthropic + ANTHROPIC_API_KEY)[/dim]"
-            )
         text = f"""[bold cyan]InfoHunter — Quantasset Market Intelligence[/bold cyan]
 
 [bold]KEYBINDINGS[/bold]
@@ -721,12 +487,6 @@ class HelpScreen(Screen):
              tanker/pipeline strikes · OPEC surprises · bank failures · stablecoin depegs
   [yellow]MEDIUM[/yellow]    Fed-speak · PMI · earnings · M&A · geopolitical tension · regulatory news
   [dim]LOW[/dim]       Routine company news · analyst ratings · recaps · lifestyle
-
-[bold]AI SCORING[/bold]
-  {ai_status}
-  Ambiguous headlines (score 2–10) are batched every {AI_RESCORE_INTERVAL}s and re-evaluated
-  by Claude for nuanced events that pure keyword rules may miss.
-  AI-scored headlines are marked with [bold]✦[/bold] in the IMP column.
 
 [bold]STATS[/bold]  {len(SOURCES)} sources  │  12-hour window  │  {REFRESH_INTERVAL_SECONDS}s refresh
 
@@ -792,7 +552,6 @@ class InfoHunter(App):
         self._rows:  list[Headline] = []
         self._refresh_ts     = "—"
         self._countdown      = REFRESH_INTERVAL_SECONDS
-        self._ai_running     = False
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -815,15 +574,7 @@ class InfoHunter(App):
         self._rebuild_table()
         self.fetch_all()
         self.set_interval(REFRESH_INTERVAL_SECONDS, self.fetch_all)
-        self.set_interval(AI_RESCORE_INTERVAL,      self.ai_rescore)
         self.set_interval(1,                        self._tick)
-
-    def on_worker_state_changed(self, event) -> None:
-        # Kick off AI scoring as soon as the first fetch worker finishes
-        from textual.worker import WorkerState
-        if event.state == WorkerState.SUCCESS and event.worker.name == "fetch_all":
-            if AI_ENABLED:
-                self.ai_rescore()
 
     # ── Workers ───────────────────────────────────────────────────────────────
 
@@ -841,42 +592,6 @@ class InfoHunter(App):
         self.call_from_thread(self._set_fetch, f"✓ {ts}")
         self.call_from_thread(self._rebuild_table)
 
-    @work(thread=True, exclusive=False)
-    def ai_rescore(self) -> None:
-        if not AI_ENABLED:
-            return
-        # Simple mutex — if a scoring pass is already running, skip
-        if getattr(self, "_ai_running", False):
-            return
-        self._ai_running = True
-        try:
-            unscored = self.store.get_unscored()
-            if not unscored:
-                return
-            # Clear stale errors so a recovered Ollama can retry
-            self.store.last_ai_error = ""
-            # Score up to AI_MAX_PER_PASS headlines this pass
-            to_score = unscored[:AI_MAX_PER_PASS]
-            if AI_BACKEND == "ollama":
-                # One headline at a time for Ollama — avoids timeout on slow mobile
-                import time as _time
-                for h in to_score:
-                    if self.store.last_ai_error:
-                        break
-                    updates = ai_rescore_batch([h], self.store)
-                    if updates:
-                        self.store.apply_ai_scores(updates)
-                        self.call_from_thread(self._rebuild_table)
-                    _time.sleep(2)  # breathe between calls — prevents CPU/thermal throttle
-            else:
-                # Anthropic: batch all at once
-                updates = ai_rescore_batch(to_score, self.store)
-                if updates:
-                    self.store.apply_ai_scores(updates)
-                    self.call_from_thread(self._rebuild_table)
-        finally:
-            self._ai_running = False
-
     # ── Table ─────────────────────────────────────────────────────────────────
 
     def _rebuild_table(self) -> None:
@@ -890,9 +605,8 @@ class InfoHunter(App):
 
         for h in self._rows:
             cell_style, row_style = IMPACT_STYLE.get(h.impact, ("white", "white"))
-            ai_mark     = "✦" if h.ai_scored else " "
             time_cell   = Text(f"{h.date_str} {h.ts_str}", style="dim")
-            impact_cell = Text(f"{ai_mark}{h.impact}", style=cell_style)
+            impact_cell = Text(h.impact, style=cell_style)
             cat_cell    = Text(h.category, style=CATEGORY_STYLE.get(h.category, "white"))
             src_cell    = Text(h.source[:22], style="dim cyan")
             title_disp  = h.title[:108] + ("…" if len(h.title) > 108 else "")
@@ -924,18 +638,7 @@ class InfoHunter(App):
     def _update_status(self) -> None:
         try:
             c      = self.store.counts()
-            if AI_ENABLED:
-                err = self.store.last_ai_error
-                if err:
-                    ai_bit = f"  [bold red]AI ERR: {_esc(err[:60])}[/bold red]"
-                else:
-                    pending = c['total'] - c['ai']
-                    ai_bit = (
-                        f"  [dim]AI:{c['ai']}✦[/dim]"
-                        + (f"  [yellow]pending:{pending}[/yellow]" if pending else "")
-                    )
-            else:
-                ai_bit = ""
+            ai_bit = ""
             self.query_one("#status-bar", Static).update(
                 f" {c['total']} headlines (12h)  │ "
                 f"[bold red]HIGH:{c['high']}[/bold red]  "
@@ -1015,54 +718,6 @@ class InfoHunter(App):
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _restart_ollama_silently() -> bool:
-    """
-    Kill any existing Ollama process and relaunch it with stdout+stderr captured,
-    so GIN HTTP logs cannot bleed into the Textual terminal.
-
-    Ollama is a separate OS process — dup2() on Python's fds has no effect on it.
-    The only reliable fix is to own the Ollama process ourselves.
-
-    Returns True if Ollama is ready after the restart.
-    """
-    import subprocess, time, sys, os
-    if AI_BACKEND != "ollama":
-        return False
-
-    devnull = open(os.devnull, "w")
-
-    # Kill any existing ollama serve process
-    try:
-        subprocess.run(["pkill", "-f", "ollama serve"],
-                       stdout=devnull, stderr=devnull, timeout=5)
-        time.sleep(1)
-    except Exception:
-        pass
-
-    # Relaunch with all output captured — this process is now ours
-    try:
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=devnull,
-            stderr=devnull,
-            stdin=subprocess.DEVNULL,
-        )
-        # Wait for server to be ready (up to 15 seconds)
-        for _ in range(15):
-            time.sleep(1)
-            try:
-                r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=2)
-                if r.status_code == 200:
-                    return True
-            except Exception:
-                pass
-        return False
-    except FileNotFoundError:
-        print("[InfoHunter] ERROR: 'ollama' not found in PATH. Install it first.")
-        return False
-    except Exception as e:
-        print(f"[InfoHunter] Could not start Ollama: {e}")
-        return False
 
 
 if __name__ == "__main__":
@@ -1079,32 +734,5 @@ if __name__ == "__main__":
         print(f"[InfoHunter] Missing dependencies: {', '.join(missing)}")
         print(f"Run:  pip install {' '.join(missing)}")
         sys.exit(1)
-
-    if AI_BACKEND == "ollama":
-        print(f"[InfoHunter] AI scoring: ENABLED  (Ollama / {OLLAMA_MODEL})")
-        print(f"[InfoHunter] Restarting Ollama silently (this captures its logs)…")
-        ready = _restart_ollama_silently()
-        if ready:
-            # Verify the model is available
-            try:
-                hc     = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-                models = [m["name"] for m in hc.json().get("models", [])]
-                loaded = any(OLLAMA_MODEL.split(":")[0] in m for m in models)
-                if loaded:
-                    print(f"[InfoHunter] Ollama ready. Model '{OLLAMA_MODEL}' loaded. Starting…")
-                else:
-                    avail = ", ".join(models) if models else "(none)"
-                    print(f"[InfoHunter] WARNING: '{OLLAMA_MODEL}' not in Ollama. Available: {avail}")
-                    print(f"[InfoHunter]   Run:  ollama pull {OLLAMA_MODEL}")
-                    print(f"[InfoHunter] Tip: tinyllama is the fastest — ollama pull tinyllama")
-                    print(f"[InfoHunter] Falling back to rule-based scoring.")
-            except Exception:
-                print(f"[InfoHunter] Ollama reachable but could not verify model. Continuing…")
-        else:
-            print(f"[InfoHunter] WARNING: Ollama did not start in time. Falling back to rules.")
-    elif AI_BACKEND == "anthropic" and AI_ENABLED:
-        print("[InfoHunter] AI scoring: ENABLED  (claude-haiku)")
-    else:
-        print("[InfoHunter] AI scoring: DISABLED  (set INFOHUNTER_AI=ollama to enable)")
 
     InfoHunter().run()

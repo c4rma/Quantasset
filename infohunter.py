@@ -525,6 +525,7 @@ class InfoHunter(App):
     DataTable { height: 1fr; }
     DataTable > .datatable--header { background: $surface; color: $text; text-style: bold; }
     DataTable > .datatable--cursor { background: $accent 40%; }
+    DataTable > .datatable--body { overflow-x: auto; }
     """
 
     BINDINGS = [
@@ -537,6 +538,8 @@ class InfoHunter(App):
         Binding("q",             "quit",                  "Quit"),
         Binding("h",             "help",                  "Help"),
         Binding("question_mark", "help",                  "Help", show=False),
+        Binding("left",          "scroll_left",           "Scroll left",  show=False),
+        Binding("right",         "scroll_right",          "Scroll right", show=False),
     ]
 
     IMPACT_CYCLE   = [None, "HIGH", "MEDIUM", "LOW"]
@@ -566,6 +569,7 @@ class InfoHunter(App):
             id="toolbar",
         )
         tbl = DataTable(id="tbl", cursor_type="row", zebra_stripes=True)
+        tbl.show_horizontal_scrollbar = True
         tbl.add_columns("TIME", "IMP", "CAT", "SOURCE", "HEADLINE")
         yield tbl
         yield Static("", id="status-bar")
@@ -716,6 +720,32 @@ class InfoHunter(App):
         tbl = self.query_one("#tbl", DataTable)
         if tbl.cursor_row is not None and tbl.cursor_row < len(self._rows):
             self.push_screen(DetailScreen(self._rows[tbl.cursor_row]))
+
+    def action_scroll_left(self) -> None:
+        try:
+            self.query_one("#tbl", DataTable).scroll_left(animate=False)
+        except Exception:
+            pass
+
+    def action_scroll_right(self) -> None:
+        try:
+            self.query_one("#tbl", DataTable).scroll_right(animate=False)
+        except Exception:
+            pass
+
+    def on_mouse_scroll_left(self, event) -> None:
+        try:
+            tbl = self.query_one("#tbl", DataTable)
+            tbl.scroll_x = max(0.0, tbl.scroll_x - 4)
+        except Exception:
+            pass
+
+    def on_mouse_scroll_right(self, event) -> None:
+        try:
+            tbl = self.query_one("#tbl", DataTable)
+            tbl.scroll_x = min(tbl.max_scroll_x, tbl.scroll_x + 4)
+        except Exception:
+            pass
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

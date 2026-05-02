@@ -117,7 +117,16 @@ Key constants at the top of `infohunter.py`:
 
 ## Changelog
 
-### v1.12 — Current
+### v1.15 — Current
+- **Fixed**: Scroll position resetting after the user scrolls between refreshes — replaced snapshot-based restore with continuous tracking via `on_scroll_changed`; `_user_scroll_y` is updated every time the user moves the viewport (mouse wheel, scrollbar, keyboard), so the restore always uses the latest position rather than a stale pre-rebuild snapshot
+
+### v1.14
+- **Fixed**: Scroll position not preserved on refresh when using mouse wheel or scrollbar — `move_cursor` was triggering an auto-scroll-into-view that overrode the restored position; now uses `call_after_refresh` + `set_scroll` to restore the exact scroll offset after the layout pass settles
+
+### v1.13
+- **Fixed**: Scroll position jumping to top on every feed refresh — cursor row and scroll offset are now saved before the table is cleared and restored after it's rebuilt
+
+### v1.12
 - **Fixed**: `ScreenStackError` crash from accidental command palette activation on mobile — disabled with `COMMANDS = set()` and `ENABLE_COMMAND_PALETTE = False`
 - **Simplified**: Startup is instant, no external dependencies
 

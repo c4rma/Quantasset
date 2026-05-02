@@ -552,6 +552,7 @@ class InfoHunter(App):
         self._rows:  list[Headline] = []
         self._refresh_ts     = "—"
         self._countdown      = REFRESH_INTERVAL_SECONDS
+        self._user_scroll_y  = 0.0   # tracks where the user has scrolled to
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -601,6 +602,10 @@ class InfoHunter(App):
             search=self.search_query,
         )
         tbl = self.query_one("#tbl", DataTable)
+
+        # Preserve cursor row; scroll position is tracked continuously in _user_scroll_y
+        saved_row = tbl.cursor_row
+
         tbl.clear()
 
         for h in self._rows:
@@ -612,6 +617,22 @@ class InfoHunter(App):
             title_disp  = h.title[:108] + ("…" if len(h.title) > 108 else "")
             title_cell  = Text(title_disp, style=row_style)
             tbl.add_row(time_cell, impact_cell, cat_cell, src_cell, title_cell)
+
+        # Restore cursor (clamped in case rows were pruned)
+        if saved_row is not None and len(self._rows) > 0:
+            tbl.move_cursor(row=min(saved_row, len(self._rows) - 1), animate=False)
+
+        # Restore the user's scroll position. We use _user_scroll_y (updated
+        # continuously by on_scroll_changed) rather than the pre-clear snapshot,
+        # so that scrolling done between refreshes is always honoured.
+        # call_after_refresh ensures this runs after move_cursor's internal
+        # scroll-into-view, giving us the final word on the viewport position.
+        target_scroll = self._user_scroll_y
+
+        def _restore_scroll() -> None:
+            tbl.scroll_y = target_scroll
+
+        self.call_after_refresh(_restore_scroll)
 
         self._update_toolbar()
         self._update_status()
@@ -653,6 +674,11 @@ class InfoHunter(App):
     def _tick(self) -> None:
         self._countdown = max(0, self._countdown - 1)
         self._update_status()
+        # Continuously track where the user has scrolled to
+        try:
+            self._user_scroll_y = self.query_one("#tbl", DataTable).scroll_y
+        except Exception:
+            pass
 
     # ── Actions ───────────────────────────────────────────────────────────────
 

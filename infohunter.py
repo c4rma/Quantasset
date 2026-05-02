@@ -538,8 +538,12 @@ class InfoHunter(App):
         Binding("q",             "quit",                  "Quit"),
         Binding("h",             "help",                  "Help"),
         Binding("question_mark", "help",                  "Help", show=False),
-        Binding("left",          "scroll_left",           "Scroll left",  show=False),
-        Binding("right",         "scroll_right",          "Scroll right", show=False),
+        Binding("left",          "scroll_left",           "← scroll",   show=False),
+        Binding("right",         "scroll_right",          "→ scroll",   show=False),
+        Binding("shift+left",    "scroll_left_far",       "←← scroll",  show=False),
+        Binding("shift+right",   "scroll_right_far",      "→→ scroll",  show=False),
+        Binding("home",          "scroll_home_h",         "← home",     show=False),
+        Binding("end",           "scroll_end_h",          "→ end",      show=False),
     ]
 
     IMPACT_CYCLE   = [None, "HIGH", "MEDIUM", "LOW"]
@@ -721,31 +725,19 @@ class InfoHunter(App):
         if tbl.cursor_row is not None and tbl.cursor_row < len(self._rows):
             self.push_screen(DetailScreen(self._rows[tbl.cursor_row]))
 
-    def action_scroll_left(self) -> None:
-        try:
-            self.query_one("#tbl", DataTable).scroll_left(animate=False)
-        except Exception:
-            pass
-
-    def action_scroll_right(self) -> None:
-        try:
-            self.query_one("#tbl", DataTable).scroll_right(animate=False)
-        except Exception:
-            pass
-
-    def on_mouse_scroll_left(self, event) -> None:
+    def _hscroll(self, delta: float) -> None:
         try:
             tbl = self.query_one("#tbl", DataTable)
-            tbl.scroll_x = max(0.0, tbl.scroll_x - 4)
+            tbl.scroll_x = max(0.0, min(tbl.max_scroll_x, tbl.scroll_x + delta))
         except Exception:
             pass
 
-    def on_mouse_scroll_right(self, event) -> None:
-        try:
-            tbl = self.query_one("#tbl", DataTable)
-            tbl.scroll_x = min(tbl.max_scroll_x, tbl.scroll_x + 4)
-        except Exception:
-            pass
+    def action_scroll_left(self)     -> None: self._hscroll(-8)
+    def action_scroll_right(self)    -> None: self._hscroll(8)
+    def action_scroll_left_far(self) -> None: self._hscroll(-40)
+    def action_scroll_right_far(self)-> None: self._hscroll(40)
+    def action_scroll_home_h(self)   -> None: self._hscroll(-99999)
+    def action_scroll_end_h(self)    -> None: self._hscroll(99999)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

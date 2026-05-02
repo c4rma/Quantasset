@@ -45,6 +45,9 @@ python infohunter.py
 | `F` | Cycle impact filter: ALL → HIGH → MEDIUM → LOW |
 | `C` | Cycle category filter: ALL → CB → MACRO → FOREX → MARKETS → CRYPTO |
 | `S` | Open search |
+| `←` / `→` | Scroll table left / right (8 cols) |
+| `Shift+←` / `Shift+→` | Scroll table left / right (40 cols) |
+| `Home` / `End` | Snap to left / right edge of table |
 | `ESC` | Clear all filters |
 | `Q` | Quit |
 | `H` / `?` | Help screen |
@@ -117,7 +120,14 @@ Key constants at the top of `infohunter.py`:
 
 ## Changelog
 
-### v1.15 — Current
+### v1.17 — Current
+- **Fixed**: Horizontal scrolling — Termux translates horizontal finger swipes into rapid `MouseDown/Up` tap pairs (not scroll events), so touch-based horizontal scrolling is not possible; instead made arrow key scrolling much faster: `←`/`→` jump 8 columns per press, `Shift+←`/`Shift+→` jump 40 columns, `Home`/`End` snap to the far left/right edge
+- **Removed**: Dead `on_mouse_scroll_left`/`on_mouse_scroll_right` handlers (confirmed non-functional on Termux/Android)
+
+### v1.16
+- **Added**: Horizontal scrolling in Termux — finger swipes left/right now scroll the headline table horizontally via `on_mouse_scroll_left`/`on_mouse_scroll_right` handlers; `←` / `→` arrow keys also scroll horizontally; horizontal scrollbar enabled on the DataTable
+
+### v1.15
 - **Fixed**: Scroll position resetting after the user scrolls between refreshes — replaced snapshot-based restore with continuous tracking via `on_scroll_changed`; `_user_scroll_y` is updated every time the user moves the viewport (mouse wheel, scrollbar, keyboard), so the restore always uses the latest position rather than a stale pre-rebuild snapshot
 
 ### v1.14

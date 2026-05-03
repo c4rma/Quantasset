@@ -559,7 +559,8 @@ class InfoHunter(App):
         self._rows:  list[Headline] = []
         self._refresh_ts     = "—"
         self._countdown      = REFRESH_INTERVAL_SECONDS
-        self._user_scroll_y  = 0.0   # tracks where the user has scrolled to
+        self._user_scroll_y  = 0.0   # tracks vertical scroll position
+        self._user_scroll_x  = 0.0   # tracks horizontal scroll position
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -635,10 +636,12 @@ class InfoHunter(App):
         # so that scrolling done between refreshes is always honoured.
         # call_after_refresh ensures this runs after move_cursor's internal
         # scroll-into-view, giving us the final word on the viewport position.
-        target_scroll = self._user_scroll_y
+        target_y = self._user_scroll_y
+        target_x = self._user_scroll_x
 
         def _restore_scroll() -> None:
-            tbl.scroll_y = target_scroll
+            tbl.scroll_y = target_y
+            tbl.scroll_x = target_x
 
         self.call_after_refresh(_restore_scroll)
 
@@ -684,7 +687,9 @@ class InfoHunter(App):
         self._update_status()
         # Continuously track where the user has scrolled to
         try:
-            self._user_scroll_y = self.query_one("#tbl", DataTable).scroll_y
+            tbl = self.query_one("#tbl", DataTable)
+            self._user_scroll_y = tbl.scroll_y
+            self._user_scroll_x = tbl.scroll_x
         except Exception:
             pass
 

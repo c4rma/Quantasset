@@ -44,9 +44,11 @@ KILL_ZONES = [
     ('EOD',         960,  1080, 'YLW'),   # 4:00pm  – 6:00pm
     ('EEOD',        1110, 1440, 'YLW'),   # 6:30pm  – 12:00am
 ]
-EXCL_DAYS_09 = {2, 3, 6}   # Wed=2, Thu=3, Sun=6
+EXCL_DAYS_09 = {2, 3}      # Wed=2, Thu=3 — 09:00-10:00 exclusion
 EXCL_START   = 540          # 09:00
 EXCL_END     = 600          # 10:00
+EXCL_SUN     = 6            # Sunday — no trading
+EXCL_EEOD_START = 1110      # 18:30 CT — EEOD begins, no trading
 
 # ── Terminal colours ──────────────────────────────────────────────────────────
 if sys.platform == 'win32':
@@ -89,12 +91,21 @@ def ratio_colour(ratio):
 def get_session_status():
     now_ct  = datetime.now(timezone.utc) + CT_OFFSET
     t_mins  = now_ct.hour * 60 + now_ct.minute
-    dow     = now_ct.weekday()
-    in_excl = (dow in EXCL_DAYS_09 and EXCL_START <= t_mins < EXCL_END)
+    dow     = now_ct.weekday()  # Mon=0 ... Sun=6
+
+    # Determine exclusion reason (priority order)
+    excl_reason = None
+    if dow == EXCL_SUN:
+        excl_reason = 'Sunday — no trading'
+    elif dow in EXCL_DAYS_09 and EXCL_START <= t_mins < EXCL_END:
+        excl_reason = 'Excluded (09:00–10:00)'
+    elif t_mins >= EXCL_EEOD_START:
+        excl_reason = 'EEOD — no trading'
+
     for name, start, end, col in KILL_ZONES:
         if start <= t_mins < end:
-            return name, COLS[col], in_excl
-    return None, None, in_excl
+            return name, COLS[col], excl_reason
+    return None, None, excl_reason
 
 # ── Phemex price fetch ────────────────────────────────────────────────────────
 async def fetch_eth_price():
@@ -159,7 +170,7 @@ def draw_static():
     mark('ts');        p()
     p()
 
-    p(f"  {BLD}{'─'*4} MARKET {'─'*(WIDTH-13)}{RST}")
+    p(f"  {BLD}{'─'*4} MARKET {'─'*(WIDTH-10)}{RST}")
     mark('eth_price'); p(f"    {'ETH Perp (Phemex)':<24}")
     mark('session');   p(f"    {'Session':<24}")
     p()
@@ -191,7 +202,7 @@ def draw_static():
 
 def update_values(results, errors, fetch_time, remaining, eth_price):
     bar_width = 30
-    ts = fetch_time.strftime('%Y-%m-%d  %H:%M:%S UTC')
+    ts = fetch_time.strftime('%A  %Y-%m-%d  %H:%M:%S UTC')
 
     move(ROWS['ts'])
     erase_line()
@@ -204,11 +215,11 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
     else:
         sys.stdout.write(f"    {'ETH Perp (Phemex)':<24} {DIM}unavailable{RST}")
 
-    session_name, session_col, in_excl = get_session_status()
+    session_name, session_col, excl_reason = get_session_status()
     move(ROWS['session'])
     erase_line()
-    if in_excl:
-        sys.stdout.write(f"    {'Session':<24} {RED}{BLD}EXCLUDED (09:00-10:00){RST}")
+    if excl_reason:
+        sys.stdout.write(f"    {'Session':<24} {RED}{BLD}{excl_reason}{RST}")
     elif session_name:
         sys.stdout.write(f"    {'Session':<24} {GRN}{BLD}{session_name}{RST}")
     else:

@@ -146,9 +146,11 @@ def _phemex_get(path, query):
     }
     if USE_BRIDGE:
         import json as _json, urllib.request as _req
+        # Convert query string to dict so bridge reconstructs it correctly
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
         payload = _json.dumps({
             "method": "GET", "path": path,
-            "query": query, "body": "", "headers": hdrs,
+            "params": params, "body": "",
         }).encode()
         req = _req.Request(
             f"{BRIDGE_URL}/phemex", data=payload,
@@ -157,7 +159,9 @@ def _phemex_get(path, query):
             method="POST",
         )
         with _req.urlopen(req, timeout=8) as resp:
-            return __import__("json").loads(resp.read())
+            raw = __import__("json").loads(resp.read())
+            # Bridge wraps response in {"resp": ...}
+            return raw.get("resp", raw)
     else:
         r = requests.get(f"{PHEMEX_BASE_URL}{path}?{query}", headers=hdrs, timeout=6)
         return r.json()

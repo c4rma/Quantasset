@@ -151,7 +151,7 @@ C_SESS_MORN = 32   # Morning     08:30-10:30  cyan
 C_SESS_EXCL = 33   # Exclusion   09:00-10:00  red (Wed/Thu)
 C_SESS_LUNCH= 34   # Lunchtime   11:30-13:30  yellow
 C_SESS_PWR  = 35   # Power Hour  14:00-15:00  magenta
-C_SESS_EOD  = 36   # EOD/EEOD    18:30-00:00  green
+C_SESS_EOD  = 36   # EEOD        18:30-00:00  red (non-tradable)
 # Alert color
 C_ALERT     = 37   # alert box / triggered
 C_VWAP      = 16   # VWAP line
@@ -197,6 +197,8 @@ class ChartState:
         self.ws            = None
         self.ws_thread     = None
         self.last_price    = 0.0
+        self.last_price_btc = 0.0   # always-updated BTC ticker for macro mode
+        self.last_price_eth = 0.0   # always-updated ETH ticker for macro mode
         self.status        = "Connecting..."
         self.error         = ""       # last REST/WS error for display
         self.session       = 0
@@ -237,8 +239,7 @@ class ChartState:
         self.trade_monitor  = False # True while trade monitor thread running
         # Indicator levels written by draw() for alert_monitor to read
         self.indicator_levels = {}  # {vwap, sd_p05, sd_m05, sd_p2, sd_m2, sd_p25, sd_m25, vah, val, poc}
-        self.btd_buy_fired   = False  # set True when BTD buy fires on candle close
-        self.btd_sell_fired  = False  # set True when BTD sell fires on candle close
+        self.btd_events      = []     # list of "buy"/"sell" events from live BTD signals
         # Position tool: list of {entry,sl,tp,anchor_idx,side,active}
         self.pos_tools = []
         # Horizontal line drawings: [{price, label, alert, active}]
@@ -415,6 +416,8 @@ def ws_kraken(asset: str, session: int):
             with state.lock:
                 if stale(): return
                 state.last_price = c.c
+                if state.asset == "ETH": state.last_price_eth = c.c
+                if state.asset == "BTC": state.last_price_btc = c.c
                 if state.candles and state.candles[-1].ts == ts_open:
                     state.candles[-1] = c
                     state.live = None
@@ -543,6 +546,8 @@ def ws_phemex(asset: str, session: int):
                     c  = Candle(ts=ts, o=row[3], h=row[4], l=row[5],
                                 c=row[6], v=row[7], closed=False)
                     state.last_price = c.c
+                    if state.asset == "ETH": state.last_price_eth = c.c
+                    if state.asset == "BTC": state.last_price_btc = c.c
 
                     if state.candles and state.candles[-1].ts == ts:
                         state.candles[-1] = c
@@ -866,7 +871,7 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_SESS_EXCL, curses.COLOR_RED,     -1)
     curses.init_pair(C_SESS_LUNCH,curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_SESS_PWR,  curses.COLOR_MAGENTA, -1)
-    curses.init_pair(C_SESS_EOD,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_SESS_EOD,  curses.COLOR_RED,     -1)
     curses.init_pair(C_ALERT,     curses.COLOR_YELLOW,  curses.COLOR_RED)
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
@@ -1347,7 +1352,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         ("Morn",  8*60+30, 10*60+30, C_SESS_MORN, None),
         ("Lunch", 11*60+30,13*60+30, C_SESS_LUNCH,None),
         ("PWR",   14*60,   15*60,   C_SESS_PWR,  None),
-        ("EOD",   18*60+30,23*60+59, C_SESS_EOD,  None),
+        ("EEOD",  18*60+30,23*60+59, C_SESS_EOD,  None),   # non-tradable
     ]
     _cur_sess_lbl  = ""
     _cur_sess_pair = C_HEADER
@@ -1856,7 +1861,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             ("Excl",  (9,  0), (10, 0), C_SESS_EXCL,  [2, 3]),
             ("Lunch", (11,30), (13,30), C_SESS_LUNCH,  None),
             ("PWR",   (14, 0), (15, 0), C_SESS_PWR,   None),
-            ("EOD",   (18,30), (23,59), C_SESS_EOD,   None),
+            ("EEOD",  (18,30), (23,59), C_SESS_EOD,   None),
         ]
         _sc_sess = chart_r - n_vis
 
@@ -2111,10 +2116,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     and chart_top <= _row_b < chart_bot
                     and _ci - _last_buy_signal >= BTD_COOLDOWN):
                 _last_buy_signal = _ci
-                # Signal on live candle → notify alert_monitor
+                # Signal on live candle → push to event queue
                 if _ci >= len(all_candles) - 1:
-                    state.btd_buy_fired  = True
-                    state.btd_sell_fired = False
+                    state.btd_events.append("buy")
                 if _cb > _t3b:
                     # T3: 3-wide × 2-tall — unmissable
                     for _dx in range(-1, 2):
@@ -2136,10 +2140,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     and chart_top <= _row_s < chart_bot
                     and _ci - _last_sell_signal >= BTD_COOLDOWN):
                 _last_sell_signal = _ci
-                # Signal on live candle → notify alert_monitor
+                # Signal on live candle → push to event queue
                 if _ci >= len(all_candles) - 1:
-                    state.btd_sell_fired  = True
-                    state.btd_buy_fired   = False
+                    state.btd_events.append("sell")
                 if _cs > _t3s:
                     # T3: 3-wide × 2-tall
                     for _dx in range(-1, 2):
@@ -2195,10 +2198,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 _tick_mins = 60;  _lbl_fmt = "%H:%M"; _gap = 5
             elif _res <= 3600:   # 1H  → every 6h with date
                 _tick_mins = 360; _lbl_fmt = "%m/%d %H:%M"; _gap = 12
-            elif _res <= 14400:  # 4H  → each candle date
-                _tick_mins = 240; _lbl_fmt = "%m/%d"; _gap = 6
+            elif _res <= 14400:  # 4H  → each candle, show weekday
+                _tick_mins = 240; _lbl_fmt = "%a %m/%d"; _gap = 8
             else:                # 1D  → weekly grouping
-                _tick_mins = 1440;_lbl_fmt = "%m/%d"; _gap = 6
+                _tick_mins = 1440;_lbl_fmt = "%a %m/%d"; _gap = 8
 
             MIN_LABEL_GAP  = _gap
             last_label_col = -MIN_LABEL_GAP - 1
@@ -2229,7 +2232,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 )
 
                 if _is_day_break and lbl_col - last_label_col >= 5:
-                    lbl = dt.strftime("%m/%d")
+                    lbl = dt.strftime("%a %m/%d")   # e.g. "Wed 04/16"
                     db.puts(time_row, lbl_col, lbl, C_LABEL,
                             curses.A_BOLD | curses.A_UNDERLINE)
                     last_label_col = lbl_col
@@ -2344,11 +2347,17 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
 
     # Return deferred state updates to avoid mid-draw lock contention
+    # Merge VWAP + VP levels into a single indicator_levels dict
+    _all_ind_levels = {}
+    if "_deferred_vwap_lvl" in vars() and _deferred_vwap_lvl:
+        _all_ind_levels.update(_deferred_vwap_lvl)
+    if "_deferred_vp" in vars() and _deferred_vp:
+        _all_ind_levels.update(_deferred_vp)
     _rv = {
         "n_vis":          n_vis,
         "view_offset":    _deferred_view_offset    if "_deferred_view_offset"    in vars() else None,
         "cursor_col_idx": _deferred_cursor_col_idx if "_deferred_cursor_col_idx" in vars() else None,
-        "vp_levels":      _deferred_vp             if "_deferred_vp"             in vars() else None,
+        "indicator_levels": _all_ind_levels if _all_ind_levels else None,
     }
     return {k: v for k, v in _rv.items() if v is not None}
 
@@ -2752,8 +2761,8 @@ def draw_global(db: "DoubleBuffer", rows: int, cols: int):
     # Fetch live ticker prices for crypto assets directly from state
     _live_price_map = {}
     with state.lock:
-        _live_price_map["ETH"] = state.last_price if state.asset == "ETH" else 0.0
-        _live_price_map["BTC"] = state.last_price if state.asset == "BTC" else 0.0
+        _live_price_map["ETH"] = state.last_price_eth or state.last_price
+        _live_price_map["BTC"] = state.last_price_btc
 
     for label, row in placed.items():
         pct        = final_pcts[label]
@@ -3405,8 +3414,11 @@ def trade_monitor_loop():
         with state.lock:
             existing_lines = {tl.get("_id"): tl for tl in state.trade_lines
                               if tl.get("_id")}
+            # Track all _trade_id variants (including _tp/_sl suffixes)
+            _base_ids = {a.get("_trade_id", "").rsplit("_tp",1)[0].rsplit("_sl",1)[0]
+                         for a in state.alerts if a.get("_trade_id")}
             existing_alerts = {a.get("_trade_id") for a in state.alerts
-                               if a.get("_trade_id")}
+                               if a.get("_trade_id")} | _base_ids
 
         new_lines  = []
         active_ids = set()
@@ -3444,17 +3456,27 @@ def trade_monitor_loop():
                     "limit_price": None, "status": "active",
                 }
                 new_lines.append(tl)
-                # Alert at entry if not already set
-                if entry > 0 and _id not in existing_alerts:
-                    _dir = "price_cross_up" if side == "buy" else "price_cross_down"
+                # Alerts at TP and SL levels (not entry)
+                if _id not in existing_alerts:
                     with state.lock:
-                        state.alerts.append({
-                            "_trade_id": _id,
-                            "name": f"{pos_side} @ {entry:.2f}",
-                            "conditions": [{"type": _dir, "value": entry}],
-                            "message": f"Position {pos_side} filled @ {entry:.2f}",
-                            "active": True, "sound": True, "_last_state": False,
-                        })
+                        if tp > 0:
+                            _tp_dir = "price_cross_up" if side == "buy" else "price_cross_down"
+                            state.alerts.append({
+                                "_trade_id": f"{_id}_tp",
+                                "name": f"TP {tp:.2f} ({pos_side})",
+                                "conditions": [{"type": _tp_dir, "value": tp}],
+                                "message": f"Take Profit hit @ {tp:.2f}",
+                                "active": True, "sound": True, "_last_state": False,
+                            })
+                        if sl > 0:
+                            _sl_dir = "price_cross_down" if side == "buy" else "price_cross_up"
+                            state.alerts.append({
+                                "_trade_id": f"{_id}_sl",
+                                "name": f"SL {sl:.2f} ({pos_side})",
+                                "conditions": [{"type": _sl_dir, "value": sl}],
+                                "message": f"Stop Loss hit @ {sl:.2f}",
+                                "active": True, "sound": True, "_last_state": False,
+                            })
 
         # ── Process pending limit orders ───────────────────────────────────────
         for o in ord_data:
@@ -3666,9 +3688,18 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
 
     cond_type, cond_label = ALERT_CONDITIONS[cond_idx]
 
-    # Step 1-4: text fields
-    # Re-draw box with fields below the visible conditions area
-    _frow = box_y + 2 + VISIBLE  # first field row = after condition list
+    # Conditions that monitor indicators/BTD automatically — no price needed
+    _NO_PRICE = {
+        "touch_vwap", "touch_sd_plus05", "touch_sd_minus05",
+        "touch_sd_plus2", "touch_sd_minus2", "touch_sd_plus25", "touch_sd_minus25",
+        "touch_vah", "touch_val", "touch_poc",
+        "big_trade_buy", "big_trade_sell",
+        "over_ext_up", "over_ext_down",
+    }
+    _needs_price = cond_type not in _NO_PRICE
+
+    # Step 1: price input (only for price-cross conditions)
+    _frow = box_y + 2 + VISIBLE
     for r in range(box_h):
         try: stdscr.addstr(box_y + r, box_x, " " * box_w,
                            curses.color_pair(C_CURSOR) | curses.A_BOLD)
@@ -3679,38 +3710,44 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
         stdscr.addstr(_frow, box_x + 2,
                       f"Condition: {cond_label}"[:box_w-4],
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
-        stdscr.addstr(_frow + 1, box_x + 2, "Price value: ",
-                      curses.color_pair(C_LABEL) | curses.A_BOLD)
-    except curses.error:
-        pass
-    stdscr.refresh()
-    val_str = _input_field(stdscr, _frow + 1, box_x + 15, 20, _prefill_val)
-    if val_str is None:
-        stdscr.timeout(50)
-        return None
-    try:
-        val = float(val_str)
-    except ValueError:
-        val = state.last_price
+    except curses.error: pass
+
+    if _needs_price:
+        try:
+            stdscr.addstr(_frow + 1, box_x + 2, "Price value: ",
+                          curses.color_pair(C_LABEL) | curses.A_BOLD)
+        except curses.error: pass
+        stdscr.refresh()
+        val_str = _input_field(stdscr, _frow + 1, box_x + 15, 20, _prefill_val)
+        if val_str is None:
+            stdscr.timeout(50); return None
+        try:    val = float(val_str)
+        except: val = state.last_price
+        _frow_offset = 1   # price field took a row
+    else:
+        stdscr.refresh()
+        val_str = "0"
+        val     = 0.0
+        _frow_offset = 0   # no price field
 
     try:
-        stdscr.addstr(_frow + 2, box_x + 2, "Alert name:  ",
+        stdscr.addstr(_frow + 1 + _frow_offset, box_x + 2, "Alert name:  ",
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
     except curses.error:
         pass
-    name = _input_field(stdscr, _frow + 2, box_x + 15,
-                        30, _prefill_name or f"Alert @ {val_str}")
+    name = _input_field(stdscr, _frow + 1 + _frow_offset, box_x + 15,
+                        30, _prefill_name or cond_label)
     if name is None:
         stdscr.timeout(50)
         return None
 
     try:
-        stdscr.addstr(_frow + 3, box_x + 2, "Message:     ",
+        stdscr.addstr(_frow + 2 + _frow_offset, box_x + 2, "Message:     ",
                       curses.color_pair(C_LABEL) | curses.A_BOLD)
     except curses.error:
         pass
-    msg = _input_field(stdscr, _frow + 3, box_x + 15,
-                       40, _prefill_msg or f"{cond_label} {val_str}")
+    msg = _input_field(stdscr, _frow + 2 + _frow_offset, box_x + 15,
+                       40, _prefill_msg or cond_label)
     if msg is None:
         stdscr.timeout(50)
         return None
@@ -3721,7 +3758,7 @@ def alert_create_dialog(stdscr, rows: int, cols: int, existing: dict = None):
         draw_box(cond_idx, 4, snd)
         snd_str = f"  Sound: {'[ON ]' if snd else '[OFF]'}   ← → toggle"
         try:
-            stdscr.addstr(_frow + 4, box_x + 2, snd_str,
+            stdscr.addstr(_frow + 3 + _frow_offset, box_x + 2, snd_str,
                           curses.color_pair(C_CURSOR) | curses.A_BOLD)
         except curses.error:
             pass
@@ -4231,53 +4268,61 @@ def alert_monitor():
                     _m = (_prev_price > 0 and _prev_price <= _cv < _cur)
                 elif _ct == "price_cross_down":
                     _m = (_prev_price > 0 and _prev_price >= _cv > _cur)
-                # ── Indicator touch alerts (no line drawn) ──────────────────
+                # ── Indicator touch: fire when price crosses through level ──
                 elif _ct.startswith("touch_"):
-                    with state.lock:
-                        _lvls = dict(state.indicator_levels)
-                    _tgt_map = {
-                        "touch_vwap":   _lvls.get("vwap", 0),
-                        "touch_sd_plus05": _lvls.get("sd_p05", 0),
-                        "touch_sd_minus05": _lvls.get("sd_m05", 0),
-                        "touch_sd_plus2":  _lvls.get("sd_p2", 0),
-                        "touch_sd_minus2": _lvls.get("sd_m2", 0),
-                        "touch_sd_plus25": _lvls.get("sd_p25", 0),
-                        "touch_sd_minus25":_lvls.get("sd_m25", 0),
-                        "touch_vah":    _lvls.get("vah", 0),
-                        "touch_val":    _lvls.get("val", 0),
-                        "touch_poc":    _lvls.get("poc", 0),
-                    }
-                    _tgt = _tgt_map.get(_ct, 0)
-                    # "Touch" = price within 0.1% of target level
-                    _m = (_tgt > 0 and abs(_cur - _tgt) / _tgt < 0.001)
-                # ── BTD + Over-Extension alerts (candle close based) ────────
+                    _lvl_key = {
+                        "touch_vwap":      "vwap",
+                        "touch_sd_plus05": "sd_p05",
+                        "touch_sd_minus05":"sd_m05",
+                        "touch_sd_plus2":  "sd_p2",
+                        "touch_sd_minus2": "sd_m2",
+                        "touch_sd_plus25": "sd_p25",
+                        "touch_sd_minus25":"sd_m25",
+                        "touch_vah":       "vah",
+                        "touch_val":       "val",
+                        "touch_poc":       "poc",
+                    }.get(_ct)
+                    if _lvl_key:
+                        with state.lock:
+                            _tgt = state.indicator_levels.get(_lvl_key, 0)
+                        # Fire when price crosses through the level from either side
+                        _m = (_tgt > 0 and _prev_price > 0 and
+                              (((_prev_price < _tgt) and (_cur >= _tgt)) or
+                               ((_prev_price > _tgt) and (_cur <= _tgt))))
+                    else:
+                        _m = False
+                # ── BTD alerts: consume from event queue ─────────────────────
                 elif _ct == "big_trade_buy":
                     with state.lock:
-                        _m = state.btd_buy_fired
+                        _evts = state.btd_events
+                        _m = "buy" in _evts
                 elif _ct == "big_trade_sell":
                     with state.lock:
-                        _m = state.btd_sell_fired
+                        _evts = state.btd_events
+                        _m = "sell" in _evts
+                # ── Over-Extension: both conditions must be true ──────────────
                 elif _ct == "over_ext_up":
+                    # price >= +2sd AND a Big Sell just closed
                     with state.lock:
-                        _sd2u = state.indicator_levels.get("sd_p2", 0)
-                        _bsell = state.btd_sell_fired
-                    _m = (_sd2u > 0 and _cur >= _sd2u and _bsell)
+                        _sd2u  = state.indicator_levels.get("sd_p2", 0)
+                        _evts2 = state.btd_events
+                    _m = (_sd2u > 0 and _cur >= _sd2u and "sell" in _evts2)
                 elif _ct == "over_ext_down":
+                    # price <= -2sd AND a Big Buy just closed
                     with state.lock:
-                        _sd2d = state.indicator_levels.get("sd_m2", 0)
-                        _bbuy = state.btd_buy_fired
-                    _m = (_sd2d > 0 and _cur <= _sd2d and _bbuy)
+                        _sd2d  = state.indicator_levels.get("sd_m2", 0)
+                        _evts2 = state.btd_events
+                    _m = (_sd2d > 0 and _cur <= _sd2d and "buy" in _evts2)
                 else:
                     _m = False
                 if not _m:
                     _all_met = False
                     break
 
-            if _all_met and not _alt.get("_last_state", False):
-                _alt["_last_state"] = True
+            if _all_met and not _alt.get("_fired", False):
+                # Mark as fired — will be deleted below, never re-triggers
+                _alt["_fired"] = True
                 _newly.append(_alt)
-            elif not _all_met:
-                _alt["_last_state"] = False
 
         if _newly:
             with state.lock:
@@ -4289,14 +4334,8 @@ def alert_monitor():
                     })
                     # Price-cross alerts fire once and delete themselves
                     # BTD/Over-ext/Indicator-touch alerts PERSIST (remain active)
-                    _ct0 = _ta.get("conditions", [{}])[0].get("type", "")
-                    _auto_delete = _ct0 in ("price_cross_up", "price_cross_down",
-                                            "touch_vwap", "touch_sd_plus05",
-                                            "touch_sd_minus05", "touch_sd_plus2",
-                                            "touch_sd_minus2", "touch_sd_plus25",
-                                            "touch_sd_minus25", "touch_vah",
-                                            "touch_val", "touch_poc")
-                    if _auto_delete and _ta in state.alerts:
+                    # All alerts are one-time — remove after firing
+                    if _ta in state.alerts:
                         state.alerts.remove(_ta)
                 state.alert_triggered = state.alert_triggered[:20]
                 state.show_alert_popup = True
@@ -4309,6 +4348,10 @@ def alert_monitor():
                         import sys, os; os.write(sys.stdout.fileno(), b"\a")
                     except Exception:
                         pass
+
+        # Clear BTD event queue after each evaluation pass
+        with state.lock:
+            state.btd_events.clear()
 
         _prev_price = _cur
 
@@ -4504,6 +4547,194 @@ def load_econ_calendar():
 
 
 # ── main loop ────────────────────────────────────────────────────────────────
+def _bg_ticker_loop():
+    """
+    Opens a second Phemex WebSocket for the inactive asset (the one NOT shown
+    on the main chart) so Macro Mode always has a true real-time price for both
+    ETH and BTC — identical feed to the main chart, no polling lag.
+
+    Also mirrors the active asset's last_price into last_price_eth/btc each tick.
+    """
+    import time as _t
+
+    _inactive_ws   = [None]   # current WS connection for the inactive asset
+    _inactive_sym  = [None]   # symbol currently subscribed
+
+    def _open_inactive_ws(symbol, attr):
+        """Subscribe to kline_p for `symbol`, write close price to state.`attr`."""
+        import websocket as _wslib
+
+        def _on_open(ws):
+            ws.send(json.dumps({
+                "id": 99,
+                "method": "kline_p.subscribe",
+                "params": [symbol, 60]   # 1-minute candles
+            }))
+
+        def _on_msg(ws, message):
+            try:
+                msg = json.loads(message)
+            except Exception:
+                return
+            if msg.get("result") in ({"status": "success"}, "pong"):
+                return
+            klines = msg.get("kline_p")
+            if not klines:
+                return
+            # Use the last row's close field (index 6)
+            try:
+                _p = float(klines[-1][6])
+                if _p > 0:
+                    with state.lock:
+                        setattr(state, attr, _p)
+            except Exception:
+                pass
+
+        def _on_ping(ws, data):
+            try: ws.send(json.dumps({"id": 99, "method": "server.ping", "params": []}))
+            except Exception: pass
+
+        ws = _wslib.WebSocketApp(
+            PHEMEX_WS_URL,
+            on_open=_on_open,
+            on_message=_on_msg,
+            on_ping=_on_ping,
+        )
+        _inactive_ws[0]  = ws
+        _inactive_sym[0] = symbol
+        import threading as _thr
+        _thr.Thread(
+            target=lambda: ws.run_forever(ping_interval=20, ping_timeout=8),
+            daemon=True
+        ).start()
+
+    while True:
+        _t.sleep(1)
+        try:
+            with state.lock:
+                _active = state.asset
+                _lp     = state.last_price
+
+            # Mirror active asset into its dedicated price field
+            if _active == "ETH":
+                with state.lock:
+                    state.last_price_eth = _lp
+                _need_sym  = "BTCUSDT"
+                _need_attr = "last_price_btc"
+            else:
+                with state.lock:
+                    state.last_price_btc = _lp
+                _need_sym  = "ETHUSDT"
+                _need_attr = "last_price_eth"
+
+            # If the inactive WS is not connected to the right symbol, open one
+            if _inactive_sym[0] != _need_sym:
+                # Close old connection if any
+                if _inactive_ws[0]:
+                    try: _inactive_ws[0].close()
+                    except Exception: pass
+                    _inactive_ws[0]  = None
+                    _inactive_sym[0] = None
+                _open_inactive_ws(_need_sym, _need_attr)
+
+        except Exception:
+            pass
+
+
+
+def check_open_position_on_startup():
+    """
+    Called once at startup. Queries Phemex for any open position in the
+    active asset. If found, creates a pos_tool entry (entry/TP/SL lines)
+    and TP+SL alerts — same as if the user had drawn the position tool manually.
+    Silently skips if no API key or no open position.
+    """
+    if not PHEMEX_API_KEY:
+        return
+
+    # Brief wait so the feed has time to connect and populate state.asset
+    time.sleep(2)
+
+    try:
+        sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
+
+        # Fetch open positions
+        _path  = "/g-accounts/accountPositions"
+        _query = "currency=USDT"
+        _r = requests.get(
+            f"{PHEMEX_REST_URL}{_path}?{_query}",
+            headers=_phemex_headers(_path, _query),
+            timeout=8
+        )
+        positions = (_r.json().get("data") or {}).get("positions", []) or []
+
+        for p in positions:
+            if p.get("symbol") != sym:
+                continue
+            size = float(p.get("size", 0) or 0)
+            if size == 0:
+                continue
+
+            pos_side = p.get("posSide", "Long")
+            entry    = float(p.get("avgEntryPriceRp") or 0)
+            sl       = float(p.get("stopLossPriceRp")  or 0)
+            tp       = float(p.get("takeProfitPriceRp") or 0)
+
+            if entry <= 0:
+                continue
+
+            # Find the candle closest to entry time as anchor
+            with state.lock:
+                _candles = list(state.candles)
+            _anchor = max(0, len(_candles) - 1)
+
+            pt = {
+                "entry":         entry,
+                "tp":            tp   if tp > 0 else entry + 50,
+                "sl":            sl   if sl > 0 else entry - 15,
+                "active":        True,
+                "_anchor_idx":   _anchor,
+                "_stop_idx":     None,
+                "create_alerts": True,
+                "_from_monitor": True,
+            }
+
+            with state.lock:
+                # Don't add duplicates
+                already = any(t.get("_from_monitor") for t in state.pos_tools)
+                if not already:
+                    state.pos_tools.append(pt)
+
+                    # TP alert
+                    if tp > 0:
+                        _tp_dir = ("price_cross_up"
+                                   if pos_side == "Long" else "price_cross_down")
+                        state.alerts.append({
+                            "name":       f"TP {tp:.2f}",
+                            "conditions": [{"type": _tp_dir, "value": tp}],
+                            "message":    f"Take Profit hit @ {tp:.2f}",
+                            "active":     True,
+                            "sound":      True,
+                            "_fired":     False,
+                        })
+                    # SL alert
+                    if sl > 0:
+                        _sl_dir = ("price_cross_down"
+                                   if pos_side == "Long" else "price_cross_up")
+                        state.alerts.append({
+                            "name":       f"SL {sl:.2f}",
+                            "conditions": [{"type": _sl_dir, "value": sl}],
+                            "message":    f"Stop Loss hit @ {sl:.2f}",
+                            "active":     True,
+                            "sound":      True,
+                            "_fired":     False,
+                        })
+            break   # only handle the first matching position
+
+    except Exception:
+        pass   # silently skip on any error
+
+
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -4518,6 +4749,8 @@ def main(stdscr):
 
     threading.Thread(target=start_feed, args=(state.asset,), daemon=True).start()
     threading.Thread(target=alert_monitor, daemon=True).start()
+    threading.Thread(target=_bg_ticker_loop, daemon=True).start()
+    threading.Thread(target=check_open_position_on_startup, daemon=True).start()
     # Start trade monitor immediately — auto-plots any existing positions/orders
     if PHEMEX_API_KEY:
         with state.lock:
@@ -4623,7 +4856,7 @@ def main(stdscr):
                                              daemon=True).start()
                 db.prev = None
             elif key in (ord("z"), ord("Z")):
-                # Clear all trade lines AND position tools
+                # Clear all trade lines AND position tools (including startup)
                 with state.lock:
                     state.trade_lines = []
                     state.pos_tools   = []
@@ -4992,9 +5225,9 @@ def main(stdscr):
                 state.n_vis          = _result.get("n_vis", state.n_vis)
                 state.view_offset    = _result.get("view_offset", state.view_offset)
                 state.cursor_col_idx = _result.get("cursor_col_idx", state.cursor_col_idx)
-                _vp = _result.get("vp_levels")
-                if _vp:
-                    state.indicator_levels.update(_vp)
+                _ind = _result.get("indicator_levels")
+                if _ind:
+                    state.indicator_levels.update(_ind)
 
         db.flush(stdscr)
         stdscr.noutrefresh()

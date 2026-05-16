@@ -1,0 +1,315 @@
+//@version=5
+indicator("Quantasset Master", overlay=true,
+          max_bars_back=500, max_lines_count=500,
+          max_boxes_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── VWAP ──────────────────────────────────────────────────────────────────
+i_show_vwap    = input.bool(true,  "Show VWAP",            group="VWAP")
+i_show_05band  = input.bool(true,  "Show ±0.5σ Band",      group="VWAP")
+i_show_2band   = input.bool(true,  "Show ±2σ / ±2.5σ",    group="VWAP")
+
+// ── BIG TRADES ────────────────────────────────────────────────────────────
+i_show_btd     = input.bool(true,  "Show Big Trades",      group="Big Trades")
+i_btd_lookback = input.int(10,     "Lookback",             group="Big Trades", minval=3, maxval=100)
+i_btd_sigma    = input.float(3.0,  "Sigma Threshold",      group="Big Trades", minval=1.0, step=0.5)
+
+// ── VOLUME PROFILE ────────────────────────────────────────────────────────
+i_show_vp      = input.bool(true,  "Show Volume Profile",  group="Volume Profile")
+i_vp_rows      = input.int(50,     "Price Rows",           group="Volume Profile", minval=10, maxval=200)
+i_vp_va_pct    = input.float(70.0, "Value Area %",         group="Volume Profile", minval=50.0, maxval=95.0, step=5.0)
+
+// ── SESSIONS ──────────────────────────────────────────────────────────────
+i_show_sess    = input.bool(true,  "Show Sessions",        group="Sessions")
+i_show_ndo     = input.bool(true,  "NDO  (00:00–03:30)",   group="Sessions")
+i_show_morn    = input.bool(true,  "Morning  (08:30–10:30)", group="Sessions")
+i_show_excl    = input.bool(true,  "Exclusion  (09:00–10:00 Wed/Thu)", group="Sessions")
+i_show_lunch   = input.bool(true,  "Lunch  (11:30–13:30)", group="Sessions")
+i_show_pwr     = input.bool(true,  "Power Hour  (14:00–15:00)", group="Sessions")
+i_show_eeod    = input.bool(true,  "EEOD  (18:30–23:59)",  group="Sessions")
+
+// NOTE: Volume bars — add TradingView's built-in "Volume" indicator
+//       separately. An overlay=true script cannot render a proper sub-pane
+//       volume histogram without distorting the price scale.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION DETECTION  (anchor: 19:00 Chicago time = daily CME open)
+// ═══════════════════════════════════════════════════════════════════════════
+
+CT = "America/Chicago"
+
+// New session fires on the first bar that crosses 19:00 CT
+_sess_bar_ct  = hour(time, CT) * 60 + minute(time, CT)
+_sess_bar_ct1 = hour(time[1], CT) * 60 + minute(time[1], CT)
+is_new_session = _sess_bar_ct >= 19 * 60 and _sess_bar_ct1 < 19 * 60
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VWAP + STANDARD DEVIATION BANDS
+// Welford's online volume-weighted variance — same formula as chart.py
+// ═══════════════════════════════════════════════════════════════════════════
+
+var float _cum_tpv  = 0.0   // Σ tp * vol
+var float _cum_vol  = 0.0   // Σ vol
+var float _cum_dev2 = 0.0   // Σ vol * (tp - VWAP)²  (Welford accumulator)
+
+if is_new_session
+    _cum_tpv  := 0.0
+    _cum_vol  := 0.0
+    _cum_dev2 := 0.0
+
+float tp = (high + low + close) / 3.0
+
+float _old_vol = _cum_tpv > 0 ? _cum_vol : 0.0
+_cum_tpv += tp * volume
+_cum_vol += volume
+
+float vwap_val = na
+float vwap_sd  = na
+
+if _cum_vol > 0
+    vwap_val := _cum_tpv / _cum_vol
+    if _old_vol > 0
+        float _old_vwap  = (_cum_tpv - tp * volume) / _old_vol
+        _cum_dev2 += volume * (tp - _old_vwap) * (tp - vwap_val)
+    vwap_sd := math.sqrt(math.max(0.0, _cum_dev2 / _cum_vol))
+
+float vwap_p05 = i_show_vwap and i_show_05band ? vwap_val + 0.5 * vwap_sd : na
+float vwap_m05 = i_show_vwap and i_show_05band ? vwap_val - 0.5 * vwap_sd : na
+float vwap_p2  = i_show_vwap and i_show_2band  ? vwap_val + 2.0 * vwap_sd : na
+float vwap_m2  = i_show_vwap and i_show_2band  ? vwap_val - 2.0 * vwap_sd : na
+float vwap_p25 = i_show_vwap and i_show_2band  ? vwap_val + 2.5 * vwap_sd : na
+float vwap_m25 = i_show_vwap and i_show_2band  ? vwap_val - 2.5 * vwap_sd : na
+
+p_vwap = plot(i_show_vwap ? vwap_val : na, "VWAP",   color=color.white,                     linewidth=2)
+p_p05  = plot(vwap_p05,                    "+0.5σ",  color=color.new(color.aqua, 60),        linewidth=1)
+p_m05  = plot(vwap_m05,                    "−0.5σ",  color=color.new(color.aqua, 60),        linewidth=1)
+p_p2   = plot(vwap_p2,                     "+2σ",    color=color.new(color.yellow, 30),      linewidth=1)
+p_m2   = plot(vwap_m2,                     "−2σ",    color=color.new(color.yellow, 30),      linewidth=1)
+p_p25  = plot(vwap_p25,                    "+2.5σ",  color=color.new(color.yellow, 60),      linewidth=1, style=plot.style_circles)
+p_m25  = plot(vwap_m25,                    "−2.5σ",  color=color.new(color.yellow, 60),      linewidth=1, style=plot.style_circles)
+
+fill(p_p05, p_m05, color=color.new(color.aqua, 88), title="0.5σ Fill")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BIG TRADES DETECTOR — volume intensity z-score, tiered bubbles
+// Logic mirrors chart.py:2062-2169
+// ═══════════════════════════════════════════════════════════════════════════
+
+float _hl = high - low
+float buy_int  = _hl > 0 ? (close - low)  / _hl * volume : 0.0
+float sell_int = _hl > 0 ? (high - close) / _hl * volume : 0.0
+
+float buy_mean  = ta.sma(buy_int,  i_btd_lookback)
+float sell_mean = ta.sma(sell_int, i_btd_lookback)
+float buy_std   = ta.stdev(buy_int,  i_btd_lookback)
+float sell_std  = ta.stdev(sell_int, i_btd_lookback)
+
+float _bt1 = buy_mean  + buy_std  * i_btd_sigma
+float _bt2 = buy_mean  + buy_std  * (i_btd_sigma + 1.5)
+float _bt3 = buy_mean  + buy_std  * (i_btd_sigma + 3.0)
+float _st1 = sell_mean + sell_std * i_btd_sigma
+float _st2 = sell_mean + sell_std * (i_btd_sigma + 1.5)
+float _st3 = sell_mean + sell_std * (i_btd_sigma + 3.0)
+
+bool buy_t1  = i_show_btd and buy_int  > _bt1
+bool buy_t2  = i_show_btd and buy_int  > _bt2
+bool buy_t3  = i_show_btd and buy_int  > _bt3
+bool sell_t1 = i_show_btd and sell_int > _st1
+bool sell_t2 = i_show_btd and sell_int > _st2
+bool sell_t3 = i_show_btd and sell_int > _st3
+
+// T3 — strongest signal (large bubble)
+plotshape(buy_t3,  title="Buy T3",  style=shape.circle, location=location.belowbar,
+          color=color.new(color.aqua,    0),  size=size.large)
+plotshape(sell_t3, title="Sell T3", style=shape.circle, location=location.abovebar,
+          color=color.new(color.fuchsia, 0),  size=size.large)
+
+// T2 — medium signal
+plotshape(buy_t2  and not buy_t3,  title="Buy T2",  style=shape.circle, location=location.belowbar,
+          color=color.new(color.aqua,    30), size=size.normal)
+plotshape(sell_t2 and not sell_t3, title="Sell T2", style=shape.circle, location=location.abovebar,
+          color=color.new(color.fuchsia, 30), size=size.normal)
+
+// T1 — baseline signal (small bubble)
+plotshape(buy_t1  and not buy_t2,  title="Buy T1",  style=shape.circle, location=location.belowbar,
+          color=color.new(color.aqua,    60), size=size.small)
+plotshape(sell_t1 and not sell_t2, title="Sell T1", style=shape.circle, location=location.abovebar,
+          color=color.new(color.fuchsia, 60), size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSIONS WITH EXCLUSIONS
+// chart.py:1858-1928 — same sessions, same CT timezone anchor
+// Only drawn on intraday timeframes (1m–1H)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool _intraday = timeframe.isintraday
+
+bool _is_ndo   = _intraday and i_show_sess and i_show_ndo   and not na(time(timeframe.period, "0000-0330", CT))
+bool _is_morn  = _intraday and i_show_sess and i_show_morn  and not na(time(timeframe.period, "0830-1030", CT))
+bool _is_lunch = _intraday and i_show_sess and i_show_lunch and not na(time(timeframe.period, "1130-1330", CT))
+bool _is_pwr   = _intraday and i_show_sess and i_show_pwr   and not na(time(timeframe.period, "1400-1500", CT))
+bool _is_eeod  = _intraday and i_show_sess and i_show_eeod  and not na(time(timeframe.period, "1830-2359", CT))
+
+// Exclusion zone: 09:00–10:00 CT, Wednesday (4) and Thursday (5) only
+bool _is_excl  = _intraday and i_show_sess and i_show_excl
+                 and not na(time(timeframe.period, "0900-1000", CT))
+                 and (dayofweek == dayofweek.wednesday or dayofweek == dayofweek.thursday)
+
+bgcolor(_is_ndo   ? color.new(color.blue,    85) : na, title="NDO")
+bgcolor(_is_morn  ? color.new(color.aqua,    85) : na, title="Morning")
+bgcolor(_is_lunch ? color.new(color.yellow,  85) : na, title="Lunch")
+bgcolor(_is_pwr   ? color.new(color.fuchsia, 85) : na, title="Power Hour")
+bgcolor(_is_eeod  ? color.new(color.green,   85) : na, title="EEOD")
+bgcolor(_is_excl  ? color.new(color.red,     75) : na, title="Exclusion")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOLUME PROFILE — session-based, POC / VAH / VAL
+// Accumulates per-bar into price buckets. Finalizes at next session open,
+// then draws horizontal lines extending right until price touches them.
+// Logic mirrors chart.py:1468-1576 (50% wick / 50% body volume split,
+// 70% value area).
+// ═══════════════════════════════════════════════════════════════════════════
+
+int   VP_ROWS = i_vp_rows
+
+// Per-session accumulators
+var float[] _vp_vol  = array.new_float(0)   // bucket volume totals
+var float   _vp_slo  = na                    // session low
+var float   _vp_shi  = na                    // session high
+var float   _vp_tvol = 0.0                   // session total volume
+
+// Active VP level lines (POC, VAH, VAL) — managed across sessions
+var line _poc_line = na
+var line _vah_line = na
+var line _val_line = na
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+f_bucket(float p, float lo, float hi, int rows) =>
+    hi > lo ? math.max(0, math.min(rows - 1, int((p - lo) / (hi - lo) * (rows - 1)))) : 0
+
+// Distribute vol evenly across bucket range [b0, b1] inclusive
+f_fill_range(float[] arr, int b0, int b1, float vol_share) =>
+    int n = math.abs(b1 - b0) + 1
+    float per = vol_share / n
+    int lo_b = math.min(b0, b1)
+    int hi_b = math.max(b0, b1)
+    for i = lo_b to hi_b
+        array.set(arr, i, array.get(arr, i) + per)
+
+// Find POC index (max volume bucket)
+f_poc(float[] arr) =>
+    int poc_i = 0
+    float poc_v = 0.0
+    for i = 0 to array.size(arr) - 1
+        float v = array.get(arr, i)
+        if v > poc_v
+            poc_v := v
+            poc_i := i
+    poc_i
+
+// Find VAH/VAL bucket indices enclosing va_pct% of total volume around POC
+f_value_area(float[] arr, int poc_i, float va_pct) =>
+    float total = array.sum(arr)
+    float target = total * va_pct / 100.0
+    int   rows   = array.size(arr)
+    int   lo_i   = poc_i
+    int   hi_i   = poc_i
+    float accum  = array.get(arr, poc_i)
+    while accum < target and (lo_i > 0 or hi_i < rows - 1)
+        float add_lo = lo_i > 0         ? array.get(arr, lo_i - 1) : 0.0
+        float add_hi = hi_i < rows - 1  ? array.get(arr, hi_i + 1) : 0.0
+        if add_hi >= add_lo
+            hi_i  := hi_i + 1
+            accum += add_hi
+        else
+            lo_i  := lo_i - 1
+            accum += add_lo
+    [lo_i, hi_i]
+
+// ── Reset on new session ─────────────────────────────────────────────────
+
+if is_new_session and i_show_vp
+    // Finalize previous session: compute POC/VAH/VAL and draw lines
+    if array.size(_vp_vol) == VP_ROWS and not na(_vp_slo) and not na(_vp_shi) and _vp_tvol > 0
+        int poc_i = f_poc(_vp_vol)
+        [val_i, vah_i] = f_value_area(_vp_vol, poc_i, i_vp_va_pct)
+
+        float s_range  = _vp_shi - _vp_slo
+        float poc_p = _vp_slo + (poc_i + 0.5) / VP_ROWS * s_range
+        float vah_p = _vp_slo + (vah_i + 0.5) / VP_ROWS * s_range
+        float val_p = _vp_slo + (val_i + 0.5) / VP_ROWS * s_range
+
+        // Delete previous lines before drawing new ones
+        if not na(_poc_line)
+            line.delete(_poc_line)
+        if not na(_vah_line)
+            line.delete(_vah_line)
+        if not na(_val_line)
+            line.delete(_val_line)
+
+        _poc_line := line.new(bar_index, poc_p, bar_index + 500, poc_p,
+                              color=color.yellow, width=2, extend=extend.right)
+        _vah_line := line.new(bar_index, vah_p, bar_index + 500, vah_p,
+                              color=color.purple, width=1, style=line.style_dashed,
+                              extend=extend.right)
+        _val_line := line.new(bar_index, val_p, bar_index + 500, val_p,
+                              color=color.purple, width=1, style=line.style_dashed,
+                              extend=extend.right)
+
+    // Reset accumulators for the new session
+    array.clear(_vp_vol)
+    for _r = 0 to VP_ROWS - 1
+        array.push(_vp_vol, 0.0)
+    _vp_slo  := low
+    _vp_shi  := high
+    _vp_tvol := 0.0
+
+// ── Initialize on very first bar ────────────────────────────────────────
+
+if array.size(_vp_vol) == 0 and i_show_vp
+    for _r = 0 to VP_ROWS - 1
+        array.push(_vp_vol, 0.0)
+    _vp_slo := low
+    _vp_shi := high
+
+// ── Accumulate current bar into buckets ─────────────────────────────────
+
+if i_show_vp and array.size(_vp_vol) == VP_ROWS and not na(_vp_slo)
+    _vp_slo  := math.min(_vp_slo, low)
+    _vp_shi  := math.max(_vp_shi, high)
+    _vp_tvol += volume
+
+    // 50% of volume spread over wick range, 50% over body range
+    // (matches chart.py VP_BUCKETS logic)
+    float half_vol = volume * 0.5
+    float body_lo  = math.min(open, close)
+    float body_hi  = math.max(open, close)
+
+    int wb0 = f_bucket(low,     _vp_slo, _vp_shi, VP_ROWS)
+    int wb1 = f_bucket(high,    _vp_slo, _vp_shi, VP_ROWS)
+    int bb0 = f_bucket(body_lo, _vp_slo, _vp_shi, VP_ROWS)
+    int bb1 = f_bucket(body_hi, _vp_slo, _vp_shi, VP_ROWS)
+
+    f_fill_range(_vp_vol, wb0, wb1, half_vol)
+    f_fill_range(_vp_vol, bb0, bb1, half_vol)
+
+// ── Extend / expire level lines when price trades through them ───────────
+// Virgin POC/VAH/VAL: stop extending once touched (mimics chart.py virgin lines)
+
+if i_show_vp and barstate.isconfirmed
+    if not na(_poc_line)
+        float poc_lvl = line.get_price(_poc_line, bar_index)
+        if low <= poc_lvl and poc_lvl <= high
+            line.set_extend(_poc_line, extend.none)
+    if not na(_vah_line)
+        float vah_lvl = line.get_price(_vah_line, bar_index)
+        if low <= vah_lvl and vah_lvl <= high
+            line.set_extend(_vah_line, extend.none)
+    if not na(_val_line)
+        float val_lvl = line.get_price(_val_line, bar_index)
+        if low <= val_lvl and val_lvl <= high
+            line.set_extend(_val_line, extend.none)

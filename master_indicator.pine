@@ -25,13 +25,40 @@ i_vp_rows      = input.int(50,     "Price Rows",           group="Volume Profile
 i_vp_va_pct    = input.float(70.0, "Value Area %",         group="Volume Profile", minval=50.0, maxval=95.0, step=5.0)
 
 // ── SESSIONS ──────────────────────────────────────────────────────────────
-i_show_sess    = input.bool(true,  "Show Sessions",        group="Sessions")
-i_show_ndo     = input.bool(true,  "NDO  (00:00–03:30)",   group="Sessions")
-i_show_morn    = input.bool(true,  "Morning  (08:30–10:30)", group="Sessions")
-i_show_excl    = input.bool(true,  "Exclusion  (09:00–10:00 Wed/Thu)", group="Sessions")
-i_show_lunch   = input.bool(true,  "Lunch  (11:30–13:30)", group="Sessions")
-i_show_pwr     = input.bool(true,  "Power Hour  (14:00–15:00)", group="Sessions")
-i_show_eeod    = input.bool(true,  "EEOD  (18:30–23:59)",  group="Sessions")
+i_show_sess  = input.bool(true,   "Show Sessions", group="Sessions")
+i_sess_tz    = input.string("America/Chicago", "Timezone", group="Sessions")
+
+i_show_ndo   = input.bool(true,  "", inline="ndo",   group="Sessions")
+i_ndo_label  = input.string("NDO",        "", inline="ndo",   group="Sessions")
+i_ndo_ses    = input.session("0000-0330",  "", inline="ndo",   group="Sessions")
+i_ndo_col    = input.color(color.new(color.blue,    80), "", inline="ndo",   group="Sessions")
+
+i_show_morn  = input.bool(true,  "", inline="morn",  group="Sessions")
+i_morn_label = input.string("Morning",    "", inline="morn",  group="Sessions")
+i_morn_ses   = input.session("0830-1030",  "", inline="morn",  group="Sessions")
+i_morn_col   = input.color(color.new(color.aqua,    80), "", inline="morn",  group="Sessions")
+
+i_show_excl  = input.bool(true,  "", inline="excl",  group="Sessions")
+i_excl_label = input.string("Exclusion",  "", inline="excl",  group="Sessions")
+i_excl_ses   = input.session("0900-1000",  "", inline="excl",  group="Sessions")
+i_excl_col   = input.color(color.new(color.red,     75), "", inline="excl",  group="Sessions")
+i_excl_day   = input.string("Wed/Thu", "Excl. Days", group="Sessions",
+                 options=["Every Day", "Mon", "Tue", "Wed", "Thu", "Fri", "Wed/Thu"])
+
+i_show_lunch = input.bool(true,  "", inline="lunch", group="Sessions")
+i_lunch_label = input.string("Lunch",     "", inline="lunch", group="Sessions")
+i_lunch_ses  = input.session("1130-1330",  "", inline="lunch", group="Sessions")
+i_lunch_col  = input.color(color.new(color.yellow,  80), "", inline="lunch", group="Sessions")
+
+i_show_pwr   = input.bool(true,  "", inline="pwr",   group="Sessions")
+i_pwr_label  = input.string("Power Hour", "", inline="pwr",   group="Sessions")
+i_pwr_ses    = input.session("1400-1500",  "", inline="pwr",   group="Sessions")
+i_pwr_col    = input.color(color.new(color.fuchsia, 80), "", inline="pwr",   group="Sessions")
+
+i_show_eeod  = input.bool(true,  "", inline="eeod",  group="Sessions")
+i_eeod_label = input.string("EEOD",       "", inline="eeod",  group="Sessions")
+i_eeod_ses   = input.session("1830-2359",  "", inline="eeod",  group="Sessions")
+i_eeod_col   = input.color(color.new(color.green,   80), "", inline="eeod",  group="Sessions")
 
 // NOTE: Volume bars — add TradingView's built-in "Volume" indicator
 //       separately. An overlay=true script cannot render a proper sub-pane
@@ -138,29 +165,34 @@ plotshape(i_show_btd and is_bt_sell_t3                        ? pos_sell : na, t
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSIONS WITH EXCLUSIONS
-// chart.py:1858-1928 — same sessions, same CT timezone anchor
-// Only drawn on intraday timeframes (1m–1H)
 // ═══════════════════════════════════════════════════════════════════════════
 
-bool _intraday = timeframe.isintraday
+_tf = timeframe.period
 
-bool _is_ndo   = _intraday and i_show_sess and i_show_ndo   and not na(time(timeframe.period, "0000-0330", CT))
-bool _is_morn  = _intraday and i_show_sess and i_show_morn  and not na(time(timeframe.period, "0830-1030", CT))
-bool _is_lunch = _intraday and i_show_sess and i_show_lunch and not na(time(timeframe.period, "1130-1330", CT))
-bool _is_pwr   = _intraday and i_show_sess and i_show_pwr   and not na(time(timeframe.period, "1400-1500", CT))
-bool _is_eeod  = _intraday and i_show_sess and i_show_eeod  and not na(time(timeframe.period, "1830-2359", CT))
+bool _is_ndo   = i_show_sess and i_show_ndo   and math.sign(nz(time(_tf, i_ndo_ses,   i_sess_tz))) > 0
+bool _is_morn  = i_show_sess and i_show_morn  and math.sign(nz(time(_tf, i_morn_ses,  i_sess_tz))) > 0
+bool _is_lunch = i_show_sess and i_show_lunch and math.sign(nz(time(_tf, i_lunch_ses, i_sess_tz))) > 0
+bool _is_pwr   = i_show_sess and i_show_pwr   and math.sign(nz(time(_tf, i_pwr_ses,   i_sess_tz))) > 0
+bool _is_eeod  = i_show_sess and i_show_eeod  and math.sign(nz(time(_tf, i_eeod_ses,  i_sess_tz))) > 0
 
-// Exclusion zone: 09:00–10:00 CT, Wednesday (4) and Thursday (5) only
-bool _is_excl  = _intraday and i_show_sess and i_show_excl
-                 and not na(time(timeframe.period, "0900-1000", CT))
-                 and (dayofweek == dayofweek.wednesday or dayofweek == dayofweek.thursday)
+bool _excl_time  = math.sign(nz(time(_tf, i_excl_ses, i_sess_tz))) > 0
+bool _excl_day_ok = switch i_excl_day
+    "Mon"     => dayofweek == dayofweek.monday
+    "Tue"     => dayofweek == dayofweek.tuesday
+    "Wed"     => dayofweek == dayofweek.wednesday
+    "Thu"     => dayofweek == dayofweek.thursday
+    "Fri"     => dayofweek == dayofweek.friday
+    "Wed/Thu" => dayofweek == dayofweek.wednesday or dayofweek == dayofweek.thursday
+    => true  // "Every Day"
 
-bgcolor(_is_ndo   ? color.new(color.blue,    85) : na, title="NDO")
-bgcolor(_is_morn  ? color.new(color.aqua,    85) : na, title="Morning")
-bgcolor(_is_lunch ? color.new(color.yellow,  85) : na, title="Lunch")
-bgcolor(_is_pwr   ? color.new(color.fuchsia, 85) : na, title="Power Hour")
-bgcolor(_is_eeod  ? color.new(color.green,   85) : na, title="EEOD")
-bgcolor(_is_excl  ? color.new(color.red,     75) : na, title="Exclusion")
+bool _is_excl = i_show_sess and i_show_excl and _excl_time and _excl_day_ok
+
+bgcolor(_is_ndo   ? i_ndo_col   : na, title="NDO")
+bgcolor(_is_morn  ? i_morn_col  : na, title="Morning")
+bgcolor(_is_lunch ? i_lunch_col : na, title="Lunch")
+bgcolor(_is_pwr   ? i_pwr_col   : na, title="Power Hour")
+bgcolor(_is_eeod  ? i_eeod_col  : na, title="EEOD")
+bgcolor(_is_excl  ? i_excl_col  : na, title="Exclusion")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VOLUME PROFILE — session-based, POC / VAH / VAL
@@ -178,10 +210,13 @@ var float   _vp_slo  = na                    // session low
 var float   _vp_shi  = na                    // session high
 var float   _vp_tvol = 0.0                   // session total volume
 
-// Active VP level lines (POC, VAH, VAL) — managed across sessions
-var line _poc_line = na
-var line _vah_line = na
-var line _val_line = na
+// Active VP level lines + labels (POC, VAH, VAL) — managed across sessions
+var line  _poc_line  = na
+var line  _vah_line  = na
+var line  _val_line  = na
+var label _poc_label = na
+var label _vah_label = na
+var label _val_label = na
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -240,22 +275,30 @@ if is_new_session and i_show_vp
         float vah_p = _vp_slo + (vah_i + 0.5) / VP_ROWS * s_range
         float val_p = _vp_slo + (val_i + 0.5) / VP_ROWS * s_range
 
-        // Delete previous lines before drawing new ones
-        if not na(_poc_line)
-            line.delete(_poc_line)
-        if not na(_vah_line)
-            line.delete(_vah_line)
-        if not na(_val_line)
-            line.delete(_val_line)
+        // Delete previous lines and labels before drawing new ones
+        if not na(_poc_line),  line.delete(_poc_line)
+        if not na(_vah_line),  line.delete(_vah_line)
+        if not na(_val_line),  line.delete(_val_line)
+        if not na(_poc_label), label.delete(_poc_label)
+        if not na(_vah_label), label.delete(_vah_label)
+        if not na(_val_label), label.delete(_val_label)
 
-        _poc_line := line.new(bar_index, poc_p, bar_index + 500, poc_p,
-                              color=color.yellow, width=2, extend=extend.right)
-        _vah_line := line.new(bar_index, vah_p, bar_index + 500, vah_p,
-                              color=color.purple, width=1, style=line.style_dashed,
-                              extend=extend.right)
-        _val_line := line.new(bar_index, val_p, bar_index + 500, val_p,
-                              color=color.purple, width=1, style=line.style_dashed,
-                              extend=extend.right)
+        _poc_line  := line.new(bar_index, poc_p, bar_index, poc_p,
+                               color=color.red,  width=2, style=line.style_solid, extend=extend.right)
+        _vah_line  := line.new(bar_index, vah_p, bar_index, vah_p,
+                               color=color.blue, width=1, style=line.style_solid, extend=extend.right)
+        _val_line  := line.new(bar_index, val_p, bar_index, val_p,
+                               color=color.blue, width=1, style=line.style_solid, extend=extend.right)
+
+        _poc_label := label.new(bar_index, poc_p, "POC: " + str.tostring(poc_p, format.mintick),
+                                color=color.red,  textcolor=color.white,
+                                style=label.style_label_right, size=size.small)
+        _vah_label := label.new(bar_index, vah_p, "VAH: " + str.tostring(vah_p, format.mintick),
+                                color=color.blue, textcolor=color.white,
+                                style=label.style_label_right, size=size.small)
+        _val_label := label.new(bar_index, val_p, "VAL: " + str.tostring(val_p, format.mintick),
+                                color=color.blue, textcolor=color.white,
+                                style=label.style_label_right, size=size.small)
 
     // Reset accumulators for the new session
     array.clear(_vp_vol)

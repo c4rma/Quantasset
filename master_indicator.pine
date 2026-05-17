@@ -198,7 +198,7 @@ get_range(session, session_name, session_css, bstyle = line.style_dotted) =>
                        style     = label.style_label_down,
                        color     = color.new(color.white, 100),
                        size      = size.tiny)
-    if session and session == session[1] and not na(_bx)
+    if session > 0 and session == session[1] and not na(_bx)
         _hi := math.max(high, _hi)
         _lo := math.min(low,  _lo)
         box.set_top(_bx, _hi)

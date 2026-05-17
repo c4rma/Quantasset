@@ -1,0 +1,70 @@
+// Adjusted indicator
+
+//@version=6
+indicator('Big Trades Detector [Volume Anomalies] By HF', overlay = true, shorttitle = 'Big Trades Detector')
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+show_btd = input.bool(true, 'Show Big Trades Detector', group = 'Big Trade (Whale) Settings')
+
+group_bt = 'Big Trade (Whale) Settings'
+bt_lookback = input.int(2, 'Lookback Period', minval = 2, group = group_bt)
+bt_mult = input.float(3.0, 'Sensitivity (Sigma)', minval = 1.0, step = 0.1, tooltip = '2.0 = Signifikant, 4.0 = Extrem.', group = group_bt)
+c_bt_buy = input.color(color.new(color.lime, 20), 'Big Buy Color', group = group_bt)
+c_bt_sell = input.color(color.new(color.red, 20), 'Big Sell Color', group = group_bt)
+
+// ==========================================
+// BERECHNUNG
+// ==========================================
+
+range_size = high - low
+
+// Intrabar Intensity Calculation
+raw_buy_vol = range_size == 0 ? 0 : (close - low) / range_size * volume
+raw_sell_vol = range_size == 0 ? 0 : (high - close) / range_size * volume
+
+// Real-Time Logic (Vergleich mit VORHERIGEN Kerzen [1])
+avg_buy_vol = ta.sma(raw_buy_vol, bt_lookback)[1]
+std_buy_vol = ta.stdev(raw_buy_vol, bt_lookback)[1]
+
+avg_sell_vol = ta.sma(raw_sell_vol, bt_lookback)[1]
+std_sell_vol = ta.stdev(raw_sell_vol, bt_lookback)[1]
+
+// Thresholds
+thresh_buy = avg_buy_vol + std_buy_vol * bt_mult
+thresh_sell = avg_sell_vol + std_sell_vol * bt_mult
+
+// Detection
+is_bt_buy_t1 = raw_buy_vol > thresh_buy
+is_bt_buy_t2 = raw_buy_vol > avg_buy_vol + std_buy_vol * (bt_mult + 1.5)
+is_bt_buy_t3 = raw_buy_vol > avg_buy_vol + std_buy_vol * (bt_mult + 3.0)
+
+is_bt_sell_t1 = raw_sell_vol > thresh_sell
+is_bt_sell_t2 = raw_sell_vol > avg_sell_vol + std_sell_vol * (bt_mult + 1.5)
+is_bt_sell_t3 = raw_sell_vol > avg_sell_vol + std_sell_vol * (bt_mult + 3.0)
+
+// ==========================================
+// POSITIONIERUNG (NEU)
+// ==========================================
+
+// Wir schätzen den Ort des Geschehens:
+// Käufe passieren meist im unteren Teil (Push von Low zu Close)
+pos_buy = math.avg(close, low)
+// Verkäufe passieren meist im oberen Teil (Push von High zu Close)
+pos_sell = math.avg(close, high)
+
+// ==========================================
+// VISUALS
+// ==========================================
+
+// BUYS (Lime)
+plotshape(show_btd and is_bt_buy_t1 and not is_bt_buy_t2 ? pos_buy : na, title = 'Big Buy (Small)', style = shape.circle, location = location.absolute, color = c_bt_buy, size = size.small)
+plotshape(show_btd and is_bt_buy_t2 and not is_bt_buy_t3 ? pos_buy : na, title = 'Big Buy (Med)',   style = shape.circle, location = location.absolute, color = c_bt_buy, size = size.normal)
+plotshape(show_btd and is_bt_buy_t3                      ? pos_buy : na, title = 'Big Buy (Large)', style = shape.circle, location = location.absolute, color = c_bt_buy, size = size.large)
+
+// SELLS (Red/Purple)
+plotshape(show_btd and is_bt_sell_t1 and not is_bt_sell_t2 ? pos_sell : na, title = 'Big Sell (Small)', style = shape.circle, location = location.absolute, color = c_bt_sell, size = size.small)
+plotshape(show_btd and is_bt_sell_t2 and not is_bt_sell_t3 ? pos_sell : na, title = 'Big Sell (Med)',   style = shape.circle, location = location.absolute, color = c_bt_sell, size = size.normal)
+plotshape(show_btd and is_bt_sell_t3                        ? pos_sell : na, title = 'Big Sell (Large)', style = shape.circle, location = location.absolute, color = c_bt_sell, size = size.large)

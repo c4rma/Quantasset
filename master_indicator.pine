@@ -1,5 +1,5 @@
 //@version=5
-indicator("Quantasset Master", overlay=true,
+indicator("ChartHacker", overlay=true,
           max_bars_back=500, max_lines_count=500,
           max_boxes_count=500, max_labels_count=500)
 
@@ -13,9 +13,11 @@ i_show_05band  = input.bool(true,  "Show ±0.5σ Band",      group="VWAP")
 i_show_2band   = input.bool(true,  "Show ±2σ / ±2.5σ",    group="VWAP")
 
 // ── BIG TRADES ────────────────────────────────────────────────────────────
-i_show_btd     = input.bool(true,  "Show Big Trades",      group="Big Trades")
-i_btd_lookback = input.int(10,     "Lookback",             group="Big Trades", minval=3, maxval=100)
-i_btd_sigma    = input.float(3.0,  "Sigma Threshold",      group="Big Trades", minval=1.0, step=0.5)
+i_show_btd     = input.bool(true,   "Show Big Trades Detector",  group="Big Trades (Whale) Settings")
+i_btd_lookback = input.int(2,       "Lookback Period",           group="Big Trades (Whale) Settings", minval=2)
+i_btd_sigma    = input.float(3.0,   "Sensitivity (Sigma)",       group="Big Trades (Whale) Settings", minval=1.0, step=0.1, tooltip="2.0 = Significant, 4.0 = Extreme.")
+i_btd_buy_col  = input.color(color.new(color.lime, 20), "Big Buy Color",  group="Big Trades (Whale) Settings")
+i_btd_sell_col = input.color(color.new(color.red,  20), "Big Sell Color", group="Big Trades (Whale) Settings")
 
 // ── VOLUME PROFILE ────────────────────────────────────────────────────────
 i_show_vp      = input.bool(true,  "Show Volume Profile",  group="Volume Profile")
@@ -95,49 +97,44 @@ fill(p_p05, p_m05, color=color.new(color.aqua, 88), title="0.5σ Fill")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BIG TRADES DETECTOR — volume intensity z-score, tiered bubbles
-// Logic mirrors chart.py:2062-2169
+// Compares current bar against PREVIOUS bars [1] for real-time accuracy.
+// Bubbles placed at avg(close,low) for buys / avg(close,high) for sells.
 // ═══════════════════════════════════════════════════════════════════════════
 
-float _hl = high - low
-float buy_int  = _hl > 0 ? (close - low)  / _hl * volume : 0.0
-float sell_int = _hl > 0 ? (high - close) / _hl * volume : 0.0
+float _btd_range = high - low
 
-float buy_mean  = ta.sma(buy_int,  i_btd_lookback)
-float sell_mean = ta.sma(sell_int, i_btd_lookback)
-float buy_std   = ta.stdev(buy_int,  i_btd_lookback)
-float sell_std  = ta.stdev(sell_int, i_btd_lookback)
+float raw_buy_vol  = _btd_range == 0 ? 0.0 : (close - low)  / _btd_range * volume
+float raw_sell_vol = _btd_range == 0 ? 0.0 : (high - close) / _btd_range * volume
 
-float _bt1 = buy_mean  + buy_std  * i_btd_sigma
-float _bt2 = buy_mean  + buy_std  * (i_btd_sigma + 1.5)
-float _bt3 = buy_mean  + buy_std  * (i_btd_sigma + 3.0)
-float _st1 = sell_mean + sell_std * i_btd_sigma
-float _st2 = sell_mean + sell_std * (i_btd_sigma + 1.5)
-float _st3 = sell_mean + sell_std * (i_btd_sigma + 3.0)
+// Stats against the previous lookback window (not the current bar)
+float avg_buy_vol  = ta.sma(raw_buy_vol,   i_btd_lookback)[1]
+float std_buy_vol  = ta.stdev(raw_buy_vol, i_btd_lookback)[1]
+float avg_sell_vol = ta.sma(raw_sell_vol,   i_btd_lookback)[1]
+float std_sell_vol = ta.stdev(raw_sell_vol, i_btd_lookback)[1]
 
-bool buy_t1  = i_show_btd and buy_int  > _bt1
-bool buy_t2  = i_show_btd and buy_int  > _bt2
-bool buy_t3  = i_show_btd and buy_int  > _bt3
-bool sell_t1 = i_show_btd and sell_int > _st1
-bool sell_t2 = i_show_btd and sell_int > _st2
-bool sell_t3 = i_show_btd and sell_int > _st3
+float thresh_buy  = avg_buy_vol  + std_buy_vol  * i_btd_sigma
+float thresh_sell = avg_sell_vol + std_sell_vol * i_btd_sigma
 
-// T3 — strongest signal (large bubble)
-plotshape(buy_t3,  title="Buy T3",  style=shape.circle, location=location.belowbar,
-          color=color.new(color.aqua,    0),  size=size.large)
-plotshape(sell_t3, title="Sell T3", style=shape.circle, location=location.abovebar,
-          color=color.new(color.fuchsia, 0),  size=size.large)
+bool is_bt_buy_t1  = raw_buy_vol  > thresh_buy
+bool is_bt_buy_t2  = raw_buy_vol  > avg_buy_vol  + std_buy_vol  * (i_btd_sigma + 1.5)
+bool is_bt_buy_t3  = raw_buy_vol  > avg_buy_vol  + std_buy_vol  * (i_btd_sigma + 3.0)
+bool is_bt_sell_t1 = raw_sell_vol > thresh_sell
+bool is_bt_sell_t2 = raw_sell_vol > avg_sell_vol + std_sell_vol * (i_btd_sigma + 1.5)
+bool is_bt_sell_t3 = raw_sell_vol > avg_sell_vol + std_sell_vol * (i_btd_sigma + 3.0)
 
-// T2 — medium signal
-plotshape(buy_t2  and not buy_t3,  title="Buy T2",  style=shape.circle, location=location.belowbar,
-          color=color.new(color.aqua,    30), size=size.normal)
-plotshape(sell_t2 and not sell_t3, title="Sell T2", style=shape.circle, location=location.abovebar,
-          color=color.new(color.fuchsia, 30), size=size.normal)
+// Bubble Y-positions: buys cluster near low side, sells near high side
+float pos_buy  = math.avg(close, low)
+float pos_sell = math.avg(close, high)
 
-// T1 — baseline signal (small bubble)
-plotshape(buy_t1  and not buy_t2,  title="Buy T1",  style=shape.circle, location=location.belowbar,
-          color=color.new(color.aqua,    60), size=size.small)
-plotshape(sell_t1 and not sell_t2, title="Sell T1", style=shape.circle, location=location.abovebar,
-          color=color.new(color.fuchsia, 60), size=size.small)
+// BUYS
+plotshape(i_show_btd and is_bt_buy_t1 and not is_bt_buy_t2 ? pos_buy : na, title="Big Buy (Small)", style=shape.circle, location=location.absolute, color=i_btd_buy_col,  size=size.small)
+plotshape(i_show_btd and is_bt_buy_t2 and not is_bt_buy_t3 ? pos_buy : na, title="Big Buy (Med)",   style=shape.circle, location=location.absolute, color=i_btd_buy_col,  size=size.normal)
+plotshape(i_show_btd and is_bt_buy_t3                      ? pos_buy : na, title="Big Buy (Large)", style=shape.circle, location=location.absolute, color=i_btd_buy_col,  size=size.large)
+
+// SELLS
+plotshape(i_show_btd and is_bt_sell_t1 and not is_bt_sell_t2 ? pos_sell : na, title="Big Sell (Small)", style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.small)
+plotshape(i_show_btd and is_bt_sell_t2 and not is_bt_sell_t3 ? pos_sell : na, title="Big Sell (Med)",   style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.normal)
+plotshape(i_show_btd and is_bt_sell_t3                        ? pos_sell : na, title="Big Sell (Large)", style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.large)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSIONS WITH EXCLUSIONS

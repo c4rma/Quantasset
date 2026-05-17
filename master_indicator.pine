@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("ChartHacker", overlay=true,
           max_bars_back=500, max_lines_count=500,
           max_boxes_count=500, max_labels_count=500)
@@ -276,12 +276,18 @@ if is_new_session and i_show_vp
         float val_p = _vp_slo + (val_i + 0.5) / VP_ROWS * s_range
 
         // Delete previous lines and labels before drawing new ones
-        if not na(_poc_line),  line.delete(_poc_line)
-        if not na(_vah_line),  line.delete(_vah_line)
-        if not na(_val_line),  line.delete(_val_line)
-        if not na(_poc_label), label.delete(_poc_label)
-        if not na(_vah_label), label.delete(_vah_label)
-        if not na(_val_label), label.delete(_val_label)
+        if not na(_poc_line)
+            line.delete(_poc_line)
+        if not na(_vah_line)
+            line.delete(_vah_line)
+        if not na(_val_line)
+            line.delete(_val_line)
+        if not na(_poc_label)
+            label.delete(_poc_label)
+        if not na(_vah_label)
+            label.delete(_vah_label)
+        if not na(_val_label)
+            label.delete(_val_label)
 
         _poc_line  := line.new(bar_index, poc_p, bar_index, poc_p,
                                color=color.red,  width=2, style=line.style_solid, extend=extend.right)

@@ -212,11 +212,10 @@ bgcolor(_s_excl == 1.0 ? color.new(i_excl_col, 80) : na, title="Exclusion Zone")
 get_range(_s_excl, i_excl_label, i_excl_col, line.style_solid)
 
 // ── Daily Divider: dashed vertical line + day-name label at each day change
-_dow = dayofweek
-if _dow != _dow[1] and show_day_div
-    line.new(bar_index, close, bar_index, close,
+if is_new_session and show_day_div
+    line.new(bar_index, close + syminfo.mintick, bar_index, close - syminfo.mintick,
              color=color.gray, extend=extend.both, style=line.style_dashed)
-    string _dname = switch _dow
+    string _dname = switch dayofweek
         dayofweek.monday    => "Monday"
         dayofweek.tuesday   => "Tuesday"
         dayofweek.wednesday => "Wednesday"

@@ -104,14 +104,14 @@ float vwap_m2  = i_show_vwap and i_show_2band  ? vwap_val - 2.0 * vwap_sd : na
 float vwap_p25 = i_show_vwap and i_show_2band  ? vwap_val + 2.5 * vwap_sd : na
 float vwap_m25 = i_show_vwap and i_show_2band  ? vwap_val - 2.5 * vwap_sd : na
 
-p_vwap = plot(i_show_vwap ? vwap_val : na, "VWAP",  color=color.white,                linewidth=2)
-p_p05  = plot(vwap_p05,  "+0.5σ", color=color.new(color.aqua,   60), linewidth=1)
-p_m05  = plot(vwap_m05,  "−0.5σ", color=color.new(color.aqua,   60), linewidth=1)
-p_p2   = plot(vwap_p2,   "+2σ",   color=color.new(color.yellow,  30), linewidth=1)
-p_m2   = plot(vwap_m2,   "−2σ",   color=color.new(color.yellow,  30), linewidth=1)
-p_p25  = plot(vwap_p25,  "+2.5σ", color=color.new(color.yellow,  60), linewidth=1, style=plot.style_circles)
-p_m25  = plot(vwap_m25,  "−2.5σ", color=color.new(color.yellow,  60), linewidth=1, style=plot.style_circles)
-fill(p_p05, p_m05, color=color.new(color.aqua, 88), title="0.5σ Fill")
+p_vwap = plot(i_show_vwap ? vwap_val : na, "VWAP",  color=color.yellow,               linewidth=2)
+p_p05  = plot(vwap_p05,  "+0.5σ", color=color.new(color.gray, 30), linewidth=1)
+p_m05  = plot(vwap_m05,  "−0.5σ", color=color.new(color.gray, 30), linewidth=1)
+p_p2   = plot(vwap_p2,   "+2σ",   color=color.new(color.red,  30), linewidth=1)
+p_m2   = plot(vwap_m2,   "−2σ",   color=color.new(color.red,  30), linewidth=1)
+p_p25  = plot(vwap_p25,  "+2.5σ", color=color.new(color.red,  60), linewidth=1)
+p_m25  = plot(vwap_m25,  "−2.5σ", color=color.new(color.red,  60), linewidth=1)
+fill(p_p05, p_m05, color=color.new(color.gray, 88), title="0.5σ Fill")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BIG TRADES DETECTOR  (volume intensity z-score, tiered bubbles)

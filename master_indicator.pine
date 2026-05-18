@@ -211,21 +211,16 @@ get_range(_s_eeod,  i_eeod_label,  i_eeod_col)
 bgcolor(_s_excl == 1.0 ? color.new(i_excl_col, 80) : na, title="Exclusion Zone")
 get_range(_s_excl, i_excl_label, i_excl_col, line.style_solid)
 
-// ── Daily Divider: dashed vertical line + day-name label at each day change
+// ── Daily Divider: dashed vertical line at 19:00 CT + day label at chart top
 if is_new_session and show_day_div
     line.new(bar_index, close + syminfo.mintick, bar_index, close - syminfo.mintick,
              color=color.gray, extend=extend.both, style=line.style_dashed)
-    string _dname = switch dayofweek
-        dayofweek.monday    => "Monday"
-        dayofweek.tuesday   => "Tuesday"
-        dayofweek.wednesday => "Wednesday"
-        dayofweek.thursday  => "Thursday"
-        dayofweek.friday    => "Friday"
-        dayofweek.saturday  => "Saturday"
-        => "Sunday"
-    label.new(bar_index, high, _dname,
-              textcolor = color.gray,
-              style     = label.style_label_down,
-              color     = color.new(color.white, 100),
-              size      = size.tiny)
+
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.sunday,    "Sun", shape.labeldown, location.top, color.new(color.white, 100), text="Sunday",    textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.monday,    "Mon", shape.labeldown, location.top, color.new(color.white, 100), text="Monday",    textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.tuesday,   "Tue", shape.labeldown, location.top, color.new(color.white, 100), text="Tuesday",   textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.wednesday, "Wed", shape.labeldown, location.top, color.new(color.white, 100), text="Wednesday", textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.thursday,  "Thu", shape.labeldown, location.top, color.new(color.white, 100), text="Thursday",  textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.friday,    "Fri", shape.labeldown, location.top, color.new(color.white, 100), text="Friday",    textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
+plotshape(is_new_session and show_day_div and dayofweek == dayofweek.saturday,  "Sat", shape.labeldown, location.top, color.new(color.white, 100), text="Saturday",  textcolor=color.gray, size=size.small, display=display.all - display.status_line, editable=false)
 

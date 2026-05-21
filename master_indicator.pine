@@ -268,11 +268,11 @@ if is_new_session and i_show_er and not na(_er_daily)
                           bgcolor=color.new(color.red,  88), border_color=na)
     _er_ulbl  := label.new(_er_x1, _up,
                             "Upper Bound: +" + str.tostring(_pct, "#.##") + "% (" + str.tostring(_up, format.mintick) + ")",
-                            textcolor=color.lime, style=label.style_label_left,
+                            textcolor=color.lime, style=label.style_label_down,
                             color=color.new(color.black, 100), size=size.small)
     _er_llbl  := label.new(_er_x1, _dn,
                             "Lower Bound: -" + str.tostring(_pct, "#.##") + "% (" + str.tostring(_dn, format.mintick) + ")",
-                            textcolor=color.red,  style=label.style_label_left,
+                            textcolor=color.red,  style=label.style_label_up,
                             color=color.new(color.black, 100), size=size.small)
 
 // ── Update live: extend lines/boxes, refresh label text + position ────────

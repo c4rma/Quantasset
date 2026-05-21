@@ -253,9 +253,10 @@ if is_new_session and i_show_er and not na(_er_daily)
     _er_open := open
     _er_x1   := bar_index
 
-    float _up  = _er_open * (1.0 + _er_daily)
-    float _dn  = _er_open * (1.0 - _er_daily)
-    float _pct = _er_daily * 100.0
+    float _dist = _er_open * _er_daily        // dollar distance (same for both bounds)
+    float _up   = _er_open + _dist
+    float _dn   = _er_open - _dist
+    float _pct  = math.floor(_er_iv / math.sqrt(365) * 100) / 100  // truncated to 2dp
 
     _er_uline := line.new(_er_x1, _up, _er_x1, _up,
                            color=color.lime, width=3, style=line.style_solid)
@@ -277,9 +278,10 @@ if is_new_session and i_show_er and not na(_er_daily)
 // ── Update live: extend lines/boxes, refresh label text + position ────────
 
 if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
-    float _up  = _er_open * (1.0 + _er_daily)
-    float _dn  = _er_open * (1.0 - _er_daily)
-    float _pct = _er_daily * 100.0
+    float _dist = _er_open * _er_daily
+    float _up   = _er_open + _dist
+    float _dn   = _er_open - _dist
+    float _pct  = math.floor(_er_iv / math.sqrt(365) * 100) / 100
 
     if not na(_er_uline)
         line.set_y1(_er_uline, _up)

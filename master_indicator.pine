@@ -309,19 +309,13 @@ if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
 
 // ── DVOL Dashboard ────────────────────────────────────────────────────────
 
-var table _dvol_tb = table.new(position.top_right, 2, 3,
+var table _dvol_tb = table.new(position.bottom_right, 2, 1,
      bgcolor=#1e222d, border_color=#373a46, border_width=1,
      frame_color=#373a46, frame_width=1)
 
 if barstate.islast and i_show_dvol_db
     string _sym_lbl = str.replace(i_er_iv_sym, "DERIBIT:", "")
     string _iv_str  = not na(_er_iv) ? str.tostring(_er_iv, "#.##") : "N/A"
-    // Spacer rows to clear the chart title bar
-    table.cell(_dvol_tb, 0, 0, " ", text_color=#1e222d, text_size=size.small, bgcolor=#1e222d)
-    table.cell(_dvol_tb, 1, 0, " ", text_color=#1e222d, text_size=size.small, bgcolor=#1e222d)
-    table.cell(_dvol_tb, 0, 1, " ", text_color=#1e222d, text_size=size.small, bgcolor=#1e222d)
-    table.cell(_dvol_tb, 1, 1, " ", text_color=#1e222d, text_size=size.small, bgcolor=#1e222d)
-    // Data row
-    table.cell(_dvol_tb, 0, 2, _sym_lbl, text_color=color.gray,   text_size=size.small, bgcolor=#1e222d)
-    table.cell(_dvol_tb, 1, 2, _iv_str,  text_color=color.yellow, text_size=size.small, bgcolor=#1e222d)
+    table.cell(_dvol_tb, 0, 0, _sym_lbl, text_color=color.gray,   text_size=size.small, bgcolor=#1e222d)
+    table.cell(_dvol_tb, 1, 0, _iv_str,  text_color=color.yellow, text_size=size.small, bgcolor=#1e222d)
 

@@ -309,7 +309,7 @@ if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
 
 // ── DVOL Dashboard ────────────────────────────────────────────────────────
 
-var table _dvol_tb = table.new(position.bottom_right, 2, 1,
+var table _dvol_tb = table.new(position.bottom_right, 3, 1,
      bgcolor=#1e222d, border_color=#373a46, border_width=1,
      frame_color=#373a46, frame_width=1)
 
@@ -321,6 +321,12 @@ if barstate.islast and i_show_dvol_db
          _er_iv < 70  ? color.yellow :
          _er_iv < 90  ? color.orange : color.red
          : color.gray
+    string _state    = not na(_er_iv) ?
+         _er_iv < 50  ? "Full Progression" :
+         _er_iv < 70  ? "3R Cap"           :
+         _er_iv < 90  ? "5R Cap"           : "1R or None"
+         : "N/A"
     table.cell(_dvol_tb, 0, 0, _sym_lbl, text_color=color.gray, text_size=size.small, bgcolor=#1e222d)
     table.cell(_dvol_tb, 1, 0, _iv_str,  text_color=_iv_color,  text_size=size.small, bgcolor=#1e222d)
+    table.cell(_dvol_tb, 2, 0, _state,   text_color=_iv_color,  text_size=size.small, bgcolor=#1e222d)
 

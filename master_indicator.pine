@@ -19,6 +19,13 @@ i_btd_sigma    = input.float(3.0,  "Sensitivity (Sigma)",      group="Big Trades
 i_btd_buy_col  = input.color(color.new(color.lime, 20), "Big Buy Color",  group="Big Trades (Whale) Settings")
 i_btd_sell_col = input.color(color.new(color.red,  20), "Big Sell Color", group="Big Trades (Whale) Settings")
 
+// ── MOVING AVERAGE ────────────────────────────────────────────────────────
+i_show_ma  = input.bool(true,    "Show MA",   group="Moving Average")
+i_ma_type  = input.string("EMA", "Type",      group="Moving Average", options=["SMA", "EMA"])
+i_ma_len   = input.int(20,       "Length",    group="Moving Average", minval=1)
+i_ma_col   = input.color(color.new(color.white, 0), "Color", group="Moving Average")
+i_ma_width = input.int(1,        "Thickness", group="Moving Average", minval=1, maxval=5)
+
 // ── EXPECTED RANGE ────────────────────────────────────────────────────────
 i_show_er      = input.bool(true, "Show Expected Range",    group="Expected Range")
 i_er_iv_sym    = input.symbol("DERIBIT:ETHDVOL", "IV Symbol (DVOL)", group="Expected Range")
@@ -150,6 +157,13 @@ plotshape(i_show_btd and is_bt_buy_t3                         ? pos_buy  : na, t
 plotshape(i_show_btd and is_bt_sell_t1 and not is_bt_sell_t2 ? pos_sell : na, title="Big Sell (Small)", style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.small)
 plotshape(i_show_btd and is_bt_sell_t2 and not is_bt_sell_t3 ? pos_sell : na, title="Big Sell (Med)",   style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.normal)
 plotshape(i_show_btd and is_bt_sell_t3                        ? pos_sell : na, title="Big Sell (Large)", style=shape.circle, location=location.absolute, color=i_btd_sell_col, size=size.large)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOVING AVERAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+float _ma_val = i_ma_type == "EMA" ? ta.ema(close, i_ma_len) : ta.sma(close, i_ma_len)
+plot(i_show_ma ? _ma_val : na, "MA", color=i_ma_col, linewidth=i_ma_width)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSIONS  — LuxAlgo bordered-box style with daily divider

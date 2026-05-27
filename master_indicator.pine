@@ -191,7 +191,7 @@ float _s_excl = i_show_sess and i_show_excl ? _excl_raw * (_excl_day_ok ? 1.0 : 
 
 // ── get_range: draw a live bordered box + label per session (LuxAlgo pattern)
 // Reads bg_transp / show_outline / show_txt from outer input scope.
-get_range(session, session_name, session_css, bstyle = line.style_dotted) =>
+get_range(session, session_name, session_css, bstyle = line.style_dotted, lbl_below = false) =>
     var int   _t   = 0
     var float _hi  = na
     var float _lo  = na
@@ -206,10 +206,10 @@ get_range(session, session_name, session_css, bstyle = line.style_dotted) =>
                    border_color = show_outline ? session_css : na,
                    border_style = bstyle)
         if show_txt
-            _lbl := label.new(_t, _hi, session_name,
+            _lbl := label.new(_t, lbl_below ? _lo : _hi, session_name,
                        xloc      = xloc.bar_time,
                        textcolor = session_css,
-                       style     = label.style_label_down,
+                       style     = lbl_below ? label.style_label_up : label.style_label_down,
                        color     = color.new(color.white, 100),
                        size      = size.tiny)
     if session > 0 and session == session[1] and not na(_bx)
@@ -218,7 +218,7 @@ get_range(session, session_name, session_css, bstyle = line.style_dotted) =>
         box.set_top(_bx, _hi)
         box.set_rightbottom(_bx, bar_index, _lo)
         if show_txt and not na(_lbl)
-            label.set_xy(_lbl, int(math.avg(float(_t), float(time))), _hi)
+            label.set_xy(_lbl, int(math.avg(float(_t), float(time))), lbl_below ? _lo : _hi)
 
 // Draw session boxes (called unconditionally so var state is tracked every bar)
 get_range(_s_ndo,   i_ndo_label,   i_ndo_col)
@@ -228,7 +228,7 @@ get_range(_s_pwr,   i_pwr_label,   i_pwr_col)
 get_range(_s_eeod,  i_eeod_label,  i_eeod_col)
 // Exclusion: full-height background (unmissable) + optional bordered box
 bgcolor(_s_excl == 1.0 ? color.new(i_excl_col, 80) : na, title="Exclusion Zone")
-get_range(_s_excl, i_excl_label, i_excl_col, line.style_solid)
+get_range(_s_excl, i_excl_label, i_excl_col, line.style_solid, true)
 
 // ── Daily Divider: dashed vertical line at 19:00 CT + day label at chart top
 if is_new_session and show_day_div

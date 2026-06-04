@@ -197,7 +197,7 @@ float _s_excl = i_show_sess and i_show_excl ? _excl_raw * (_excl_day_ok ? 1.0 : 
 
 // ── get_range: draw a live bordered box + label per session (LuxAlgo pattern)
 // Reads bg_transp / show_outline / show_txt from outer input scope.
-get_range(session, session_name, session_css, bstyle = line.style_dotted, lbl_below = false) =>
+get_range(session, session_name, session_css, bstyle = line.style_dotted, lbl_below = false, show_fill = true) =>
     var int   _t   = 0
     var float _hi  = na
     var float _lo  = na
@@ -208,7 +208,7 @@ get_range(session, session_name, session_css, bstyle = line.style_dotted, lbl_be
         _hi := high
         _lo := low
         _bx := box.new(bar_index, _hi, bar_index, _lo,
-                   bgcolor      = color.new(session_css, bg_transp),
+                   bgcolor      = show_fill ? color.new(session_css, bg_transp) : color.new(color.black, 100),
                    border_color = show_outline ? session_css : na,
                    border_style = bstyle)
         if show_txt
@@ -227,11 +227,11 @@ get_range(session, session_name, session_css, bstyle = line.style_dotted, lbl_be
             label.set_xy(_lbl, int(math.avg(float(_t), float(time))), lbl_below ? _lo : _hi)
 
 // Draw session boxes (called unconditionally so var state is tracked every bar)
-get_range(_s_ndo,   i_ndo_label,   i_ndo_col)
-get_range(_s_morn,  i_morn_label,  i_morn_col)
-get_range(_s_lunch, i_lunch_label, i_lunch_col)
-get_range(_s_pwr,   i_pwr_label,   i_pwr_col)
-get_range(_s_eeod,  i_eeod_label,  i_eeod_col)
+get_range(_s_ndo,   i_ndo_label,   i_ndo_col,  line.style_dotted, false, false)
+get_range(_s_morn,  i_morn_label,  i_morn_col, line.style_dotted, false, false)
+get_range(_s_lunch, i_lunch_label, i_lunch_col, line.style_dotted, false, false)
+get_range(_s_pwr,   i_pwr_label,   i_pwr_col,  line.style_dotted, false, false)
+get_range(_s_eeod,  i_eeod_label,  i_eeod_col, line.style_dotted, false, false)
 // Exclusion: full-height background (unmissable) + optional bordered box
 bgcolor(_s_excl == 1.0 ? color.new(i_excl_col, 80) : na, title="Exclusion Zone")
 get_range(_s_excl, i_excl_label, i_excl_col, line.style_solid, true)

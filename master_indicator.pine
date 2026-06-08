@@ -39,9 +39,8 @@ i_sell_lvl      = input.price(0.0, "Sell Territory", inline="selllvl", group="Le
 
 // ── EXPECTED RANGE ────────────────────────────────────────────────────────
 i_show_er      = input.bool(true,           "Show Expected Range",    group="Expected Range")
-i_er_source    = input.string("IV Symbol",  "IV Source",              group="Expected Range", options=["IV Symbol", "Manual"])
-i_er_iv_sym    = input.symbol("DERIBIT:ETHDVOL", "IV Symbol (DVOL)", group="Expected Range")
-i_er_iv_manual = input.float(50.0,          "Manual IV (%)",          group="Expected Range", minval=1.0, maxval=999.0, step=0.5, tooltip="Annual implied volatility in percent (e.g. 50 = 50%). Only used when IV Source is set to Manual.")
+i_er_iv_sym    = input.symbol("DERIBIT:ETHDVOL", "IV Symbol (DVOL)", group="Expected Range", tooltip="Used in Crypto mode.")
+i_er_iv_manual = input.float(50.0,          "Manual IV (%)",          group="Expected Range", minval=1.0, maxval=999.0, step=0.5, tooltip="Annual implied volatility in percent (e.g. 50 = 50%). Used in Equities mode.")
 i_show_dvol_db = input.bool(true,           "Show DVOL Dashboard",   group="Expected Range")
 
 // ── SESSIONS ──────────────────────────────────────────────────────────────
@@ -266,7 +265,7 @@ plotshape(is_new_session and show_day_div and dayofweek == dayofweek.saturday,  
 // ═══════════════════════════════════════════════════════════════════════════
 
 float _er_iv_sym_val = request.security(i_er_iv_sym, "D", close)
-float _er_iv    = i_er_source == "Manual" ? i_er_iv_manual : _er_iv_sym_val
+float _er_iv    = i_asset_mode == "Equities" ? i_er_iv_manual : _er_iv_sym_val
 float _er_daily = not na(_er_iv) and _er_iv > 0 ? _er_iv / math.sqrt(365) / 100 : na
 
 var float _er_open      = na
@@ -436,7 +435,7 @@ var table _dvol_tb = table.new(position.bottom_right, 3, 1,
      frame_color=#373a46, frame_width=1)
 
 if barstate.islast and i_show_dvol_db
-    string _sym_lbl  = i_er_source == "Manual" ? "Manual IV" : str.replace(i_er_iv_sym, "DERIBIT:", "")
+    string _sym_lbl  = i_asset_mode == "Equities" ? "Manual IV" : str.replace(i_er_iv_sym, "DERIBIT:", "")
     string _iv_str   = not na(_er_iv) ? str.tostring(_er_iv, "#.##") : "N/A"
     color  _iv_color = not na(_er_iv) ?
          _er_iv < 50  ? color.green  :

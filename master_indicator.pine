@@ -7,6 +7,11 @@ indicator("ChartHacker", overlay=true,
 // INPUTS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ── GENERAL ───────────────────────────────────────────────────────────────
+i_asset_mode = input.string("Crypto", "Asset Mode", group="General",
+                 options=["Crypto", "Equities"],
+                 tooltip="Crypto: new day at 19:00 CT (CME futures open), anchored to candle open.\nEquities: new day at 16:00 CT (market close), anchored to candle close.")
+
 // ── VWAP ──────────────────────────────────────────────────────────────────
 i_show_vwap   = input.bool(true,  "Show VWAP",         group="VWAP")
 i_show_05band = input.bool(true,  "Show ±0.5σ Band",   group="VWAP")
@@ -87,9 +92,10 @@ i_eeod_col    = input.color(color.new(color.green,   80), "", inline="eeod",  gr
 // ═══════════════════════════════════════════════════════════════════════════
 
 CT = "America/Chicago"
-_ct_now  = hour(time, CT) * 60 + minute(time, CT)
-_ct_prev = hour(time[1], CT) * 60 + minute(time[1], CT)
-is_new_session = _ct_now >= 19 * 60 and _ct_prev < 19 * 60
+_ct_now   = hour(time, CT) * 60 + minute(time, CT)
+_ct_prev  = hour(time[1], CT) * 60 + minute(time[1], CT)
+int _sess_boundary = i_asset_mode == "Equities" ? 16 * 60 : 19 * 60
+is_new_session = _ct_now >= _sess_boundary and _ct_prev < _sess_boundary
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)
@@ -287,7 +293,7 @@ var label _er_l80lbl    = na
 // ── Initialise new session objects at 19:00 CT ────────────────────────────
 
 if is_new_session and i_show_er and not na(_er_daily)
-    _er_open := open
+    _er_open := i_asset_mode == "Equities" ? close : open
     _er_x1   := bar_index
 
     float _dist  = _er_open * _er_daily
@@ -457,10 +463,11 @@ var label _so_lbl   = na
 if is_new_session and i_show_so
     line.delete(_so_line)
     label.delete(_so_lbl)
-    _so_price := open
+    _so_price := i_asset_mode == "Equities" ? close : open
+    string _so_txt = i_asset_mode == "Equities" ? "Day Close" : "Session Open"
     _so_line  := line.new(bar_index, _so_price, bar_index + 1, _so_price,
                           color=color.white, style=line.style_dashed, width=1, extend=extend.right)
-    _so_lbl   := label.new(bar_index, _so_price, "Session Open",
+    _so_lbl   := label.new(bar_index, _so_price, _so_txt,
                            textcolor=color.white, style=label.style_label_left,
                            color=color.new(color.black, 100), size=size.small)
 

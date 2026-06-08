@@ -44,6 +44,7 @@ bg_transp     = input.float(85.0,                "Range Transparency",     group
 show_outline  = input.bool(true,                 "Range Outline",          group="Sessions")
 show_txt      = input.bool(true,                 "Range Label",            group="Sessions")
 show_day_div  = input.bool(true,                 "Show Daily Divider",     group="Sessions")
+i_show_so     = input.bool(true,                 "Show Session Open Line", group="Sessions")
 
 i_show_ndo    = input.bool(true,  "", inline="ndo",   group="Sessions")
 i_ndo_label   = input.string("NDO",        "", inline="ndo",   group="Sessions")
@@ -441,6 +442,27 @@ if barstate.islast and i_show_dvol_db
     table.cell(_dvol_tb, 0, 0, _sym_lbl, text_color=color.gray, text_size=size.small, bgcolor=#1e222d)
     table.cell(_dvol_tb, 1, 0, _iv_str,  text_color=_iv_color,  text_size=size.small, bgcolor=#1e222d)
     table.cell(_dvol_tb, 2, 0, _state,   text_color=_iv_color,  text_size=size.small, bgcolor=#1e222d)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION OPEN LINE — dashed white line at 19:00 CT candle open
+// ═══════════════════════════════════════════════════════════════════════════
+
+var float _so_price = na
+var line  _so_line  = na
+var label _so_lbl   = na
+
+if is_new_session and i_show_so
+    line.delete(_so_line)
+    label.delete(_so_lbl)
+    _so_price := open
+    _so_line  := line.new(bar_index, _so_price, bar_index + 1, _so_price,
+                          color=color.white, style=line.style_dashed, width=1, extend=extend.right)
+    _so_lbl   := label.new(bar_index, _so_price, "Session Open",
+                           textcolor=color.white, style=label.style_label_left,
+                           color=color.new(color.black, 100), size=size.small)
+
+if i_show_so and not na(_so_line) and not is_new_session
+    label.set_xy(_so_lbl, bar_index, _so_price)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // USER LEVELS — Buy Territory / Sell Territory

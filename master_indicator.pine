@@ -272,10 +272,14 @@ var float _er_open      = na
 var int   _er_x1        = 0
 var line  _er_uline     = na
 var line  _er_lline     = na
+var line  _er_u150line  = na
+var line  _er_l150line  = na
 var box   _er_ubox      = na
 var box   _er_lbox      = na
 var label _er_ulbl      = na
 var label _er_llbl      = na
+var label _er_u150lbl   = na
+var label _er_l150lbl   = na
 var line  _er_u20line   = na
 var line  _er_u40line   = na
 var line  _er_u60line   = na
@@ -303,23 +307,35 @@ if is_new_session and i_show_er and not na(_er_daily)
     _er_open := i_asset_mode == "Equities" ? close : open
     _er_x1   := bar_index
 
-    float _dist  = _er_open * _er_daily
-    float _up    = _er_open + _dist
-    float _dn    = _er_open - _dist
-    float _up_20 = _er_open + _dist * 0.2
-    float _up_40 = _er_open + _dist * 0.4
-    float _up_60 = _er_open + _dist * 0.6
-    float _up_80 = _er_open + _dist * 0.8
-    float _dn_20 = _er_open - _dist * 0.2
-    float _dn_40 = _er_open - _dist * 0.4
-    float _dn_60 = _er_open - _dist * 0.6
-    float _dn_80 = _er_open - _dist * 0.8
-    float _pct   = math.floor(_er_iv / math.sqrt(365) * 100) / 100
+    float _dist   = _er_open * _er_daily
+    float _up     = _er_open + _dist
+    float _dn     = _er_open - _dist
+    float _up_150 = _er_open + _dist * 1.5
+    float _dn_150 = _er_open - _dist * 1.5
+    float _up_20  = _er_open + _dist * 0.2
+    float _up_40  = _er_open + _dist * 0.4
+    float _up_60  = _er_open + _dist * 0.6
+    float _up_80  = _er_open + _dist * 0.8
+    float _dn_20  = _er_open - _dist * 0.2
+    float _dn_40  = _er_open - _dist * 0.4
+    float _dn_60  = _er_open - _dist * 0.6
+    float _dn_80  = _er_open - _dist * 0.8
+    float _pct    = math.floor(_er_iv / math.sqrt(365) * 100) / 100
 
-    _er_uline   := line.new(_er_x1, _up, _er_x1, _up,
-                             color=color.lime, width=3, style=line.style_solid)
-    _er_lline   := line.new(_er_x1, _dn, _er_x1, _dn,
-                             color=color.red,  width=3, style=line.style_solid)
+    _er_uline    := line.new(_er_x1, _up, _er_x1, _up,
+                              color=color.lime, width=3, style=line.style_solid)
+    _er_lline    := line.new(_er_x1, _dn, _er_x1, _dn,
+                              color=color.red,  width=3, style=line.style_solid)
+    _er_u150line := line.new(_er_x1, _up_150, _er_x1, _up_150,
+                              color=color.purple, width=3, style=line.style_solid)
+    _er_l150line := line.new(_er_x1, _dn_150, _er_x1, _dn_150,
+                              color=color.purple, width=3, style=line.style_solid)
+    _er_u150lbl  := label.new(_er_x1, _up_150, " 150% - Volatility Hard Stop",
+                               textcolor=color.purple, style=label.style_label_left,
+                               color=color.new(color.black, 100), size=size.small)
+    _er_l150lbl  := label.new(_er_x1, _dn_150, " 150% - Volatility Hard Stop",
+                               textcolor=color.purple, style=label.style_label_left,
+                               color=color.new(color.black, 100), size=size.small)
     // Outer zones (0–40% and 80–100%): light fill
     _er_ubox    := box.new(_er_x1, _up_40, _er_x1, _er_open,
                             bgcolor=color.new(color.lime, 88), border_color=na)
@@ -388,18 +404,20 @@ if is_new_session and i_show_er and not na(_er_daily)
 // ── Update live: extend lines/boxes, refresh label text + position ────────
 
 if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
-    float _dist  = _er_open * _er_daily
-    float _up    = _er_open + _dist
-    float _dn    = _er_open - _dist
-    float _up_20 = _er_open + _dist * 0.2
-    float _up_40 = _er_open + _dist * 0.4
-    float _up_60 = _er_open + _dist * 0.6
-    float _up_80 = _er_open + _dist * 0.8
-    float _dn_20 = _er_open - _dist * 0.2
-    float _dn_40 = _er_open - _dist * 0.4
-    float _dn_60 = _er_open - _dist * 0.6
-    float _dn_80 = _er_open - _dist * 0.8
-    float _pct   = math.floor(_er_iv / math.sqrt(365) * 100) / 100
+    float _dist   = _er_open * _er_daily
+    float _up     = _er_open + _dist
+    float _dn     = _er_open - _dist
+    float _up_150 = _er_open + _dist * 1.5
+    float _dn_150 = _er_open - _dist * 1.5
+    float _up_20  = _er_open + _dist * 0.2
+    float _up_40  = _er_open + _dist * 0.4
+    float _up_60  = _er_open + _dist * 0.6
+    float _up_80  = _er_open + _dist * 0.8
+    float _dn_20  = _er_open - _dist * 0.2
+    float _dn_40  = _er_open - _dist * 0.4
+    float _dn_60  = _er_open - _dist * 0.6
+    float _dn_80  = _er_open - _dist * 0.8
+    float _pct    = math.floor(_er_iv / math.sqrt(365) * 100) / 100
 
     if not na(_er_uline)
         line.set_y1(_er_uline, _up)
@@ -409,6 +427,18 @@ if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
         line.set_y1(_er_lline, _dn)
         line.set_y2(_er_lline, _dn)
         line.set_x2(_er_lline, bar_index)
+    if not na(_er_u150line)
+        line.set_y1(_er_u150line, _up_150)
+        line.set_y2(_er_u150line, _up_150)
+        line.set_x2(_er_u150line, bar_index)
+    if not na(_er_l150line)
+        line.set_y1(_er_l150line, _dn_150)
+        line.set_y2(_er_l150line, _dn_150)
+        line.set_x2(_er_l150line, bar_index)
+    if not na(_er_u150lbl)
+        label.set_xy(_er_u150lbl, bar_index, _up_150)
+    if not na(_er_l150lbl)
+        label.set_xy(_er_l150lbl, bar_index, _dn_150)
     if not na(_er_ubox)
         box.set_top(_er_ubox,    _up_40)
         box.set_bottom(_er_ubox, _er_open)

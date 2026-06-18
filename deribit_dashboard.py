@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# deribit_dashboard.py — Real-time Deribit Put/Call Volume Monitor
+# deribit_dashboard.py — Real-time Deribit + CBOE Put/Call Volume Monitor
 #
 # Usage:
 #   python deribit_dashboard.py
 #   python deribit_dashboard.py --interval 60
+#
+# Equities (TLT/GLD/QQQ) put/call volume comes from CBOE's free delayed-quote
+# feed (exchange-sourced, ~15 min delay). Needs only httpx — no extra package.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -34,6 +37,18 @@ WS_URL         = 'wss://www.deribit.com/ws/api/v2'
 CURRENCIES     = ['ETH', 'BTC']
 PHEMEX_TICKER  = 'https://api.phemex.com/md/v3/ticker/24hr?symbol=ETHUSDT'
 CT_OFFSET      = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
+
+# ── Equities options config (CBOE delayed quotes — exchange source, ~15m delay) ─
+# Webull's free API was inconsistent and its volumes didn't match IBKR. CBOE's
+# delayed-quote feed returns the full consolidated chain and tracks IBKR's
+# put/call direction (e.g. GLD/TLT correctly read < 1.00). Needs only httpx.
+EQUITY_SYMBOLS = ['TLT', 'GLD', 'QQQ']
+CBOE_URL       = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
+
+# ── Shared equities state (prefetched in background, promoted at cycle boundary) ─
+eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30)
+eq_errors  = {}            # symbol -> short error string
+eq_status  = 'starting…'
 
 # ── Kill zones (CT, minutes since midnight) ───────────────────────────────────
 KILL_ZONES = [
@@ -144,6 +159,77 @@ def _play_alert():
     except Exception:
         pass
 
+# ── Equities options fetch (CBOE delayed quotes) ──────────────────────────────
+async def _cboe_symbol_volume(client, symbol):
+    """
+    Return (put_vol, call_vol, iv30) for one symbol — a single GET.
+
+    put_vol/call_vol are summed across the entire CBOE option chain (all strikes,
+    all expiries); iv30 is CBOE's 30-day implied volatility (VIX-style, in %).
+    Each contract's OCC symbol ends with <type><8-digit-strike>, e.g.
+    'GLD260618P00388000', so the option type is reliably the 9th char from the
+    end. No expiry attribution games — the whole consolidated chain is returned.
+    """
+    r = await client.get(CBOE_URL.format(symbol))
+    r.raise_for_status()
+    data    = r.json().get('data') or {}
+    options = data.get('options') or []
+    if not options:
+        raise RuntimeError('empty chain')
+
+    try:
+        iv30 = float(data.get('iv30'))
+    except (TypeError, ValueError):
+        iv30 = 0.0
+
+    put_vol = call_vol = 0.0
+    for o in options:
+        name = o.get('option') or ''
+        if len(name) < 9:
+            continue
+        cp  = name[-9]                       # 'C' or 'P' (before the 8-digit strike)
+        vol = o.get('volume') or 0
+        try:
+            vol = float(vol)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if cp == 'P':
+            put_vol  += vol
+        elif cp == 'C':
+            call_vol += vol
+
+    return put_vol, call_vol, iv30
+
+
+async def refresh_equities():
+    """
+    Fetch all equity symbols concurrently from CBOE and return a completed
+    snapshot: (results, errors, status). Does NOT touch the displayed globals —
+    the caller promotes the snapshot at the crypto cycle boundary so equities
+    update in lockstep with the counter. ~9s total for all three.
+    """
+    results, errors = {}, {}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            async def _one(symbol):
+                try:
+                    put_vol, call_vol, iv30 = await _cboe_symbol_volume(client, symbol)
+                    ratio = put_vol / call_vol if call_vol > 0 else 0.0
+                    results[symbol] = (put_vol, call_vol, ratio, iv30)
+                except Exception as e:
+                    errors[symbol] = str(e).replace('\n', ' ')[:36]
+
+            await asyncio.gather(*(_one(s) for s in EQUITY_SYMBOLS))
+        status = f'OK ({len(results)}/{len(EQUITY_SYMBOLS)})'
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        status = ('err: ' + str(e).replace('\n', ' '))[:40]
+
+    return results, errors, status
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
 WIDTH = 62
 ROWS  = {}
@@ -181,6 +267,7 @@ def draw_static():
         mark(f'{ccy}_put');       p(f"    {'24h Put Volume':<20}")
         mark(f'{ccy}_call');      p(f"    {'24h Call Volume':<20}")
         mark(f'{ccy}_total');     p(f"    {'24h Total Volume':<20}")
+        mark(f'{ccy}_dvol');      p(f"    {'DVOL (30d IV)':<20}")
         p()
         mark(f'{ccy}_ratio');     p(f"    {'Put/Call Ratio':<20}")
         p()
@@ -190,9 +277,17 @@ def draw_static():
         mark(f'{ccy}_pct');       p(f"    {DIM}     {'':35}{RST}")
         p()
 
+    # ── Equities (CBOE) — compact table ──────────────────────────────────────
+    p(f"  {BLD}{YLW}{'─'*4} EQUITIES (CBOE) {'─'*(WIDTH-18)}{RST}")
+    mark('eq_status'); p(f"    {'Status':<8}")
+    p(f"    {BLD}{'Symbol':<8}{'Put Vol':>11}{'Call Vol':>11}{'P/C':>7}{'IV':>8}  Sentiment{RST}")
+    for sym in EQUITY_SYMBOLS:
+        mark(f'eq_{sym}'); p(f"    {sym:<8}")
+    p()
+
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    p(f"  {DIM}Source: Deribit API  |  Covers all strikes & expiries{RST}")
-    p(f"  {DIM}Red bar = Puts  |  Green bar = Calls{RST}")
+    p(f"  {DIM}Crypto: Deribit (all strikes/expiries)  |  Equities: CBOE{RST}")
+    p(f"  {DIM}Equities P/C = total volume, all strikes & expiries (~15m delay){RST}")
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     mark('exit'); p(f"  {DIM}Press Ctrl+C to exit{RST}")
@@ -200,7 +295,7 @@ def draw_static():
     sys.stdout.flush()
 
 
-def update_values(results, errors, fetch_time, remaining, eth_price):
+def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
     bar_width = 30
     ts = fetch_time.strftime('%A  %Y-%m-%d  %H:%M:%S UTC')
 
@@ -230,7 +325,7 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
             move(ROWS[f'{ccy}_put'])
             erase_line()
             sys.stdout.write(f"    {RED}✗ Error: {errors[ccy]}{RST}")
-            for key in ('call', 'total', 'ratio', 'sentiment', 'bar', 'pct'):
+            for key in ('call', 'total', 'dvol', 'ratio', 'sentiment', 'bar', 'pct'):
                 move(ROWS[f'{ccy}_{key}'])
                 erase_line()
             continue
@@ -254,6 +349,14 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
         move(ROWS[f'{ccy}_total'])
         erase_line()
         sys.stdout.write(f"    {'24h Total Volume':<20} {DIM}{total:>12,.2f}{RST}  {ccy}")
+
+        move(ROWS[f'{ccy}_dvol'])
+        erase_line()
+        dv = dvol.get(ccy)
+        if dv is not None:
+            sys.stdout.write(f"    {'DVOL (30d IV)':<20} {CYN}{BLD}{dv:>12.2f}{RST}  %")
+        else:
+            sys.stdout.write(f"    {'DVOL (30d IV)':<20} {DIM}{'unavailable':>12}{RST}")
 
         move(ROWS[f'{ccy}_ratio'])
         erase_line()
@@ -285,6 +388,49 @@ def update_values(results, errors, fetch_time, remaining, eth_price):
         erase_line()
         sys.stdout.write(f"    {DIM}     {put_pct*100:>5.1f}%{' '*(bar_width-1)}{call_pct*100:>5.1f}%{RST}")
 
+    # ── Equities (CBOE) ───────────────────────────────────────────────────────
+    move(ROWS['eq_status'])
+    erase_line()
+    if eq_status.startswith('OK'):
+        st_col = GRN
+    elif eq_status.startswith('err'):
+        st_col = RED
+    else:
+        st_col = YLW
+    sys.stdout.write(f"    {'Status':<8} {st_col}{eq_status}{RST}")
+
+    for sym in EQUITY_SYMBOLS:
+        move(ROWS[f'eq_{sym}'])
+        erase_line()
+
+        if sym in eq_errors:
+            sys.stdout.write(f"    {sym:<8} {RED}✗ {eq_errors[sym]}{RST}")
+            continue
+        if sym not in eq_results:
+            sys.stdout.write(f"    {sym:<8} {DIM}waiting…{RST}")
+            continue
+
+        put_vol, call_vol, ratio, iv30 = eq_results[sym]
+        rc = ratio_colour(ratio)
+        if ratio >= 1.02:
+            eq_sent = f"{RED}{BLD}BEARISH{RST}"
+        elif 0 < ratio <= 0.98:
+            eq_sent = f"{GRN}{BLD}BULLISH{RST}"
+        else:
+            eq_sent = f"{YLW}{BLD}NEUTRAL{RST}"
+        iv_str = f"{iv30:.1f}%" if iv30 else "n/a"
+
+        sys.stdout.write(
+            f"    {sym:<8}{RED}{put_vol:>11,.0f}{RST}{GRN}{call_vol:>11,.0f}{RST}"
+            f"{rc}{BLD}{ratio:>7.2f}{RST}{CYN}{iv_str:>8}{RST}  {eq_sent}"
+        )
+
+        # Sentiment-change alert (shared with crypto)
+        label = _get_sentiment(ratio)
+        if _prev_sentiment.get(sym) is not None and _prev_sentiment[sym] != label:
+            _play_alert()
+        _prev_sentiment[sym] = label
+
     move(ROWS['exit'])
     erase_line()
     sys.stdout.write(f"  {DIM}Press Ctrl+C to exit{RST}")
@@ -301,9 +447,16 @@ def cleanup_terminal():
 
 # ── Main fetch loop ───────────────────────────────────────────────────────────
 async def fetch_all(interval):
+    global eq_status
     msg_id    = 0
     eth_price = None
     backoff   = 5   # seconds, doubles on each failed attempt up to 60s
+
+    # Equities prefetch pipeline: a fetch is kicked off at the start of each
+    # countdown and runs (~9s) in the background. Its completed snapshot is
+    # promoted to the display at the next cycle boundary, so equities refresh in
+    # lockstep with the crypto counter instead of at random times.
+    eq_job = None
 
     while True:
         try:
@@ -323,6 +476,18 @@ async def fetch_all(interval):
                     fetch_time = datetime.now(timezone.utc)
                     results    = {}
                     errors     = {}
+
+                    # ── Equities: promote the finished prefetch, then start the
+                    #    next one so it's ready by the time this cycle ends ──
+                    if eq_job is not None and eq_job.done():
+                        res, errs, status = eq_job.result()
+                        eq_results.clear(); eq_results.update(res)
+                        eq_errors.clear();  eq_errors.update(errs)
+                        eq_status = status
+                        eq_job = None
+                    if eq_job is None:
+                        eq_status = 'fetching…'
+                        eq_job = asyncio.ensure_future(refresh_equities())
 
                     for ccy in CURRENCIES:
                         try:
@@ -369,13 +534,47 @@ async def fetch_all(interval):
                                 raise
                             errors[ccy] = str(e)
 
+                    # ── Deribit DVOL (30-day volatility index) per currency ──
+                    dvol    = {}
+                    now_ms  = int(time.time() * 1000)
+                    for ccy in CURRENCIES:
+                        try:
+                            msg_id += 1
+                            req = {
+                                "jsonrpc": "2.0",
+                                "id":      msg_id,
+                                "method":  "public/get_volatility_index_data",
+                                "params":  {
+                                    "currency":        ccy,
+                                    "start_timestamp": now_ms - 7200000,   # last 2h
+                                    "end_timestamp":   now_ms,
+                                    "resolution":      "3600",
+                                },
+                            }
+                            await ws.send(json.dumps(req))
+                            while True:
+                                raw  = await asyncio.wait_for(ws.recv(), timeout=25)
+                                resp = json.loads(raw)
+                                if resp.get('id') == msg_id:
+                                    break
+                            candles = (resp.get('result') or {}).get('data') or []
+                            if candles:
+                                dvol[ccy] = float(candles[-1][4])   # last close
+                        except asyncio.TimeoutError:
+                            pass
+                        except Exception as e:
+                            if 'websockets' in type(e).__module__ or 'close frame' in str(e).lower() or 'connection' in str(e).lower():
+                                raise
+
                     eth_price = await fetch_eth_price()
 
                     for remaining in range(interval, 0, -1):
-                        update_values(results, errors, fetch_time, remaining, eth_price)
+                        update_values(results, errors, dvol, fetch_time, remaining, eth_price)
                         await asyncio.sleep(1)
 
         except asyncio.CancelledError:
+            if eq_job is not None:
+                eq_job.cancel()
             raise
         except Exception as e:
             # Show error and wait with exponential backoff before reconnecting
@@ -389,7 +588,7 @@ async def fetch_all(interval):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Deribit Put/Call Volume Dashboard')
+    parser = argparse.ArgumentParser(description='Deribit + CBOE Put/Call Volume Dashboard')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
     args = parser.parse_args()

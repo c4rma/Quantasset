@@ -691,8 +691,8 @@ f_vp_render_boxes(VPSession s, bool place_right, int pw, int offset) =>
                 _bx2 := bar_index + offset + pw
                 _bx1 := _bx2 - int(_rpct * pw)
             else
-                _bx1 := s.start_bi
-                _bx2 := _bx1 + int(_rpct * pw)
+                _bx2 := s.end_bi
+                _bx1 := _bx2 - int(_rpct * pw)
             _vp_boxes.push(box.new(_bx1, _rhi2, _bx2, _rlo2, border_color=na, bgcolor=_col))
 
 if barstate.islast and i_show_vp

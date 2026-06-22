@@ -555,12 +555,13 @@ if is_new_session and i_show_so
     _so_price := i_asset_mode == "Equities" ? close : open
     string _so_txt = i_asset_mode == "Equities" ? "Previous EOD Close: " + str.tostring(_so_price, format.mintick) : "Session Open"
     _so_line  := line.new(bar_index, _so_price, bar_index + 1, _so_price,
-                          color=color.white, style=line.style_dashed, width=1, extend=extend.right)
+                          color=color.white, style=line.style_dashed, width=1)
     _so_lbl   := label.new(bar_index, _so_price, _so_txt,
                            textcolor=color.white, style=label.style_label_left,
                            color=color.new(color.black, 100), size=size.small)
 
 if i_show_so and not na(_so_line) and not is_new_session
+    line.set_x2(_so_line, bar_index)
     label.set_xy(_so_lbl, bar_index, _so_price)
 
 // ═══════════════════════════════════════════════════════════════════════════

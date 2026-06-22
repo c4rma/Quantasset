@@ -699,9 +699,11 @@ if barstate.islast and i_show_vp
             float _rlo2 = _rlo + _ri * _step
             float _rhi2 = _rlo + (_ri + 1) * _step
             bool  _inva = _ri >= _val_i and _ri <= _vah_i
-            color _col  = _inva ?
-                color.from_gradient(_rpct, 0, 1, color.new(#2962ff, 92), color.new(#2962ff, 25)) :
-                color.from_gradient(_rpct, 0, 1, color.new(#5d606b, 96), color.new(#5d606b, 60))
+            color _col = color.new(color.white, 100)
+            if _inva
+                _col := color.from_gradient(_rpct, 0, 1, color.new(#2962ff, 92), color.new(#2962ff, 25))
+            else
+                _col := color.from_gradient(_rpct, 0, 1, color.new(#5d606b, 96), color.new(#5d606b, 60))
             int _bx1 = 0, _bx2 = 0
             if _pr
                 _bx2 := bar_index + i_vp_offset + _pw

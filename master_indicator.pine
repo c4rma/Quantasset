@@ -86,6 +86,22 @@ i_eeod_col    = input.color(color.new(color.green,   80), "", inline="eeod",  gr
 
 // NOTE: Add TradingView's built-in "Volume" indicator separately for volume bars.
 
+// ── VOLUME PROFILE ────────────────────────────────────────────────────────
+i_show_vp       = input.bool(false,    "Show Volume Profile",   group="Volume Profile")
+i_vp_period     = input.string("Day",  "Period",                group="Volume Profile", options=["Day", "Custom"])
+i_vp_length     = input.int(200,       "Custom Length (bars)",  group="Volume Profile", minval=10, maxval=500, tooltip="Only used when Period is 'Custom'.")
+i_vp_rows       = input.int(50,        "Rows",                  group="Volume Profile", minval=10, maxval=130)
+i_vp_placement  = input.string("Right","Placement",             group="Volume Profile", options=["Right", "Left"])
+i_vp_width      = input.int(80,        "Profile Width (bars)",  group="Volume Profile", minval=5, maxval=500, tooltip="Visual width of the profile in bar units.")
+i_vp_offset     = input.int(5,         "Right Offset (bars)",  group="Volume Profile", minval=0, maxval=50, tooltip="Gap between last candle and profile. Only used when Placement is 'Right'.")
+i_vp_va_pct     = input.float(70.0,   "Value Area %",          group="Volume Profile", minval=1.0, maxval=99.0)
+i_show_poc      = input.bool(true,     "",                      inline="poc",    group="Volume Profile")
+i_poc_col       = input.color(color.red,   "POC",              inline="poc",    group="Volume Profile")
+i_poc_width     = input.int(2,         "Width",                inline="poc",    group="Volume Profile", minval=1, maxval=5)
+i_show_vah_val  = input.bool(true,     "",                      inline="vahval", group="Volume Profile")
+i_vah_val_col   = input.color(#2962ff, "VAH / VAL",            inline="vahval", group="Volume Profile")
+i_vah_val_width = input.int(1,         "Width",                inline="vahval", group="Volume Profile", minval=1, maxval=5)
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSION BOUNDARY  (anchor: 19:00 Chicago = CME daily open)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,6 +111,28 @@ _ct_now   = hour(time, CT) * 60 + minute(time, CT)
 _ct_prev  = hour(time[1], CT) * 60 + minute(time[1], CT)
 int _sess_boundary = i_asset_mode == "Equities" ? 16 * 60 : 19 * 60
 is_new_session = _ct_now >= _sess_boundary and _ct_prev < _sess_boundary
+
+// VP day-mode: accumulate bar data within current session (reset at boundary)
+var float[] _vp_d_hi  = array.new_float(0)
+var float[] _vp_d_lo  = array.new_float(0)
+var float[] _vp_d_vol = array.new_float(0)
+// VP drawing-object handles
+var box[]   _vp_boxes   = array.new<box>()
+var line    _vp_poc_ln  = na
+var line    _vp_vah_ln  = na
+var line    _vp_val_ln  = na
+var label   _vp_poc_lbl = na
+var label   _vp_vah_lbl = na
+var label   _vp_val_lbl = na
+
+if i_show_vp and i_vp_period == "Day"
+    if is_new_session
+        _vp_d_hi.clear()
+        _vp_d_lo.clear()
+        _vp_d_vol.clear()
+    _vp_d_hi.push(high)
+    _vp_d_lo.push(low)
+    _vp_d_vol.push(volume)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)
@@ -563,6 +601,145 @@ if is_new_session and i_show_so
 if i_show_so and not na(_so_line) and not is_new_session
     line.set_x2(_so_line, bar_index)
     label.set_xy(_so_lbl, bar_index, _so_price)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOLUME PROFILE
+// ═══════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and i_show_vp
+    // ── 1. Build bar arrays from period source ────────────────────────────
+    float[] _bh = na
+    float[] _bl = na
+    float[] _bv = na
+    int _vp_start_bi = 0
+
+    if i_vp_period == "Day"
+        _bh := _vp_d_hi
+        _bl := _vp_d_lo
+        _bv := _vp_d_vol
+        _vp_start_bi := bar_index - math.max(_vp_d_hi.size() - 1, 0)
+    else
+        int _len = math.min(i_vp_length, bar_index + 1)
+        _bh := array.new_float(_len)
+        _bl := array.new_float(_len)
+        _bv := array.new_float(_len)
+        for _i = 0 to _len - 1
+            _bh.set(_i, high[_len - 1 - _i])
+            _bl.set(_i, low[_len - 1 - _i])
+            _bv.set(_i, volume[_len - 1 - _i])
+        _vp_start_bi := bar_index - _len + 1
+
+    int _n = _bh.size()
+
+    // ── 2. Clear previous VP boxes ────────────────────────────────────────
+    if _vp_boxes.size() > 0
+        for _ci = 0 to _vp_boxes.size() - 1
+            box.delete(_vp_boxes.get(_ci))
+        _vp_boxes.clear()
+
+    if _n > 0
+        // ── 3. Price range ──────────────────────────────────────────────
+        float _rlo  = _bl.min()
+        float _rhi  = _bh.max()
+        float _step = (_rhi - _rlo) / i_vp_rows
+
+        // ── 4. Volume distribution into buckets ─────────────────────────
+        float[] _vols = array.new_float(i_vp_rows, 0.0)
+        for _bi = 0 to _n - 1
+            float _lh = _bh.get(_bi)
+            float _ll = _bl.get(_bi)
+            float _lv = _bv.get(_bi)
+            if _lh > _ll
+                int _s = math.max(int(math.floor((_ll - _rlo) / _step)), 0)
+                int _e = math.min(int(math.floor((_lh - _rlo) / _step)), i_vp_rows - 1)
+                for _pi = _s to _e
+                    float _pl   = _rlo + _pi * _step
+                    float _prop = switch
+                        _ll >= _pl and _lh > _pl + _step  => (_pl + _step - _ll) / (_lh - _ll)
+                        _lh <= _pl + _step and _ll < _pl  => (_lh - _pl) / (_lh - _ll)
+                        _ll >= _pl and _lh <= _pl + _step => 1.0
+                        => _step / (_lh - _ll)
+                    _vols.set(_pi, _vols.get(_pi) + _lv * _prop)
+
+        // ── 5. POC / VAH / VAL ──────────────────────────────────────────
+        float _max_vol = _vols.max()
+        int   _poc_i   = _vols.indexof(_max_vol)
+        float _va_tgt  = _vols.sum() * (i_vp_va_pct / 100.0)
+        float _va_vol  = _vols.get(_poc_i)
+        int   _vah_i   = _poc_i
+        int   _val_i   = _poc_i
+
+        while _va_vol < _va_tgt
+            if _val_i == 0 and _vah_i == i_vp_rows - 1
+                break
+            float _up = _vah_i < i_vp_rows - 1 ? _vols.get(_vah_i + 1) : 0.0
+            float _dn = _val_i > 0 ? _vols.get(_val_i - 1) : 0.0
+            if _up == 0.0 and _dn == 0.0
+                break
+            if _up >= _dn
+                _va_vol += _up
+                _vah_i  += 1
+            else
+                _va_vol += _dn
+                _val_i  -= 1
+
+        float _poc_p = _rlo + (_poc_i + 0.5) * _step
+        float _vah_p = _rlo + (_vah_i + 1.0) * _step
+        float _val_p = _rlo +  _val_i        * _step
+
+        // ── 6. Profile geometry ─────────────────────────────────────────
+        bool _pr  = i_vp_placement == "Right"
+        int  _pw  = i_vp_width
+        int  _lx2 = _pr ? bar_index + i_vp_offset + _pw : bar_index
+
+        // ── 7. Render profile boxes ─────────────────────────────────────
+        for _ri = 0 to i_vp_rows - 1
+            float _rv   = _vols.get(_ri)
+            float _rpct = _max_vol > 0 ? _rv / _max_vol : 0.0
+            float _rlo2 = _rlo + _ri * _step
+            float _rhi2 = _rlo + (_ri + 1) * _step
+            bool  _inva = _ri >= _val_i and _ri <= _vah_i
+            color _col  = _inva ?
+                color.from_gradient(_rpct, 0, 1, color.new(#2962ff, 92), color.new(#2962ff, 25)) :
+                color.from_gradient(_rpct, 0, 1, color.new(#5d606b, 96), color.new(#5d606b, 60))
+            int _bx1 = 0, _bx2 = 0
+            if _pr
+                _bx2 := bar_index + i_vp_offset + _pw
+                _bx1 := _bx2 - int(_rpct * _pw)
+            else
+                _bx1 := _vp_start_bi
+                _bx2 := _bx1 + int(_rpct * _pw)
+            _vp_boxes.push(box.new(_bx1, _rhi2, _bx2, _rlo2, border_color=na, bgcolor=_col))
+
+        // ── 8. POC / VAH / VAL lines + labels ──────────────────────────
+        line.delete(_vp_poc_ln)
+        line.delete(_vp_vah_ln)
+        line.delete(_vp_val_ln)
+        label.delete(_vp_poc_lbl)
+        label.delete(_vp_vah_lbl)
+        label.delete(_vp_val_lbl)
+
+        if i_show_poc
+            _vp_poc_ln  := line.new(_vp_start_bi, _poc_p, _lx2, _poc_p,
+                                    color=i_poc_col, width=i_poc_width)
+            _vp_poc_lbl := label.new(bar_index, _poc_p,
+                                     " POC: " + str.tostring(_poc_p, format.mintick),
+                                     textcolor=i_poc_col, style=label.style_label_left,
+                                     color=color.new(color.black, 100), size=size.tiny)
+
+        if i_show_vah_val
+            _vp_vah_ln  := line.new(_vp_start_bi, _vah_p, _lx2, _vah_p,
+                                    color=i_vah_val_col, width=i_vah_val_width)
+            _vp_vah_lbl := label.new(bar_index, _vah_p,
+                                     " VAH: " + str.tostring(_vah_p, format.mintick),
+                                     textcolor=i_vah_val_col, style=label.style_label_left,
+                                     color=color.new(color.black, 100), size=size.tiny)
+            _vp_val_ln  := line.new(_vp_start_bi, _val_p, _lx2, _val_p,
+                                    color=i_vah_val_col, width=i_vah_val_width)
+            _vp_val_lbl := label.new(bar_index, _val_p,
+                                     " VAL: " + str.tostring(_val_p, format.mintick),
+                                     textcolor=i_vah_val_col, style=label.style_label_left,
+                                     color=color.new(color.black, 100), size=size.tiny)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // USER LEVELS — Buy Territory / Sell Territory

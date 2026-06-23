@@ -185,16 +185,8 @@ var label  _vp_poc_lbl = na
 var label  _vp_vah_lbl = na
 var label  _vp_val_lbl = na
 
-// Equities VP uses calendar-day boundaries so each trading day (including
-// holidays/weekends) gets its own profile rather than merging across gaps.
-// Crypto VP uses the existing 19:00 CT session boundary.
-bool _vp_sess_end = i_asset_mode == "Equities" ?
-     (bar_index > 0 and (dayofmonth(time, CT) != dayofmonth(time[1], CT) or
-                          month(time, CT)      != month(time[1], CT))) :
-     is_new_session
-
 if i_show_vp and i_vp_period == "Day"
-    if _vp_sess_end
+    if is_new_session
         // Finalise the session that just ended and store it
         if _vp_d_hi.size() > 0
             _vp_hist.push(f_vp_compute(_vp_d_hi, _vp_d_lo, _vp_d_vol,

@@ -737,21 +737,22 @@ if barstate.islast and i_show_vp
         int  _pw        = i_vp_width
 
         // Render historical sessions (right-anchored to session end)
-        for _si = _first to _n_hist - 1
-            VPSession _s = _vp_hist.get(_si)
-            if bar_index - _s.end_bi > 4900
-                continue
-            f_vp_render_boxes(_s, false, _pw, i_vp_offset)
-            int _lx2 = _s.end_bi
-            int _lx1 = _lx2 - _pw  // match box width, avoids referencing old bar indices
-            if i_show_poc
-                _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
-                                           color=i_poc_col, width=i_poc_width))
-            if i_show_vah_val
-                _vp_vah_lns.push(line.new(_lx1, _s.vah_p, _lx2, _s.vah_p,
-                                           color=i_vah_val_col, width=i_vah_val_width))
-                _vp_val_lns.push(line.new(_lx1, _s.val_p, _lx2, _s.val_p,
-                                           color=i_vah_val_col, width=i_vah_val_width))
+        if _n_hist > 0
+            for _si = _first to _n_hist - 1
+                VPSession _s = _vp_hist.get(_si)
+                if bar_index - _s.end_bi > 4900
+                    continue
+                f_vp_render_boxes(_s, false, _pw, i_vp_offset)
+                int _lx2 = _s.end_bi
+                int _lx1 = _lx2 - _pw  // match box width, avoids referencing old bar indices
+                if i_show_poc
+                    _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
+                                               color=i_poc_col, width=i_poc_width))
+                if i_show_vah_val
+                    _vp_vah_lns.push(line.new(_lx1, _s.vah_p, _lx2, _s.vah_p,
+                                               color=i_vah_val_col, width=i_vah_val_width))
+                    _vp_val_lns.push(line.new(_lx1, _s.val_p, _lx2, _s.val_p,
+                                               color=i_vah_val_col, width=i_vah_val_width))
 
         // Render current session
         f_vp_render_boxes(_cur, _cur_right, _pw, i_vp_offset)

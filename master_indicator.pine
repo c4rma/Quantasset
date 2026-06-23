@@ -185,8 +185,10 @@ var label  _vp_poc_lbl = na
 var label  _vp_vah_lbl = na
 var label  _vp_val_lbl = na
 
+bool _vp_16ct = _ct_now >= 16 * 60 and _ct_prev < 16 * 60
+
 if i_show_vp and i_vp_period == "Day"
-    if is_new_session
+    if _vp_16ct
         // Finalise the session that just ended and store it
         if _vp_d_hi.size() > 0
             _vp_hist.push(f_vp_compute(_vp_d_hi, _vp_d_lo, _vp_d_vol,

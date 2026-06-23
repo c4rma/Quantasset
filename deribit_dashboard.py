@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import argparse
+import threading
 from datetime import datetime, timezone, timedelta
 
 import subprocess
@@ -45,10 +46,20 @@ CT_OFFSET      = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
 EQUITY_SYMBOLS = ['TLT', 'GLD', 'QQQ']
 CBOE_URL       = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
 
+# Auto-refresh once per weekday when the clock reaches this CT time (market open
+# data settles). Mirrors a manual restart so the new session's PCVR/IV/DVOL show
+# up without intervention.
+MARKET_OPEN_REFRESH = (8, 45)   # (hour, minute) in CT
+
 # ── Shared equities state (prefetched in background, promoted at cycle boundary) ─
 eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30)
 eq_errors  = {}            # symbol -> short error string
 eq_status  = 'starting…'
+
+# ── Interactive controls (set by the keyboard thread, polled by the loop) ──────
+_quit_evt    = threading.Event()
+_refresh_evt = threading.Event()
+_last_open_refresh = None   # date of the most recent market-open auto-refresh
 
 # ── Kill zones (CT, minutes since midnight) ───────────────────────────────────
 KILL_ZONES = [
@@ -164,11 +175,14 @@ async def _cboe_symbol_volume(client, symbol):
     """
     Return (put_vol, call_vol, iv30) for one symbol — a single GET.
 
-    put_vol/call_vol are summed across the entire CBOE option chain (all strikes,
-    all expiries); iv30 is CBOE's 30-day implied volatility (VIX-style, in %).
+    put_vol/call_vol are summed across the entire CBOE chain (all strikes,
+    all expiries). iv30 is CBOE's 30-day constant-maturity implied vol (VIX-style,
+    in %) — stable intraday and matches IBKR's IV index, which makes it the right
+    input for expected-range and vol-stop levels. (The raw 0DTE ATM IV is higher
+    and lurches as time-to-expiry → 0, so it distorts fixed ER/stop formulas.)
+
     Each contract's OCC symbol ends with <type><8-digit-strike>, e.g.
-    'GLD260618P00388000', so the option type is reliably the 9th char from the
-    end. No expiry attribution games — the whole consolidated chain is returned.
+    'GLD260618P00388000', so the option type is reliably char[-9].
     """
     r = await client.get(CBOE_URL.format(symbol))
     r.raise_for_status()
@@ -187,10 +201,9 @@ async def _cboe_symbol_volume(client, symbol):
         name = o.get('option') or ''
         if len(name) < 9:
             continue
-        cp  = name[-9]                       # 'C' or 'P' (before the 8-digit strike)
-        vol = o.get('volume') or 0
+        cp  = name[-9]                       # 'C' or 'P'
         try:
-            vol = float(vol)
+            vol = float(o.get('volume') or 0)
         except (TypeError, ValueError):
             vol = 0.0
         if cp == 'P':
@@ -286,11 +299,11 @@ def draw_static():
     p()
 
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    p(f"  {DIM}Crypto: Deribit (all strikes/expiries)  |  Equities: CBOE{RST}")
-    p(f"  {DIM}Equities P/C = total volume, all strikes & expiries (~15m delay){RST}")
+    p(f"  {DIM}Equities P/C = total volume (all strikes/expiries){RST}")
+    p(f"  {DIM}IV = 30-day (matches IBKR's IV index)  |  ~15m delayed{RST}")
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    mark('exit'); p(f"  {DIM}Press Ctrl+C to exit{RST}")
+    mark('exit'); p(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh{RST}")
 
     sys.stdout.flush()
 
@@ -433,9 +446,56 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
 
     move(ROWS['exit'])
     erase_line()
-    sys.stdout.write(f"  {DIM}Press Ctrl+C to exit{RST}")
+    sys.stdout.write(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh{RST}")
 
     sys.stdout.flush()
+
+
+# ── Keyboard input thread ([Q]uit / [R]efresh) ────────────────────────────────
+def _input_thread():
+    """Daemon thread: read single keypresses and signal the loop via events.
+    Q quits, R forces an immediate refresh. No Enter needed."""
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            while not _quit_evt.is_set():
+                ch = msvcrt.getwch()
+                if ch in ('q', 'Q'):
+                    _quit_evt.set();    break
+                elif ch in ('r', 'R'):
+                    _refresh_evt.set()
+                elif ch == '\x03':                 # Ctrl+C
+                    _quit_evt.set();    break
+        else:
+            import termios, tty, select
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while not _quit_evt.is_set():
+                    if select.select([sys.stdin], [], [], 0.2)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch in ('q', 'Q'):
+                            _quit_evt.set();    break
+                        elif ch in ('r', 'R'):
+                            _refresh_evt.set()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+def _market_open_refresh_due():
+    """True once per weekday when the CT clock first reaches MARKET_OPEN_REFRESH."""
+    global _last_open_refresh
+    now_ct = datetime.now(timezone.utc) + CT_OFFSET
+    if now_ct.weekday() >= 5:                       # Sat/Sun — market closed
+        return False
+    h, m = MARKET_OPEN_REFRESH
+    if (now_ct.hour * 60 + now_ct.minute) >= (h * 60 + m) and _last_open_refresh != now_ct.date():
+        _last_open_refresh = now_ct.date()
+        return True
+    return False
 
 
 # ── Terminal cleanup ──────────────────────────────────────────────────────────
@@ -456,7 +516,8 @@ async def fetch_all(interval):
     # countdown and runs (~9s) in the background. Its completed snapshot is
     # promoted to the display at the next cycle boundary, so equities refresh in
     # lockstep with the crypto counter instead of at random times.
-    eq_job = None
+    eq_job   = None
+    force_eq = False   # set after a manual/market-open refresh to pull fresh data
 
     while True:
         try:
@@ -478,7 +539,12 @@ async def fetch_all(interval):
                     errors     = {}
 
                     # ── Equities: promote the finished prefetch, then start the
-                    #    next one so it's ready by the time this cycle ends ──
+                    #    next one so it's ready by the time this cycle ends.
+                    #    A forced refresh discards any in-flight fetch. ──
+                    if force_eq and eq_job is not None and not eq_job.done():
+                        eq_job.cancel()
+                        eq_job = None
+                    force_eq = False
                     if eq_job is not None and eq_job.done():
                         res, errs, status = eq_job.result()
                         eq_results.clear(); eq_results.update(res)
@@ -568,9 +634,24 @@ async def fetch_all(interval):
 
                     eth_price = await fetch_eth_price()
 
+                    # ── Countdown — polls keys/market-open ~10x/sec so [R] and
+                    #    [Q] feel instant and the 08:45 refresh fires on time ──
+                    interrupted = False
                     for remaining in range(interval, 0, -1):
                         update_values(results, errors, dvol, fetch_time, remaining, eth_price)
-                        await asyncio.sleep(1)
+                        for _ in range(10):
+                            if _quit_evt.is_set():
+                                if eq_job is not None:
+                                    eq_job.cancel()
+                                return
+                            if _refresh_evt.is_set() or _market_open_refresh_due():
+                                _refresh_evt.clear()
+                                force_eq    = True   # pull fresh equities, don't reuse in-flight
+                                interrupted = True
+                                break
+                            await asyncio.sleep(0.1)
+                        if interrupted:
+                            break   # restart the cycle now → refetch everything
 
         except asyncio.CancelledError:
             if eq_job is not None:
@@ -588,16 +669,29 @@ async def fetch_all(interval):
 
 
 def main():
+    global _last_open_refresh
+
     parser = argparse.ArgumentParser(description='Deribit + CBOE Put/Call Volume Dashboard')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
     args = parser.parse_args()
+
+    # Pre-arm the market-open auto-refresh: if we launch after today's trigger
+    # time, mark it done so it only fires when the clock *crosses* 08:45 during
+    # a run (the unattended overnight case) — not redundantly at startup.
+    now_ct = datetime.now(timezone.utc) + CT_OFFSET
+    if (now_ct.hour * 60 + now_ct.minute) >= (MARKET_OPEN_REFRESH[0] * 60 + MARKET_OPEN_REFRESH[1]):
+        _last_open_refresh = now_ct.date()
+
+    # Start the keyboard listener ([Q]uit / [R]efresh) as a daemon thread.
+    threading.Thread(target=_input_thread, daemon=True).start()
 
     try:
         asyncio.run(fetch_all(args.interval))
     except KeyboardInterrupt:
         pass
     finally:
+        _quit_evt.set()
         cleanup_terminal()
         print(f"{DIM}Exited.{RST}")
 

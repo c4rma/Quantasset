@@ -11,6 +11,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import csv
 import json
 import os
 import sys
@@ -45,14 +46,24 @@ CT_OFFSET      = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
 # put/call direction (e.g. GLD/TLT correctly read < 1.00). Needs only httpx.
 EQUITY_SYMBOLS = ['TLT', 'GLD', 'QQQ']
 CBOE_URL       = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
+# Exp Move = ATM straddle of the 0DTE (or nearest) expiry × this factor.
+# 1.0 = raw straddle (≈ market-implied expected absolute move to expiry);
+# set 0.85 for the common 1-SD "expected move" convention.
+EXP_MOVE_FACTOR = 1.0
 
 # Auto-refresh once per weekday when the clock reaches this CT time (market open
 # data settles). Mirrors a manual restart so the new session's PCVR/IV/DVOL show
 # up without intervention.
 MARKET_OPEN_REFRESH = (8, 45)   # (hour, minute) in CT
 
+# ── CSV logging — one wide row appended after every refresh ────────────────────
+CSV_FILE   = 'pcvr_log.csv'   # default name (created next to this script)
+_csv_path  = None             # resolved in main(); None disables logging
+_csv_rows  = 0                # rows written this run
+_csv_err   = None             # last write error (shown on the status line)
+
 # ── Shared equities state (prefetched in background, promoted at cycle boundary) ─
-eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30)
+eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte)
 eq_errors  = {}            # symbol -> short error string
 eq_status  = 'starting…'
 
@@ -81,6 +92,14 @@ if sys.platform == 'win32':
     import ctypes
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+
+# Force UTF-8 so the box-drawing/± glyphs always encode — otherwise a non-UTF-8
+# stdout (e.g. piped to a file under cp1252) raises UnicodeEncodeError on every
+# draw and the dashboard silently loops on the reconnect handler.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 GRN = '\033[92m'
 RED = '\033[91m'
@@ -171,18 +190,35 @@ def _play_alert():
         pass
 
 # ── Equities options fetch (CBOE delayed quotes) ──────────────────────────────
+def _opt_mid(o):
+    """Mid price of a contract; falls back to last trade if no two-sided quote."""
+    try:
+        bid = float(o.get('bid') or 0)
+        ask = float(o.get('ask') or 0)
+    except (TypeError, ValueError):
+        bid = ask = 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    try:
+        return float(o.get('last_trade_price') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 async def _cboe_symbol_volume(client, symbol):
     """
-    Return (put_vol, call_vol, iv30) for one symbol — a single GET.
+    Return (put_vol, call_vol, iv30, exp_move, em_is_0dte) for one symbol — one GET.
 
-    put_vol/call_vol are summed across the entire CBOE chain (all strikes,
-    all expiries). iv30 is CBOE's 30-day constant-maturity implied vol (VIX-style,
-    in %) — stable intraday and matches IBKR's IV index, which makes it the right
-    input for expected-range and vol-stop levels. (The raw 0DTE ATM IV is higher
-    and lurches as time-to-expiry → 0, so it distorts fixed ER/stop formulas.)
+    put_vol/call_vol are summed across the entire CBOE chain (all strikes/expiries).
+    iv30 is CBOE's 30-day constant-maturity implied vol (VIX-style, %) — stable and
+    IBKR-matching, the right input for vol-stop levels.
+    exp_move is the ATM straddle (call mid + put mid at the strike nearest spot) of
+    the 0DTE expiry × EXP_MOVE_FACTOR — the market-implied expected move to expiry.
+    If the symbol has no 0DTE today (e.g. GLD/TLT), it uses the nearest expiry and
+    em_is_0dte is False.
 
-    Each contract's OCC symbol ends with <type><8-digit-strike>, e.g.
-    'GLD260618P00388000', so the option type is reliably char[-9].
+    OCC symbol ends with <YYMMDD><type><8-digit-strike>, e.g. 'GLD260618P00388000':
+    type = char[-9], expiry = chars[-15:-9], strike = int(chars[-8:]) / 1000.
     """
     r = await client.get(CBOE_URL.format(symbol))
     r.raise_for_status()
@@ -195,13 +231,24 @@ async def _cboe_symbol_volume(client, symbol):
         iv30 = float(data.get('iv30'))
     except (TypeError, ValueError):
         iv30 = 0.0
+    try:
+        price = float(data.get('current_price'))
+    except (TypeError, ValueError):
+        price = 0.0
 
+    today   = datetime.now().strftime('%y%m%d')
     put_vol = call_vol = 0.0
+    legs    = {}   # expiry -> {strike: {'C': mid, 'P': mid}}
     for o in options:
         name = o.get('option') or ''
-        if len(name) < 9:
+        if len(name) < 15:
             continue
         cp  = name[-9]                       # 'C' or 'P'
+        exp = name[-15:-9]                   # YYMMDD
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
         try:
             vol = float(o.get('volume') or 0)
         except (TypeError, ValueError):
@@ -210,8 +257,22 @@ async def _cboe_symbol_volume(client, symbol):
             put_vol  += vol
         elif cp == 'C':
             call_vol += vol
+        else:
+            continue
+        legs.setdefault(exp, {}).setdefault(strike, {})[cp] = _opt_mid(o)
 
-    return put_vol, call_vol, iv30
+    # Expected move: ATM straddle of the 0DTE expiry, else nearest expiry
+    em_is_0dte = today in legs
+    target_exp = today if em_is_0dte else min((e for e in legs if e >= today), default=None)
+    exp_move = 0.0
+    if target_exp and price > 0:
+        strikes = legs[target_exp]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 and lg.get('P', 0) > 0]
+        if atm:
+            k = min(atm, key=lambda s: abs(s - price))
+            exp_move = (strikes[k]['C'] + strikes[k]['P']) * EXP_MOVE_FACTOR
+
+    return put_vol, call_vol, iv30, exp_move, em_is_0dte
 
 
 async def refresh_equities():
@@ -226,9 +287,9 @@ async def refresh_equities():
         async with httpx.AsyncClient(timeout=20) as client:
             async def _one(symbol):
                 try:
-                    put_vol, call_vol, iv30 = await _cboe_symbol_volume(client, symbol)
+                    put_vol, call_vol, iv30, exp_move, em_is_0dte = await _cboe_symbol_volume(client, symbol)
                     ratio = put_vol / call_vol if call_vol > 0 else 0.0
-                    results[symbol] = (put_vol, call_vol, ratio, iv30)
+                    results[symbol] = (put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte)
                 except Exception as e:
                     errors[symbol] = str(e).replace('\n', ' ')[:36]
 
@@ -243,8 +304,70 @@ async def refresh_equities():
     return results, errors, status
 
 
+# ── CSV logging ───────────────────────────────────────────────────────────────
+def _csv_columns():
+    """Ordered column names — one group per crypto currency and equity symbol."""
+    cols = ['timestamp_utc', 'session', 'eth_price']
+    for ccy in CURRENCIES:
+        cols += [f'{ccy}_put_vol', f'{ccy}_call_vol', f'{ccy}_total_vol',
+                 f'{ccy}_pc_ratio', f'{ccy}_dvol', f'{ccy}_sentiment']
+    for sym in EQUITY_SYMBOLS:
+        cols += [f'{sym}_put_vol', f'{sym}_call_vol', f'{sym}_total_vol',
+                 f'{sym}_pc_ratio', f'{sym}_iv30', f'{sym}_exp_move',
+                 f'{sym}_exp_move_0dte', f'{sym}_sentiment']
+    return cols
+
+
+def append_csv(path, fetch_time, results, dvol, eth_price):
+    """Append one wide row capturing every displayed field for this refresh.
+    Reads the equities from the shared eq_results snapshot (already promoted)."""
+    global _csv_rows, _csv_err
+
+    session_name, _, excl_reason = get_session_status()
+    row = {c: '' for c in _csv_columns()}
+    row['timestamp_utc'] = fetch_time.strftime('%Y-%m-%d %H:%M:%S')
+    row['session']       = excl_reason or session_name or 'No active session'
+    row['eth_price']     = f'{eth_price:.2f}' if eth_price else ''
+
+    for ccy in CURRENCIES:
+        if ccy in results:
+            pv, cv, ratio = results[ccy]
+            row[f'{ccy}_put_vol']   = f'{pv:.2f}'
+            row[f'{ccy}_call_vol']  = f'{cv:.2f}'
+            row[f'{ccy}_total_vol'] = f'{pv + cv:.2f}'
+            row[f'{ccy}_pc_ratio']  = f'{ratio:.4f}'
+            row[f'{ccy}_sentiment'] = _get_sentiment(ratio)
+        if ccy in dvol:
+            row[f'{ccy}_dvol'] = f'{dvol[ccy]:.2f}'
+
+    for sym in EQUITY_SYMBOLS:
+        if sym in eq_results:
+            pv, cv, ratio, iv30, em, z = eq_results[sym]
+            row[f'{sym}_put_vol']      = f'{pv:.0f}'
+            row[f'{sym}_call_vol']     = f'{cv:.0f}'
+            row[f'{sym}_total_vol']    = f'{pv + cv:.0f}'
+            row[f'{sym}_pc_ratio']     = f'{ratio:.4f}'
+            row[f'{sym}_iv30']         = f'{iv30:.2f}'
+            row[f'{sym}_exp_move']     = f'{em:.2f}'
+            row[f'{sym}_exp_move_0dte'] = 'True' if z else 'False'
+            row[f'{sym}_sentiment']    = _get_sentiment(ratio)
+
+    try:
+        cols     = _csv_columns()
+        new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+        _csv_rows += 1
+        _csv_err = None
+    except Exception as e:
+        _csv_err = str(e).replace('\n', ' ')[:40]
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
-WIDTH = 62
+WIDTH = 70
 ROWS  = {}
 
 def draw_static():
@@ -293,16 +416,17 @@ def draw_static():
     # ── Equities (CBOE) — compact table ──────────────────────────────────────
     p(f"  {BLD}{YLW}{'─'*4} EQUITIES (CBOE) {'─'*(WIDTH-18)}{RST}")
     mark('eq_status'); p(f"    {'Status':<8}")
-    p(f"    {BLD}{'Symbol':<8}{'Put Vol':>11}{'Call Vol':>11}{'P/C':>7}{'IV':>8}  Sentiment{RST}")
+    p(f"    {BLD}{'Symbol':<7}{'Put Vol':>11}{'Call Vol':>11}{'P/C':>7}{'IV':>8}{'Exp Move':>10}  Sentiment{RST}")
     for sym in EQUITY_SYMBOLS:
-        mark(f'eq_{sym}'); p(f"    {sym:<8}")
+        mark(f'eq_{sym}'); p(f"    {sym:<7}")
     p()
 
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    p(f"  {DIM}Equities P/C = total volume (all strikes/expiries){RST}")
-    p(f"  {DIM}IV = 30-day (matches IBKR's IV index)  |  ~15m delayed{RST}")
+    p(f"  {DIM}Equities P/C = total volume  |  IV = 30-day (matches IBKR){RST}")
+    p(f"  {DIM}Exp Move = ±ATM straddle to expiry (0DTE, *=nearest)  |  ~15m delay{RST}")
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
+    mark('csv');  p(f"    {'CSV':<8}")
     mark('exit'); p(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh{RST}")
 
     sys.stdout.flush()
@@ -423,7 +547,7 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
             sys.stdout.write(f"    {sym:<8} {DIM}waiting…{RST}")
             continue
 
-        put_vol, call_vol, ratio, iv30 = eq_results[sym]
+        put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte = eq_results[sym]
         rc = ratio_colour(ratio)
         if ratio >= 1.02:
             eq_sent = f"{RED}{BLD}BEARISH{RST}"
@@ -432,10 +556,12 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         else:
             eq_sent = f"{YLW}{BLD}NEUTRAL{RST}"
         iv_str = f"{iv30:.1f}%" if iv30 else "n/a"
+        # '*' marks expected move taken from the nearest expiry (no 0DTE today)
+        em_str = (f"±{exp_move:.2f}" + ("" if em_is_0dte else "*")) if exp_move else "n/a"
 
         sys.stdout.write(
-            f"    {sym:<8}{RED}{put_vol:>11,.0f}{RST}{GRN}{call_vol:>11,.0f}{RST}"
-            f"{rc}{BLD}{ratio:>7.2f}{RST}{CYN}{iv_str:>8}{RST}  {eq_sent}"
+            f"    {sym:<7}{RED}{put_vol:>11,.0f}{RST}{GRN}{call_vol:>11,.0f}{RST}"
+            f"{rc}{BLD}{ratio:>7.2f}{RST}{CYN}{iv_str:>8}{RST}{MAG}{em_str:>10}{RST}  {eq_sent}"
         )
 
         # Sentiment-change alert (shared with crypto)
@@ -443,6 +569,17 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         if _prev_sentiment.get(sym) is not None and _prev_sentiment[sym] != label:
             _play_alert()
         _prev_sentiment[sym] = label
+
+    # CSV logging status
+    if 'csv' in ROWS:
+        move(ROWS['csv'])
+        erase_line()
+        if _csv_path is None:
+            sys.stdout.write(f"    {'CSV':<8} {DIM}disabled{RST}")
+        elif _csv_err:
+            sys.stdout.write(f"    {'CSV':<8} {RED}error: {_csv_err}{RST}")
+        else:
+            sys.stdout.write(f"    {'CSV':<8} {GRN}{_csv_rows}{RST} {DIM}rows → {os.path.basename(_csv_path)}{RST}")
 
     move(ROWS['exit'])
     erase_line()
@@ -634,6 +771,10 @@ async def fetch_all(interval):
 
                     eth_price = await fetch_eth_price()
 
+                    # ── Auto-save this refresh's full snapshot to CSV ──
+                    if _csv_path is not None:
+                        append_csv(_csv_path, fetch_time, results, dvol, eth_price)
+
                     # ── Countdown — polls keys/market-open ~10x/sec so [R] and
                     #    [Q] feel instant and the 08:45 refresh fires on time ──
                     interrupted = False
@@ -669,12 +810,21 @@ async def fetch_all(interval):
 
 
 def main():
-    global _last_open_refresh
+    global _last_open_refresh, _csv_path
 
     parser = argparse.ArgumentParser(description='Deribit + CBOE Put/Call Volume Dashboard')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
+    parser.add_argument('--csv', default=None, metavar='PATH',
+                        help='CSV log path (default: pcvr_log.csv next to this script)')
+    parser.add_argument('--no-csv', action='store_true',
+                        help='disable per-refresh CSV logging')
     args = parser.parse_args()
+
+    # Resolve the CSV log path (logging is on by default).
+    if not args.no_csv:
+        _csv_path = args.csv or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), CSV_FILE)
 
     # Pre-arm the market-open auto-refresh: if we launch after today's trigger
     # time, mark it done so it only fires when the clock *crosses* 08:45 during

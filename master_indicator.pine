@@ -213,7 +213,7 @@ var float   _dv_poc  = na
 var float   _dv_vah  = na
 var float   _dv_val  = na
 
-if i_show_vp and i_vp_hist_mode and i_vp_period == "Day"
+if i_show_vp and i_vp_period == "Day"
     bool _dv_new = _vp_16ct or na(_dv_rlo)
     bool _dv_out = not _dv_new and (low < _dv_rlo or high > _dv_rhi)
     if _dv_new
@@ -282,9 +282,9 @@ if i_show_vp and i_vp_hist_mode and i_vp_period == "Day"
             _dv_vah := _dv_rlo + (_vhi + 1.0) * _dv_step
             _dv_val := _dv_rlo + _vli         * _dv_step
 
-plot(i_show_vp and i_vp_hist_mode ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=1, style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=1, style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=1, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=i_poc_width,     style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)
@@ -823,10 +823,10 @@ if barstate.islast and i_show_vp
                 f_vp_render_boxes(_s, false, _pw, i_vp_offset)
                 int _lx2 = _s.end_bi
                 int _lx1 = math.max(_s.start_bi, bar_index - 4900)
-                if i_show_poc
+                if i_show_poc and not i_vp_hist_mode
                     _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))
-                if i_show_vah_val
+                if i_show_vah_val and not i_vp_hist_mode
                     _vp_vah_lns.push(line.new(_lx1, _s.vah_p, _lx2, _s.vah_p,
                                                color=i_vah_val_col, width=i_vah_val_width))
                     _vp_val_lns.push(line.new(_lx1, _s.val_p, _lx2, _s.val_p,
@@ -836,21 +836,24 @@ if barstate.islast and i_show_vp
         f_vp_render_boxes(_cur, _cur_right, _pw, i_vp_offset)
         int _cur_lx2 = _cur_right ? bar_index + i_vp_offset + _pw : bar_index
         if i_show_poc
-            _vp_poc_lns.push(line.new(_cur.start_bi, _cur.poc_p, _cur_lx2, _cur.poc_p,
-                                       color=i_poc_col, width=i_poc_width))
+            if not i_vp_hist_mode
+                _vp_poc_lns.push(line.new(_cur.start_bi, _cur.poc_p, _cur_lx2, _cur.poc_p,
+                                           color=i_poc_col, width=i_poc_width))
             _vp_poc_lbl := label.new(bar_index, _cur.poc_p,
                                      " POC: " + str.tostring(_cur.poc_p, format.mintick),
                                      textcolor=i_poc_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
         if i_show_vah_val
-            _vp_vah_lns.push(line.new(_cur.start_bi, _cur.vah_p, _cur_lx2, _cur.vah_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
+            if not i_vp_hist_mode
+                _vp_vah_lns.push(line.new(_cur.start_bi, _cur.vah_p, _cur_lx2, _cur.vah_p,
+                                           color=i_vah_val_col, width=i_vah_val_width))
             _vp_vah_lbl := label.new(bar_index, _cur.vah_p,
                                      " VAH: " + str.tostring(_cur.vah_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-            _vp_val_lns.push(line.new(_cur.start_bi, _cur.val_p, _cur_lx2, _cur.val_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
+            if not i_vp_hist_mode
+                _vp_val_lns.push(line.new(_cur.start_bi, _cur.val_p, _cur_lx2, _cur.val_p,
+                                           color=i_vah_val_col, width=i_vah_val_width))
             _vp_val_lbl := label.new(bar_index, _cur.val_p,
                                      " VAL: " + str.tostring(_cur.val_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
@@ -910,3 +913,48 @@ if barstate.islast
     _buy_lbl   := i_show_buy_lvl  and i_buy_lvl  != 0 ? label.new(bar_index, i_buy_lvl,  "Buy Territory",  textcolor=color.white, style=label.style_label_left, color=color.new(color.black, 100), size=size.small) : na
     _sell_line := i_show_sell_lvl and i_sell_lvl != 0 ? line.new(bar_index, i_sell_lvl, bar_index - 1, i_sell_lvl, color=color.white, style=line.style_dotted, width=1, extend=extend.both) : na
     _sell_lbl  := i_show_sell_lvl and i_sell_lvl != 0 ? label.new(bar_index, i_sell_lvl, "Sell Territory", textcolor=color.white, style=label.style_label_left, color=color.new(color.black, 100), size=size.small) : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTS — set up via TradingView's "Create Alert" dialog; pick any condition
+// ═══════════════════════════════════════════════════════════════════════════
+
+float _al_dist   = not na(_er_open) and not na(_er_daily) ? _er_open * _er_daily : na
+float _al_er_u40  = not na(_al_dist) ? _er_open + _al_dist * 0.4 : na
+float _al_er_d40  = not na(_al_dist) ? _er_open - _al_dist * 0.4 : na
+float _al_er_u80  = not na(_al_dist) ? _er_open + _al_dist * 0.8 : na
+float _al_er_d80  = not na(_al_dist) ? _er_open - _al_dist * 0.8 : na
+float _al_er_u100 = not na(_al_dist) ? _er_open + _al_dist       : na
+float _al_er_d100 = not na(_al_dist) ? _er_open - _al_dist       : na
+float _al_er_u150 = not na(_al_dist) ? _er_open + _al_dist * 1.5 : na
+float _al_er_d150 = not na(_al_dist) ? _er_open - _al_dist * 1.5 : na
+
+bool _al_cross40  = i_show_er and not na(_al_dist) and
+     (ta.crossover(close, _al_er_u40)  or ta.crossunder(close, _al_er_u40)  or
+      ta.crossover(close, _al_er_d40)  or ta.crossunder(close, _al_er_d40))
+bool _al_cross80  = i_show_er and not na(_al_dist) and
+     (ta.crossover(close, _al_er_u80)  or ta.crossunder(close, _al_er_u80)  or
+      ta.crossover(close, _al_er_d80)  or ta.crossunder(close, _al_er_d80))
+bool _al_cross100 = i_show_er and not na(_al_dist) and
+     (ta.crossover(close, _al_er_u100) or ta.crossunder(close, _al_er_u100) or
+      ta.crossover(close, _al_er_d100) or ta.crossunder(close, _al_er_d100))
+bool _al_cross150 = i_show_er and not na(_al_dist) and
+     (ta.crossover(close, _al_er_u150) or ta.crossunder(close, _al_er_u150) or
+      ta.crossover(close, _al_er_d150) or ta.crossunder(close, _al_er_d150))
+bool _al_poc      = i_show_vp and not na(_dv_poc) and
+     (ta.crossover(close, _dv_poc) or ta.crossunder(close, _dv_poc))
+bool _al_vah      = i_show_vp and not na(_dv_vah) and
+     (ta.crossover(close, _dv_vah) or ta.crossunder(close, _dv_vah))
+bool _al_val      = i_show_vp and not na(_dv_val) and
+     (ta.crossover(close, _dv_val) or ta.crossunder(close, _dv_val))
+bool _al_bt_buy   = i_show_btd and is_bt_buy_t1
+bool _al_bt_sell  = i_show_btd and is_bt_sell_t1
+
+alertcondition(_al_cross40,  title="Alert: ER 40% Cross",   message="Price crossed ER 40% level")
+alertcondition(_al_cross80,  title="Alert: ER 80% Cross",   message="Price crossed ER 80% level")
+alertcondition(_al_cross100, title="Alert: ER 100% Cross",  message="Price crossed ER 100% (Upper/Lower Bound)")
+alertcondition(_al_cross150, title="Alert: ER 150% Cross",  message="Price crossed ER 150% Volatility Hard Stop")
+alertcondition(_al_poc,      title="Alert: VP POC Cross",   message="Price crossed VP Point of Control")
+alertcondition(_al_vah,      title="Alert: VP VAH Cross",   message="Price crossed VP Value Area High")
+alertcondition(_al_val,      title="Alert: VP VAL Cross",   message="Price crossed VP Value Area Low")
+alertcondition(_al_bt_buy,   title="Alert: Big Buy Trade",  message="Big Buy Trade detected (candle close)")
+alertcondition(_al_bt_sell,  title="Alert: Big Sell Trade", message="Big Sell Trade detected (candle close)")

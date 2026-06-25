@@ -759,8 +759,6 @@ var line  _so_line  = na
 var label _so_lbl   = na
 
 if is_new_session and i_show_so
-    line.delete(_so_line)
-    label.delete(_so_lbl)
     _so_price := i_asset_mode == "Equities" ? close : open
     string _so_txt = i_asset_mode == "Equities" ? "Previous EOD Close: " + str.tostring(_so_price, format.mintick) : "Session Open"
     _so_line  := line.new(bar_index, _so_price, bar_index + 1, _so_price,

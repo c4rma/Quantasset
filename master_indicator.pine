@@ -110,10 +110,10 @@ i_vp_offset     = input.int(5,         "Right Offset (bars)",  group="Volume Pro
 i_vp_va_pct     = input.float(70.0,   "Value Area %",          group="Volume Profile", minval=1.0, maxval=99.0)
 i_show_poc      = input.bool(true,     "",                      inline="poc",    group="Volume Profile")
 i_poc_col       = input.color(color.red,   "POC",              inline="poc",    group="Volume Profile")
-i_poc_width     = input.int(2,         "Width",                inline="poc",    group="Volume Profile", minval=1, maxval=5)
+i_poc_width     = input.int(3,         "Width",                inline="poc",    group="Volume Profile", minval=1, maxval=5)
 i_show_vah_val  = input.bool(true,     "",                      inline="vahval", group="Volume Profile")
 i_vah_val_col   = input.color(#2962ff, "VAH / VAL",            inline="vahval", group="Volume Profile")
-i_vah_val_width = input.int(1,         "Width",                inline="vahval", group="Volume Profile", minval=1, maxval=5)
+i_vah_val_width = input.int(3,         "Width",                inline="vahval", group="Volume Profile", minval=1, maxval=5)
 
 // ── VP helper: compute a complete VPSession from bar arrays ───────────────
 f_vp_compute(float[] bh, float[] bl, float[] bv, int s_bi, int e_bi, int rows, float va_pct) =>
@@ -693,9 +693,8 @@ f_vp_render_boxes(VPSession s, bool place_right, int pw, int offset) =>
                 _bx2 := bar_index + offset + pw
                 _bx1 := _bx2 - int(_rpct * pw)
             else
-                int _span = math.max(s.end_bi - s.start_bi, 1)
                 _bx2 := s.end_bi
-                _bx1 := math.max(_bx2 - int(_rpct * _span), bar_index - 4900)
+                _bx1 := math.max(_bx2 - int(_rpct * pw), bar_index - 4900)
             _vp_boxes.push(box.new(_bx1, _rhi2, _bx2, _rlo2, border_color=na, bgcolor=_col))
 
 if barstate.islast and i_show_vp

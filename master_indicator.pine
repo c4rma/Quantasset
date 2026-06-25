@@ -114,6 +114,8 @@ i_poc_width     = input.int(3,         "Width",                inline="poc",    
 i_show_vah_val  = input.bool(true,     "",                      inline="vahval", group="Volume Profile")
 i_vah_val_col   = input.color(#2962ff, "VAH / VAL",            inline="vahval", group="Volume Profile")
 i_vah_val_width = input.int(3,         "Width",                inline="vahval", group="Volume Profile", minval=1, maxval=5)
+i_vp_hist_mode  = input.bool(false,    "Historical Mode",       group="Volume Profile",
+                   tooltip="Plots developing POC/VAH/VAL step lines that evolve bar-by-bar throughout each session.")
 
 // ── VP helper: compute a complete VPSession from bar arrays ───────────────
 f_vp_compute(float[] bh, float[] bl, float[] bv, int s_bi, int e_bi, int rows, float va_pct) =>
@@ -201,6 +203,88 @@ if i_show_vp and i_vp_period == "Day"
     _vp_d_hi.push(high)
     _vp_d_lo.push(low)
     _vp_d_vol.push(volume)
+
+// ── Developing (Historical Mode) VP — incremental bucket update every bar ──
+var float   _dv_rlo  = na
+var float   _dv_rhi  = na
+var float   _dv_step = 0.0
+var float[] _dv_bkts = array.new_float(0)
+var float   _dv_poc  = na
+var float   _dv_vah  = na
+var float   _dv_val  = na
+
+if i_show_vp and i_vp_hist_mode and i_vp_period == "Day"
+    bool _dv_new = _vp_16ct or na(_dv_rlo)
+    bool _dv_out = not _dv_new and (low < _dv_rlo or high > _dv_rhi)
+    if _dv_new
+        _dv_rlo  := low
+        _dv_rhi  := high
+        float _r  = high - low
+        _dv_step := _r > 0 ? _r / i_vp_rows : syminfo.mintick * i_vp_rows
+        _dv_bkts := array.new_float(i_vp_rows, 0.0)
+    else if _dv_out
+        _dv_rlo  := math.min(_dv_rlo, low)
+        _dv_rhi  := math.max(_dv_rhi, high)
+        float _r  = _dv_rhi - _dv_rlo
+        _dv_step := _r > 0 ? _r / i_vp_rows : syminfo.mintick * i_vp_rows
+        _dv_bkts := array.new_float(i_vp_rows, 0.0)
+    bool _dv_rebuild = _dv_new or _dv_out
+    int  _dv_nb = _vp_d_hi.size()
+    if _dv_rebuild and _dv_nb > 0 and _dv_step > 0
+        for _bi = 0 to _dv_nb - 1
+            float _lh = _vp_d_hi.get(_bi), float _ll = _vp_d_lo.get(_bi), float _lv = _vp_d_vol.get(_bi)
+            if _lh > _ll
+                int _s = math.max(int(math.floor((_ll - _dv_rlo) / _dv_step)), 0)
+                int _e = math.min(int(math.floor((_lh - _dv_rlo) / _dv_step)), i_vp_rows - 1)
+                for _pi = _s to _e
+                    float _pl = _dv_rlo + _pi * _dv_step
+                    float _pp = switch
+                        _ll >= _pl and _lh > _pl + _dv_step  => (_pl + _dv_step - _ll) / (_lh - _ll)
+                        _lh <= _pl + _dv_step and _ll < _pl  => (_lh - _pl) / (_lh - _ll)
+                        _ll >= _pl and _lh <= _pl + _dv_step => 1.0
+                        => _dv_step / (_lh - _ll)
+                    _dv_bkts.set(_pi, _dv_bkts.get(_pi) + _lv * _pp)
+    else if not _dv_rebuild and _dv_nb > 0 and _dv_step > 0
+        float _lh = _vp_d_hi.get(_dv_nb - 1), float _ll = _vp_d_lo.get(_dv_nb - 1), float _lv = _vp_d_vol.get(_dv_nb - 1)
+        if _lh > _ll
+            int _s = math.max(int(math.floor((_ll - _dv_rlo) / _dv_step)), 0)
+            int _e = math.min(int(math.floor((_lh - _dv_rlo) / _dv_step)), i_vp_rows - 1)
+            for _pi = _s to _e
+                float _pl = _dv_rlo + _pi * _dv_step
+                float _pp = switch
+                    _ll >= _pl and _lh > _pl + _dv_step  => (_pl + _dv_step - _ll) / (_lh - _ll)
+                    _lh <= _pl + _dv_step and _ll < _pl  => (_lh - _pl) / (_lh - _ll)
+                    _ll >= _pl and _lh <= _pl + _dv_step => 1.0
+                    => _dv_step / (_lh - _ll)
+                _dv_bkts.set(_pi, _dv_bkts.get(_pi) + _lv * _pp)
+    _dv_poc := na
+    _dv_vah := na
+    _dv_val := na
+    if _dv_bkts.size() == i_vp_rows and _dv_step > 0
+        float _mv = _dv_bkts.max()
+        if _mv > 0
+            int   _pi  = _dv_bkts.indexof(_mv)
+            _dv_poc   := _dv_rlo + (_pi + 0.5) * _dv_step
+            float _vt  = _dv_bkts.sum() * (i_vp_va_pct / 100.0)
+            float _vv  = _mv
+            int   _vhi = _pi, int _vli = _pi
+            while _vv < _vt
+                if _vli == 0 and _vhi == i_vp_rows - 1
+                    break
+                float _up = _vhi < i_vp_rows - 1 ? _dv_bkts.get(_vhi + 1) : 0.0
+                float _dn = _vli > 0              ? _dv_bkts.get(_vli - 1) : 0.0
+                if _up == 0.0 and _dn == 0.0
+                    break
+                if _up >= _dn
+                    _vv += _up, _vhi += 1
+                else
+                    _vv += _dn, _vli -= 1
+            _dv_vah := _dv_rlo + (_vhi + 1.0) * _dv_step
+            _dv_val := _dv_rlo + _vli         * _dv_step
+
+plot(i_show_vp and i_vp_hist_mode ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=1, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=1, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=1, style=plot.style_stepline)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)

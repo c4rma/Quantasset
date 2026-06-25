@@ -57,10 +57,13 @@ EXP_MOVE_FACTOR = 1.0
 MARKET_OPEN_REFRESH = (8, 45)   # (hour, minute) in CT
 
 # ── CSV logging — one wide row appended after every refresh ────────────────────
-CSV_FILE   = 'pcvr_log.csv'   # default name (created next to this script)
-_csv_path  = None             # resolved in main(); None disables logging
-_csv_rows  = 0                # rows written this run
-_csv_err   = None             # last write error (shown on the status line)
+# A separate file per CT day, named opt_data_MM_DD_YYYY.csv. On startup the
+# current day's file is resumed if it exists (else created); when the CT clock
+# crosses 00:00 the next refresh rolls over to a fresh file automatically.
+_csv_dir      = None          # log directory; None disables logging (set in main)
+_csv_cur_path = None          # path of the file currently being written
+_csv_rows     = 0             # rows written this session to the current file
+_csv_err      = None          # last write error (shown on the status line)
 
 # ── Shared equities state (prefetched in background, promoted at cycle boundary) ─
 eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte)
@@ -307,7 +310,7 @@ async def refresh_equities():
 # ── CSV logging ───────────────────────────────────────────────────────────────
 def _csv_columns():
     """Ordered column names — one group per crypto currency and equity symbol."""
-    cols = ['timestamp_utc', 'session', 'eth_price']
+    cols = ['timestamp_utc', 'timestamp_ct', 'session', 'eth_price']
     for ccy in CURRENCIES:
         cols += [f'{ccy}_put_vol', f'{ccy}_call_vol', f'{ccy}_total_vol',
                  f'{ccy}_pc_ratio', f'{ccy}_dvol', f'{ccy}_sentiment']
@@ -318,14 +321,29 @@ def _csv_columns():
     return cols
 
 
-def append_csv(path, fetch_time, results, dvol, eth_price):
+def _daily_csv_path(ct_dt):
+    """Path of the CSV for a given CT datetime: opt_data_MM_DD_YYYY.csv."""
+    return os.path.join(_csv_dir, f"opt_data_{ct_dt.strftime('%m_%d_%Y')}.csv")
+
+
+def append_csv(fetch_time, results, dvol, eth_price):
     """Append one wide row capturing every displayed field for this refresh.
+    Writes to the current CT day's file, rolling over to a new file at 00:00 CT.
     Reads the equities from the shared eq_results snapshot (already promoted)."""
-    global _csv_rows, _csv_err
+    global _csv_rows, _csv_err, _csv_cur_path
+
+    ct = fetch_time + CT_OFFSET
+
+    # Resume today's file or roll over to a new day's file (also covers startup)
+    path = _daily_csv_path(ct)
+    if path != _csv_cur_path:
+        _csv_cur_path = path
+        _csv_rows = 0
 
     session_name, _, excl_reason = get_session_status()
     row = {c: '' for c in _csv_columns()}
     row['timestamp_utc'] = fetch_time.strftime('%Y-%m-%d %H:%M:%S')
+    row['timestamp_ct']  = ct.strftime('%Y-%m-%d %H:%M:%S')
     row['session']       = excl_reason or session_name or 'No active session'
     row['eth_price']     = f'{eth_price:.2f}' if eth_price else ''
 
@@ -366,6 +384,24 @@ def append_csv(path, fetch_time, results, dvol, eth_price):
         _csv_err = str(e).replace('\n', ' ')[:40]
 
 
+def _resume_csv_row_count():
+    """On startup, seed the row counter from today's existing file (if any) so
+    the status line reflects rows already logged rather than just this session."""
+    global _csv_cur_path, _csv_rows
+    if _csv_dir is None:
+        return
+    ct = datetime.now(timezone.utc) + CT_OFFSET
+    path = _daily_csv_path(ct)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                n = sum(1 for _ in f)
+            _csv_cur_path = path
+            _csv_rows = max(0, n - 1)   # minus the header line
+        except Exception:
+            pass
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
 WIDTH = 70
 ROWS  = {}
@@ -387,7 +423,7 @@ def draw_static():
         ROWS[key] = row[0]
 
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
-    p(f"{BLD}{CYN}  DERIBIT  PUT/CALL VOLUME MONITOR  —  ALL EXPIRIES{RST}")
+    p(f"{BLD}{CYN}  Options Flow Dashboard - Crypto & Equities{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     mark('ts');        p()
     p()
@@ -434,11 +470,12 @@ def draw_static():
 
 def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
     bar_width = 30
-    ts = fetch_time.strftime('%A  %Y-%m-%d  %H:%M:%S UTC')
+    ct = fetch_time + CT_OFFSET
+    ts = f"{ct.strftime('%A %Y-%m-%d  %H:%M:%S')} CT  /  {fetch_time.strftime('%H:%M:%S')} UTC"
 
     move(ROWS['ts'])
     erase_line()
-    sys.stdout.write(f"  {DIM}{ts}    refreshing in {remaining}s{RST}")
+    sys.stdout.write(f"  {DIM}{ts}   refresh in {remaining}s{RST}")
 
     move(ROWS['eth_price'])
     erase_line()
@@ -574,12 +611,14 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
     if 'csv' in ROWS:
         move(ROWS['csv'])
         erase_line()
-        if _csv_path is None:
+        if _csv_dir is None:
             sys.stdout.write(f"    {'CSV':<8} {DIM}disabled{RST}")
         elif _csv_err:
             sys.stdout.write(f"    {'CSV':<8} {RED}error: {_csv_err}{RST}")
+        elif _csv_cur_path:
+            sys.stdout.write(f"    {'CSV':<8} {GRN}{_csv_rows}{RST} {DIM}rows → {os.path.basename(_csv_cur_path)}{RST}")
         else:
-            sys.stdout.write(f"    {'CSV':<8} {GRN}{_csv_rows}{RST} {DIM}rows → {os.path.basename(_csv_path)}{RST}")
+            sys.stdout.write(f"    {'CSV':<8} {DIM}starting…{RST}")
 
     move(ROWS['exit'])
     erase_line()
@@ -772,8 +811,8 @@ async def fetch_all(interval):
                     eth_price = await fetch_eth_price()
 
                     # ── Auto-save this refresh's full snapshot to CSV ──
-                    if _csv_path is not None:
-                        append_csv(_csv_path, fetch_time, results, dvol, eth_price)
+                    if _csv_dir is not None:
+                        append_csv(fetch_time, results, dvol, eth_price)
 
                     # ── Countdown — polls keys/market-open ~10x/sec so [R] and
                     #    [Q] feel instant and the 08:45 refresh fires on time ──
@@ -810,21 +849,22 @@ async def fetch_all(interval):
 
 
 def main():
-    global _last_open_refresh, _csv_path
+    global _last_open_refresh, _csv_dir
 
-    parser = argparse.ArgumentParser(description='Deribit + CBOE Put/Call Volume Dashboard')
+    parser = argparse.ArgumentParser(description='Options Flow Dashboard - Crypto & Equities')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
-    parser.add_argument('--csv', default=None, metavar='PATH',
-                        help='CSV log path (default: pcvr_log.csv next to this script)')
+    parser.add_argument('--csv-dir', default=None, metavar='DIR',
+                        help='directory for daily CSV logs (default: next to this script)')
     parser.add_argument('--no-csv', action='store_true',
                         help='disable per-refresh CSV logging')
     args = parser.parse_args()
 
-    # Resolve the CSV log path (logging is on by default).
+    # Resolve the CSV log directory (logging is on by default). Files are named
+    # opt_data_MM_DD_YYYY.csv, one per CT day. Resume today's file if it exists.
     if not args.no_csv:
-        _csv_path = args.csv or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), CSV_FILE)
+        _csv_dir = args.csv_dir or os.path.dirname(os.path.abspath(__file__))
+        _resume_csv_row_count()
 
     # Pre-arm the market-open auto-refresh: if we launch after today's trigger
     # time, mark it done so it only fires when the clock *crosses* 08:45 during

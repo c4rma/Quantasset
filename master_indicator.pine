@@ -693,8 +693,9 @@ f_vp_render_boxes(VPSession s, bool place_right, int pw, int offset) =>
                 _bx2 := bar_index + offset + pw
                 _bx1 := _bx2 - int(_rpct * pw)
             else
+                int _span = math.max(s.end_bi - s.start_bi, 1)
                 _bx2 := s.end_bi
-                _bx1 := _bx2 - int(_rpct * pw)
+                _bx1 := _bx2 - int(_rpct * _span)
             _vp_boxes.push(box.new(_bx1, _rhi2, _bx2, _rlo2, border_color=na, bgcolor=_col))
 
 if barstate.islast and i_show_vp
@@ -738,7 +739,7 @@ if barstate.islast and i_show_vp
                     continue
                 f_vp_render_boxes(_s, false, _pw, i_vp_offset)
                 int _lx2 = _s.end_bi
-                int _lx1 = _lx2 - _pw  // match box width, avoids referencing old bar indices
+                int _lx1 = _s.start_bi
                 if i_show_poc
                     _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))

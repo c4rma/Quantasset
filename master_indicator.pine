@@ -117,6 +117,19 @@ i_vah_val_width = input.int(3,         "Width",                inline="vahval", 
 i_vp_hist_mode  = input.bool(false,    "Historical Mode",       group="Volume Profile",
                    tooltip="Plots developing POC/VAH/VAL step lines that evolve bar-by-bar throughout each session.")
 
+// ── ALERTS ────────────────────────────────────────────────────────────────
+i_alerts_on   = input.bool(false, "Enable Alerts", group="Alerts",
+                 tooltip="Fires alerts automatically at candle close for each checked type below.\nSetup: create ONE TradingView alert on this indicator with condition 'Any alert() function call'.")
+i_al_er_40    = input.bool(true,  "ER 40% Cross",   group="Alerts")
+i_al_er_80    = input.bool(true,  "ER 80% Cross",   group="Alerts")
+i_al_er_100   = input.bool(true,  "ER 100% Cross",  group="Alerts")
+i_al_er_150   = input.bool(true,  "ER 150% Cross",  group="Alerts")
+i_al_vp_poc   = input.bool(true,  "VP POC Cross",   group="Alerts")
+i_al_vp_vah   = input.bool(true,  "VP VAH Cross",   group="Alerts")
+i_al_vp_val   = input.bool(true,  "VP VAL Cross",   group="Alerts")
+i_al_bt_buy   = input.bool(true,  "Big Buy Trade",  group="Alerts")
+i_al_bt_sell  = input.bool(true,  "Big Sell Trade", group="Alerts")
+
 // ── VP helper: compute a complete VPSession from bar arrays ───────────────
 f_vp_compute(float[] bh, float[] bl, float[] bv, int s_bi, int e_bi, int rows, float va_pct) =>
     int     _n    = bh.size()
@@ -958,3 +971,24 @@ alertcondition(_al_vah,      title="Alert: VP VAH Cross",   message="Price cross
 alertcondition(_al_val,      title="Alert: VP VAL Cross",   message="Price crossed VP Value Area Low")
 alertcondition(_al_bt_buy,   title="Alert: Big Buy Trade",  message="Big Buy Trade detected (candle close)")
 alertcondition(_al_bt_sell,  title="Alert: Big Sell Trade", message="Big Sell Trade detected (candle close)")
+
+// Auto-fire alerts — require only one "Any alert() function call" alert in TradingView
+if i_alerts_on and barstate.isconfirmed
+    if i_al_er_40  and _al_cross40
+        alert(syminfo.ticker + " ▸ ER 40% Cross — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_er_80  and _al_cross80
+        alert(syminfo.ticker + " ▸ ER 80% Cross — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_er_100 and _al_cross100
+        alert(syminfo.ticker + " ▸ ER 100% Cross — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_er_150 and _al_cross150
+        alert(syminfo.ticker + " ▸ ER 150% Hard Stop Cross — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_vp_poc and _al_poc
+        alert(syminfo.ticker + " ▸ VP POC Cross — close " + str.tostring(close, format.mintick) + "  POC " + str.tostring(_dv_poc, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_vp_vah and _al_vah
+        alert(syminfo.ticker + " ▸ VP VAH Cross — close " + str.tostring(close, format.mintick) + "  VAH " + str.tostring(_dv_vah, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_vp_val and _al_val
+        alert(syminfo.ticker + " ▸ VP VAL Cross — close " + str.tostring(close, format.mintick) + "  VAL " + str.tostring(_dv_val, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_bt_buy  and _al_bt_buy
+        alert(syminfo.ticker + " ▸ Big Buy Trade — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if i_al_bt_sell and _al_bt_sell
+        alert(syminfo.ticker + " ▸ Big Sell Trade — close " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)

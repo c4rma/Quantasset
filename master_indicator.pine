@@ -533,10 +533,10 @@ if is_new_session and i_show_er and not na(_er_daily)
                               color=color.purple, width=3, style=line.style_solid)
     _er_l150line := line.new(_er_x1, _dn_150, _er_x1, _dn_150,
                               color=color.purple, width=3, style=line.style_solid)
-    _er_u150lbl  := label.new(_er_x1, _up_150, " 150% - Volatility Hard Stop",
+    _er_u150lbl  := label.new(_er_x1, _up_150, " 150% - Volatility Hard Stop (" + str.tostring(_up_150, format.mintick) + ")",
                                textcolor=color.purple, style=label.style_label_left,
                                color=color.new(color.black, 100), size=size.small)
-    _er_l150lbl  := label.new(_er_x1, _dn_150, " 150% - Volatility Hard Stop",
+    _er_l150lbl  := label.new(_er_x1, _dn_150, " 150% - Volatility Hard Stop (" + str.tostring(_dn_150, format.mintick) + ")",
                                textcolor=color.purple, style=label.style_label_left,
                                color=color.new(color.black, 100), size=size.small)
     // Outer zones (0–40% and 80–100%): light fill
@@ -640,8 +640,10 @@ if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
         line.set_x2(_er_l150line, bar_index)
     if not na(_er_u150lbl)
         label.set_xy(_er_u150lbl, bar_index, _up_150)
+        label.set_text(_er_u150lbl, " 150% - Volatility Hard Stop (" + str.tostring(_up_150, format.mintick) + ")")
     if not na(_er_l150lbl)
         label.set_xy(_er_l150lbl, bar_index, _dn_150)
+        label.set_text(_er_l150lbl, " 150% - Volatility Hard Stop (" + str.tostring(_dn_150, format.mintick) + ")")
     if not na(_er_ubox)
         box.set_top(_er_ubox,    _up_40)
         box.set_bottom(_er_ubox, _er_open)

@@ -574,25 +574,25 @@ if is_new_session and i_show_er and not na(_er_daily)
     _er_u20lbl  := label.new(_er_x1, _up_20, " 20%",
                               textcolor=color.lime, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
-    _er_u40lbl  := label.new(_er_x1, _up_40, " 40%",
+    _er_u40lbl  := label.new(_er_x1, _up_40, " 40% (" + str.tostring(_up_40, format.mintick) + ")",
                               textcolor=color.lime, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
     _er_u60lbl  := label.new(_er_x1, _up_60, " 60%",
                               textcolor=color.lime, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
-    _er_u80lbl  := label.new(_er_x1, _up_80, " 80%",
+    _er_u80lbl  := label.new(_er_x1, _up_80, " 80% (" + str.tostring(_up_80, format.mintick) + ")",
                               textcolor=color.lime, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
     _er_l20lbl  := label.new(_er_x1, _dn_20, " 20%",
                               textcolor=color.red, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
-    _er_l40lbl  := label.new(_er_x1, _dn_40, " 40%",
+    _er_l40lbl  := label.new(_er_x1, _dn_40, " 40% (" + str.tostring(_dn_40, format.mintick) + ")",
                               textcolor=color.red, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
     _er_l60lbl  := label.new(_er_x1, _dn_60, " 60%",
                               textcolor=color.red, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
-    _er_l80lbl  := label.new(_er_x1, _dn_80, " 80%",
+    _er_l80lbl  := label.new(_er_x1, _dn_80, " 80% (" + str.tostring(_dn_80, format.mintick) + ")",
                               textcolor=color.red, style=label.style_label_left,
                               color=color.new(color.black, 100), size=size.tiny)
     _er_ulbl    := label.new(_er_x1, _up,
@@ -702,18 +702,22 @@ if i_show_er and not na(_er_open) and not na(_er_daily) and not is_new_session
         label.set_xy(_er_u20lbl, bar_index, _up_20)
     if not na(_er_u40lbl)
         label.set_xy(_er_u40lbl, bar_index, _up_40)
+        label.set_text(_er_u40lbl, " 40% (" + str.tostring(_up_40, format.mintick) + ")")
     if not na(_er_u60lbl)
         label.set_xy(_er_u60lbl, bar_index, _up_60)
     if not na(_er_u80lbl)
         label.set_xy(_er_u80lbl, bar_index, _up_80)
+        label.set_text(_er_u80lbl, " 80% (" + str.tostring(_up_80, format.mintick) + ")")
     if not na(_er_l20lbl)
         label.set_xy(_er_l20lbl, bar_index, _dn_20)
     if not na(_er_l40lbl)
         label.set_xy(_er_l40lbl, bar_index, _dn_40)
+        label.set_text(_er_l40lbl, " 40% (" + str.tostring(_dn_40, format.mintick) + ")")
     if not na(_er_l60lbl)
         label.set_xy(_er_l60lbl, bar_index, _dn_60)
     if not na(_er_l80lbl)
         label.set_xy(_er_l80lbl, bar_index, _dn_80)
+        label.set_text(_er_l80lbl, " 80% (" + str.tostring(_dn_80, format.mintick) + ")")
     if not na(_er_ulbl)
         label.set_xy(_er_ulbl, bar_index, _up)
         label.set_text(_er_ulbl, " Upper Bound: +" + str.tostring(_pct, "#.##") + "% (" + str.tostring(_up, format.mintick) + ")")
@@ -852,7 +856,7 @@ if barstate.islast and i_show_vp
             if not i_vp_hist_mode
                 _vp_poc_lns.push(line.new(_cur.start_bi, _cur.poc_p, _cur_lx2, _cur.poc_p,
                                            color=i_poc_col, width=i_poc_width))
-            _vp_poc_lbl := label.new(bar_index, _cur.poc_p,
+            _vp_poc_lbl := label.new(_cur_lx2, _cur.poc_p,
                                      " POC: " + str.tostring(_cur.poc_p, format.mintick),
                                      textcolor=i_poc_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
@@ -860,14 +864,14 @@ if barstate.islast and i_show_vp
             if not i_vp_hist_mode
                 _vp_vah_lns.push(line.new(_cur.start_bi, _cur.vah_p, _cur_lx2, _cur.vah_p,
                                            color=i_vah_val_col, width=i_vah_val_width))
-            _vp_vah_lbl := label.new(bar_index, _cur.vah_p,
+            _vp_vah_lbl := label.new(_cur_lx2, _cur.vah_p,
                                      " VAH: " + str.tostring(_cur.vah_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
             if not i_vp_hist_mode
                 _vp_val_lns.push(line.new(_cur.start_bi, _cur.val_p, _cur_lx2, _cur.val_p,
                                            color=i_vah_val_col, width=i_vah_val_width))
-            _vp_val_lbl := label.new(bar_index, _cur.val_p,
+            _vp_val_lbl := label.new(_cur_lx2, _cur.val_p,
                                      " VAL: " + str.tostring(_cur.val_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)

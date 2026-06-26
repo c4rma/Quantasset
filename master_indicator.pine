@@ -33,7 +33,7 @@ i_show_2band  = input.bool(true,  "Show ±2σ / ±2.5σ", group="VWAP")
 // ── BIG TRADES ────────────────────────────────────────────────────────────
 i_show_btd     = input.bool(true,  "Show Big Trades Detector", group="Big Trades (Whale) Settings")
 i_btd_lookback = input.int(2,      "Lookback Period",          group="Big Trades (Whale) Settings", minval=2)
-i_btd_sigma    = input.float(2.5,  "Sensitivity (Sigma)",      group="Big Trades (Whale) Settings", minval=1.0, step=0.1, tooltip="2.0 = Significant, 4.0 = Extreme.")
+i_btd_sigma    = input.float(3.0,  "Sensitivity (Sigma)",      group="Big Trades (Whale) Settings", minval=1.0, step=0.1, tooltip="2.0 = Significant, 4.0 = Extreme.")
 i_btd_buy_col  = input.color(color.new(color.lime, 20), "Big Buy Color",  group="Big Trades (Whale) Settings")
 i_btd_sell_col = input.color(color.new(color.red,  20), "Big Sell Color", group="Big Trades (Whale) Settings")
 

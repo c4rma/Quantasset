@@ -187,11 +187,17 @@ int _sess_boundary = i_asset_mode == "Equities" ? 16 * 60 : 19 * 60
 is_new_session = _ct_now >= _sess_boundary and _ct_prev < _sess_boundary
 
 // VP state — current session accumulation + completed session history
-var float[]      _vp_d_hi   = array.new_float(0)
-var float[]      _vp_d_lo   = array.new_float(0)
-var float[]      _vp_d_vol  = array.new_float(0)
-var int          _vp_d_start = 0
-var VPSession[]  _vp_hist   = array.new<VPSession>(0)
+var float[]      _vp_d_hi    = array.new_float(0)
+var float[]      _vp_d_lo    = array.new_float(0)
+var float[]      _vp_d_vol   = array.new_float(0)
+var int          _vp_d_start  = 0
+var VPSession[]  _vp_hist    = array.new<VPSession>(0)
+// Custom period accumulation
+var float[]      _vp_c_hi    = array.new_float(0)
+var float[]      _vp_c_lo    = array.new_float(0)
+var float[]      _vp_c_vol   = array.new_float(0)
+var int          _vp_c_start  = 0
+var VPSession[]  _vp_c_hist  = array.new<VPSession>(0)
 // VP drawing-object handles
 var box[]  _vp_boxes   = array.new<box>()
 var line[] _vp_poc_lns = array.new<line>()
@@ -220,6 +226,20 @@ if i_show_vp and i_vp_period == "Day"
     _vp_d_hi.push(high)
     _vp_d_lo.push(low)
     _vp_d_vol.push(volume)
+
+if i_show_vp and i_vp_period == "Custom"
+    if _vp_cust_tod
+        if _vp_c_hi.size() > 0
+            _vp_c_hist.push(f_vp_compute(_vp_c_hi, _vp_c_lo, _vp_c_vol,
+                                          _vp_c_start, bar_index - 1,
+                                          i_vp_rows, i_vp_va_pct))
+        _vp_c_hi.clear()
+        _vp_c_lo.clear()
+        _vp_c_vol.clear()
+        _vp_c_start := bar_index
+    _vp_c_hi.push(high)
+    _vp_c_lo.push(low)
+    _vp_c_vol.push(volume)
 
 // ── Developing (Historical Mode) VP — incremental bucket update every bar ──
 var float   _dv_rlo  = na
@@ -880,39 +900,56 @@ if barstate.islast and i_show_vp
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
 
-    else  // Custom period — single profile from start time
-        int _len = math.min(_vp_cust_len, bar_index + 1)
-        float[] _bh = array.new_float(_len)
-        float[] _bl = array.new_float(_len)
-        float[] _bv = array.new_float(_len)
-        for _i = 0 to _len - 1
-            _bh.set(_i, high[_len - 1 - _i])
-            _bl.set(_i, low[_len - 1 - _i])
-            _bv.set(_i, volume[_len - 1 - _i])
-        VPSession _c = f_vp_compute(_bh, _bl, _bv,
-                                     bar_index - _len + 1, bar_index,
-                                     i_vp_rows, i_vp_va_pct)
-        bool _pr  = i_vp_placement == "Right"
-        int  _lx2 = _pr ? bar_index + i_vp_offset + i_vp_width : bar_index
-        f_vp_render_boxes(_c, _pr, i_vp_width, i_vp_offset)
+    else  // Custom period — daily sessions starting at chosen time
+        VPSession _cur_c   = f_vp_compute(_vp_c_hi, _vp_c_lo, _vp_c_vol,
+                                           _vp_c_start, bar_index,
+                                           i_vp_rows, i_vp_va_pct)
+        int _max_sess_c    = math.max(460 / math.max(i_vp_rows, 1), 1)
+        int _n_hist_c      = _vp_c_hist.size()
+        int _first_c       = math.max(_n_hist_c - (_max_sess_c - 1), 0)
+        bool _cur_right_c  = i_vp_placement == "Right"
+        int  _pw_c         = i_vp_width
+
+        if _n_hist_c > 0
+            for _si = _first_c to _n_hist_c - 1
+                VPSession _s = _vp_c_hist.get(_si)
+                if bar_index - _s.end_bi > 4900
+                    continue
+                f_vp_render_boxes(_s, false, _pw_c, i_vp_offset)
+                int _lx2c = _s.end_bi
+                int _lx1c = math.max(_s.start_bi, bar_index - 4900)
+                if i_show_poc and not i_vp_hist_mode
+                    _vp_poc_lns.push(line.new(_lx1c, _s.poc_p, _lx2c, _s.poc_p,
+                                               color=i_poc_col, width=i_poc_width))
+                if i_show_vah_val and not i_vp_hist_mode
+                    _vp_vah_lns.push(line.new(_lx1c, _s.vah_p, _lx2c, _s.vah_p,
+                                               color=i_vah_val_col, width=i_vah_val_width))
+                    _vp_val_lns.push(line.new(_lx1c, _s.val_p, _lx2c, _s.val_p,
+                                               color=i_vah_val_col, width=i_vah_val_width))
+
+        f_vp_render_boxes(_cur_c, _cur_right_c, _pw_c, i_vp_offset)
+        int _cur_lx2_c = _cur_right_c ? bar_index + i_vp_offset + _pw_c : bar_index
         if i_show_poc
-            _vp_poc_lns.push(line.new(_c.start_bi, _c.poc_p, _lx2, _c.poc_p,
-                                       color=i_poc_col, width=i_poc_width))
-            _vp_poc_lbl := label.new(bar_index, _c.poc_p,
-                                     " POC: " + str.tostring(_c.poc_p, format.mintick),
+            if not i_vp_hist_mode
+                _vp_poc_lns.push(line.new(_cur_c.start_bi, _cur_c.poc_p, _cur_lx2_c, _cur_c.poc_p,
+                                           color=i_poc_col, width=i_poc_width))
+            _vp_poc_lbl := label.new(_cur_lx2_c, _cur_c.poc_p,
+                                     " POC: " + str.tostring(_cur_c.poc_p, format.mintick),
                                      textcolor=i_poc_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
         if i_show_vah_val
-            _vp_vah_lns.push(line.new(_c.start_bi, _c.vah_p, _lx2, _c.vah_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
-            _vp_vah_lbl := label.new(bar_index, _c.vah_p,
-                                     " VAH: " + str.tostring(_c.vah_p, format.mintick),
+            if not i_vp_hist_mode
+                _vp_vah_lns.push(line.new(_cur_c.start_bi, _cur_c.vah_p, _cur_lx2_c, _cur_c.vah_p,
+                                           color=i_vah_val_col, width=i_vah_val_width))
+            _vp_vah_lbl := label.new(_cur_lx2_c, _cur_c.vah_p,
+                                     " VAH: " + str.tostring(_cur_c.vah_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-            _vp_val_lns.push(line.new(_c.start_bi, _c.val_p, _lx2, _c.val_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
-            _vp_val_lbl := label.new(bar_index, _c.val_p,
-                                     " VAL: " + str.tostring(_c.val_p, format.mintick),
+            if not i_vp_hist_mode
+                _vp_val_lns.push(line.new(_cur_c.start_bi, _cur_c.val_p, _cur_lx2_c, _cur_c.val_p,
+                                           color=i_vah_val_col, width=i_vah_val_width))
+            _vp_val_lbl := label.new(_cur_lx2_c, _cur_c.val_p,
+                                     " VAL: " + str.tostring(_cur_c.val_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
 

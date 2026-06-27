@@ -102,7 +102,7 @@ i_eeod_col    = input.color(color.new(color.green,   80), "", inline="eeod",  gr
 // ── VOLUME PROFILE ────────────────────────────────────────────────────────
 i_show_vp       = input.bool(false,    "Show Volume Profile",   group="Volume Profile")
 i_vp_period     = input.string("Day",  "Period",                group="Volume Profile", options=["Day", "Custom"])
-i_vp_length     = input.int(200,       "Custom Length (bars)",  group="Volume Profile", minval=10, maxval=500, tooltip="Only used when Period is 'Custom'.")
+i_vp_start_time = input.time(timestamp("2024-01-01 00:00"), "Custom Start Time", group="Volume Profile", tooltip="Start date/time for the Custom period VP. Only used when Period is 'Custom'.")
 i_vp_rows       = input.int(50,        "Rows",                  group="Volume Profile", minval=10, maxval=130)
 i_vp_placement  = input.string("Right","Placement",             group="Volume Profile", options=["Right", "Left"])
 i_vp_width      = input.int(80,        "Profile Width (bars)",  group="Volume Profile", minval=5, maxval=500, tooltip="Visual width of the profile in bar units.")
@@ -201,6 +201,7 @@ var label  _vp_vah_lbl = na
 var label  _vp_val_lbl = na
 
 bool _vp_16ct = _ct_now >= 16 * 60 and _ct_prev < 16 * 60
+int  _vp_cust_len = math.max(int(nz(ta.barssince(time < i_vp_start_time), bar_index + 1)), 1)
 
 if i_show_vp and i_vp_period == "Day"
     if _vp_16ct
@@ -876,8 +877,8 @@ if barstate.islast and i_show_vp
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
 
-    else  // Custom period — single profile from lookback
-        int _len = math.min(i_vp_length, bar_index + 1)
+    else  // Custom period — single profile from start time
+        int _len = math.min(_vp_cust_len, bar_index + 1)
         float[] _bh = array.new_float(_len)
         float[] _bl = array.new_float(_len)
         float[] _bv = array.new_float(_len)

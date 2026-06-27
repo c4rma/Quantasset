@@ -561,6 +561,7 @@ class InfoHunter(App):
         self._countdown      = REFRESH_INTERVAL_SECONDS
         self._user_scroll_y  = 0.0   # tracks vertical scroll position
         self._user_scroll_x  = 0.0   # tracks horizontal scroll position
+        self._rebuilding     = False # True while a table rebuild restores scroll
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -575,7 +576,15 @@ class InfoHunter(App):
         )
         tbl = DataTable(id="tbl", cursor_type="row", zebra_stripes=True)
         tbl.show_horizontal_scrollbar = True
-        tbl.add_columns("TIME", "IMP", "CAT", "SOURCE", "HEADLINE")
+        # Fixed column widths keep the table's virtual width constant across
+        # refreshes. With auto-sized columns, clearing the rows momentarily
+        # shrinks each column to its label width, which collapses max_scroll_x
+        # to ~0 and makes the horizontal scroll position snap back to the left.
+        tbl.add_column("TIME",     width=14)
+        tbl.add_column("IMP",      width=6)
+        tbl.add_column("CAT",      width=8)
+        tbl.add_column("SOURCE",   width=22)
+        tbl.add_column("HEADLINE", width=110)
         yield tbl
         yield Static("", id="status-bar")
         yield Footer()
@@ -605,16 +614,30 @@ class InfoHunter(App):
     # ── Table ─────────────────────────────────────────────────────────────────
 
     def _rebuild_table(self) -> None:
-        self._rows = self.store.get_sorted(
+        new_rows = self.store.get_sorted(
             filter_impact=self.filter_impact,
             filter_category=self.filter_category,
             search=self.search_query,
         )
         tbl = self.query_one("#tbl", DataTable)
 
-        # Preserve cursor row; scroll position is tracked continuously in _user_scroll_y
+        # Skip the full clear/repopulate when the visible rows are unchanged.
+        # Most refreshes bring no new headlines within the 12h window, so this
+        # avoids needless repaints — and the flicker that comes with them —
+        # while leaving the scroll position completely untouched.
+        if ([h.id for h in new_rows] == [h.id for h in self._rows]
+                and tbl.row_count == len(new_rows)):
+            self._rows = new_rows
+            self._update_toolbar()
+            self._update_status()
+            return
+
+        self._rows = new_rows
+
+        # Preserve cursor row; scroll position is tracked continuously in _tick.
         saved_row = tbl.cursor_row
 
+        self._rebuilding = True
         tbl.clear()
 
         for h in self._rows:
@@ -631,17 +654,30 @@ class InfoHunter(App):
         if saved_row is not None and len(self._rows) > 0:
             tbl.move_cursor(row=min(saved_row, len(self._rows) - 1), animate=False)
 
-        # Restore the user's scroll position. We use _user_scroll_y (updated
-        # continuously by on_scroll_changed) rather than the pre-clear snapshot,
-        # so that scrolling done between refreshes is always honoured.
-        # call_after_refresh ensures this runs after move_cursor's internal
-        # scroll-into-view, giving us the final word on the viewport position.
-        target_y = self._user_scroll_y
+        # Restore the user's scroll position (tracked continuously in _tick).
         target_x = self._user_scroll_x
+        target_y = self._user_scroll_y
+
+        # Set it synchronously so the very first repaint already shows the
+        # correct horizontal position — no one-frame snap to the left edge.
+        tbl.scroll_x = target_x
+        tbl.scroll_y = target_y
+
+        attempts = 0
 
         def _restore_scroll() -> None:
-            tbl.scroll_y = target_y
+            # Re-assert after refresh in case the scrollable area hadn't fully
+            # settled yet (which would clamp the value above). Retry across a
+            # few frames until it sticks, then stop tracking the transient.
+            nonlocal attempts
             tbl.scroll_x = target_x
+            tbl.scroll_y = target_y
+            attempts += 1
+            stuck = (tbl.scroll_x >= target_x - 0.5) and (tbl.scroll_y >= target_y - 0.5)
+            if not stuck and attempts < 10:
+                self.call_after_refresh(_restore_scroll)
+            else:
+                self._rebuilding = False
 
         self.call_after_refresh(_restore_scroll)
 
@@ -685,7 +721,11 @@ class InfoHunter(App):
     def _tick(self) -> None:
         self._countdown = max(0, self._countdown - 1)
         self._update_status()
-        # Continuously track where the user has scrolled to
+        # Continuously track where the user has scrolled to — but not while a
+        # rebuild is still restoring the scroll, or we'd capture the transient
+        # reset and make it permanent.
+        if self._rebuilding:
+            return
         try:
             tbl = self.query_one("#tbl", DataTable)
             self._user_scroll_y = tbl.scroll_y

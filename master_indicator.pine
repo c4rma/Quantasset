@@ -977,7 +977,7 @@ if barstate.islast
     _buy_lbl   := i_show_buy_lvl  and i_buy_lvl  != 0 ? label.new(bar_index, i_buy_lvl,  "Buy Territory",  textcolor=color.white,  style=label.style_label_left, color=color.new(color.black, 100), size=size.small) : na
     _sell_line := i_show_sell_lvl and i_sell_lvl != 0 ? line.new(bar_index, i_sell_lvl, bar_index - 1, i_sell_lvl, color=color.white,  style=line.style_dotted, width=1, extend=extend.both) : na
     _sell_lbl  := i_show_sell_lvl and i_sell_lvl != 0 ? label.new(bar_index, i_sell_lvl, "Sell Territory", textcolor=color.white,  style=label.style_label_left, color=color.new(color.black, 100), size=size.small) : na
-    _gex_line  := i_show_gex_lvl  and i_gex_lvl  != 0 ? line.new(bar_index, i_gex_lvl,  bar_index - 1, i_gex_lvl,  color=color.white, style=line.style_dotted, width=1, extend=extend.both) : na
+    _gex_line  := i_show_gex_lvl  and i_gex_lvl  != 0 ? line.new(bar_index, i_gex_lvl,  bar_index - 1, i_gex_lvl,  color=color.white, style=line.style_dashed, width=1, extend=extend.both) : na
     _gex_lbl   := i_show_gex_lvl  and i_gex_lvl  != 0 ? label.new(bar_index, i_gex_lvl,  "GEX Flip",       textcolor=color.white, style=label.style_label_left, color=color.new(color.black, 100), size=size.small) : na
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -3,8 +3,10 @@
 gex.py — Gamma Exposure (GEX) Interval Map
 Curses terminal chart: Y axis = strike, X axis = time (one column per refresh
 interval), each cell a dot whose size/color is the net dealer gamma exposure
-at that strike at that moment. Price is overlaid as a bright marker moving
-through the strikes.
+at that strike at that moment. Price is overlaid as a bright yellow marker in
+the gap between whichever two strikes it currently sits between (sized like
+the surrounding dots so you can tell what exposure zone price is actually in),
+landing on a strike's own row only when price exactly equals that strike.
 
   Green dot = positive gamma (call-dominated). Dealer hedging dampens moves —
               these strikes act as magnets / pin / support-resistance.
@@ -22,6 +24,14 @@ Bottom of the chart also shows, for whichever column is currently in view:
                         below it dealer hedging is destabilizing, above it
                         stabilizing. The two strikes it falls between are
                         highlighted cyan on the price axis.
+Both are averaged over the last --smooth-n raw fetches (default 5) rather than
+shown instantaneously — a single stale/transitional OI snapshot or a large
+order on a thin strike can swing the raw flip $50+ for one refresh and then
+revert; smoothing absorbs that without hiding a real, sustained level change.
+A --diag-threshold-sized jump ($30 default) in the *raw* (unsmoothed) flip
+between two consecutive fetches is logged to gex_diag_<SYMBOL>_MM_DD_YYYY.jsonl
+(full before/after OI+gamma per strike) and flashed in the status bar, so you
+can tell a data artifact from a real move.
 
 Data:
   ETH/BTC — Deribit REST, real-time, gamma+OI read directly off each ticker.
@@ -42,14 +52,19 @@ run --headless continuously (e.g. via Task Scheduler) to keep that window full.
 
 Usage:
   python gex.py [ETH|BTC|QQQ] [--interval SEC] [--all-exp] [--date MM_DD_YYYY]
-                 [--window-hours N] [--headless]
-    --interval SEC      refresh interval in seconds (default 60)
-    --all-exp           sum GEX across ALL expiries instead of just the nearest
-                         (nearest/0DTE-style expiry is the default)
-    --date MM_DD_YYYY   browse a past day's logged map instead of going live
-    --window-hours N    trailing window the live view targets (default 6)
-    --headless          no UI — just fetch+log on schedule, for keeping a
-                         continuous history running in the background
+                 [--window-hours N] [--headless] [--smooth-n N] [--diag-threshold N]
+    --interval SEC       refresh interval in seconds (default 60)
+    --all-exp            sum GEX across ALL expiries instead of just the nearest
+                          (nearest/0DTE-style expiry is the default)
+    --date MM_DD_YYYY    browse a past day's logged map instead of going live
+    --window-hours N     trailing window the live view targets (default 6)
+    --headless           no UI — just fetch+log on schedule, for keeping a
+                          continuous history running in the background
+    --smooth-n N         raw fetches averaged into the displayed Max Pain /
+                          GEX Flip (default 5; 1 = show the raw instantaneous value)
+    --diag-threshold N   dollar move in the raw flip between consecutive
+                          fetches that triggers a diagnostic log entry (default
+                          30; 0 disables)
 
 In-app: ←/→ pan by a few columns, PgUp/PgDn pan by a screenful, End jumps back
 to live. [R] refreshes now (live mode) or reloads the log from disk (history
@@ -61,6 +76,7 @@ import time
 import threading
 import os
 import json
+import bisect
 
 # Windows compatibility — install windows-curses if _curses is missing
 try:
@@ -114,6 +130,22 @@ if "--window-hours" in args:
     i = args.index("--window-hours")
     try:
         WINDOW_HOURS = max(0.1, float(args[i + 1]))
+    except (IndexError, ValueError):
+        pass
+    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+SMOOTH_N = 5
+if "--smooth-n" in args:
+    i = args.index("--smooth-n")
+    try:
+        SMOOTH_N = max(1, int(args[i + 1]))
+    except (IndexError, ValueError):
+        pass
+    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+DIAG_THRESHOLD = 30.0
+if "--diag-threshold" in args:
+    i = args.index("--diag-threshold")
+    try:
+        DIAG_THRESHOLD = float(args[i + 1])
     except (IndexError, ValueError):
         pass
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
@@ -302,6 +334,74 @@ def append_log(col):
     except Exception as e:
         return False, str(e)
 
+def diag_log_path(date_str):
+    suffix = "_allexp" if ALL_EXP else ""
+    return os.path.join(LOG_DIR, f"gex_diag_{SYMBOL}{suffix}_{date_str}.jsonl")
+
+def append_diag(prev_col, prev_level, new_col, new_level):
+    """Log a raw-flip jump exceeding DIAG_THRESHOLD: full before/after OI+gamma per
+    strike, so a stale-OI-snapshot artifact can be told apart from a real move."""
+    try:
+        with open(diag_log_path(datetime.now().strftime("%m_%d_%Y")), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": new_col["ts"].isoformat(), "prev_ts": prev_col["ts"].isoformat(),
+                "delta": new_level - prev_level,
+                "prev_flip_level": prev_level, "new_flip_level": new_level,
+                "prev_spot": prev_col["spot"], "new_spot": new_col["spot"],
+                "prev_gex": prev_col["gex"], "new_gex": new_col["gex"],
+                "prev_oi_by_type": prev_col.get("oi_by_type"), "new_oi_by_type": new_col.get("oi_by_type"),
+            }) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def check_flip_jump(prev_col, new_col):
+    """Compare raw (unsmoothed) flip levels between two consecutive columns; if the
+    jump exceeds DIAG_THRESHOLD, log it and return a short status message, else None."""
+    if DIAG_THRESHOLD <= 0:
+        return None
+    prev_flip = compute_gamma_flip(prev_col["gex"], prev_col["spot"])
+    new_flip  = compute_gamma_flip(new_col["gex"], new_col["spot"])
+    if not prev_flip or not new_flip:
+        return None
+    delta = new_flip[2] - prev_flip[2]
+    if abs(delta) < DIAG_THRESHOLD:
+        return None
+    append_diag(prev_col, prev_flip[2], new_col, new_flip[2])
+    sign = "+" if delta > 0 else "-"
+    return f"⚠ flip jumped {sign}{fstrike(abs(delta))} @ {new_col['ts'].strftime('%H:%M:%S')} (logged)"
+
+def smoothed_max_pain_and_flip(history, end_idx, n):
+    """Average Max Pain and the GEX-flip level over the last n raw columns ending at
+    end_idx, to absorb single-snapshot OI/IV artifacts (see check_flip_jump/module
+    docstring). Returns (smoothed_max_pain_or_None, smoothed_flip_level_or_None)."""
+    window = history[max(0, end_idx - n):end_idx]
+    if not window:
+        return None, None
+    mps, levels = [], []
+    for c in window:
+        mp = compute_max_pain(c.get("oi_by_type"))
+        if mp is not None:
+            mps.append(mp)
+        fl = compute_gamma_flip(c["gex"], c["spot"])
+        if fl:
+            levels.append(fl[2])
+    smoothed_mp    = sum(mps) / len(mps) if mps else None
+    smoothed_level = sum(levels) / len(levels) if levels else None
+    return smoothed_mp, smoothed_level
+
+def bounding_strikes(sorted_strikes, level):
+    """The two adjacent grid strikes that bracket `level` (equal if level lands exactly
+    on one, or is beyond either end of the grid)."""
+    i = bisect.bisect_left(sorted_strikes, level)
+    if i <= 0:
+        return sorted_strikes[0], sorted_strikes[0]
+    if i >= len(sorted_strikes):
+        return sorted_strikes[-1], sorted_strikes[-1]
+    if sorted_strikes[i] == level:
+        return sorted_strikes[i], sorted_strikes[i]
+    return sorted_strikes[i - 1], sorted_strikes[i]
+
 def load_log(date_str):
     """Read a day's log back into column dicts (no 'nearest' yet — ingest_column adds it)."""
     path = log_path(date_str)
@@ -433,23 +533,37 @@ def fstrike(strike):
         return f"${strike:,.0f}"
     return f"${strike:,.2f}"
 
-def dot_repr(net, scale_max):
-    """Character + colour attr for one GEX cell, scaled against the session max."""
-    if scale_max <= 0 or net == 0:
-        return " ", 0
+def magnitude_char(net, scale_max, floor_char=" "):
+    """Size-tier character for |net| as a fraction of scale_max — shared by dot_repr
+    (green/red) and price_marker_repr (forced yellow) so both use the same scale."""
+    if scale_max <= 0:
+        return floor_char, 0.0
     frac = min(1.0, abs(net) / scale_max)
     if frac < 0.04:
-        return " ", 0
+        return floor_char, frac
     elif frac < 0.15:
-        ch = "."
+        return ".", frac
     elif frac < 0.35:
-        ch = "o"
+        return "o", frac
     elif frac < 0.65:
-        ch = "O"
+        return "O", frac
     else:
-        ch = "●"  # ●
+        return "●", frac  # ●
+
+def dot_repr(net, scale_max):
+    """Character + colour attr for one GEX cell, scaled against the session max."""
+    ch, frac = magnitude_char(net, scale_max)
+    if ch == " ":
+        return " ", 0
     pair = P_GREEN if net > 0 else P_RED
     return ch, cp(pair, bold=(frac >= 0.35))
+
+def price_marker_repr(net, scale_max):
+    """Price-row glyph: same size tiers as dot_repr (so the gamma magnitude under the
+    current price stays visible — large/med/small/tiny) but forced yellow, and floored
+    to a small dot rather than blank so the price track never vanishes in dead zones."""
+    ch, frac = magnitude_char(net, scale_max, floor_char="·")
+    return ch, cp(P_YELLOW, bold=(frac >= 0.35))
 
 # ── DRAW ──────────────────────────────────────────────────────────────────
 def draw(win, history, grid, scale_max, meta, status, ui):
@@ -498,6 +612,9 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         pieces += [(f"  Log ⚠{log_err[:20]}", cp(P_RED, bold=True))]
     else:
         pieces += [(f"  Log {log_rows}", cp(P_DIM, dim=True))]
+    diag_count = ui.get("diag_count", 0)
+    if diag_count:
+        pieces += [(f"  Jumps {diag_count}", cp(P_RED, bold=True))]
     x = 0
     for text, attr in pieces:
         safe_add(win, 0, x, text, attr)
@@ -511,7 +628,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         (". ", cp(P_GREEN)), ("tiny   ", cp(P_DIM, dim=True)),
         ("green", cp(P_GREEN, bold=True)), ("=+gamma(pin/support)  ", cp(P_DIM, dim=True)),
         ("red", cp(P_RED, bold=True)), ("=-gamma(accelerant)  ", cp(P_DIM, dim=True)),
-        ("●", cp(P_YELLOW, bold=True)), ("=price  ", cp(P_DIM, dim=True)),
+        ("●", cp(P_YELLOW, bold=True)), ("=price(sized)  ", cp(P_DIM, dim=True)),
         ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes", cp(P_DIM, dim=True)),
     ]
     x = 0
@@ -533,7 +650,8 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     axis_w = max(len(fstrike(s)) for s in grid) + 2
     top    = 3
     bottom_reserved = 3   # time-axis row + Max Pain/GEX Flip row + status bar
-    avail_rows = max(1, h - top - bottom_reserved)
+    row_h  = 2            # 1 content row + 1 blank spacer row, for readability between strikes
+    avail_rows = max(1, (h - top - bottom_reserved) // row_h)
 
     grid_sorted = sorted(grid)
     atm_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
@@ -557,18 +675,23 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         start_idx = max(0, end_idx - n_cols)
         cols = history[start_idx:end_idx]
 
-    # Max Pain + Zero Gamma/GEX Flip, computed from whatever column is currently in view
-    # (the live edge, or the paused/scrolled-to column — same one driving "spot" above).
-    ref_col   = cols[-1] if cols else None
-    max_pain  = compute_max_pain(ref_col.get("oi_by_type")) if ref_col else None
-    flip      = compute_gamma_flip(ref_col["gex"], ref_col["spot"]) if ref_col else None
+    # Max Pain + Zero Gamma/GEX Flip: averaged over the last SMOOTH_N raw fetches ending
+    # at whatever column is currently in view (live edge, or the paused/scrolled-to one —
+    # same one driving "spot" above) to absorb single-snapshot OI/IV artifacts. See
+    # module docstring / check_flip_jump for why raw values jump around.
+    max_pain, flip_level = smoothed_max_pain_and_flip(history, end_idx, SMOOTH_N)
+    flip = None
+    if flip_level is not None:
+        flip = bounding_strikes(grid_sorted, flip_level) + (flip_level,)
     flip_strikes = (flip[0], flip[1]) if flip else ()
 
     # ── Rows ─────────────────────────────────────────────────────────────
+    row_of = {}   # strike -> rendered row, for the price-marker pass below
     for ri, strike in enumerate(visible):
-        row = top + ri
+        row = top + ri * row_h
         if row >= h - bottom_reserved:
             break
+        row_of[strike] = row
         is_current = cols and cols[-1].get("nearest") == strike
         if is_current:
             lbl_attr = cp(P_ATM, bold=True)
@@ -584,10 +707,29 @@ def draw(win, history, grid, scale_max, meta, status, ui):
                 break
             net = col["gex"].get(strike, 0.0)
             ch, attr = dot_repr(net, scale_max)
-            if col.get("nearest") == strike:
-                ch, attr = "●", cp(P_YELLOW, bold=True)
             safe_add(win, row, cx, ch, attr)
             cx += COL_W
+
+    # ── Price markers — plotted in the spacer row between the two strikes spot
+    # actually sits between (only landing on a strike's own row if spot exactly
+    # equals it), so the dot no longer implies price is "at" whichever strike
+    # happened to be nearest. Drawn after the grid so it isn't overwritten.
+    for ci, col in enumerate(cols):
+        cx = axis_w + ci * COL_W
+        if cx >= w - 1:
+            break
+        spot_c = col["spot"]
+        lo_s, hi_s = bounding_strikes(grid_sorted, spot_c)
+        if lo_s == hi_s:
+            target_row, net_src = row_of.get(lo_s), lo_s
+        elif hi_s in row_of and lo_s in row_of:
+            target_row = row_of[hi_s] + 1   # hi_s renders above lo_s (descending list)
+            net_src = lo_s if abs(spot_c - lo_s) <= abs(spot_c - hi_s) else hi_s
+        else:
+            target_row, net_src = None, None
+        if target_row is not None and top <= target_row < h - bottom_reserved:
+            ch, attr = price_marker_repr(col["gex"].get(net_src, 0.0), scale_max)
+            safe_add(win, target_row, cx, ch, attr)
 
     # ── Time axis ────────────────────────────────────────────────────────
     axis_row = h - bottom_reserved
@@ -612,6 +754,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     info_pieces = [
         (" Max Pain ", cp(P_DIM, dim=True)), (mp_str, cp(P_YELLOW, bold=True)),
         ("    Zero Gamma/GEX Flip ", cp(P_DIM, dim=True)), (flip_str, cp(P_CYAN, bold=True)),
+        (f"    (smoothed over last {SMOOTH_N})", cp(P_DIM, dim=True)),
     ]
     info_row = h - bottom_reserved + 1
     ix = 0
@@ -647,6 +790,9 @@ def curses_main(stdscr):
     fetching = False
     log_rows = 0
     log_err  = None
+    diag_count = 0
+    diag_msg   = None
+    diag_msg_time = 0.0
     lock = threading.Lock()
 
     # Scroll state: live_follow=True always shows the newest columns; panning
@@ -676,11 +822,13 @@ def curses_main(stdscr):
 
     def do_fetch():
         nonlocal error_msg, last_fetch, fetching, fetch_dur, scale_max, meta, log_rows, log_err
+        nonlocal diag_count, diag_msg, diag_msg_time
         t0 = time.time()
         try:
             d = fetch_snapshot()
             elapsed = time.time() - t0
             with lock:
+                prev_col = history[-1] if history else None
                 col = {"ts": datetime.now(), "spot": d["spot"], "gex": d["strikes"],
                        "oi_by_type": d.get("oi_by_type") or {},
                        "expiry_label": d.get("expiry_label"),
@@ -698,6 +846,12 @@ def curses_main(stdscr):
                     log_err = None
                 else:
                     log_err = err
+                if prev_col is not None:
+                    msg = check_flip_jump(prev_col, col)
+                    if msg:
+                        diag_count += 1
+                        diag_msg = msg
+                        diag_msg_time = time.time()
         except Exception as e:
             with lock:
                 error_msg = str(e)
@@ -778,8 +932,10 @@ def curses_main(stdscr):
             cur_scale = scale_max
             cur_meta = dict(meta)
             cur_error = error_msg
+            cur_diag_count = diag_count
+            cur_diag_msg = diag_msg if diag_msg and (time.time() - diag_msg_time) < 120 else None
             ui = {"live_follow": live_follow, "view_end_idx": view_end_idx,
-                  "log_rows": log_rows, "log_err": log_err}
+                  "log_rows": log_rows, "log_err": log_err, "diag_count": cur_diag_count}
 
         if HISTORICAL_MODE:
             status = "history mode — no live fetch"
@@ -788,6 +944,8 @@ def curses_main(stdscr):
         else:
             next_in = max(0, int(REFRESH_SEC - elapsed))
             status = f"↻ in {next_in}s"
+        if cur_diag_msg:
+            status = f"{cur_diag_msg}  |  {status}"
         if cur_error:
             status += f"  ⚠ {cur_error}"
 
@@ -802,6 +960,7 @@ def headless_main():
     print(f"gex.py headless logger — {SYMBOL}{' (all-exp)' if ALL_EXP else ''}, "
           f"every {REFRESH_SEC}s -> {log_path(datetime.now().strftime('%m_%d_%Y'))}")
     print("Ctrl+C to stop.")
+    prev_col = None
     while True:
         t0 = time.time()
         ts = datetime.now()
@@ -815,6 +974,11 @@ def headless_main():
             tag = "OK" if ok else f"LOG ERROR: {err}"
             print(f"[{ts.strftime('%H:%M:%S')}] spot={col['spot']:.2f} "
                   f"strikes={len(col['gex'])} {tag}")
+            if prev_col is not None:
+                msg = check_flip_jump(prev_col, col)
+                if msg:
+                    print(f"  {msg}")
+            prev_col = col
         except Exception as e:
             print(f"[{ts.strftime('%H:%M:%S')}] fetch error: {e}")
         time.sleep(max(1.0, REFRESH_SEC - (time.time() - t0)))

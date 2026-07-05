@@ -23,7 +23,10 @@ Bottom of the chart also shows, for whichever column is currently in view:
   Zero Gamma/GEX Flip  strike level where cumulative net GEX crosses zero —
                         below it dealer hedging is destabilizing, above it
                         stabilizing. The two strikes it falls between are
-                        highlighted cyan on the price axis.
+                        highlighted cyan on the price axis, and a wide white
+                        dashed line is drawn across the chart at that level
+                        (in the gap between the two strikes, like the price
+                        marker, unless the flip lands exactly on a strike).
 Both are averaged over the last --smooth-n raw fetches (default 5) rather than
 shown instantaneously — a single stale/transitional OI snapshot or a large
 order on a thin strike can swing the raw flip $50+ for one refresh and then
@@ -398,6 +401,17 @@ def bounding_strikes(sorted_strikes, level):
         return sorted_strikes[i], sorted_strikes[i]
     return sorted_strikes[i - 1], sorted_strikes[i]
 
+def resolve_marker_row(lo_s, hi_s, row_of):
+    """Row for a level given its two bounding strikes (from bounding_strikes): that
+    strike's own row if lo==hi (exact hit, or clamped to a grid edge), else the spacer
+    row between them if both are currently rendered, else None (off-screen). Shared by
+    the price marker and the GEX-flip reference line so both use the same placement."""
+    if lo_s == hi_s:
+        return row_of.get(lo_s)
+    if hi_s in row_of and lo_s in row_of:
+        return row_of[hi_s] + 1   # hi_s renders above lo_s (descending strike list)
+    return None
+
 def load_log(date_str):
     """Read a day's log back into column dicts (no 'nearest' yet — ingest_column adds it)."""
     path = log_path(date_str)
@@ -610,7 +624,8 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         ("green", cp(P_GREEN, bold=True)), ("=+gamma(pin/support)  ", cp(P_DIM, dim=True)),
         ("red", cp(P_RED, bold=True)), ("=-gamma(accelerant)  ", cp(P_DIM, dim=True)),
         ("●", cp(P_YELLOW, bold=True)), ("=price(sized)  ", cp(P_DIM, dim=True)),
-        ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes", cp(P_DIM, dim=True)),
+        ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes  ", cp(P_DIM, dim=True)),
+        ("----", cp(P_DEFAULT, bold=True)), ("=GEX flip level", cp(P_DIM, dim=True)),
     ]
     x = 0
     for text, attr in legend:
@@ -691,6 +706,19 @@ def draw(win, history, grid, scale_max, meta, status, ui):
             safe_add(win, row, cx, ch, attr)
             cx += COL_W
 
+    # ── GEX-flip reference line — a wide dashed white line at the (possibly-between-
+    # strikes) row for the smoothed flip level, spanning every rendered time column.
+    # Drawn before the price markers so a price dot on the same row still shows through.
+    if flip:
+        flip_row = resolve_marker_row(flip[0], flip[1], row_of)
+        if flip_row is not None and top <= flip_row < h - bottom_reserved:
+            cx = axis_w
+            for _ in cols:
+                if cx >= w - 1:
+                    break
+                safe_add(win, flip_row, cx, "-", cp(P_DEFAULT, bold=True))
+                cx += COL_W
+
     # ── Price markers — plotted in the spacer row between the two strikes spot
     # actually sits between (only landing on a strike's own row if spot exactly
     # equals it), so the dot no longer implies price is "at" whichever strike
@@ -701,13 +729,8 @@ def draw(win, history, grid, scale_max, meta, status, ui):
             break
         spot_c = col["spot"]
         lo_s, hi_s = bounding_strikes(grid_sorted, spot_c)
-        if lo_s == hi_s:
-            target_row, net_src = row_of.get(lo_s), lo_s
-        elif hi_s in row_of and lo_s in row_of:
-            target_row = row_of[hi_s] + 1   # hi_s renders above lo_s (descending list)
-            net_src = lo_s if abs(spot_c - lo_s) <= abs(spot_c - hi_s) else hi_s
-        else:
-            target_row, net_src = None, None
+        target_row = resolve_marker_row(lo_s, hi_s, row_of)
+        net_src = lo_s if lo_s == hi_s or abs(spot_c - lo_s) <= abs(spot_c - hi_s) else hi_s
         if target_row is not None and top <= target_row < h - bottom_reserved:
             ch, attr = price_marker_repr(col["gex"].get(net_src, 0.0), scale_max)
             safe_add(win, target_row, cx, ch, attr)

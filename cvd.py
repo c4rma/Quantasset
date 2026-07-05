@@ -107,6 +107,24 @@ In-app:
       live "last" readout. Panning right back past the true live edge exits
       the crosshair automatically.
   [L] / End jumps back to the live candle (also exits Goto mode/crosshair).
+  [+] / [-] (or [=] / [_]) zoom in/out — merges every N real bars into one
+      displayed candle at each zoom-out step (pure visual OHLC/CVD
+      aggregation via merge_bars; the underlying --interval, log, and CSV
+      are completely untouched), roughly exponential per press. [+] undoes
+      merging back toward the natural 1:1 floor; there's no "zoom in beyond
+      1:1" (each real bar is already maximum detail). Note: ←/→ pan steps
+      stay in raw-bar units regardless of zoom level, so at a heavy zoom-out
+      the coarser [ / ] / { / } tiers will feel more responsive than ←/→.
+  [T] toggles the Big Trade Detector overlay on the price panel — recreated
+      from chart.py, same formula and thresholds: each bar's buy/sell
+      "intensity" ((close−low)/range and (high−close)/range, each × the
+      bar's total volume — chart.py's exact proxy, used as-is rather than
+      cvd.py's real per-side buy_vol/sell_vol, which turned out to be too
+      sparse/bursty bar-to-bar for a meaningful rolling baseline) is
+      compared against a rolling z-score baseline from the preceding 10
+      bars, flagging cyan (buy, below the low wick) or magenta (sell,
+      above the high wick) blocks in 3 escalating tiers (3σ/4.5σ/6σ)
+      exactly like chart.py's defaults.
   [Q] / Esc quits.
 """
 
@@ -116,9 +134,19 @@ import time
 import json
 import csv
 import bisect
+import locale
 import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
+
+# Required for curses to correctly encode the box-drawing glyphs (█│─) used
+# for candle bodies/wicks as UTF-8 when writing via addstr — without this,
+# ncursesw falls back to the C locale and mangles anything outside ASCII.
+# Must happen before curses.initscr()/wrapper() is ever called.
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except Exception:
+    pass
 
 try:
     import curses
@@ -926,7 +954,7 @@ def ws_phemex(session):
         _ping_stop.clear()
 
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
-P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS = range(1, 8)
+P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_MAGENTA = range(1, 9)
 
 def init_colors():
     curses.start_color()
@@ -939,6 +967,7 @@ def init_colors():
     curses.init_pair(P_GREEN,   curses.COLOR_GREEN,  BG)
     curses.init_pair(P_RED,     curses.COLOR_RED,    BG)
     curses.init_pair(P_STATUS,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
+    curses.init_pair(P_MAGENTA, curses.COLOR_MAGENTA, BG)   # BTD sell signal (buy uses P_CYAN)
 
 def cp(pair, bold=False, dim=False):
     a = curses.color_pair(pair)
@@ -972,7 +1001,122 @@ def fmt_time(ts):
     fine = BAR_MODE == "volume" or BAR_SECS < 60
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S" if fine else "%H:%M")
 
-def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_idx=-1, fmt_fn=None):
+# ── ZOOM (merge N real bars into 1 displayed candle — [+]/[-]) ────────────
+ZOOM_MAX_GROUP = 500
+
+def merge_bars(group):
+    """Combine consecutive closed bars into one OHLC+CVD candle — used only
+    for the [+]/[-] zoom display (pure visual aggregation; the underlying
+    --interval, log, and CSV are completely untouched). Standard OHLC merge
+    for price; CVD open/close come directly from the group's first/last
+    values (already a continuous running series), high/low are the extremes
+    actually reached anywhere within the group."""
+    if len(group) == 1:
+        return group[0]
+    o, c = group[0]["o"], group[-1]["c"]
+    h = max(b["h"] for b in group)
+    l = min(b["l"] for b in group)
+    buy_vol = sum(b["buy_vol"] for b in group)
+    sell_vol = sum(b["sell_vol"] for b in group)
+    cvd_open = group[0].get("cvd_open", group[0].get("cvd", 0.0))
+    cvd = group[-1].get("cvd", cvd_open)
+    cvd_high = max(b.get("cvd_high", b.get("cvd", cvd_open)) for b in group)
+    cvd_low = min(b.get("cvd_low", b.get("cvd", cvd_open)) for b in group)
+    return {"ts": group[0]["ts"], "o": o, "h": h, "l": l, "c": c,
+            "buy_vol": buy_vol, "sell_vol": sell_vol, "delta": buy_vol - sell_vol,
+            "cvd_open": cvd_open, "cvd_high": cvd_high, "cvd_low": cvd_low, "cvd": cvd}
+
+def zoom_bars(all_bars, group_size):
+    """Resample the WHOLE bar sequence (not just the visible tail) at the
+    given group_size, so bars just before the visible window are still
+    available at the correct zoom level for BTD's lookback baseline.
+    group_size=1 is the identity (no zoom)."""
+    if group_size <= 1 or not all_bars:
+        return all_bars
+    return [merge_bars(all_bars[i:i + group_size]) for i in range(0, len(all_bars), group_size)]
+
+def zoom_step(size, direction):
+    """One [+]/[-] press: roughly exponential in/out so it feels like a zoom
+    rather than a linear scroll — direction>0 zooms out (bigger groups, more
+    history per screen), direction<0 zooms in (smaller groups, toward the
+    natural 1:1 floor)."""
+    if direction > 0:
+        return min(ZOOM_MAX_GROUP, size + max(1, size // 3) + 1)
+    return max(1, size - max(1, size // 4) - 1)
+
+# ── BIG TRADE DETECTOR (recreated from chart.py) ────────────────────────────
+# Same statistical test as chart.py: a bar's buy/sell volume is compared
+# against a rolling z-score baseline from the preceding BTD_LOOKBACK bars
+# (not including itself); T1/T2/T3 tiers at sigma/sigma+1.5/sigma+3.0 match
+# chart.py's exact thresholds and defaults. The one deliberate difference:
+# chart.py has no real trade-side data, so it infers a buy/sell split from
+# where each candle's close sits within its own high-low range, weighted by
+# total volume — cvd.py already has the REAL buy_vol/sell_vol per bar (from
+# actual trade tape), so this feeds the identical test with that strictly
+# more accurate input instead of chart.py's proxy.
+BTD_LOOKBACK = 10
+BTD_SIGMA = 3.0
+
+def compute_btd_signals(bars, lookback=BTD_LOOKBACK, sigma=BTD_SIGMA):
+    """Returns {index: {"buy": tier|None, "sell": tier|None}} for every bar
+    in `bars` that qualifies (index >= lookback, matching chart.py's own
+    warm-up gate). Both buy and sell are checked independently (not
+    elif) — matching chart.py exactly, a single bar can in principle flag
+    both sides simultaneously, though it's rare in real data.
+
+    IMPORTANT: uses chart.py's EXACT input formula —
+      buy_intensity  = (close - low)  / (high - low) * total_volume
+      sell_intensity = (high - close) / (high - low) * total_volume
+    — NOT raw buy_vol/sell_vol directly, even though cvd.py has that real
+    per-bar data and chart.py has to infer this proxy from candle shape
+    (it has no real trade-side data at all). Tried raw buy_vol/sell_vol
+    first; empirically it over-triggered massively (~17% of real 1m bars
+    vs a "3-sigma" event's theoretical ~0.1%) because raw per-side volume
+    is extremely sparse/bursty bar-to-bar (long stretches near zero on one
+    side purely from random trade timing, not genuine calm), so the
+    rolling baseline's mean/stdev were themselves often tiny — trivially
+    cleared by an unremarkable bar. chart.py's proxy is anchored to each
+    bar's TOTAL volume (buy_vol+sell_vol, rarely near-zero) and varies
+    continuously with candle shape, giving the well-behaved baseline the
+    sigma=3.0 threshold was actually designed against — matching chart.py's
+    formula, not just its threshold constants, is what reproduces its
+    actual (much rarer) signal frequency."""
+    buy_iv, sell_iv = [], []
+    for b in bars:
+        rng = b["h"] - b["l"]
+        vol = b["buy_vol"] + b["sell_vol"]
+        if rng > 0:
+            buy_iv.append((b["c"] - b["l"]) / rng * vol)
+            sell_iv.append((b["h"] - b["c"]) / rng * vol)
+        else:
+            buy_iv.append(0.0)
+            sell_iv.append(0.0)
+
+    signals = {}
+    n = len(bars)
+    for i in range(lookback, n):
+        wb = buy_iv[i - lookback:i]
+        ws = sell_iv[i - lookback:i]
+        m = len(wb)
+        if m < 2:
+            continue
+        mb, ms = sum(wb) / m, sum(ws) / m
+        sdb = (sum((x - mb) ** 2 for x in wb) / (m - 1)) ** 0.5
+        sds = (sum((x - ms) ** 2 for x in ws) / (m - 1)) ** 0.5
+        cb, cs = buy_iv[i], sell_iv[i]
+        entry = {}
+        t1b, t2b, t3b = mb + sdb * sigma, mb + sdb * (sigma + 1.5), mb + sdb * (sigma + 3.0)
+        if cb > t1b:
+            entry["buy"] = 3 if cb > t3b else (2 if cb > t2b else 1)
+        t1s, t2s, t3s = ms + sds * sigma, ms + sds * (sigma + 1.5), ms + sds * (sigma + 3.0)
+        if cs > t1s:
+            entry["sell"] = 3 if cs > t3s else (2 if cs > t2s else 1)
+        if entry:
+            signals[i] = entry
+    return signals
+
+def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_idx=-1, fmt_fn=None,
+                  btd_signals=None):
     """Shared OHLC candlestick renderer — used for both the price panel and
     the CVD panel (candles built from cvd_open/high/low/close) so the two
     panels share identical visual language. Returns (vmin, vmax) of the
@@ -994,7 +1138,15 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
     real variation into a sliver at the top/bottom instead of using the full
     panel height, exactly the "flat-looking" bug this fixed. The zero line
     itself is only drawn when 0 actually falls within that auto-scaled
-    range — otherwise there's nothing meaningful to draw."""
+    range — otherwise there's nothing meaningful to draw.
+
+    btd_signals (Big Trade Detector, recreated from chart.py — see
+    compute_btd_signals): {column_index: {"buy": tier, "sell": tier}}. Buy
+    markers render as reversed cyan block(s) just below the bar's low wick,
+    sell as reversed magenta just above the high wick — tier 1 = single
+    cell, tier 2 = 1-wide x 2-tall, tier 3 = 3-wide x 2-tall, matching
+    chart.py's exact tier shapes. Marked cells are added to `occupied` so
+    the crosshair's guide lines skip over them instead of overwriting."""
     highs = [ohlc_fn(b)[1] for b in visible]
     lows  = [ohlc_fn(b)[2] for b in visible]
     vmax, vmin = max(highs), min(lows)
@@ -1019,40 +1171,75 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         up = c >= o
         color = cp(P_YELLOW, bold=True) if is_cursor else (cp(P_GREEN, bold=True) if up else cp(P_RED, bold=True))
         for r in range(r_hi, r_lo + 1):
-            win.addch(r, i, ord("│"), cp(P_DIM))
+            win.addstr(r, i, "│", cp(P_DIM))
             occupied.add((r, i))
         body_top, body_bot = min(r_op, r_cl), max(r_op, r_cl)
         for r in range(body_top, body_bot + 1):
-            win.addch(r, i, ord("█"), color)
+            win.addstr(r, i, "█", color)
             occupied.add((r, i))
         if body_top == body_bot:
-            win.addch(body_top, i, ord("─"), color)
+            win.addstr(body_top, i, "─", color)
             occupied.add((body_top, i))
         if is_cursor:
             cursor_row, cursor_val = r_cl, c
 
+        if btd_signals and i in btd_signals:
+            sig = btd_signals[i]
+            rev = curses.A_BOLD | curses.A_REVERSE
+            if "buy" in sig:
+                tier = sig["buy"]
+                row_b = min(rows[-1], r_lo + 1)
+                width = 3 if tier == 3 else 1
+                for dx in range(-(width // 2), width // 2 + 1):
+                    col = i + dx
+                    # tier 3 spans 3 columns (matching chart.py), which can reach an
+                    # ADJACENT candle's own column — never overwrite a cell that
+                    # candle already drew its body/wick into (or that a prior BTD
+                    # marker already claimed), or the marker corrupts real candle
+                    # data instead of just annotating alongside it
+                    if 0 <= col < plot_w and (row_b, col) not in occupied:
+                        win.addstr(row_b, col, "#", cp(P_CYAN) | rev)
+                        occupied.add((row_b, col))
+                        if tier >= 2 and row_b + 1 <= rows[-1] and (row_b + 1, col) not in occupied:
+                            win.addstr(row_b + 1, col, "#", cp(P_CYAN) | rev)
+                            occupied.add((row_b + 1, col))
+            if "sell" in sig:
+                tier = sig["sell"]
+                row_s = max(rows[0], r_hi - 1)
+                width = 3 if tier == 3 else 1
+                for dx in range(-(width // 2), width // 2 + 1):
+                    col = i + dx
+                    if 0 <= col < plot_w and (row_s, col) not in occupied:
+                        win.addstr(row_s, col, "#", cp(P_MAGENTA) | rev)
+                        occupied.add((row_s, col))
+                        if tier >= 2 and row_s - 1 >= rows[0] and (row_s - 1, col) not in occupied:
+                            win.addstr(row_s - 1, col, "#", cp(P_MAGENTA) | rev)
+                            occupied.add((row_s - 1, col))
+
     if 0 <= cursor_idx < len(visible):
         for r in rows:
             if (r, cursor_idx) not in occupied:
-                win.addch(r, cursor_idx, ord(":"), cp(P_YELLOW, dim=True))
+                win.addstr(r, cursor_idx, ":", cp(P_YELLOW, dim=True))
     if cursor_row is not None:
         for c2 in range(plot_w):
             if (cursor_row, c2) not in occupied:
-                win.addch(cursor_row, c2, ord("-"), cp(P_YELLOW, dim=True))
+                win.addstr(cursor_row, c2, "-", cp(P_YELLOW, dim=True))
         if fmt_fn:
             safe_add(win, cursor_row, plot_w + 1, fmt_fn(cursor_val), cp(P_YELLOW, bold=True))
 
     return vmin, vmax
 
 # ── DRAW ──────────────────────────────────────────────────────────────────
-def draw(win, bars, live_bar, status_line, cursor_idx=-1):
+def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd=False):
     """Returns n_vis — the number of bars actually rendered this frame — so
     the caller can track it for the NEXT frame's crosshair/pan arithmetic
     (the exact visible count depends on terminal width, only known here)."""
     h, w = win.getmaxyx()
     win.erase()
 
-    header = f" AGGREGATE CVD — {SYMBOL}  bar:{INTERVAL_LABEL}  "
+    zoom_tag = f"  zoom:{zoom_group}x" if zoom_group > 1 else ""
+    btd_tag = "  BTD:ON" if show_btd else ""
+    header = f" AGGREGATE CVD — {SYMBOL}  bar:{INTERVAL_LABEL}{zoom_tag}{btd_tag}  "
     safe_add(win, 0, 0, header.ljust(w), cp(P_STATUS))
 
     all_bars = bars + ([live_bar] if live_bar else [])
@@ -1061,11 +1248,17 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1):
         win.noutrefresh()
         return 0
 
+    all_bars = zoom_bars(all_bars, zoom_group)
+    btd_signals_full = compute_btd_signals(all_bars) if show_btd else None
+
     axis_w = 12               # right-side price/cvd axis label gutter
     plot_w = max(1, w - axis_w)
     n = min(len(all_bars), plot_w)
     visible = all_bars[-n:]
     cursor_idx = cursor_idx if 0 <= cursor_idx < n else -1
+    offset = len(all_bars) - n
+    btd_signals = ({i: btd_signals_full[offset + i] for i in range(n) if (offset + i) in btd_signals_full}
+                   if btd_signals_full else None)
 
     bottom_reserved = 2       # time axis row + status bar row
     top = 1
@@ -1083,7 +1276,7 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1):
         return b["o"], b["h"], b["l"], b["c"]
 
     pmin, pmax = draw_candles(win, visible, price_rows, _price_ohlc, plot_w,
-                              cursor_idx=cursor_idx, fmt_fn=fmt_price)
+                              cursor_idx=cursor_idx, fmt_fn=fmt_price, btd_signals=btd_signals)
     prows = len(price_rows)
     for tick_frac in (0.0, 0.5, 1.0):
         r = price_rows[int(round(tick_frac * (prows - 1)))]
@@ -1258,6 +1451,8 @@ def curses_main(stdscr):
     view_end_idx = 0
     cursor_idx = -1     # crosshair: -1 = none (pure live / plain view)
     last_n_vis = 0      # bars actually rendered last frame — for cursor activation/pan math
+    zoom_group = 1      # [+]/[-]: how many real bars are merged into 1 displayed candle
+    show_btd = False    # [T]: Big Trade Detector overlay on the price panel
 
     if HISTORICAL_MODE:
         for row in load_log(VIEW_DATE):
@@ -1285,6 +1480,12 @@ def curses_main(stdscr):
         elif key in (ord('z'), ord('Z')):
             with state.lock:
                 state.cvd_offset = state.raw_cvd
+        elif key in (ord('t'), ord('T')):
+            show_btd = not show_btd
+        elif key in (ord('+'), ord('=')):
+            zoom_group = zoom_step(zoom_group, -1)
+        elif key in (ord('-'), ord('_')):
+            zoom_group = zoom_step(zoom_group, 1)
         elif key in PAN_KEYS and not HISTORICAL_MODE:
             step = PAN_KEYS[key]
             with state.lock:
@@ -1408,7 +1609,8 @@ def curses_main(stdscr):
         if cur_error:
             sl += f"  ⚠ log: {cur_error}"
 
-        last_n_vis = draw(stdscr, draw_bars, draw_live, sl, cursor_idx=cursor_idx) or 0
+        last_n_vis = draw(stdscr, draw_bars, draw_live, sl, cursor_idx=cursor_idx,
+                          zoom_group=zoom_group, show_btd=show_btd) or 0
         curses.doupdate()
 
 # ── HEADLESS ────────────────────────────────────────────────────────────

@@ -43,21 +43,21 @@ to this script) so history survives restarts. Launching on a day that already
 has a log resumes it; `--date` opens a past day for pure playback/browsing.
 
 IMPORTANT: neither Deribit nor CBOE expose *historical* per-strike gamma/OI —
-only a live snapshot. There is no API to backfill "the last 6 hours" out of
-thin air on a cold start; the only real history is whatever this tool (or a
---headless instance of it) actually logged while running. The live view
-defaults to showing the trailing --window-hours of whatever's been logged so
-far today (compressing columns to fit if there's more than fits on screen);
-run --headless continuously (e.g. via Task Scheduler) to keep that window full.
+only a live snapshot. There is no API to backfill history out of thin air on a
+cold start; the only real history is whatever this tool (or a --headless
+instance of it) actually logged while running. The live view always shows raw,
+uncompressed minute-to-minute columns (same resolution as scrolling back with
+the arrow keys) — a screen's worth at a time, growing further back into
+whatever's been logged as you pan; run --headless continuously (e.g. via Task
+Scheduler) to keep more history on disk to pan back into.
 
 Usage:
   python gex.py [ETH|BTC|QQQ] [--interval SEC] [--all-exp] [--date MM_DD_YYYY]
-                 [--window-hours N] [--headless] [--smooth-n N] [--diag-threshold N]
+                 [--headless] [--smooth-n N] [--diag-threshold N]
     --interval SEC       refresh interval in seconds (default 60)
     --all-exp            sum GEX across ALL expiries instead of just the nearest
                           (nearest/0DTE-style expiry is the default)
     --date MM_DD_YYYY    browse a past day's logged map instead of going live
-    --window-hours N     trailing window the live view targets (default 6)
     --headless           no UI — just fetch+log on schedule, for keeping a
                           continuous history running in the background
     --smooth-n N         raw fetches averaged into the displayed Max Pain /
@@ -66,9 +66,12 @@ Usage:
                           fetches that triggers a diagnostic log entry (default
                           30; 0 disables)
 
-In-app: ←/→ pan by a few columns, PgUp/PgDn pan by a screenful, End jumps back
-to live. [R] refreshes now (live mode) or reloads the log from disk (history
-mode, in case another instance is still writing to it).
+In-app: ←/→ pan time by a few columns, PgUp/PgDn pan time by a screenful.
+↑/↓ scroll the price axis by one strike, [/] scroll it by a page, {/} jump to
+the highest/lowest strike in the grid. End resets both axes back to live
+(auto-following the latest column, auto-centered on the current strike).
+[R] refreshes now (live mode) or reloads the log from disk (history mode, in
+case another instance is still writing to it).
 """
 
 import sys
@@ -98,7 +101,7 @@ except ModuleNotFoundError:
     import requests
 
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Force UTF-8 stdout — the default Windows console codepage (cp1252) can't encode
@@ -122,14 +125,6 @@ if "--interval" in args:
     i = args.index("--interval")
     try:
         REFRESH_SEC = max(5, int(args[i + 1]))
-    except (IndexError, ValueError):
-        pass
-    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
-WINDOW_HOURS = 6.0
-if "--window-hours" in args:
-    i = args.index("--window-hours")
-    try:
-        WINDOW_HOURS = max(0.1, float(args[i + 1]))
     except (IndexError, ValueError):
         pass
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
@@ -179,9 +174,10 @@ VIEW_DATE       = LOAD_DATE or TODAY_STR
 HISTORICAL_MODE = LOAD_DATE is not None and LOAD_DATE != TODAY_STR   # pure playback, no live fetch
 
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
-ARROW_STEP = 5    # columns per Left/Right press
-PAGE_STEP  = 30   # columns per PgUp/PgDn press
-WINDOW_SEC = WINDOW_HOURS * 3600   # trailing window the live view targets
+ARROW_STEP = 5    # columns per Left/Right press (time axis)
+PAGE_STEP  = 30   # columns per PgUp/PgDn press (time axis)
+VERT_STEP      = 1    # strikes per Up/Down press (price axis)
+VERT_PAGE_STEP = 8    # strikes per [/] press (price axis)
 
 # ── DERIBIT HELPERS (crypto) ─────────────────────────────────────────────────
 def api(path, **params):
@@ -479,21 +475,6 @@ def compute_gamma_flip(strikes, spot):
         return None
     return min(crossings, key=lambda c: abs(c[2] - spot))
 
-def bucket_columns(cols, n_buckets):
-    """Downsample a chronological column list to at most n_buckets entries by keeping
-    the most recent raw column in each even time-slice — used to fit --window-hours of
-    real logged history into however many character-columns the terminal actually has,
-    rather than only ever showing a raw-column-per-refresh sliver of the trailing window."""
-    total = len(cols)
-    if total <= n_buckets or n_buckets <= 0:
-        return cols
-    out, prev_end = [], 0
-    for b in range(n_buckets):
-        end = max((b + 1) * total // n_buckets, prev_end + 1)
-        out.append(cols[end - 1])
-        prev_end = end
-    return out
-
 # ── COLOUR PAIRS ───────────────────────────────────────────────────────────
 P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_ATM = range(1, 9)
 
@@ -654,9 +635,14 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     avail_rows = max(1, (h - top - bottom_reserved) // row_h)
 
     grid_sorted = sorted(grid)
-    atm_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    if ui["vert_follow"]:
+        # Default: auto-center on whatever strike is currently nearest spot.
+        center_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    else:
+        # Manually scrolled (↑/↓, [/], {/}) — frozen index, doesn't drift as spot moves.
+        center_idx = max(0, min(len(grid_sorted) - 1, ui["vert_center_idx"]))
     half = avail_rows // 2
-    lo = max(0, atm_idx - half)
+    lo = max(0, center_idx - half)
     hi = min(len(grid_sorted), lo + avail_rows)
     lo = max(0, hi - avail_rows)
     visible = list(reversed(grid_sorted[lo:hi]))   # highest strike at top
@@ -664,16 +650,11 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     usable_w = max(0, w - axis_w - 1)
     n_cols   = max(1, usable_w // COL_W)
 
-    if live_follow:
-        # Default view: the trailing WINDOW_HOURS of whatever's actually been logged,
-        # compressed (most-recent-per-slice) to fit the screen if it's more than fits raw.
-        cutoff = history[-1]["ts"] - timedelta(seconds=WINDOW_SEC)
-        windowed = [c for c in history if c["ts"] >= cutoff]
-        cols = bucket_columns(windowed, n_cols)
-    else:
-        # Panning (arrow/PgUp/PgDn) inspects raw, uncompressed columns at 1:1 resolution.
-        start_idx = max(0, end_idx - n_cols)
-        cols = history[start_idx:end_idx]
+    # Always raw, uncompressed minute-to-minute columns — live mode just keeps end_idx
+    # pinned to len(history) so it tracks the latest column; panning freezes end_idx.
+    # Older history is reached the same way in both cases: scroll back with the arrows.
+    start_idx = max(0, end_idx - n_cols)
+    cols = history[start_idx:end_idx]
 
     # Max Pain + Zero Gamma/GEX Flip: averaged over the last SMOOTH_N raw fetches ending
     # at whatever column is currently in view (live edge, or the paused/scrolled-to one —
@@ -766,8 +747,9 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     bot = h - 1
     exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
     refresh_hint = "r=reload" if HISTORICAL_MODE else "r=refresh"
-    win_tag = f"window={WINDOW_HOURS:g}h" if live_follow else "1:1 pan"
-    hint = f" q=quit  {refresh_hint}  ←/→ PgUp/PgDn=pan  End=live  [{SYMBOL}]  [{exp_tag}]  [{win_tag}]  {status}"
+    vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
+    hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  "
+            f"strikes:↑/↓/[/]/{{/}}  End=live  [{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
     safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
 
     win.noutrefresh()
@@ -800,6 +782,21 @@ def curses_main(stdscr):
     # as new columns keep landing in the background.
     live_follow = True
     view_end_idx = 0
+
+    # Same pattern for the price axis: vert_follow=True auto-centers on whatever
+    # strike is nearest spot; scrolling (↑/↓, [/], {/}) freezes an absolute index
+    # into the sorted strike grid so it doesn't drift as price moves.
+    vert_follow = True
+    vert_center_idx = 0
+
+    def _atm_idx():
+        """Index of the strike nearest the latest spot — used to seed vert_center_idx
+        the moment the user starts scrolling away from auto-center."""
+        if not grid or not history:
+            return 0
+        gs = sorted(grid)
+        spot_now = history[-1]["spot"]
+        return min(range(len(gs)), key=lambda i: abs(gs[i] - spot_now))
 
     def _load_into(date_str):
         """(Re)populate history/grid/scale_max/meta from a day's log on disk."""
@@ -912,6 +909,39 @@ def curses_main(stdscr):
         elif key == curses.KEY_END:
             with lock:
                 live_follow = True
+                vert_follow = True
+        elif key == curses.KEY_UP:
+            with lock:
+                if vert_follow:
+                    vert_center_idx = _atm_idx()
+                vert_follow = False
+                vert_center_idx = min(max(0, len(grid) - 1), vert_center_idx + VERT_STEP)
+        elif key == curses.KEY_DOWN:
+            with lock:
+                if vert_follow:
+                    vert_center_idx = _atm_idx()
+                vert_follow = False
+                vert_center_idx = max(0, vert_center_idx - VERT_STEP)
+        elif key == ord('['):
+            with lock:
+                if vert_follow:
+                    vert_center_idx = _atm_idx()
+                vert_follow = False
+                vert_center_idx = min(max(0, len(grid) - 1), vert_center_idx + VERT_PAGE_STEP)
+        elif key == ord(']'):
+            with lock:
+                if vert_follow:
+                    vert_center_idx = _atm_idx()
+                vert_follow = False
+                vert_center_idx = max(0, vert_center_idx - VERT_PAGE_STEP)
+        elif key == ord('{'):
+            with lock:
+                vert_follow = False
+                vert_center_idx = max(0, len(grid) - 1)   # jump to the highest strike in the grid
+        elif key == ord('}'):
+            with lock:
+                vert_follow = False
+                vert_center_idx = 0                        # jump to the lowest strike in the grid
 
         if not HISTORICAL_MODE:
             with lock:
@@ -935,6 +965,7 @@ def curses_main(stdscr):
             cur_diag_count = diag_count
             cur_diag_msg = diag_msg if diag_msg and (time.time() - diag_msg_time) < 120 else None
             ui = {"live_follow": live_follow, "view_end_idx": view_end_idx,
+                  "vert_follow": vert_follow, "vert_center_idx": vert_center_idx,
                   "log_rows": log_rows, "log_err": log_err, "diag_count": cur_diag_count}
 
         if HISTORICAL_MODE:

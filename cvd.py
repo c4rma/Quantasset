@@ -16,12 +16,30 @@ aggressive, buyers or sellers" independent of price — divergence between a
 rising price and a falling/flat CVD line is the classic "hidden selling"
 signal traders watch this indicator for.
 
-Data (real trade prints, not just OHLC volume):
-  Phemex — wss://ws.phemex.com  trade_p.subscribe  (hedged USDT perp)
-  Kraken — wss://ws.kraken.com/v2  channel=trade   (USD spot)
-Both run concurrently in background threads; every individual print from
-either exchange feeds the SAME bar/CVD accumulator, so "aggregate" means
-combined across exchanges, not per-exchange lines.
+Data (real trade prints, not just OHLC volume) — depends on the symbol:
+  ETH / BTC (crypto)     — Phemex (wss://ws.phemex.com trade_p.subscribe,
+                           hedged USDT perp) + Kraken (wss://ws.kraken.com/v2
+                           channel=trade, USD spot), run concurrently; every
+                           print from EITHER feeds the SAME bar/CVD
+                           accumulator, so "aggregate" means combined across
+                           exchanges, not per-exchange lines. Both exchanges
+                           tag each trade's real taker side directly.
+  anything else (equity/ETF ticker, e.g. TLT/GLD/QQQ)
+                         — Alpaca's free real-time IEX feed (single source —
+                           IEX is ~1-3% of total US equity volume, not the
+                           full consolidated tape; there's no free source
+                           that offers more). Requires a free Alpaca
+                           paper-trading account: set ALPACA_API_KEY_ID and
+                           ALPACA_API_SECRET_KEY in .env. Alpaca trades have
+                           no native buy/sell tag (true of most non-crypto
+                           venues), so each print is classified live against
+                           the running IEX quote via the quote-rule
+                           (Lee-Ready: at/above the ask = buy, at/below the
+                           bid = sell, tick-rule vs the previous trade price
+                           as a fallback when a print lands inside the
+                           spread or before any quote has arrived yet) —
+                           the standard approach real CVD tools use when
+                           trades aren't natively side-tagged.
 
 Every closed bar is appended to a per-day log (cvd_<SYMBOL>_<bar>_MM_DD_YYYY.jsonl,
 next to this script) so history survives restarts — launching on a day that
@@ -53,14 +71,19 @@ Historical backfill on cold start (default: since 19:00 CT session open):
   status bar so it's never ambiguous which portion is which.
 
 Usage:
-  python cvd.py [ETH|BTC] [--interval LABEL] [--date MM_DD_YYYY] [--headless]
+  python cvd.py [SYMBOL] [--interval LABEL] [--date MM_DD_YYYY] [--headless]
                  [--backfill-hours N]
+    SYMBOL               ETH or BTC for crypto (Phemex+Kraken aggregate), or
+                         any equity/ETF ticker (e.g. TLT, GLD, QQQ) for
+                         Alpaca's free IEX feed (needs ALPACA_API_KEY_ID /
+                         ALPACA_API_SECRET_KEY in .env). Default BTC. Can
+                         also be changed at runtime with the [S] key.
     --interval LABEL     bar size: 1s,5s,15s,30s,1m,3m,5m,15m,1H, or a volume
                          bar like 500V / 2500V (default 1m)
     --date MM_DD_YYYY    browse a past day's logged bars (playback, no live feed)
     --backfill-hours N   fixed hours of historical trades to reconstruct on a
-                         cold start, Kraken-sourced (default: since 19:00 CT
-                         session open; 0 disables backfill entirely)
+                         cold start (default: since 19:00 CT session open;
+                         0 disables backfill entirely)
     --headless           no UI — just ingest+log trades forever (e.g. Task
                         Scheduler), so a real history is on disk once you
                         open the full UI later. ALSO writes a separate,
@@ -125,6 +148,11 @@ In-app:
       bars, flagging cyan (buy, below the low wick) or magenta (sell,
       above the high wick) blocks in 3 escalating tiers (3σ/4.5σ/6σ)
       exactly like chart.py's defaults.
+  [S] switches the tracked symbol on the fly — type ETH/BTC for crypto or any
+      equity/ETF ticker for Alpaca, hit Enter. Tears down the old feed(s),
+      resets all state, and reloads/backfills the new symbol from scratch —
+      same live-swap mechanism as [I]'s interval switch, just for the
+      underlying instrument instead of the bar shape.
   [Q] / Esc quits.
 """
 
@@ -136,6 +164,7 @@ import csv
 import bisect
 import locale
 import threading
+from pathlib import Path
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -178,6 +207,23 @@ try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+# ── .env loader (same pattern as chart.py) ──────────────────────────────────
+def load_env():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+load_env()
+
+ALPACA_API_KEY_ID = os.environ.get("ALPACA_API_KEY_ID", "")
+ALPACA_API_SECRET_KEY = os.environ.get("ALPACA_API_SECRET_KEY", "")
 
 # ── ARG PARSING ────────────────────────────────────────────────────────────
 args = sys.argv[1:]
@@ -262,15 +308,27 @@ if "--date" in args:
         sys.exit(1)
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
 
+# Crypto symbols route through Phemex+Kraken (real dual-exchange aggregate);
+# anything else is treated as a US equity/ETF ticker routed through Alpaca's
+# free IEX feed instead (single-source, quote-rule-classified — see
+# ws_alpaca()/fetch_alpaca_trades_range() for why real CVD is still possible
+# there without a paid consolidated-tape subscription).
+CRYPTO_SYMBOLS = {"ETH", "BTC"}
+
 SYMBOL = args[0].upper() if args else "BTC"
-if SYMBOL not in ("ETH", "BTC"):
-    print(f"Unknown symbol '{SYMBOL}' — use ETH or BTC")
+IS_CRYPTO = SYMBOL in CRYPTO_SYMBOLS
+if not IS_CRYPTO and not (ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY):
+    print(f"'{SYMBOL}' isn't a crypto symbol ({', '.join(sorted(CRYPTO_SYMBOLS))}), so it's "
+          f"treated as an equity/ETF ticker — that needs Alpaca credentials.")
+    print("Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in .env (free paper-trading account).")
     sys.exit(1)
 
 PHEMEX_SYMBOLS  = {"ETH": "ETHUSDT", "BTC": "BTCUSDT"}
 KRAKEN_WS_PAIRS = {"ETH": "ETH/USD", "BTC": "BTC/USD"}
 PHEMEX_WS_URL = "wss://ws.phemex.com"
 KRAKEN_WS_URL = "wss://ws.kraken.com/v2"
+ALPACA_WS_URL = "wss://stream.data.alpaca.markets/v2/iex"
+ALPACA_REST_URL = "https://data.alpaca.markets/v2"
 
 TODAY_STR       = datetime.now().strftime("%m_%d_%Y")
 VIEW_DATE       = LOAD_DATE or TODAY_STR
@@ -372,21 +430,144 @@ def fetch_kraken_trades_since(pair, hours, progress=None):
     now = time.time()
     return fetch_kraken_trades_range(pair, now - hours * 3600, now, progress=progress)
 
-def backfill_kraken(hours, progress=None, reset=True):
-    """Reconstruct bars/CVD from real Kraken trade history before live feeds
-    start. Runs the exact same ingest_trade() path as live trades, so the
-    resulting bars are exact, not approximated — just single-exchange for
-    this stretch (Phemex has no historical trades API, see docstring).
+# ── ALPACA (equity/ETF trade data — free IEX feed, quote-rule classified) ──
+def _parse_rfc3339(ts_str):
+    """Alpaca timestamps carry up to 9 fractional digits (nanoseconds);
+    Python's datetime only parses up to 6 (microseconds) — truncate rather
+    than lose the whole field. Sub-microsecond precision doesn't matter for
+    bucketing trades into bars."""
+    ts_str = ts_str.rstrip("Z")
+    if "." in ts_str:
+        base, frac = ts_str.split(".")
+        ts_str = f"{base}.{frac[:6]}"
+    return datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc).timestamp()
+
+def _alpaca_headers():
+    return {"APCA-API-KEY-ID": ALPACA_API_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY}
+
+def _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=None):
+    """Historical trade prints (IEX feed) — (ts, price, size), no side yet.
+    Calls progress() after every page (same as fetch_kraken_trades_range) so
+    a slow fetch for a liquid symbol still shows visible movement instead of
+    looking hung."""
+    out = []
+    page_token = None
+    start_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+    end_iso = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+    for _ in range(2000):
+        params = {"symbols": symbol, "start": start_iso, "end": end_iso, "limit": 10000, "feed": "iex"}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{ALPACA_REST_URL}/stocks/trades", params=params, headers=_alpaca_headers(), timeout=15)
+            d = r.json()
+        except Exception:
+            break
+        page_trades = (d.get("trades") or {}).get(symbol) or []
+        for t in page_trades:
+            out.append((_parse_rfc3339(t["t"]), t["p"], t["s"]))
+        if progress and page_trades:
+            progress(len(out), datetime.fromtimestamp(out[-1][0]))
+        page_token = d.get("next_page_token")
+        if not page_token:
+            break
+        time.sleep(0.2)
+    return out
+
+def classify_one_trade(price, bid, ask, prev_price, prev_side):
+    """Quote-rule (Lee-Ready) classification for a single trade, shared by
+    both the historical batch classifier below and ws_alpaca's live path so
+    the two can never drift apart. A trade at/above the prevailing ask is
+    buyer-initiated, at/below the bid is seller-initiated (standard — this is
+    what real CVD tools do when trades aren't natively side-tagged, which is
+    the norm outside a few crypto venues). Falls back to a tick-rule (vs the
+    previous trade's price) when the trade prints inside the spread or no
+    quote is available yet, and to "assume buy" for the very first trade
+    with neither a quote nor prior context to go on."""
+    if ask is not None and price >= ask:
+        return True
+    if bid is not None and price <= bid:
+        return False
+    if prev_price is not None:
+        return price > prev_price if price != prev_price else prev_side
+    return True
+
+def classify_trades_quote_rule(raw_trades, quotes):
+    """Turn (ts, price, size) trades + (ts, bid, ask) quotes into (ts, price,
+    qty, is_buy) — same tuple shape fetch_kraken_trades_range produces, so
+    build_bars_from_trades/ingest_trade don't need to know or care which
+    exchange/asset-class a trade came from. See classify_one_trade for the
+    actual classification rule."""
+    out = []
+    qi = 0
+    bid = ask = None
+    prev_price, prev_side = None, True
+    for ts, price, size in raw_trades:
+        while qi < len(quotes) and quotes[qi][0] <= ts:
+            bid, ask = quotes[qi][1], quotes[qi][2]
+            qi += 1
+        is_buy = classify_one_trade(price, bid, ask, prev_price, prev_side)
+        out.append((ts, price, size, is_buy))
+        prev_price, prev_side = price, is_buy
+    return out
+
+def fetch_alpaca_trades_range(symbol, since_ts, until_ts, progress=None):
+    """Real historical Alpaca trade prints, classified into the same (ts,
+    price, qty, is_buy) shape the Kraken fetcher produces. IEX feed only
+    (free tier) — a real but honest ceiling of roughly 1-3% of total US
+    equity volume, not the full consolidated tape (see module docstring).
+
+    Historical/backfilled bars use TICK-RULE classification only (no quotes
+    fetched here) — deliberately, not an oversight: measured live, a single
+    liquid symbol (QQQ) generates ~31,000 NBBO quote updates in just 5
+    minutes (~375k/hour). A backfill spanning many hours would need to page
+    through millions of quote rows sequentially with no way to show
+    meaningful progress in between, which is indistinguishable from a hung
+    app (confirmed — this is exactly what happened before this fix). Trade
+    counts are far more tractable (IEX being a small slice of consolidated
+    volume). Live bars still get the more accurate quote-rule classification
+    via ws_alpaca's own continuously-updated running quote, which has none
+    of this scaling problem since it only ever sees new updates as they
+    arrive, never a historical backlog."""
+    raw_trades = _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=progress)
+    return classify_trades_quote_rule(raw_trades, [])
+
+def fetch_trades_range(since_ts, until_ts, progress=None):
+    """Dispatch to whichever data source SYMBOL actually belongs to — every
+    caller (goto_to, extend_history_backward, backfill_trades) goes through
+    this instead of hardcoding Kraken, so the entire ingest/bar-building
+    pipeline downstream is asset-class-agnostic."""
+    if IS_CRYPTO:
+        return fetch_kraken_trades_range(KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=progress)
+    return fetch_alpaca_trades_range(SYMBOL, since_ts, until_ts, progress=progress)
+
+def fetch_trades_since(hours, progress=None):
+    """Trailing-window wrapper, asset-class-aware: equities' free-tier REST
+    is 15-minute delayed (crypto's isn't), so "now" would otherwise ask for
+    data that doesn't exist yet — capped accordingly. The live WebSocket
+    feed picks up the remaining gap in real time regardless."""
+    now = time.time()
+    until_ts = now if IS_CRYPTO else now - 900
+    return fetch_trades_range(now - hours * 3600, until_ts, progress=progress)
+
+def backfill_trades(hours, progress=None, reset=True):
+    """Reconstruct bars/CVD from real historical trade data before live feeds
+    start — Kraken for crypto, Alpaca (IEX, quote-rule classified) for
+    equities/ETFs, via fetch_trades_since(). Runs the exact same
+    ingest_trade() path as live trades, so the resulting bars are exact, not
+    approximated — just single-exchange/single-feed for this stretch either
+    way (Phemex has no historical trades API; Alpaca's free tier is IEX-only,
+    see module docstring for both).
 
     reset=True (default) truncates today's on-disk log and clears in-memory
     state first, so the backfill always supersedes whatever partial/stray log
     might already exist for today — "resume" only ever existed as a
     workaround for data sources with NO real history API (gex.py's Deribit/
-    CBOE); Kraken actually has one, so a fresh reconstruction is strictly
-    better than resuming a stale local file. Nothing is touched until the
-    fetch actually returns data, so a network hiccup can't wipe real history."""
-    pair = KRAKEN_REST_PAIRS[SYMBOL]
-    trades = fetch_kraken_trades_since(pair, hours, progress=progress)
+    CBOE); both Kraken and Alpaca actually have one, so a fresh reconstruction
+    is strictly better than resuming a stale local file. Nothing is touched
+    until the fetch actually returns data, so a network hiccup can't wipe
+    real history."""
+    trades = fetch_trades_since(hours, progress=progress)
     if not trades:
         return 0
     if reset:
@@ -423,7 +604,7 @@ def backfill_kraken(hours, progress=None, reset=True):
 def initialize_today(progress=None):
     """Populate state for a live (non --date) launch, OR to rebuild state
     after an in-app interval switch (see switch_interval()): backfill takes
-    priority whenever it succeeds (see backfill_kraken docstring for why),
+    priority whenever it succeeds (see backfill_trades docstring for why),
     falling back to resuming today's existing log only when backfill is
     disabled (--backfill-hours 0) or the fetch came back empty. Returns a
     short status string for the caller to display/print.
@@ -431,9 +612,11 @@ def initialize_today(progress=None):
     is running yet) but required when called mid-session, since the live WS
     threads are already mutating state.history/live/raw_cvd concurrently."""
     if BACKFILL_HOURS > 0:
-        n = backfill_kraken(BACKFILL_HOURS, progress=progress, reset=True)
+        n = backfill_trades(BACKFILL_HOURS, progress=progress, reset=True)
         if n:
-            return f"backfilled {n} Kraken trades since {datetime.fromtimestamp(time.time() - BACKFILL_HOURS*3600).strftime('%H:%M:%S')}"
+            src = "Kraken" if IS_CRYPTO else "Alpaca (IEX)"
+            since_str = datetime.fromtimestamp(time.time() - BACKFILL_HOURS * 3600).strftime('%H:%M:%S')
+            return f"backfilled {n} {src} trades since {since_str}"
     existing = load_log(TODAY_STR)
     if existing:
         with state.lock:
@@ -485,6 +668,7 @@ class State:
         self.log_err = None
         self.phemex_status = "connecting…"
         self.kraken_status = "connecting…"
+        self.alpaca_status = "connecting…"   # only used for equity/ETF symbols
         self.last_price = None
         self.session = 0
         self.backfill_boundary_ts = None   # set once: everything <= this is Kraken-only
@@ -743,8 +927,7 @@ def goto_to(target_ts, progress=None):
     until_ts = oldest_ts if oldest_ts is not None else time.time()
     if since_ts >= until_ts:
         return oldest_ts is not None
-    pair = KRAKEN_REST_PAIRS[SYMBOL]
-    trades = fetch_kraken_trades_range(pair, since_ts, until_ts, progress=progress)
+    trades = fetch_trades_range(since_ts, until_ts, progress=progress)
     new_bars, raw_final = build_bars_from_trades(trades, 0.0)
     if not new_bars:
         return False
@@ -776,9 +959,8 @@ def extend_history_backward():
         oldest_bar = state.history[0] if state.history else state.live
         old_since = oldest_bar["ts"]
         join_baseline = oldest_bar["cvd_open"]
-    pair = KRAKEN_REST_PAIRS[SYMBOL]
     new_since = old_since - GOTO_WINDOW_HOURS * 3600
-    trades = fetch_kraken_trades_range(pair, new_since, old_since, progress=None)
+    trades = fetch_trades_range(new_since, old_since, progress=None)
     new_bars, raw_final = build_bars_from_trades(trades, 0.0)
     if new_bars:
         shift = join_baseline - raw_final
@@ -791,6 +973,17 @@ def extend_history_backward():
         state.history = new_bars + state.history
         state.history_loading_older = False
         state.pending_shift += len(new_bars)   # caller's view index must shift by this
+
+def start_feeds(session):
+    """Start the live WS feed(s) for the current SYMBOL — Phemex+Kraken (true
+    dual-exchange aggregate) for crypto, or the single Alpaca IEX feed for
+    equities/ETFs. Shared by curses_main and headless_main so a [S]ymbol
+    switch and a fresh launch use identically-behaving startup logic."""
+    if IS_CRYPTO:
+        threading.Thread(target=ws_kraken, args=(session,), daemon=True).start()
+        threading.Thread(target=ws_phemex, args=(session,), daemon=True).start()
+    else:
+        threading.Thread(target=ws_alpaca, args=(session,), daemon=True).start()
 
 # ── KRAKEN TRADE FEED ────────────────────────────────────────────────────────
 def ws_kraken(session):
@@ -815,7 +1008,7 @@ def ws_kraken(session):
             return
         # Only live increments — we never request snapshot:true, and (like
         # the Phemex handler) don't want any surprise historical replay
-        # corrupting volume-bar ordering. Real history comes from backfill_kraken().
+        # corrupting volume-bar ordering. Real history comes from backfill_trades().
         if msg.get("type") != "update":
             return
         for t in msg.get("data", []):
@@ -886,7 +1079,7 @@ def ws_phemex(session):
         # out of chronological order into the bar builder (harmless for time
         # bars thanks to the late-print guard, but corrupts volume-bar
         # ordering outright). Real historical reach is handled separately by
-        # backfill_kraken(); only fold in genuine live prints here.
+        # backfill_trades(); only fold in genuine live prints here.
         if msg.get("type") == "snapshot":
             return
         trades = msg.get("trades_p")
@@ -952,6 +1145,86 @@ def ws_phemex(session):
         backoff = min(backoff * 2, 30)
         _ping_stop.set()
         _ping_stop.clear()
+
+# ── ALPACA TRADE FEED (equities/ETFs — single source, quote-rule classified) ─
+def ws_alpaca(session):
+    """Real-time IEX trades+quotes for an equity/ETF symbol. Alpaca has no
+    native buy/sell tag on trades (same as most non-crypto venues), so this
+    maintains a running bid/ask from the quote stream and classifies each
+    trade live via classify_one_trade() — the exact same rule
+    fetch_alpaca_trades_range() uses for backfill, so the live and
+    backfilled portions are computed identically, not just similarly."""
+    def stale():
+        return state.session != session
+
+    latest = {"bid": None, "ask": None, "prev_price": None, "prev_side": True}
+
+    def on_open(ws):
+        ws.send(json.dumps({"action": "auth", "key": ALPACA_API_KEY_ID, "secret": ALPACA_API_SECRET_KEY}))
+
+    def on_message(ws, message):
+        if stale(): return
+        try:
+            msgs = json.loads(message)
+        except Exception:
+            return
+        if not isinstance(msgs, list):
+            msgs = [msgs]
+        for msg in msgs:
+            mtype = msg.get("T")
+            if mtype == "success" and msg.get("msg") == "authenticated":
+                ws.send(json.dumps({"action": "subscribe", "trades": [SYMBOL], "quotes": [SYMBOL]}))
+                with state.lock:
+                    if stale(): return
+                    state.alpaca_status = "live"
+            elif mtype == "error":
+                with state.lock:
+                    if stale(): return
+                    state.alpaca_status = f"err: {str(msg.get('msg', ''))[:30]}"
+            elif mtype == "q":
+                latest["bid"] = msg.get("bp")
+                latest["ask"] = msg.get("ap")
+            elif mtype == "t":
+                try:
+                    ts = _parse_rfc3339(msg["t"])
+                    price = float(msg["p"])
+                    qty = float(msg["s"])
+                except Exception:
+                    continue
+                is_buy = classify_one_trade(price, latest["bid"], latest["ask"],
+                                             latest["prev_price"], latest["prev_side"])
+                latest["prev_price"], latest["prev_side"] = price, is_buy
+                with state.lock:
+                    if stale(): return
+                    ingest_trade(ts, price, qty, is_buy)
+                    state.alpaca_status = "live"
+
+    def on_error(ws, err):
+        if stale(): return
+        with state.lock:
+            if stale(): return
+            state.alpaca_status = f"err: {str(err)[:30]}"
+
+    def on_close(ws, code, msg):
+        if stale(): return
+        with state.lock:
+            if stale(): return
+            state.alpaca_status = "reconnecting…"
+
+    backoff = 1
+    while not stale():
+        ws_app = websocket.WebSocketApp(
+            ALPACA_WS_URL, on_open=on_open, on_message=on_message,
+            on_error=on_error, on_close=on_close,
+        )
+        ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        if stale():
+            break
+        with state.lock:
+            if stale(): break
+            state.alpaca_status = f"reconnecting… ({backoff}s)"
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
 
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
 P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_MAGENTA = range(1, 9)
@@ -1330,12 +1603,16 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
         last_price = state.last_price
         last_cvd = _cvd_ohlc(visible[-1])[3] if visible else 0.0
         last_delta = visible[-1].get("delta", 0.0) if visible else 0.0
+        feed_status = (f"Phemex:{state.phemex_status}  Kraken:{state.kraken_status}" if IS_CRYPTO
+                       else f"Alpaca(IEX):{state.alpaca_status}")
         info = (f" px:{fmt_price(last_price)}  CVD:{last_cvd:+,.2f}  Δbar:{last_delta:+,.2f}  "
-                f"Phemex:{state.phemex_status}  Kraken:{state.kraken_status}  "
-                f"log:{state.log_rows}  {status_line}")
+                f"{feed_status}  log:{state.log_rows}  {status_line}")
     if state.backfill_boundary_ts:
         boundary = datetime.fromtimestamp(state.backfill_boundary_ts).strftime("%H:%M:%S")
-        info += f"  |  Kraken-only before {boundary}, aggregate after"
+        if IS_CRYPTO:
+            info += f"  |  Kraken-only before {boundary}, aggregate after"
+        else:
+            info += f"  |  backfilled before {boundary} (Alpaca IEX, quote-rule classified throughout)"
     safe_add(win, h - 1, 0, info.ljust(w), cp(P_STATUS))
     return n
 
@@ -1402,6 +1679,12 @@ def _prompt_goto(stdscr):
     latter."""
     return _prompt_text(stdscr, "Goto date/time (MM_DD_YYYY [HH:MM]) — Enter=apply, Esc=cancel: ")
 
+def _prompt_symbol(stdscr):
+    """[S] key — returns the typed symbol uppercased, or None if
+    cancelled/empty."""
+    buf = _prompt_text(stdscr, "New symbol (crypto: ETH/BTC, or any equity/ETF ticker) — Enter=apply, Esc=cancel: ")
+    return buf.strip().upper() if buf else None
+
 def _move_cursor(step, cursor_idx, view_end_idx, total, n_vis, allow_exit_to_live):
     """Crosshair + pan, same model as charthacker.py/quantasset_chart.py: a
     plain pan step first moves the cursor WITHIN the currently-visible
@@ -1441,7 +1724,7 @@ def _move_cursor(step, cursor_idx, view_end_idx, total, n_vis, allow_exit_to_liv
 
 # ── CURSES MAIN ──────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global INTERVAL_LABEL, BAR_MODE, BAR_SECS, VOL_THRESHOLD
+    global INTERVAL_LABEL, BAR_MODE, BAR_SECS, VOL_THRESHOLD, SYMBOL, IS_CRYPTO
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -1461,7 +1744,8 @@ def curses_main(stdscr):
     else:
         def _progress(n, last_dt):
             h, w = stdscr.getmaxyx()
-            msg = f"Backfilling {BACKFILL_HOURS:g}h from Kraken… {n} trades ({last_dt.strftime('%H:%M:%S')})"
+            src = "Kraken" if IS_CRYPTO else "Alpaca"
+            msg = f"Backfilling {BACKFILL_HOURS:g}h from {src}… {n} trades ({last_dt.strftime('%H:%M:%S')})"
             stdscr.erase()
             safe_add(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg, cp(P_CYAN))
             stdscr.refresh()
@@ -1469,8 +1753,7 @@ def curses_main(stdscr):
         init_shown_at = time.time()
         state.session += 1
         session = state.session
-        threading.Thread(target=ws_kraken, args=(session,), daemon=True).start()
-        threading.Thread(target=ws_phemex, args=(session,), daemon=True).start()
+        start_feeds(session)
         status_line = init_status
 
     while True:
@@ -1486,6 +1769,48 @@ def curses_main(stdscr):
             zoom_group = zoom_step(zoom_group, -1)
         elif key in (ord('-'), ord('_')):
             zoom_group = zoom_step(zoom_group, 1)
+        elif key in (ord('s'), ord('S')) and not HISTORICAL_MODE:
+            new_symbol = _prompt_symbol(stdscr)
+            if new_symbol is not None:
+                new_is_crypto = new_symbol in CRYPTO_SYMBOLS
+                if not new_is_crypto and not (ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY):
+                    status_line = f"'{new_symbol}' needs ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY in .env"
+                    init_shown_at = time.time()
+                else:
+                    # bump session FIRST so the old symbol's WS threads notice
+                    # they're stale and stop touching state as early as
+                    # possible, before the reset below even begins
+                    state.session += 1
+                    session = state.session
+                    with state.lock:
+                        state.history.clear()
+                        state.live = None
+                        state.raw_cvd = 0.0
+                        state.cvd_offset = 0.0
+                        state.log_rows = 0
+                        state.log_err = None
+                        state.pending_shift = 0
+                        state.history_loading_older = False
+                        state.backfill_boundary_ts = None
+                        state.phemex_status = "connecting…"
+                        state.kraken_status = "connecting…"
+                        state.alpaca_status = "connecting…"
+                        csv_state.live = None
+                        csv_state.day_str = None
+                    SYMBOL, IS_CRYPTO = new_symbol, new_is_crypto
+
+                    def _symbol_progress(n, last_dt):
+                        hh, ww = stdscr.getmaxyx()
+                        msg = f"Loading {new_symbol}… {n} trades ({last_dt.strftime('%H:%M:%S')})"
+                        stdscr.erase()
+                        safe_add(stdscr, hh // 2, max(0, (ww - len(msg)) // 2), msg, cp(P_CYAN))
+                        stdscr.refresh()
+                    status_line = initialize_today(progress=_symbol_progress)
+                    start_feeds(session)
+                    live_follow = True
+                    view_end_idx = 0
+                    cursor_idx = -1
+                init_shown_at = time.time()
         elif key in PAN_KEYS and not HISTORICAL_MODE:
             step = PAN_KEYS[key]
             with state.lock:
@@ -1624,8 +1949,7 @@ def headless_main():
     print(f"\n{init_status} ({state.log_rows} bars logged) — live from here on.")
     state.session += 1
     session = state.session
-    threading.Thread(target=ws_kraken, args=(session,), daemon=True).start()
-    threading.Thread(target=ws_phemex, args=(session,), daemon=True).start()
+    start_feeds(session)
 
     last_logged = state.log_rows
     while True:

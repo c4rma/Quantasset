@@ -39,7 +39,12 @@ can tell a data artifact from a real move.
 Data:
   ETH/BTC — Deribit REST, real-time, gamma+OI read directly off each ticker.
   QQQ     — CBOE delayed-quotes feed (~15m delay), gamma+OI read directly off
-            each contract (CBOE publishes greeks, no Black-Scholes needed).
+            each contract (CBOE publishes greeks, no Black-Scholes needed). GEX
+            itself is computed against CBOE's own (delayed) reference price,
+            since that's what its gamma values are relative to — but the
+            displayed/plotted spot comes from Yahoo's near-real-time quote
+            instead (falls back to CBOE's price if that fetch fails), so the
+            header and price marker don't read ~15m stale.
 
 Every refresh is appended to a per-day log (gex_<SYMBOL>_MM_DD_YYYY.jsonl, next
 to this script) so history survives restarts. Launching on a day that already
@@ -256,6 +261,26 @@ def fetch_eth(currency, all_exp):
     return {"spot": spot, "strikes": strikes, "oi_by_type": oi_by_type, "expiry_label": exp_label,
             "ttl": ttl, "fetched_at": datetime.now().strftime("%H:%M:%S")}
 
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_YAHOO_HEADERS  = {"User-Agent": "Mozilla/5.0"}
+
+def fetch_live_price(symbol):
+    """Best-effort near-real-time quote via Yahoo's v8 chart 'meta' block — NOT the
+    OHLC bars, which Yahoo delays ~15m for equities same as CBOE, but meta's own
+    regularMarketPrice/regularMarketTime tick live (confirmed: its timestamp tracks
+    within seconds of wall-clock). Used only to display/position price for QQQ, whose
+    options feed (CBOE) is itself ~15m delayed. Returns None on any failure — caller
+    falls back to the options feed's own reference price rather than blocking on this."""
+    try:
+        r = requests.get(YAHOO_CHART_URL.format(symbol), headers=_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta  = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
+
 # ── CBOE HELPERS (QQQ) ────────────────────────────────────────────────────────
 def fetch_qqq(all_exp):
     r = requests.get(CBOE_URL.format("QQQ"), timeout=15)
@@ -305,7 +330,15 @@ def fetch_qqq(all_exp):
     is_0dte   = (not all_exp) and target_exps[0] == today
     exp_label = target_exps[0] if len(target_exps) == 1 else f"ALL({len(target_exps)})"
 
-    return {"spot": price, "strikes": strikes, "oi_by_type": oi_by_type, "expiry_label": exp_label,
+    # GEX itself is computed above against CBOE's own (delayed) reference price, since
+    # that's the price its gamma values are relative to. Display/positioning uses a
+    # near-real-time quote instead so the header and price marker aren't ~15m stale —
+    # falls back to CBOE's price if the live quote fetch fails.
+    live_price = fetch_live_price("QQQ")
+    spot = live_price if live_price else price
+
+    return {"spot": spot, "spot_is_live": live_price is not None, "cboe_ref_price": price,
+            "strikes": strikes, "oi_by_type": oi_by_type, "expiry_label": exp_label,
             "ttl": None, "is_0dte": is_0dte, "fetched_at": datetime.now().strftime("%H:%M:%S")}
 
 def fetch_snapshot():
@@ -598,8 +631,12 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         pieces += [("  TTL ", cp(P_DIM, dim=True)), (ttl, cp(P_YELLOW, bold=True))]
     if HISTORICAL_MODE:
         src_tag = f"  (historical playback — {VIEW_DATE})"
+    elif IS_CRYPTO:
+        src_tag = "  (live)"
+    elif meta.get("spot_is_live"):
+        src_tag = "  (spot live via Yahoo, GEX ~15m delay via CBOE)"
     else:
-        src_tag = f"  ({'live' if IS_CRYPTO else '~15m delay'})"
+        src_tag = "  (spot+GEX ~15m delay — live quote fetch failed)"
     pieces += [("  Updated ", cp(P_DIM, dim=True)), (fetched, cp(P_DEFAULT)),
                (src_tag, cp(P_DIM, dim=True))]
     log_rows, log_err = ui.get("log_rows", 0), ui.get("log_err")

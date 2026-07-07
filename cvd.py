@@ -1280,6 +1280,28 @@ def cp(pair, bold=False, dim=False):
     if dim:  a |= curses.A_DIM
     return a
 
+_shadow_buf = None   # [P] Screenshot support — see _shadow_put()
+
+def _shadow_put(y, x, s):
+    """Mirror a just-drawn string into the screenshot shadow buffer, one
+    real character per column. Screenshots read from THIS, never from
+    curses' own win.instr() — instr() reads back through the narrow
+    chtype API, which can't correctly reconstruct the multi-byte Unicode
+    box/block glyphs (█ │ ─) this app draws with, corrupting/misaligning
+    exactly those characters (same class of bug as the Termux addch()
+    glyph corruption, on the read side this time). Tracking what we
+    actually asked curses to draw sidesteps the round-trip entirely."""
+    if _shadow_buf is None:
+        return
+    if not (0 <= y < len(_shadow_buf)):
+        return
+    row = _shadow_buf[y]
+    w = len(row)
+    for i, ch in enumerate(s):
+        col = x + i
+        if 0 <= col < w:
+            row[col] = ch
+
 def safe_add(win, y, x, s, attr=0):
     h, w = win.getmaxyx()
     if y < 0 or y >= h or x < 0:
@@ -1287,10 +1309,36 @@ def safe_add(win, y, x, s, attr=0):
     avail = w - x - 1
     if avail <= 0:
         return
+    text = s[:avail]
     try:
-        win.addstr(y, x, s[:avail], attr)
+        win.addstr(y, x, text, attr)
+        _shadow_put(y, x, text)
     except curses.error:
         pass
+
+def take_screenshot(win=None):
+    """Dump the last-rendered frame to screenshots/cvd_<SYMBOL>_<ts>.txt
+    (same convention as charthacker.py's [P] key). Reads from the
+    _shadow_buf tracked alongside every real draw call (see _shadow_put) —
+    NOT from curses' win.instr(), which corrupts the multi-byte candle
+    glyphs on readback. win is only used as a last-resort size fallback
+    if no frame has been drawn yet (shouldn't happen in practice: draw()
+    always runs at least once before the first key is read)."""
+    folder = os.path.join(os.path.dirname(__file__), "screenshots")
+    os.makedirs(folder, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = os.path.join(folder, f"cvd_{SYMBOL}_{ts}.txt")
+    if _shadow_buf is not None:
+        buf = _shadow_buf
+    elif win is not None:
+        h, w = win.getmaxyx()
+        buf = [[" "] * w for _ in range(h)]
+    else:
+        buf = []
+    lines = ["".join(row).rstrip() for row in buf]
+    with open(fn, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return fn
 
 def fmt_price(p):
     if p is None:
@@ -1464,6 +1512,10 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         r = int(round((1 - frac) * (n_rows - 1)))
         return rows[max(0, min(n_rows - 1, r))]
 
+    def _w(y, x, s, attr):
+        win.addstr(y, x, s, attr)
+        _shadow_put(y, x, s)
+
     if zero_line and vmin <= 0.0 <= vmax:
         safe_add(win, to_row(0.0), 0, "·" * max(1, plot_w), cp(P_DIM))
 
@@ -1476,14 +1528,14 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         up = c >= o
         color = cp(P_YELLOW, bold=True) if is_cursor else (cp(P_GREEN, bold=True) if up else cp(P_RED, bold=True))
         for r in range(r_hi, r_lo + 1):
-            win.addstr(r, i, "│", cp(P_DIM))
+            _w(r, i, "│", cp(P_DIM))
             occupied.add((r, i))
         body_top, body_bot = min(r_op, r_cl), max(r_op, r_cl)
         for r in range(body_top, body_bot + 1):
-            win.addstr(r, i, "█", color)
+            _w(r, i, "█", color)
             occupied.add((r, i))
         if body_top == body_bot:
-            win.addstr(body_top, i, "─", color)
+            _w(body_top, i, "─", color)
             occupied.add((body_top, i))
         if is_cursor:
             cursor_row, cursor_val = r_cl, c
@@ -1503,10 +1555,10 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
                     # marker already claimed), or the marker corrupts real candle
                     # data instead of just annotating alongside it
                     if 0 <= col < plot_w and (row_b, col) not in occupied:
-                        win.addstr(row_b, col, "#", cp(P_CYAN) | rev)
+                        _w(row_b, col, "#", cp(P_CYAN) | rev)
                         occupied.add((row_b, col))
                         if tier >= 2 and row_b + 1 <= rows[-1] and (row_b + 1, col) not in occupied:
-                            win.addstr(row_b + 1, col, "#", cp(P_CYAN) | rev)
+                            _w(row_b + 1, col, "#", cp(P_CYAN) | rev)
                             occupied.add((row_b + 1, col))
             if "sell" in sig:
                 tier = sig["sell"]
@@ -1515,20 +1567,20 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
                 for dx in range(-(width // 2), width // 2 + 1):
                     col = i + dx
                     if 0 <= col < plot_w and (row_s, col) not in occupied:
-                        win.addstr(row_s, col, "#", cp(P_MAGENTA) | rev)
+                        _w(row_s, col, "#", cp(P_MAGENTA) | rev)
                         occupied.add((row_s, col))
                         if tier >= 2 and row_s - 1 >= rows[0] and (row_s - 1, col) not in occupied:
-                            win.addstr(row_s - 1, col, "#", cp(P_MAGENTA) | rev)
+                            _w(row_s - 1, col, "#", cp(P_MAGENTA) | rev)
                             occupied.add((row_s - 1, col))
 
     if 0 <= cursor_idx < len(visible):
         for r in rows:
             if (r, cursor_idx) not in occupied:
-                win.addstr(r, cursor_idx, ":", cp(P_YELLOW, dim=True))
+                _w(r, cursor_idx, ":", cp(P_YELLOW, dim=True))
     if cursor_row is not None:
         for c2 in range(plot_w):
             if (cursor_row, c2) not in occupied:
-                win.addstr(cursor_row, c2, "-", cp(P_YELLOW, dim=True))
+                _w(cursor_row, c2, "-", cp(P_YELLOW, dim=True))
         if fmt_fn:
             safe_add(win, cursor_row, plot_w + 1, fmt_fn(cursor_val), cp(P_YELLOW, bold=True))
 
@@ -1539,8 +1591,10 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
     """Returns n_vis — the number of bars actually rendered this frame — so
     the caller can track it for the NEXT frame's crosshair/pan arithmetic
     (the exact visible count depends on terminal width, only known here)."""
+    global _shadow_buf
     h, w = win.getmaxyx()
     win.erase()
+    _shadow_buf = [[" "] * w for _ in range(h)]
 
     zoom_tag = f"  zoom:{zoom_group}x" if zoom_group > 1 else ""
     btd_tag = "  BTD:ON" if show_btd else ""
@@ -1768,6 +1822,8 @@ def curses_main(stdscr):
     last_n_vis = 0      # bars actually rendered last frame — for cursor activation/pan math
     zoom_group = 1      # [+]/[-]: how many real bars are merged into 1 displayed candle
     show_btd = False    # [T]: Big Trade Detector overlay on the price panel
+    screenshot_msg = None   # [P]: transient confirmation, shown for 5s
+    screenshot_until = 0
 
     if HISTORICAL_MODE:
         for row in load_log(VIEW_DATE):
@@ -1801,6 +1857,10 @@ def curses_main(stdscr):
             zoom_group = zoom_step(zoom_group, -1)
         elif key in (ord('-'), ord('_')):
             zoom_group = zoom_step(zoom_group, 1)
+        elif key in (ord('p'), ord('P')):
+            fn = take_screenshot(stdscr)
+            screenshot_msg = f"Screenshot: {os.path.basename(fn)}"
+            screenshot_until = time.time() + 5
         elif key in (ord('s'), ord('S')) and not HISTORICAL_MODE:
             new_symbol = _prompt_symbol(stdscr)
             if new_symbol is not None:
@@ -1967,6 +2027,8 @@ def curses_main(stdscr):
                 sl = f"{status_line}  |  {sl}"
         if cur_error:
             sl += f"  ⚠ log: {cur_error}"
+        if screenshot_msg and time.time() < screenshot_until:
+            sl = f"{screenshot_msg}  |  {sl}"
 
         last_n_vis = draw(stdscr, draw_bars, draw_live, sl, cursor_idx=cursor_idx,
                           zoom_group=zoom_group, show_btd=show_btd) or 0

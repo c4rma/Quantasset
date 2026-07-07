@@ -34,6 +34,12 @@ except ImportError:
     print("httpx not installed — run: pip install httpx")
     sys.exit(1)
 
+try:
+    from PIL import ImageGrab            # optional — only needed for [S]creenshot
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 # ── Config ────────────────────────────────────────────────────────────────────
 WS_URL         = 'wss://www.deribit.com/ws/api/v2'
 CURRENCIES     = ['ETH', 'BTC']
@@ -71,9 +77,14 @@ eq_errors  = {}            # symbol -> short error string
 eq_status  = 'starting…'
 
 # ── Interactive controls (set by the keyboard thread, polled by the loop) ──────
-_quit_evt    = threading.Event()
-_refresh_evt = threading.Event()
+_quit_evt       = threading.Event()
+_refresh_evt    = threading.Event()
+_screenshot_evt = threading.Event()
 _last_open_refresh = None   # date of the most recent market-open auto-refresh
+
+# ── Screenshot state ([S] key saves a PNG of the console window) ───────────────
+_shot_dir    = None         # resolved in main() -> <script dir>/screenshots
+_shot_status = None         # last screenshot result (shown on the Shot line)
 
 # ── Kill zones (CT, minutes since midnight) ───────────────────────────────────
 KILL_ZONES = [
@@ -95,6 +106,15 @@ if sys.platform == 'win32':
     import ctypes
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    # DPI-aware so GetWindowRect returns physical pixels that line up with the
+    # screenshot grab (otherwise the [S] capture is cropped wrong on scaled displays).
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # Force UTF-8 so the box-drawing/± glyphs always encode — otherwise a non-UTF-8
 # stdout (e.g. piped to a file under cp1252) raises UnicodeEncodeError on every
@@ -463,7 +483,8 @@ def draw_static():
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     mark('csv');  p(f"    {'CSV':<8}")
-    mark('exit'); p(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh{RST}")
+    mark('shot'); p(f"    {'Shot':<8}")
+    mark('exit'); p(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}{BLD}[S]{RST}{DIM}creenshot{RST}")
 
     sys.stdout.flush()
 
@@ -620,17 +641,29 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         else:
             sys.stdout.write(f"    {'CSV':<8} {DIM}starting…{RST}")
 
+    # Screenshot status
+    if 'shot' in ROWS:
+        move(ROWS['shot'])
+        erase_line()
+        if not PIL_AVAILABLE:
+            sys.stdout.write(f"    {'Shot':<8} {DIM}[S] needs Pillow (pip install pillow){RST}")
+        elif _shot_status:
+            col = RED if _shot_status.startswith('error') else GRN
+            sys.stdout.write(f"    {'Shot':<8} {col}{_shot_status}{RST}")
+        else:
+            sys.stdout.write(f"    {'Shot':<8} {DIM}press [S] to capture{RST}")
+
     move(ROWS['exit'])
     erase_line()
-    sys.stdout.write(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh{RST}")
+    sys.stdout.write(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}{BLD}[S]{RST}{DIM}creenshot{RST}")
 
     sys.stdout.flush()
 
 
-# ── Keyboard input thread ([Q]uit / [R]efresh) ────────────────────────────────
+# ── Keyboard input thread ([Q]uit / [R]efresh / [S]creenshot) ─────────────────
 def _input_thread():
     """Daemon thread: read single keypresses and signal the loop via events.
-    Q quits, R forces an immediate refresh. No Enter needed."""
+    Q quits, R forces an immediate refresh, S saves a screenshot. No Enter needed."""
     try:
         if sys.platform == 'win32':
             import msvcrt
@@ -640,6 +673,8 @@ def _input_thread():
                     _quit_evt.set();    break
                 elif ch in ('r', 'R'):
                     _refresh_evt.set()
+                elif ch in ('s', 'S'):
+                    _screenshot_evt.set()
                 elif ch == '\x03':                 # Ctrl+C
                     _quit_evt.set();    break
         else:
@@ -655,10 +690,48 @@ def _input_thread():
                             _quit_evt.set();    break
                         elif ch in ('r', 'R'):
                             _refresh_evt.set()
+                        elif ch in ('s', 'S'):
+                            _screenshot_evt.set()
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
         pass
+
+
+def take_screenshot():
+    """Save a PNG of the console window (fallback: full screen) to the shots dir.
+    Sets _shot_status for the on-screen Shot line."""
+    global _shot_status
+    if not PIL_AVAILABLE:
+        _shot_status = 'Pillow not installed — pip install pillow'
+        return
+    try:
+        os.makedirs(_shot_dir, exist_ok=True)
+        ct    = datetime.now(timezone.utc) + CT_OFFSET
+        fname = f"opt_dashboard_{ct.strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        path  = os.path.join(_shot_dir, fname)
+
+        # Try to grab just the console window; fall back to the full screen.
+        bbox = None
+        if sys.platform == 'win32':
+            try:
+                from ctypes import wintypes
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    r = wintypes.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+                    if r.right > r.left and r.bottom > r.top:
+                        bbox = (r.left, r.top, r.right, r.bottom)
+            except Exception:
+                bbox = None
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            img = ImageGrab.grab(bbox=bbox)
+
+        img.save(path)
+        _shot_status = f'saved → {fname}'
+    except Exception as e:
+        _shot_status = 'error: ' + str(e).replace('\n', ' ')[:32]
 
 
 def _market_open_refresh_due():
@@ -824,6 +897,9 @@ async def fetch_all(interval):
                                 if eq_job is not None:
                                     eq_job.cancel()
                                 return
+                            if _screenshot_evt.is_set():
+                                _screenshot_evt.clear()
+                                take_screenshot()
                             if _refresh_evt.is_set() or _market_open_refresh_due():
                                 _refresh_evt.clear()
                                 force_eq    = True   # pull fresh equities, don't reuse in-flight
@@ -849,7 +925,7 @@ async def fetch_all(interval):
 
 
 def main():
-    global _last_open_refresh, _csv_dir
+    global _last_open_refresh, _csv_dir, _shot_dir
 
     parser = argparse.ArgumentParser(description='Options Flow Dashboard - Crypto & Equities')
     parser.add_argument('--interval', type=int, default=30,
@@ -858,13 +934,20 @@ def main():
                         help='directory for daily CSV logs (default: next to this script)')
     parser.add_argument('--no-csv', action='store_true',
                         help='disable per-refresh CSV logging')
+    parser.add_argument('--shots-dir', default=None, metavar='DIR',
+                        help='directory for [S] screenshots (default: <script dir>/screenshots)')
     args = parser.parse_args()
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Resolve the CSV log directory (logging is on by default). Files are named
     # opt_data_MM_DD_YYYY.csv, one per CT day. Resume today's file if it exists.
     if not args.no_csv:
-        _csv_dir = args.csv_dir or os.path.dirname(os.path.abspath(__file__))
+        _csv_dir = args.csv_dir or script_dir
         _resume_csv_row_count()
+
+    # Resolve the screenshot directory ([S] key saves PNGs here).
+    _shot_dir = args.shots_dir or os.path.join(script_dir, 'screenshots')
 
     # Pre-arm the market-open auto-refresh: if we launch after today's trigger
     # time, mark it done so it only fires when the clock *crosses* 08:45 during

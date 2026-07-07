@@ -20,17 +20,31 @@ positioning assumption used by public GEX tools. Not observed truth.
 
 Bottom of the chart also shows, for whichever column is currently in view:
   Max Pain           strike minimizing total option-holder payout at expiry
-  Zero Gamma/GEX Flip  strike level where cumulative net GEX crosses zero —
-                        below it dealer hedging is destabilizing, above it
-                        stabilizing. The two strikes it falls between are
+  Net GEX            Σ net GEX across the whole chain — green if net positive
+                      (dealers net long gamma, dampening), red if net negative
+                      (dealers net short gamma, amplifying)
+  Zero Gamma/GEX Flip  spot level where total dealer gamma exposure would flip
+                        sign — below it dealer hedging is destabilizing, above
+                        it stabilizing. Computed properly via Black-Scholes:
+                        every contract's gamma is re-priced at a sweep of
+                        hypothetical spot levels (not just today's actual
+                        spot) using its own strike/IV/time-to-expiry, and the
+                        flip is where that re-priced total crosses zero —
+                        the same approach professional GEX tools use, not a
+                        simpler "sum today's already-priced gamma by strike"
+                        proxy (which only describes today's gamma shape, not
+                        where the market would actually flip as spot moves).
+                        The two listed strikes it falls between are
                         highlighted cyan on the price axis, and a wide white
                         dashed line is drawn across the chart at that level
                         (in the gap between the two strikes, like the price
                         marker, unless the flip lands exactly on a strike).
-Both are averaged over the last --smooth-n raw fetches (default 5) rather than
-shown instantaneously — a single stale/transitional OI snapshot or a large
-order on a thin strike can swing the raw flip $50+ for one refresh and then
-revert; smoothing absorbs that without hiding a real, sustained level change.
+Max Pain and the flip are averaged over the last --smooth-n raw fetches
+(default 5) rather than shown instantaneously — a single stale/transitional OI
+snapshot or a large order on a thin strike can swing the raw flip $50+ for one
+refresh and then revert; smoothing absorbs that without hiding a real,
+sustained level change. Net GEX is shown raw (unsmoothed) since it's a sum
+across the whole chain, not a sensitive zero-crossing point.
 A --diag-threshold-sized jump ($30 default) in the *raw* (unsmoothed) flip
 between two consecutive fetches is logged to gex_diag_<SYMBOL>_MM_DD_YYYY.jsonl
 (full before/after OI+gamma per strike) and flashed in the status bar, so you
@@ -60,8 +74,11 @@ whatever's been logged as you pan; run --headless continuously (e.g. via Task
 Scheduler) to keep more history on disk to pan back into.
 
 Usage:
-  python gex.py [ETH|BTC|QQQ] [--interval SEC] [--all-exp] [--date MM_DD_YYYY]
+  python gex.py [SYMBOL] [--interval SEC] [--all-exp] [--date MM_DD_YYYY]
                  [--headless] [--smooth-n N] [--diag-threshold N]
+    SYMBOL               ETH or BTC (Deribit), or any CBOE-listed equity/ETF
+                          ticker, e.g. QQQ, SPY (default: ETH). Not case-sensitive.
+                          Can also be changed in-app with [S].
     --interval SEC       refresh interval in seconds (default 60)
     --all-exp            sum GEX across ALL expiries instead of just the nearest
                           (nearest/0DTE-style expiry is the default)
@@ -80,6 +97,32 @@ the highest/lowest strike in the grid. End resets both axes back to live
 (auto-following the latest column, auto-centered on the current strike).
 [R] refreshes now (live mode) or reloads the log from disk (history mode, in
 case another instance is still writing to it).
+
+[G] toggles a second view: GEX BY STRIKE — a bar chart (strike on the X axis,
+GEX $ on the Y axis) matching the Barchart-style "Gamma Exposure by Strike"
+chart, with call gamma (blue) and put gamma (orange) as separate bars per
+strike — no aggregate line. [N] toggles that view into NET mode: one bar per
+strike (call+put combined) instead of two, green if positive / red if negative
+(same convention as the interval map's dots). Always shows the latest fetched
+column (this view has no time axis to pause on); ←/→/PgUp/PgDn/↑/↓/[/]/{/} all
+scroll through strikes here instead (reusing the same "which strike is
+centered" state as the interval map's price-axis scroll — panning in one view
+carries over to the other). Max Pain / Net GEX / Zero Gamma read the same
+either way.
+
+[S] opens a one-line prompt to type any symbol (not case-sensitive) — ETH/BTC
+route to Deribit, anything else is tried as a CBOE-listed equity/ETF ticker
+(QQQ, SPY, AAPL, ...). Enter confirms, Esc cancels. Switching resets
+history/scale/scroll state and (re)loads whatever's already logged for the
+new symbol today (or at --date), same as if you'd launched the app with that
+symbol from the start. [G]/[N] (which view, and whether it's net) carry over
+across a switch; everything else resets.
+
+[P] saves a plain-text dump of exactly what's on screen right now to
+screenshots/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt, next to this script — works the
+same in every mode (interval map, GEX by strike, separate or net), since it
+just captures whatever's currently drawn. Same convention chart.py's [P]shot
+already uses elsewhere in this repo.
 """
 
 import sys
@@ -88,6 +131,7 @@ import threading
 import os
 import json
 import bisect
+import math
 
 # Windows compatibility — install windows-curses if _curses is missing
 try:
@@ -163,13 +207,22 @@ if "--date" in args:
         sys.exit(1)
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
 SYMBOL = args[0].upper() if args else "ETH"
-if SYMBOL not in ("ETH", "BTC", "QQQ"):
-    print(f"Unknown symbol '{SYMBOL}' — use ETH, BTC, or QQQ")
+if not SYMBOL:
+    print("Symbol can't be empty — e.g. ETH, BTC, QQQ, or any CBOE-listed equity/ETF ticker")
     sys.exit(1)
 
+# SYMBOL/IS_CRYPTO/MULT/BAND_PCT are reassigned at runtime by curses_main's
+# _switch_symbol (the 's' key) — every function below reads them as globals at call
+# time, so switching just these four is enough to retarget the whole fetch/log/display
+# pipeline at a different symbol without restarting the process.
 IS_CRYPTO = SYMBOL in ("ETH", "BTC")
 MULT      = 1 if IS_CRYPTO else 100     # Deribit = 1 coin/contract, equities = 100 shares/contract
 BAND_PCT  = 0.20 if IS_CRYPTO else 0.12 # strike-grid band around spot, as a fraction of spot
+
+# Black-Scholes hypothetical-spot sweep for the GEX Flip (see bs_gamma/build_bs_gex_curve):
+# how far above/below spot to re-price gamma, and how many points across that span.
+BS_SWEEP_PCT    = 0.20
+BS_SWEEP_POINTS = 61
 
 BASE_URL = "https://www.deribit.com/api/v2"
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
@@ -186,6 +239,7 @@ ARROW_STEP = 5    # columns per Left/Right press (time axis)
 PAGE_STEP  = 30   # columns per PgUp/PgDn press (time axis)
 VERT_STEP      = 1    # strikes per Up/Down press (price axis)
 VERT_PAGE_STEP = 8    # strikes per [/] press (price axis)
+SYMBOL_PROMPT  = " Enter symbol (Enter=confirm, Esc=cancel): "
 
 # ── DERIBIT HELPERS (crypto) ─────────────────────────────────────────────────
 def api(path, **params):
@@ -235,8 +289,10 @@ def fetch_eth(currency, all_exp):
             except Exception:
                 pass
 
-    strikes    = {}
-    oi_by_type = {}   # strike -> {"call": raw_oi, "put": raw_oi}, unweighted — for Max Pain
+    strikes     = {}
+    oi_by_type  = {}   # strike -> {"call": raw_oi, "put": raw_oi}, unweighted — for Max Pain
+    gex_by_type = {}   # strike -> {"call": call_gex, "put": put_gex} — for the by-strike bar chart
+    contracts   = []   # (strike, otype, oi, iv_decimal, T_years) — for the BS GEX-flip curve
     for ins in chain_ins:
         t = tickers.get(ins["instrument_name"])
         if not t:
@@ -250,6 +306,15 @@ def fetch_eth(currency, all_exp):
             gex = -gex
         strikes[ins["strike"]] = strikes.get(ins["strike"], 0.0) + gex
         oi_by_type.setdefault(ins["strike"], {"call": 0.0, "put": 0.0})[otype] += oi
+        gex_by_type.setdefault(ins["strike"], {"call": 0.0, "put": 0.0})[otype] += gex
+
+        iv_pct = t.get("mark_iv") or 0.0   # Deribit reports this in percentage points (e.g. 65.3)
+        exp_ms = ins["expiration_timestamp"]
+        T = max(exp_ms - now_ms, 60_000) / 1000.0 / 86400.0 / 365.0   # floor 60s to avoid T~0
+        if oi > 0 and iv_pct > 0:
+            contracts.append((ins["strike"], otype, oi, iv_pct / 100.0, T))
+
+    bs_gex_curve = build_bs_gex_curve(contracts, spot, MULT)
 
     if target_exp:
         exp_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d%b%y").upper()
@@ -258,8 +323,9 @@ def fetch_eth(currency, all_exp):
         exp_label = f"ALL({len(by_exp)})"
         ttl       = None
 
-    return {"spot": spot, "strikes": strikes, "oi_by_type": oi_by_type, "expiry_label": exp_label,
-            "ttl": ttl, "fetched_at": datetime.now().strftime("%H:%M:%S")}
+    return {"spot": spot, "strikes": strikes, "oi_by_type": oi_by_type, "gex_by_type": gex_by_type,
+            "bs_gex_curve": bs_gex_curve,
+            "expiry_label": exp_label, "ttl": ttl, "fetched_at": datetime.now().strftime("%H:%M:%S")}
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 _YAHOO_HEADERS  = {"User-Agent": "Mozilla/5.0"}
@@ -281,9 +347,24 @@ def fetch_live_price(symbol):
     except Exception:
         return None
 
-# ── CBOE HELPERS (QQQ) ────────────────────────────────────────────────────────
-def fetch_qqq(all_exp):
-    r = requests.get(CBOE_URL.format("QQQ"), timeout=15)
+def _cboe_time_to_expiry_years(exp_str):
+    """exp_str: 'YYMMDD'. Time to expiry in years, treating expiry as market close
+    (15:00 local — matches this repo's other CT-based tools) on that date. Crude for
+    non-0DTE expiries (ignores intraday time-of-day drift beyond "today"), but BS gamma
+    cares far more about T being near-zero than about being off by an hour — the floor
+    below is what actually matters for 0DTE numerical stability."""
+    exp_date = datetime.strptime(exp_str, "%y%m%d").date()
+    close_dt = datetime(exp_date.year, exp_date.month, exp_date.day, 15, 0, 0)
+    seconds  = (close_dt - datetime.now()).total_seconds()
+    return max(seconds, 60.0) / 86400.0 / 365.0   # floor 60s to avoid T~0 blowups
+
+# ── CBOE HELPERS (equities/ETFs) ────────────────────────────────────────────
+def fetch_equity(symbol, all_exp):
+    """Any CBOE-listed, optionable equity/ETF ticker — QQQ was the first one wired up,
+    but the OCC option-symbol parsing below is offset-from-the-end (date+type+strike are
+    always the trailing 15 chars regardless of ticker length), so this generalizes to
+    any ticker CBOE's delayed-quotes endpoint recognizes without further changes."""
+    r = requests.get(CBOE_URL.format(symbol), timeout=15)
     r.raise_for_status()
     data  = r.json().get("data") or {}
     price = float(data.get("current_price") or 0)
@@ -314,9 +395,12 @@ def fetch_qqq(all_exp):
         future = [e for e in by_exp if e >= today]
         target_exps = [min(future)] if future else [min(by_exp)]
 
-    strikes    = {}
-    oi_by_type = {}   # strike -> {"call": raw_oi, "put": raw_oi}, unweighted — for Max Pain
+    strikes     = {}
+    oi_by_type  = {}   # strike -> {"call": raw_oi, "put": raw_oi}, unweighted — for Max Pain
+    gex_by_type = {}   # strike -> {"call": call_gex, "put": put_gex} — for the by-strike bar chart
+    contracts   = []   # (strike, otype, oi, iv_decimal, T_years) — for the BS GEX-flip curve
     for exp in target_exps:
+        T_exp = _cboe_time_to_expiry_years(exp)
         for cp_flag, strike, o in by_exp[exp]:
             gamma = float(o.get("gamma") or 0)
             oi    = float(o.get("open_interest") or 0)
@@ -326,6 +410,13 @@ def fetch_qqq(all_exp):
             strikes[strike] = strikes.get(strike, 0.0) + gex
             otype = "call" if cp_flag == "C" else "put"
             oi_by_type.setdefault(strike, {"call": 0.0, "put": 0.0})[otype] += oi
+            gex_by_type.setdefault(strike, {"call": 0.0, "put": 0.0})[otype] += gex
+
+            iv = float(o.get("iv") or 0)   # CBOE reports this as a decimal already (e.g. 0.33 = 33%)
+            if oi > 0 and iv > 0:
+                contracts.append((strike, otype, oi, iv, T_exp))
+
+    bs_gex_curve = build_bs_gex_curve(contracts, price, MULT)
 
     is_0dte   = (not all_exp) and target_exps[0] == today
     exp_label = target_exps[0] if len(target_exps) == 1 else f"ALL({len(target_exps)})"
@@ -334,17 +425,19 @@ def fetch_qqq(all_exp):
     # that's the price its gamma values are relative to. Display/positioning uses a
     # near-real-time quote instead so the header and price marker aren't ~15m stale —
     # falls back to CBOE's price if the live quote fetch fails.
-    live_price = fetch_live_price("QQQ")
+    live_price = fetch_live_price(symbol)
     spot = live_price if live_price else price
 
     return {"spot": spot, "spot_is_live": live_price is not None, "cboe_ref_price": price,
-            "strikes": strikes, "oi_by_type": oi_by_type, "expiry_label": exp_label,
+            "strikes": strikes, "oi_by_type": oi_by_type, "gex_by_type": gex_by_type,
+            "bs_gex_curve": bs_gex_curve,
+            "expiry_label": exp_label,
             "ttl": None, "is_0dte": is_0dte, "fetched_at": datetime.now().strftime("%H:%M:%S")}
 
 def fetch_snapshot():
-    if SYMBOL == "QQQ":
-        return fetch_qqq(ALL_EXP)
-    return fetch_eth(SYMBOL, ALL_EXP)
+    if IS_CRYPTO:
+        return fetch_eth(SYMBOL, ALL_EXP)
+    return fetch_equity(SYMBOL, ALL_EXP)
 
 # ── PERSISTENCE — one JSON-lines file per symbol/day, next to this script ────
 # JSONL (not wide CSV) because each column is a variable-size {strike: gex}
@@ -360,6 +453,8 @@ def append_log(col):
             f.write(json.dumps({
                 "ts": col["ts"].isoformat(), "spot": col["spot"], "gex": col["gex"],
                 "oi_by_type": col.get("oi_by_type") or {},
+                "gex_by_type": col.get("gex_by_type") or {},
+                "bs_gex_curve": col.get("bs_gex_curve") or [],
                 "expiry_label": col.get("expiry_label"), "is_0dte": col.get("is_0dte"),
             }) + "\n")
         return True, None
@@ -392,8 +487,8 @@ def check_flip_jump(prev_col, new_col):
     jump exceeds DIAG_THRESHOLD, log it and return a short status message, else None."""
     if DIAG_THRESHOLD <= 0:
         return None
-    prev_flip = compute_gamma_flip(prev_col["gex"], prev_col["spot"])
-    new_flip  = compute_gamma_flip(new_col["gex"], new_col["spot"])
+    prev_flip = _find_nearest_zero_crossing(prev_col.get("bs_gex_curve") or [], prev_col["spot"])
+    new_flip  = _find_nearest_zero_crossing(new_col.get("bs_gex_curve") or [], new_col["spot"])
     if not prev_flip or not new_flip:
         return None
     delta = new_flip[2] - prev_flip[2]
@@ -415,7 +510,7 @@ def smoothed_max_pain_and_flip(history, end_idx, n):
         mp = compute_max_pain(c.get("oi_by_type"))
         if mp is not None:
             mps.append(mp)
-        fl = compute_gamma_flip(c["gex"], c["spot"])
+        fl = _find_nearest_zero_crossing(c.get("bs_gex_curve") or [], c["spot"])
         if fl:
             levels.append(fl[2])
     smoothed_mp    = sum(mps) / len(mps) if mps else None
@@ -445,6 +540,17 @@ def resolve_marker_row(lo_s, hi_s, row_of):
         return row_of[hi_s] + 1   # hi_s renders above lo_s (descending strike list)
     return None
 
+def resolve_marker_col(lo_s, hi_s, col_of):
+    """Column for a level given its two bounding strikes, for the GEX-by-strike bar
+    chart (ascending left-to-right strike layout — the mirror image of
+    resolve_marker_row's descending row layout): that strike's own column if lo==hi,
+    else the midpoint between the two strikes' columns if both are rendered, else None."""
+    if lo_s == hi_s:
+        return col_of.get(lo_s)
+    if lo_s in col_of and hi_s in col_of:
+        return (col_of[lo_s] + col_of[hi_s]) // 2
+    return None
+
 def load_log(date_str):
     """Read a day's log back into column dicts (no 'nearest' yet — ingest_column adds it)."""
     path = log_path(date_str)
@@ -461,8 +567,12 @@ def load_log(date_str):
                 cols.append({
                     "ts": datetime.fromisoformat(d["ts"]), "spot": d["spot"],
                     "gex": {float(k): v for k, v in d["gex"].items()},
-                    # older logs predate oi_by_type — .get(...) so Max Pain just shows N/A for them
+                    # older logs predate oi_by_type/gex_by_type/bs_gex_curve — .get(...) so
+                    # Max Pain / the by-strike bar chart / GEX Flip just show N/A or empty
+                    # for columns logged before each of these was added
                     "oi_by_type": {float(k): v for k, v in (d.get("oi_by_type") or {}).items()},
+                    "gex_by_type": {float(k): v for k, v in (d.get("gex_by_type") or {}).items()},
+                    "bs_gex_curve": d.get("bs_gex_curve") or [],
                     "expiry_label": d.get("expiry_label"), "is_0dte": d.get("is_0dte"),
                 })
             except Exception:
@@ -498,32 +608,64 @@ def compute_max_pain(oi_by_type):
             best_payout, best_strike = payout, k
     return best_strike
 
-def compute_gamma_flip(strikes, spot):
-    """Zero Gamma / GEX Flip: the strike level where the cumulative net GEX (summed low
-    to high strike) crosses zero. Returns (low_strike, high_strike, interpolated_level)
-    for the crossing nearest spot, or None if the cumulative sum never crosses zero."""
-    sorted_strikes = sorted(strikes)
-    if len(sorted_strikes) < 2:
+def _find_nearest_zero_crossing(points, ref):
+    """points: [(x, y), ...] sorted ascending by x. Returns (x_lo, x_hi, interpolated_x)
+    for the y-crossing nearest `ref`, or None if y never crosses zero (x_lo==x_hi if the
+    crossing lands exactly on a point). Shared by build_bs_gex_curve's hypothetical-spot
+    GEX-flip curve — the one and only crossing-finder in this file now that the flip is
+    computed via Black-Scholes re-pricing rather than a raw per-strike cumulative sum."""
+    if len(points) < 2:
         return None
-    running, cum = 0.0, []
-    for s in sorted_strikes:
-        running += strikes[s]
-        cum.append(running)
     crossings = []
-    for i in range(len(sorted_strikes) - 1):
-        c0, c1 = cum[i], cum[i + 1]
-        if c0 == 0:
-            crossings.append((sorted_strikes[i], sorted_strikes[i], sorted_strikes[i]))
-        elif (c0 < 0) != (c1 < 0):
-            s0, s1 = sorted_strikes[i], sorted_strikes[i + 1]
-            level = s0 + (s1 - s0) * (-c0 / (c1 - c0))
-            crossings.append((s0, s1, level))
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        if y0 == 0:
+            crossings.append((x0, x0, x0))
+        elif (y0 < 0) != (y1 < 0):
+            level = x0 + (x1 - x0) * (-y0 / (y1 - y0))
+            crossings.append((x0, x1, level))
     if not crossings:
         return None
-    return min(crossings, key=lambda c: abs(c[2] - spot))
+    return min(crossings, key=lambda c: abs(c[2] - ref))
+
+def bs_gamma(S, K, T, sigma):
+    """Black-Scholes gamma (identical formula for calls and puts) at spot S, strike K,
+    time-to-expiry T (years), annualized vol sigma (decimal, e.g. 0.30 = 30%). r=0 —
+    a standard simplification for short-dated options where the rate barely moves d1."""
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    return math.exp(-0.5 * d1 * d1) / (math.sqrt(2 * math.pi) * S * sigma * math.sqrt(T))
+
+def build_bs_gex_curve(contracts, spot, mult, n_points=BS_SWEEP_POINTS, sweep_pct=BS_SWEEP_PCT):
+    """The real Zero Gamma / GEX Flip calculation: re-prices every contract's gamma at a
+    sweep of hypothetical spot levels (not just today's actual spot) via Black-Scholes,
+    and returns the resulting [(hyp_spot, total_net_gex), ...] curve — this is what
+    professional GEX tools (SpotGamma, Barchart) compute, as opposed to a simpler "sum
+    each contract's already-priced gamma by strike" proxy, which only tells you today's
+    gamma distribution, not where the *market* would flip sign as spot actually moves.
+
+    contracts: [(strike, "call"|"put", oi, iv_decimal, T_years), ...]. IV/OI/T are
+    floored to strictly positive by the caller — a contract with no priced IV or OI
+    contributes nothing (correctly: BS gamma is undefined/meaningless there anyway).
+    The returned curve is what gets persisted per column (compact: n_points entries,
+    not one per contract) and is what _find_nearest_zero_crossing scans for the flip."""
+    lo, hi = spot * (1 - sweep_pct), spot * (1 + sweep_pct)
+    step = (hi - lo) / (n_points - 1) if n_points > 1 else 0.0
+    curve = []
+    for i in range(n_points):
+        S = lo + step * i
+        total = 0.0
+        for strike, otype, oi, iv, T in contracts:
+            gamma = bs_gamma(S, strike, T, iv)
+            gex = gamma * oi * mult * S * S * 0.01
+            total += -gex if otype == "put" else gex
+        curve.append((S, total))
+    return curve
 
 # ── COLOUR PAIRS ───────────────────────────────────────────────────────────
-P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_ATM = range(1, 9)
+P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_ATM, P_BLUE, P_ORANGE = range(1, 11)
 
 def init_colors():
     curses.start_color()
@@ -537,12 +679,23 @@ def init_colors():
     curses.init_pair(P_RED,     curses.COLOR_RED,    BG)
     curses.init_pair(P_STATUS,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
     curses.init_pair(P_ATM,     curses.COLOR_YELLOW, BG)
+    curses.init_pair(P_BLUE,    curses.COLOR_BLUE,   BG)    # call gamma (GEX-by-strike mode)
+    curses.init_pair(P_ORANGE,  curses.COLOR_YELLOW, BG)    # put gamma — base 8-color curses has
+                                                             # no true orange; yellow is the closest
 
 def cp(pair, bold=False, dim=False):
     a = curses.color_pair(pair)
     if bold: a |= curses.A_BOLD
     if dim:  a |= curses.A_DIM
     return a
+
+_screen_mirror = []   # plain-text mirror of the current frame, for take_screenshot() —
+                      # see its docstring for why this is kept instead of reading curses
+                      # back via win.instr()/win.inch()
+
+def _mirror_reset(h, w):
+    global _screen_mirror
+    _screen_mirror = [[" "] * w for _ in range(h)]
 
 def safe_add(win, y, x, s, attr=0):
     h, w = win.getmaxyx()
@@ -551,15 +704,54 @@ def safe_add(win, y, x, s, attr=0):
     avail = w - x - 1
     if avail <= 0:
         return
+    s = s[:avail]
     try:
-        win.addstr(y, x, s[:avail], attr)
+        win.addstr(y, x, s, attr)
     except curses.error:
         pass
+    if _screen_mirror and y < len(_screen_mirror):
+        row = _screen_mirror[y]
+        row_w = len(row)
+        for i, ch in enumerate(s):
+            xi = x + i
+            if 0 <= xi < row_w:
+                row[xi] = ch
+
+def take_screenshot():
+    """Dump the current frame to screenshots/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt — same
+    plain-text convention chart.py's [P]shot already uses in this repo. Reads back
+    _screen_mirror (a plain-Python copy of every string safe_add has written this frame)
+    rather than curses' own buffer (win.instr()/win.inch()): this file's dot/line
+    characters (●, ─, │, etc.) are multi-byte, and whether curses' internal storage
+    round-trips them losslessly depends on the underlying build — chart.py sidesteps the
+    same uncertainty the same way, with its own DoubleBuffer. Works identically for every
+    chart mode, since it just dumps whatever's already been drawn — no per-mode logic."""
+    folder = os.path.join(LOG_DIR, "screenshots")
+    os.makedirs(folder, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(folder, f"gex_{SYMBOL}_{ts}.txt")
+    lines = ["".join(row).rstrip() for row in _screen_mirror]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
 
 def fstrike(strike):
     if IS_CRYPTO:
         return f"${strike:,.0f}"
     return f"${strike:,.2f}"
+
+def fdollars_compact(v):
+    """Compact signed dollar format for totals that can run into the billions
+    (e.g. Net GEX summed across a whole chain) — $1.23B / $45.6M / $789.1K / $12.34."""
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1e9:
+        return f"{sign}${v / 1e9:,.2f}B"
+    if v >= 1e6:
+        return f"{sign}${v / 1e6:,.2f}M"
+    if v >= 1e3:
+        return f"{sign}${v / 1e3:,.2f}K"
+    return f"{sign}${v:,.2f}"
 
 def magnitude_char(net, scale_max, floor_char=" "):
     """Size-tier character for |net| as a fraction of scale_max — shared by dot_repr
@@ -593,21 +785,16 @@ def price_marker_repr(net, scale_max):
     ch, frac = magnitude_char(net, scale_max, floor_char="·")
     return ch, cp(P_YELLOW, bold=(frac >= 0.35))
 
-# ── DRAW ──────────────────────────────────────────────────────────────────
-def draw(win, history, grid, scale_max, meta, status, ui):
-    h, w = win.getmaxyx()
-    win.erase()
-
-    live_follow = ui["live_follow"]
-    n_hist      = len(history)
-    end_idx     = n_hist if live_follow else max(1, min(ui["view_end_idx"], n_hist))
-
-    label  = meta.get("expiry_label", "—")
-    ttl    = meta.get("ttl")
+def build_header(history, meta, ui, live_follow, end_idx, title="GEX MAP"):
+    """(spot, pieces) for header row 0 — shared by both chart modes (interval map and
+    GEX-by-strike). `live_follow`/`end_idx` mean "is the latest column being shown" /
+    "index of whichever column IS being shown"; the by-strike mode always passes
+    live_follow=True, end_idx=len(history) since it has no time axis to pause on."""
+    label   = meta.get("expiry_label", "—")
+    ttl     = meta.get("ttl")
     is_0dte = meta.get("is_0dte", True if IS_CRYPTO else False)
     fetched = meta.get("fetched_at", "—")
 
-    # ── Row 0: header ────────────────────────────────────────────────────
     if live_follow:
         mode_piece = ("● LIVE", cp(P_GREEN, bold=True))
         spot = history[-1]["spot"] if history else meta.get("spot", 0.0)
@@ -617,7 +804,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         spot = history[end_idx - 1]["spot"] if history else meta.get("spot", 0.0)
 
     pieces = [
-        ("GEX MAP", cp(P_CYAN, bold=True)),
+        (title, cp(P_CYAN, bold=True)),
         ("  │  ", cp(P_DIM, dim=True)),
         (f"{SYMBOL}", cp(P_DEFAULT, bold=True)),
         ("  ", cp(P_DIM, dim=True)),
@@ -647,6 +834,20 @@ def draw(win, history, grid, scale_max, meta, status, ui):
     diag_count = ui.get("diag_count", 0)
     if diag_count:
         pieces += [(f"  Jumps {diag_count}", cp(P_RED, bold=True))]
+    return spot, pieces
+
+# ── DRAW: TIME-INTERVAL MAP ─────────────────────────────────────────────────
+def draw(win, history, grid, scale_max, meta, status, ui):
+    h, w = win.getmaxyx()
+    win.erase()
+    _mirror_reset(h, w)
+
+    live_follow = ui["live_follow"]
+    n_hist      = len(history)
+    end_idx     = n_hist if live_follow else max(1, min(ui["view_end_idx"], n_hist))
+
+    # ── Row 0: header ────────────────────────────────────────────────────
+    spot, pieces = build_header(history, meta, ui, live_follow, end_idx)
     x = 0
     for text, attr in pieces:
         safe_add(win, 0, x, text, attr)
@@ -784,8 +985,14 @@ def draw(win, history, grid, scale_max, meta, status, ui):
             safe_add(win, axis_row, cx, ts, cp(P_DIM, dim=True))
         cx += COL_W
 
-    # ── Max Pain / Zero Gamma (GEX Flip) ────────────────────────────────
+    # ── Max Pain / Net GEX / Zero Gamma (GEX Flip) ──────────────────────
     mp_str = fstrike(max_pain) if max_pain is not None else "N/A"
+    net_gex = sum(cols[-1]["gex"].values()) if cols else None
+    if net_gex is None:
+        net_gex_str, net_gex_attr = "N/A", cp(P_DIM, dim=True)
+    else:
+        net_gex_str = fdollars_compact(net_gex)
+        net_gex_attr = cp(P_GREEN if net_gex >= 0 else P_RED, bold=True)
     if flip:
         lo, hi, level = flip
         flip_str = (fstrike(level) if lo == hi else
@@ -794,8 +1001,9 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         flip_str = "N/A"
     info_pieces = [
         (" Max Pain ", cp(P_DIM, dim=True)), (mp_str, cp(P_YELLOW, bold=True)),
+        ("    Net GEX ", cp(P_DIM, dim=True)), (net_gex_str, net_gex_attr),
         ("    Zero Gamma/GEX Flip ", cp(P_DIM, dim=True)), (flip_str, cp(P_CYAN, bold=True)),
-        (f"    (smoothed over last {SMOOTH_N})", cp(P_DIM, dim=True)),
+        (f"    (Max Pain/Flip smoothed over last {SMOOTH_N})", cp(P_DIM, dim=True)),
     ]
     info_row = h - bottom_reserved + 1
     ix = 0
@@ -805,12 +1013,217 @@ def draw(win, history, grid, scale_max, meta, status, ui):
 
     # ── Status bar ───────────────────────────────────────────────────────
     bot = h - 1
-    exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
-    refresh_hint = "r=reload" if HISTORICAL_MODE else "r=refresh"
-    vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-    hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  "
-            f"strikes:↑/↓/[/]/{{/}}  End=live  [{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
-    safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
+    if ui.get("entering_symbol"):
+        prompt = SYMBOL_PROMPT + ui.get("symbol_input_buf", "")
+        safe_add(win, bot, 0, prompt.ljust(w - 1)[:w - 1], cp(P_STATUS))
+    else:
+        exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
+        refresh_hint = "r=reload" if HISTORICAL_MODE else "r=refresh"
+        vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
+        hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  End=live  "
+                f"g=by-strike  s=symbol  p=screenshot  [{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
+        safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
+
+    win.noutrefresh()
+
+# ── DRAW: GEX BY STRIKE (bar chart) ─────────────────────────────────────────
+def draw_by_strike(win, history, grid, meta, status, ui):
+    """Strike on the X axis, GEX $ on the Y axis, matching the Barchart-style 'Gamma
+    Exposure by Strike' chart — no aggregate line. Two sub-modes, toggled with 'n':
+      separate (default) — call gamma (blue) and put gamma (orange) as two bars per strike
+      net ('n' toggles)  — one bar per strike (call+put combined), green if positive
+                           (call-dominated) / red if negative (put-dominated), matching
+                           the interval map's dot-color convention
+    Always shows the latest fetched column (this mode has no time axis to pause on);
+    horizontal strike scrolling reuses the same vert_follow/vert_center_idx state the
+    interval map uses for its vertical strike scroll — same underlying idea ("which
+    strike is centered"), just applied to columns here instead of rows."""
+    h, w = win.getmaxyx()
+    win.erase()
+    _mirror_reset(h, w)
+
+    net_mode = ui.get("by_strike_net", False)
+    title = "GEX BY STRIKE (NET)" if net_mode else "GEX BY STRIKE"
+    spot, pieces = build_header(history, meta, ui, True, len(history), title=title)
+    x = 0
+    for text, attr in pieces:
+        safe_add(win, 0, x, text, attr)
+        x += len(text)
+
+    if net_mode:
+        legend = [
+            ("█ ", cp(P_GREEN, bold=True)), ("net +gamma (call-dominated)  ", cp(P_DIM, dim=True)),
+            ("█ ", cp(P_RED, bold=True)), ("net -gamma (put-dominated)  ", cp(P_DIM, dim=True)),
+            ("yellow", cp(P_ATM, bold=True)), ("=current strike  ", cp(P_DIM, dim=True)),
+            ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes  ", cp(P_DIM, dim=True)),
+            ("|", cp(P_DEFAULT, bold=True)), ("=GEX flip level", cp(P_DIM, dim=True)),
+        ]
+    else:
+        legend = [
+            ("█ ", cp(P_BLUE, bold=True)), ("call gamma  ", cp(P_DIM, dim=True)),
+            ("█ ", cp(P_ORANGE, bold=True)), ("put gamma  ", cp(P_DIM, dim=True)),
+            ("yellow", cp(P_ATM, bold=True)), ("=current strike  ", cp(P_DIM, dim=True)),
+            ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes  ", cp(P_DIM, dim=True)),
+            ("|", cp(P_DEFAULT, bold=True)), ("=GEX flip level", cp(P_DIM, dim=True)),
+        ]
+    x = 0
+    for text, attr in legend:
+        safe_add(win, 1, x, text, attr)
+        x += len(text)
+
+    if not history or not grid:
+        msg = (f"No log found for {VIEW_DATE} — nothing to show." if HISTORICAL_MODE
+               else "Waiting for first snapshot…")
+        safe_add(win, h // 2, 2, msg, cp(P_CYAN))
+        bot = h - 1
+        hint = f" q=quit  r=refresh  [{SYMBOL}]  {status}"
+        safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
+        win.noutrefresh()
+        return
+
+    ref_col     = history[-1]
+    gex_by_type = ref_col.get("gex_by_type") or {}
+    nearest_strike = ref_col.get("nearest")
+
+    top             = 3
+    bottom_reserved = 3   # x-axis strike-label row + Max Pain/Net GEX/Flip row + status bar
+    grid_sorted     = sorted(grid)
+    strike_col_w    = 3
+    y_axis_w        = 10   # room for "$XXX.XXM"-style gridline labels on the left
+
+    usable_w      = max(0, w - y_axis_w - 1)
+    n_strike_cols = max(1, usable_w // strike_col_w)
+
+    if ui["vert_follow"]:
+        center_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    else:
+        center_idx = max(0, min(len(grid_sorted) - 1, ui["vert_center_idx"]))
+    half = n_strike_cols // 2
+    lo = max(0, center_idx - half)
+    hi = min(len(grid_sorted), lo + n_strike_cols)
+    lo = max(0, hi - n_strike_cols)
+    visible_strikes = grid_sorted[lo:hi]   # ascending — lowest strike on the left
+
+    # Scale scoped to what's visible. Net mode scales off the *combined* per-strike
+    # value (usually much smaller than either raw side alone, due to call/put
+    # cancellation) — sharing the separate-mode scale would make net bars look
+    # artificially tiny, so each sub-mode gets its own scale.
+    scale = 0.0
+    if net_mode:
+        for strike in visible_strikes:
+            scale = max(scale, abs(ref_col["gex"].get(strike, 0.0)))
+    else:
+        for strike in visible_strikes:
+            entry = gex_by_type.get(strike, {})
+            scale = max(scale, abs(entry.get("call", 0.0)), abs(entry.get("put", 0.0)))
+
+    avail_v    = max(2, h - top - bottom_reserved)
+    zero_row   = top + avail_v // 2
+    avail_up   = zero_row - top
+    avail_down = (h - bottom_reserved - 1) - zero_row
+
+    # Max Pain / Net GEX / Zero Gamma — identical calcs to the interval map, always
+    # anchored to the latest column since this mode has no time axis to pause on.
+    max_pain, flip_level = smoothed_max_pain_and_flip(history, len(history), SMOOTH_N)
+    flip = None
+    if flip_level is not None:
+        flip = bounding_strikes(grid_sorted, flip_level) + (flip_level,)
+    flip_strikes = (flip[0], flip[1]) if flip else ()
+    net_gex = sum(ref_col["gex"].values())
+
+    # Column positions computed before anything is drawn, so the flip line (drawn first)
+    # and the bars (drawn after, so they show through if they land on the same column)
+    # agree on where each strike sits.
+    col_of = {}
+    for si, strike in enumerate(visible_strikes):
+        cx = y_axis_w + si * strike_col_w
+        if cx >= w - 1:
+            break
+        col_of[strike] = cx
+
+    if flip:
+        flip_col = resolve_marker_col(flip[0], flip[1], col_of)
+        if flip_col is not None:
+            for ry in range(top, h - bottom_reserved):
+                safe_add(win, ry, flip_col, "|", cp(P_DEFAULT, bold=True))
+
+    # Zero baseline — dim reference line spanning the chart, drawn before the bars so a
+    # bar at a near-zero strike still shows visibly on top of it.
+    for cx in range(y_axis_w, w - 1):
+        safe_add(win, zero_row, cx, "─", cp(P_DIM, dim=True))
+
+    # Y-axis (dollar value) gridlines.
+    safe_add(win, top, 0, fdollars_compact(scale).rjust(y_axis_w - 1), cp(P_DIM, dim=True))
+    safe_add(win, zero_row, 0, "$0".rjust(y_axis_w - 1), cp(P_DIM, dim=True))
+    safe_add(win, h - bottom_reserved - 1, 0, fdollars_compact(-scale).rjust(y_axis_w - 1), cp(P_DIM, dim=True))
+
+    # Bars + x-axis strike labels (thinned so labels don't collide).
+    label_every = max(1, 12 // strike_col_w)
+    for si, strike in enumerate(visible_strikes):
+        cx = col_of.get(strike)
+        if cx is None:
+            break
+
+        if net_mode:
+            net_val = ref_col["gex"].get(strike, 0.0)
+            rows = round(abs(net_val) / scale * (avail_up if net_val >= 0 else avail_down)) if scale > 0 else 0
+            pair = P_GREEN if net_val >= 0 else P_RED
+            step = -1 if net_val >= 0 else 1   # up for positive, down for negative
+            for r in range(1, rows + 1):
+                safe_add(win, zero_row + step * r, cx, "█", cp(pair, bold=True))
+        else:
+            entry = gex_by_type.get(strike, {})
+            call_val, put_val = entry.get("call", 0.0), entry.get("put", 0.0)
+            call_rows = round(abs(call_val) / scale * avail_up) if scale > 0 else 0
+            put_rows  = round(abs(put_val) / scale * avail_down) if scale > 0 else 0
+            for r in range(1, call_rows + 1):
+                safe_add(win, zero_row - r, cx, "█", cp(P_BLUE, bold=True))
+            for r in range(1, put_rows + 1):
+                safe_add(win, zero_row + r, cx, "█", cp(P_ORANGE, bold=True))
+
+        if si % label_every == 0 or si == len(visible_strikes) - 1:
+            if strike == nearest_strike:
+                lbl_attr = cp(P_ATM, bold=True)
+            elif strike in flip_strikes:
+                lbl_attr = cp(P_CYAN, bold=True)
+            else:
+                lbl_attr = cp(P_DIM, dim=True)
+            safe_add(win, h - bottom_reserved, max(0, cx - 1), fstrike(strike), lbl_attr)
+
+    # ── Max Pain / Net GEX / Zero Gamma (GEX Flip) ──────────────────────
+    mp_str = fstrike(max_pain) if max_pain is not None else "N/A"
+    net_gex_str  = fdollars_compact(net_gex)
+    net_gex_attr = cp(P_GREEN if net_gex >= 0 else P_RED, bold=True)
+    if flip:
+        lo_f, hi_f, level = flip
+        flip_str = (fstrike(level) if lo_f == hi_f else
+                    f"{fstrike(level)}  (between {fstrike(lo_f)} & {fstrike(hi_f)})")
+    else:
+        flip_str = "N/A"
+    info_pieces = [
+        (" Max Pain ", cp(P_DIM, dim=True)), (mp_str, cp(P_YELLOW, bold=True)),
+        ("    Net GEX ", cp(P_DIM, dim=True)), (net_gex_str, net_gex_attr),
+        ("    Zero Gamma/GEX Flip ", cp(P_DIM, dim=True)), (flip_str, cp(P_CYAN, bold=True)),
+        (f"    (Max Pain/Flip smoothed over last {SMOOTH_N})", cp(P_DIM, dim=True)),
+    ]
+    info_row = h - bottom_reserved + 1
+    ix = 0
+    for text, attr in info_pieces:
+        safe_add(win, info_row, ix, text, attr)
+        ix += len(text)
+
+    # ── Status bar ───────────────────────────────────────────────────────
+    bot = h - 1
+    if ui.get("entering_symbol"):
+        prompt = SYMBOL_PROMPT + ui.get("symbol_input_buf", "")
+        safe_add(win, bot, 0, prompt.ljust(w - 1)[:w - 1], cp(P_STATUS))
+    else:
+        exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
+        vert_tag = "" if ui["vert_follow"] else "[scrolled]"
+        hint = (f" q=quit  r=refresh  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  End=center  "
+                f"g=interval map  n=net/separate  s=symbol  p=screenshot  "
+                f"[{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
+        safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
 
     win.noutrefresh()
 
@@ -836,6 +1249,29 @@ def curses_main(stdscr):
     diag_msg   = None
     diag_msg_time = 0.0
     lock = threading.Lock()
+    # Bumped on every symbol switch; a fetch in flight for the old symbol checks this
+    # when it completes and discards its result rather than merging stale data into
+    # the new symbol's just-reset history (see _switch_symbol / do_fetch).
+    fetch_epoch = 0
+
+    # "interval" = the time-interval dot map, "strike" = the GEX-by-strike bar chart.
+    # Toggled with 'g'; both modes share the fetch/log pipeline below, only the
+    # renderer and what Left/Right/PgUp/PgDn control (time vs. strikes) differ.
+    mode = "interval"
+    # Within GEX-by-strike mode: False = separate call(blue)/put(orange) bars per
+    # strike, True = one net bar per strike (green/red). Toggled with 'n'.
+    by_strike_net = False
+
+    # 's' opens a one-line text prompt (typed into symbol_input_buf) instead of
+    # cycling a fixed list — Enter commits (case-insensitive, uppercased on submit),
+    # Esc cancels. While entering_symbol is True, every other key below is swallowed
+    # by the input-mode branch rather than falling through to its usual handler.
+    entering_symbol = False
+    symbol_input_buf = ""
+
+    # 'p' saves a plain-text dump of whatever's currently on screen (either chart mode).
+    screenshot_msg = None
+    screenshot_msg_time = 0.0
 
     # Scroll state: live_follow=True always shows the newest columns; panning
     # back sets an absolute view_end_idx so the frozen window doesn't drift
@@ -858,14 +1294,33 @@ def curses_main(stdscr):
         spot_now = history[-1]["spot"]
         return min(range(len(gs)), key=lambda i: abs(gs[i] - spot_now))
 
+    def _vert_step(delta):
+        """Move vert_center_idx by delta strikes, seeding it from the currently
+        auto-centered strike the first time (so scrolling starts from wherever you're
+        already looking, not index 0). Shared by the interval map's ↑/↓/[/] (vertical,
+        rows) and the by-strike chart's ←/→/PgUp/PgDn (horizontal, columns) — same
+        "which strike is centered" state either way, just rendered differently."""
+        nonlocal vert_follow, vert_center_idx
+        if vert_follow:
+            vert_center_idx = _atm_idx()
+        vert_follow = False
+        vert_center_idx = max(0, min(max(0, len(grid) - 1), vert_center_idx + delta))
+
     def _load_into(date_str):
         """(Re)populate history/grid/scale_max/meta from a day's log on disk."""
         nonlocal scale_max, meta, log_rows
         grid.clear()
         history.clear()
         scale_max = 0.0
+        last_expiry = None
         for c in load_log(date_str):
             c, local_max = ingest_column(c, grid)
+            # A new expiry (e.g. Deribit's daily ~03:00 CT rollover) starts with far less
+            # built-up OI than a day-old chain — carrying the old expiry's scale forward
+            # makes the new (smaller but real) values round down to invisible dots.
+            if last_expiry is not None and c.get("expiry_label") != last_expiry:
+                scale_max = 0.0
+            last_expiry = c.get("expiry_label")
             history.append(c)
             scale_max = max(scale_max, local_max)
         if history:
@@ -877,7 +1332,11 @@ def curses_main(stdscr):
     with lock:
         _load_into(VIEW_DATE)   # resume today's log if present, or load the --date file
 
-    def do_fetch():
+    def do_fetch(epoch):
+        """epoch: fetch_epoch at the moment this fetch was triggered. If the symbol has
+        been switched (fetch_epoch bumped) by the time this completes, its result is for
+        a symbol nobody's looking at anymore — discarded rather than merged into the new
+        symbol's freshly-reset history."""
         nonlocal error_msg, last_fetch, fetching, fetch_dur, scale_max, meta, log_rows, log_err
         nonlocal diag_count, diag_msg, diag_msg_time
         t0 = time.time()
@@ -885,12 +1344,20 @@ def curses_main(stdscr):
             d = fetch_snapshot()
             elapsed = time.time() - t0
             with lock:
+                if epoch != fetch_epoch:
+                    return
                 prev_col = history[-1] if history else None
                 col = {"ts": datetime.now(), "spot": d["spot"], "gex": d["strikes"],
                        "oi_by_type": d.get("oi_by_type") or {},
+                       "gex_by_type": d.get("gex_by_type") or {},
+                       "bs_gex_curve": d.get("bs_gex_curve") or [],
                        "expiry_label": d.get("expiry_label"),
                        "is_0dte": d.get("is_0dte", True if IS_CRYPTO else False)}
                 col, local_max = ingest_column(col, grid)
+                # Same expiry-rollover reset as _load_into (see its comment) — a fresh
+                # expiry's naturally smaller scale shouldn't be dwarfed by the old one's.
+                if prev_col is not None and prev_col.get("expiry_label") != col.get("expiry_label"):
+                    scale_max = 0.0
                 history.append(col)
                 scale_max = max(scale_max, local_max)
                 meta = {k: v for k, v in d.items() if k != "strikes"}
@@ -911,10 +1378,12 @@ def curses_main(stdscr):
                         diag_msg_time = time.time()
         except Exception as e:
             with lock:
-                error_msg = str(e)
+                if epoch == fetch_epoch:
+                    error_msg = str(e)
         finally:
             with lock:
-                fetching = False
+                if epoch == fetch_epoch:
+                    fetching = False
 
     def trigger_fetch():
         nonlocal fetching, fetch_started
@@ -923,7 +1392,36 @@ def curses_main(stdscr):
                 return
             fetching = True
             fetch_started = time.time()
-        threading.Thread(target=do_fetch, daemon=True).start()
+            epoch = fetch_epoch
+        threading.Thread(target=do_fetch, args=(epoch,), daemon=True).start()
+
+    def _switch_symbol(new_symbol):
+        """Retarget the whole app at a different symbol without restarting: reset every
+        piece of per-symbol state, then (re)load whatever's already logged for the new
+        symbol at VIEW_DATE (mirrors what happens at startup). Caller must hold `lock`;
+        does not itself call trigger_fetch (that acquires `lock` too — call it after
+        releasing, same convention as the 'r'/reload key handler below)."""
+        nonlocal error_msg, last_fetch, fetch_dur, fetching, fetch_epoch
+        nonlocal diag_count, diag_msg, diag_msg_time
+        nonlocal live_follow, view_end_idx, vert_follow, vert_center_idx
+        global SYMBOL, IS_CRYPTO, MULT, BAND_PCT
+        SYMBOL    = new_symbol
+        IS_CRYPTO = SYMBOL in ("ETH", "BTC")
+        MULT      = 1 if IS_CRYPTO else 100
+        BAND_PCT  = 0.20 if IS_CRYPTO else 0.12
+        fetch_epoch += 1   # invalidate any fetch already in flight for the old symbol
+        error_msg = ""
+        last_fetch = 0.0
+        fetch_dur = 5.0
+        fetching = False
+        diag_count = 0
+        diag_msg = None
+        diag_msg_time = 0.0
+        live_follow = True
+        view_end_idx = 0
+        vert_follow = True
+        vert_center_idx = 0
+        _load_into(VIEW_DATE)   # note: not HISTORICAL_MODE-gated — mode/by_strike_net persist
 
     if not HISTORICAL_MODE:
         trigger_fetch()
@@ -934,74 +1432,111 @@ def curses_main(stdscr):
 
     while True:
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q'), 27):
-            break
-        if key in (ord('r'), ord('R')):
-            if HISTORICAL_MODE:
+
+        if entering_symbol:
+            # Every key is captured for the typed buffer here — q/Q/Esc/etc. must NOT
+            # fall through to their usual meanings while typing (a ticker could contain
+            # any letter, including 'q'), so this branch is fully separate from the
+            # normal dispatch below rather than layered on top of it.
+            if key in (10, 13, curses.KEY_ENTER):
+                typed = symbol_input_buf.strip().upper()
+                entering_symbol = False
+                symbol_input_buf = ""
+                if typed:
+                    with lock:
+                        _switch_symbol(typed)
+                    if not HISTORICAL_MODE:
+                        trigger_fetch()   # outside the lock — trigger_fetch acquires it itself
+            elif key == 27:   # Esc cancels, leaves the current symbol untouched
+                entering_symbol = False
+                symbol_input_buf = ""
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                symbol_input_buf = symbol_input_buf[:-1]
+            elif key != -1 and 32 <= key < 127 and len(symbol_input_buf) < 10:
+                symbol_input_buf += chr(key)
+        else:
+            if key in (ord('q'), ord('Q'), 27):
+                break
+            if key in (ord('r'), ord('R')):
+                if HISTORICAL_MODE:
+                    with lock:
+                        _load_into(VIEW_DATE)
+                else:
+                    trigger_fetch()
+            elif key in (ord('g'), ord('G')):
                 with lock:
-                    _load_into(VIEW_DATE)
-            else:
-                trigger_fetch()
-        elif key == curses.KEY_LEFT:
-            with lock:
-                if live_follow:
-                    view_end_idx = len(history)
-                live_follow = False
-                view_end_idx = max(1, view_end_idx - ARROW_STEP)
-        elif key == curses.KEY_RIGHT:
-            with lock:
-                if not live_follow:
-                    view_end_idx = min(len(history), view_end_idx + ARROW_STEP)
-                    if view_end_idx >= len(history):
-                        live_follow = True
-        elif key == curses.KEY_PPAGE:
-            with lock:
-                if live_follow:
-                    view_end_idx = len(history)
-                live_follow = False
-                view_end_idx = max(1, view_end_idx - PAGE_STEP)
-        elif key == curses.KEY_NPAGE:
-            with lock:
-                if not live_follow:
-                    view_end_idx = min(len(history), view_end_idx + PAGE_STEP)
-                    if view_end_idx >= len(history):
-                        live_follow = True
-        elif key == curses.KEY_END:
-            with lock:
-                live_follow = True
-                vert_follow = True
-        elif key == curses.KEY_UP:
-            with lock:
-                if vert_follow:
-                    vert_center_idx = _atm_idx()
-                vert_follow = False
-                vert_center_idx = min(max(0, len(grid) - 1), vert_center_idx + VERT_STEP)
-        elif key == curses.KEY_DOWN:
-            with lock:
-                if vert_follow:
-                    vert_center_idx = _atm_idx()
-                vert_follow = False
-                vert_center_idx = max(0, vert_center_idx - VERT_STEP)
-        elif key == ord('['):
-            with lock:
-                if vert_follow:
-                    vert_center_idx = _atm_idx()
-                vert_follow = False
-                vert_center_idx = min(max(0, len(grid) - 1), vert_center_idx + VERT_PAGE_STEP)
-        elif key == ord(']'):
-            with lock:
-                if vert_follow:
-                    vert_center_idx = _atm_idx()
-                vert_follow = False
-                vert_center_idx = max(0, vert_center_idx - VERT_PAGE_STEP)
-        elif key == ord('{'):
-            with lock:
-                vert_follow = False
-                vert_center_idx = max(0, len(grid) - 1)   # jump to the highest strike in the grid
-        elif key == ord('}'):
-            with lock:
-                vert_follow = False
-                vert_center_idx = 0                        # jump to the lowest strike in the grid
+                    mode = "strike" if mode == "interval" else "interval"
+            elif key in (ord('n'), ord('N')):
+                with lock:
+                    by_strike_net = not by_strike_net
+            elif key in (ord('s'), ord('S')):
+                entering_symbol = True
+                symbol_input_buf = ""
+            elif key in (ord('p'), ord('P')):
+                try:
+                    path = take_screenshot()
+                    screenshot_msg = f"📸 Saved screenshots/{os.path.basename(path)}"
+                except Exception as e:
+                    screenshot_msg = f"⚠ Screenshot failed: {e}"
+                screenshot_msg_time = time.time()
+            elif key == curses.KEY_LEFT:
+                with lock:
+                    if mode == "strike":
+                        _vert_step(-VERT_STEP)
+                    else:
+                        if live_follow:
+                            view_end_idx = len(history)
+                        live_follow = False
+                        view_end_idx = max(1, view_end_idx - ARROW_STEP)
+            elif key == curses.KEY_RIGHT:
+                with lock:
+                    if mode == "strike":
+                        _vert_step(VERT_STEP)
+                    elif not live_follow:
+                        view_end_idx = min(len(history), view_end_idx + ARROW_STEP)
+                        if view_end_idx >= len(history):
+                            live_follow = True
+            elif key == curses.KEY_PPAGE:
+                with lock:
+                    if mode == "strike":
+                        _vert_step(-VERT_PAGE_STEP)
+                    else:
+                        if live_follow:
+                            view_end_idx = len(history)
+                        live_follow = False
+                        view_end_idx = max(1, view_end_idx - PAGE_STEP)
+            elif key == curses.KEY_NPAGE:
+                with lock:
+                    if mode == "strike":
+                        _vert_step(VERT_PAGE_STEP)
+                    elif not live_follow:
+                        view_end_idx = min(len(history), view_end_idx + PAGE_STEP)
+                        if view_end_idx >= len(history):
+                            live_follow = True
+            elif key == curses.KEY_END:
+                with lock:
+                    live_follow = True
+                    vert_follow = True
+            elif key == curses.KEY_UP:
+                with lock:
+                    _vert_step(VERT_STEP)
+            elif key == curses.KEY_DOWN:
+                with lock:
+                    _vert_step(-VERT_STEP)
+            elif key == ord('['):
+                with lock:
+                    _vert_step(VERT_PAGE_STEP)
+            elif key == ord(']'):
+                with lock:
+                    _vert_step(-VERT_PAGE_STEP)
+            elif key == ord('{'):
+                with lock:
+                    vert_follow = False
+                    vert_center_idx = max(0, len(grid) - 1)   # jump to the highest strike in the grid
+            elif key == ord('}'):
+                with lock:
+                    vert_follow = False
+                    vert_center_idx = 0                        # jump to the lowest strike in the grid
 
         if not HISTORICAL_MODE:
             with lock:
@@ -1026,6 +1561,8 @@ def curses_main(stdscr):
             cur_diag_msg = diag_msg if diag_msg and (time.time() - diag_msg_time) < 120 else None
             ui = {"live_follow": live_follow, "view_end_idx": view_end_idx,
                   "vert_follow": vert_follow, "vert_center_idx": vert_center_idx,
+                  "by_strike_net": by_strike_net,
+                  "entering_symbol": entering_symbol, "symbol_input_buf": symbol_input_buf,
                   "log_rows": log_rows, "log_err": log_err, "diag_count": cur_diag_count}
 
         if HISTORICAL_MODE:
@@ -1037,10 +1574,26 @@ def curses_main(stdscr):
             status = f"↻ in {next_in}s"
         if cur_diag_msg:
             status = f"{cur_diag_msg}  |  {status}"
+        if screenshot_msg and (time.time() - screenshot_msg_time) < 8:
+            status = f"{screenshot_msg}  |  {status}"
         if cur_error:
             status += f"  ⚠ {cur_error}"
 
-        draw(stdscr, cur_history, cur_grid, cur_scale, cur_meta, status, ui)
+        if mode == "strike":
+            draw_by_strike(stdscr, cur_history, cur_grid, cur_meta, status, ui)
+        else:
+            draw(stdscr, cur_history, cur_grid, cur_scale, cur_meta, status, ui)
+
+        if entering_symbol:
+            curses.curs_set(1)
+            h, w = stdscr.getmaxyx()
+            cursor_x = min(w - 1, len(SYMBOL_PROMPT) + len(symbol_input_buf))
+            try:
+                stdscr.move(h - 1, cursor_x)
+            except curses.error:
+                pass
+        else:
+            curses.curs_set(0)
         curses.doupdate()
 
 # ── HEADLESS LOGGER ──────────────────────────────────────────────────────
@@ -1059,6 +1612,8 @@ def headless_main():
             d = fetch_snapshot()
             col = {"ts": ts, "spot": d["spot"], "gex": d["strikes"],
                    "oi_by_type": d.get("oi_by_type") or {},
+                   "gex_by_type": d.get("gex_by_type") or {},
+                   "bs_gex_curve": d.get("bs_gex_curve") or [],
                    "expiry_label": d.get("expiry_label"),
                    "is_0dte": d.get("is_0dte", True if IS_CRYPTO else False)}
             ok, err = append_log(col)

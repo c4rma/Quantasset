@@ -676,8 +676,28 @@ class State:
         self.pending_shift = 0    # bars just prepended by extend_history_backward,
                                   # not yet folded into the caller's view index
         self.goto_label = None   # last [G] target, for the header display only
+        self.alpaca_ws_app = None   # live WebSocketApp ref, so it can be force-closed
+                                     # (session switch / quit) instead of waiting for
+                                     # Alpaca's own dead-socket detection — see stop_alpaca_ws()
 
 state = State()
+
+def stop_alpaca_ws():
+    """Force-close any live Alpaca WS connection right now, rather than
+    leaving it to time out on Alpaca's side. Alpaca's free/IEX tier allows
+    exactly ONE concurrent connection per account — if a previous run was
+    killed (or a symbol switch just abandons the old socket), the server
+    can take a while to notice the dead connection, and every reconnect
+    attempt in the meantime gets rejected with "connection limit exceeded".
+    Calling this on quit and before every symbol switch releases the slot
+    immediately instead of relying on that server-side timeout."""
+    app = state.alpaca_ws_app
+    if app is not None:
+        try:
+            app.close()
+        except Exception:
+            pass
+        state.alpaca_ws_app = None
 
 def _bucket_ts(ts):
     return int(ts // BAR_SECS * BAR_SECS)
@@ -1199,11 +1219,15 @@ def ws_alpaca(session):
                     ingest_trade(ts, price, qty, is_buy)
                     state.alpaca_status = "live"
 
+    last_err = {"text": ""}
+
     def on_error(ws, err):
         if stale(): return
+        text = str(err)[:30]
+        last_err["text"] = text
         with state.lock:
             if stale(): return
-            state.alpaca_status = f"err: {str(err)[:30]}"
+            state.alpaca_status = f"err: {text}"
 
     def on_close(ws, code, msg):
         if stale(): return
@@ -1217,14 +1241,22 @@ def ws_alpaca(session):
             ALPACA_WS_URL, on_open=on_open, on_message=on_message,
             on_error=on_error, on_close=on_close,
         )
+        state.alpaca_ws_app = ws_app
         ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        state.alpaca_ws_app = None
         if stale():
             break
+        # "connection limit exceeded" means Alpaca's server still thinks a
+        # previous connection is live (e.g. a killed process it hasn't
+        # detected as dead yet) — retrying fast just gets rejected again,
+        # so floor the wait well above the normal 1s/2s/4s ramp.
+        if "connection limit" in last_err["text"].lower():
+            backoff = max(backoff, 15)
         with state.lock:
             if stale(): break
             state.alpaca_status = f"reconnecting… ({backoff}s)"
         time.sleep(backoff)
-        backoff = min(backoff * 2, 30)
+        backoff = min(backoff * 2, 60)
 
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
 P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_MAGENTA = range(1, 9)
@@ -1782,6 +1814,8 @@ def curses_main(stdscr):
                     # possible, before the reset below even begins
                     state.session += 1
                     session = state.session
+                    stop_alpaca_ws()   # release Alpaca's connection slot now, don't
+                                       # wait for its server-side dead-socket timeout
                     with state.lock:
                         state.history.clear()
                         state.live = None
@@ -1938,6 +1972,9 @@ def curses_main(stdscr):
                           zoom_group=zoom_group, show_btd=show_btd) or 0
         curses.doupdate()
 
+    stop_alpaca_ws()   # release Alpaca's connection slot immediately on quit,
+                       # instead of leaving it to the server's own timeout
+
 # ── HEADLESS ────────────────────────────────────────────────────────────
 def headless_main():
     print(f"cvd.py headless logger — {SYMBOL} @ {INTERVAL_LABEL} -> {log_path(TODAY_STR)}")
@@ -1971,12 +2008,14 @@ def main():
             headless_main()
         except KeyboardInterrupt:
             pass
+        stop_alpaca_ws()
         print("\ncvd.py headless logger — stopped.")
         return
     try:
         curses.wrapper(curses_main)
     except KeyboardInterrupt:
         pass
+    stop_alpaca_ws()
 
 if __name__ == "__main__":
     main()

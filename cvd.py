@@ -4,11 +4,12 @@ cvd.py — Aggregate Cumulative Volume Delta (CVD) with Underlying Price Panel
 Curses terminal chart, two stacked panels sharing one time axis:
 
   Price panel (top)  — OHLC candlesticks built from live trade prints,
-                        blended across both feeds (Phemex perp + Kraken spot).
-  CVD panel (bottom) — cumulative Σ(buy_qty − sell_qty) across BOTH feeds,
-                        also rendered as OHLC candles (open = prior bar's
-                        close, high/low = the running range within the bar),
-                        colored the same way as price (green = close>=open).
+                        blended across all three feeds (Phemex perp + Kraken
+                        spot + Coinbase spot).
+  CVD panel (bottom) — cumulative Σ(buy_qty − sell_qty) across ALL THREE
+                        feeds, also rendered as OHLC candles (open = prior
+                        bar's close, high/low = the running range within the
+                        bar), colored the same way as price (green = close>=open).
 
 CVD = the running total of signed trade volume using each print's taker side
 (buy prints add, sell prints subtract). It answers "who has been more
@@ -19,11 +20,17 @@ signal traders watch this indicator for.
 Data (real trade prints, not just OHLC volume) — depends on the symbol:
   ETH / BTC (crypto)     — Phemex (wss://ws.phemex.com trade_p.subscribe,
                            hedged USDT perp) + Kraken (wss://ws.kraken.com/v2
-                           channel=trade, USD spot), run concurrently; every
-                           print from EITHER feeds the SAME bar/CVD
+                           channel=trade, USD spot) + Coinbase
+                           (wss://ws-feed.exchange.coinbase.com matches
+                           channel, USD spot), run concurrently; every print
+                           from ANY of the three feeds the SAME bar/CVD
                            accumulator, so "aggregate" means combined across
-                           exchanges, not per-exchange lines. Both exchanges
-                           tag each trade's real taker side directly.
+                           exchanges, not per-exchange lines. Phemex and
+                           Kraken tag each trade's real taker side directly;
+                           Coinbase's `side` field is the MAKER's side, so it
+                           gets flipped (side=="sell" -> taker bought) before
+                           being folded in — see fetch_coinbase_trades_range()
+                           for the verification behind that flip.
   anything else (equity/ETF ticker, e.g. TLT/GLD/QQQ)
                          — Alpaca's free real-time IEX feed (single source —
                            IEX is ~1-3% of total US equity volume, not the
@@ -61,19 +68,30 @@ Historical backfill on cold start (default: since 19:00 CT session open):
   an approximation. By default it reaches back to the most recent 19:00 CT
   daily session open (same anchor chart.py uses elsewhere in this repo) —
   --backfill-hours N overrides with a fixed window instead. IMPORTANT
-  LIMITATION: Kraken's public Trades REST endpoint supports real pagination
-  arbitrarily far back, but Phemex's public trade endpoint only ever returns
-  the last ~1000 prints (~tens of minutes) with no pagination — there is no
-  way to backfill deep Phemex history. So the backfilled portion of the
-  window is **Kraken-only** (single exchange, not aggregate); once live WS
-  trades start flowing (immediately after backfill), CVD becomes true
-  dual-exchange aggregate again. The boundary timestamp is shown in the
-  status bar so it's never ambiguous which portion is which.
+  LIMITATION: Kraken's and Coinbase's public trade REST endpoints both
+  support real pagination arbitrarily far back, but Phemex's public trade
+  endpoint only ever returns the last ~1000 prints (~tens of minutes) with
+  no pagination — there is no way to backfill deep Phemex history. So the
+  backfilled portion of the window is **Kraken+Coinbase only** (missing
+  Phemex); once live WS trades start flowing (immediately after backfill),
+  CVD becomes the true triple-exchange aggregate again. The boundary
+  timestamp is shown in the status bar so it's never ambiguous which
+  portion is which.
+
+  TIME BUDGET: cold start is capped at INITIAL_BACKFILL_BUDGET_SECS
+  (~30s) regardless of how far back the ideal session-anchor window would
+  otherwise reach — Coinbase's dust-trade volume alone can turn a full
+  ~19-24h reconstruction into several minutes, so the actual amount loaded
+  is whatever real data fits in the time budget, not the full session
+  necessarily. Scrolling back past the loaded edge triggers
+  extend_history_backward() to fetch the next chunk automatically, each
+  one similarly capped at EXTEND_BACKWARD_BUDGET_SECS (~15s) — so reaching
+  further back is always available, just incremental instead of upfront.
 
 Usage:
   python cvd.py [SYMBOL] [--interval LABEL] [--date MM_DD_YYYY] [--headless]
                  [--backfill-hours N]
-    SYMBOL               ETH or BTC for crypto (Phemex+Kraken aggregate), or
+    SYMBOL               ETH or BTC for crypto (Phemex+Kraken+Coinbase aggregate), or
                          any equity/ETF ticker (e.g. TLT, GLD, QQQ) for
                          Alpaca's free IEX feed (needs ALPACA_API_KEY_ID /
                          ALPACA_API_SECRET_KEY in .env). Default BTC. Can
@@ -308,11 +326,11 @@ if "--date" in args:
         sys.exit(1)
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
 
-# Crypto symbols route through Phemex+Kraken (real dual-exchange aggregate);
-# anything else is treated as a US equity/ETF ticker routed through Alpaca's
-# free IEX feed instead (single-source, quote-rule-classified — see
-# ws_alpaca()/fetch_alpaca_trades_range() for why real CVD is still possible
-# there without a paid consolidated-tape subscription).
+# Crypto symbols route through Phemex+Kraken+Coinbase (real triple-exchange
+# aggregate); anything else is treated as a US equity/ETF ticker routed
+# through Alpaca's free IEX feed instead (single-source, quote-rule-
+# classified — see ws_alpaca()/fetch_alpaca_trades_range() for why real CVD
+# is still possible there without a paid consolidated-tape subscription).
 CRYPTO_SYMBOLS = {"ETH", "BTC"}
 
 SYMBOL = args[0].upper() if args else "BTC"
@@ -323,10 +341,20 @@ if not IS_CRYPTO and not (ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY):
     print("Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in .env (free paper-trading account).")
     sys.exit(1)
 
-PHEMEX_SYMBOLS  = {"ETH": "ETHUSDT", "BTC": "BTCUSDT"}
-KRAKEN_WS_PAIRS = {"ETH": "ETH/USD", "BTC": "BTC/USD"}
+PHEMEX_SYMBOLS   = {"ETH": "ETHUSDT", "BTC": "BTCUSDT"}
+KRAKEN_WS_PAIRS  = {"ETH": "ETH/USD", "BTC": "BTC/USD"}
+COINBASE_PRODUCT_IDS = {"ETH": "ETH-USD", "BTC": "BTC-USD"}
 PHEMEX_WS_URL = "wss://ws.phemex.com"
 KRAKEN_WS_URL = "wss://ws.kraken.com/v2"
+COINBASE_WS_URL   = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_REST_URL = "https://api.exchange.coinbase.com"
+# A fresh requests.get() per page pays a full TCP+TLS handshake every time —
+# measured ~4s for the first request, ~0.04s for every subsequent one on the
+# same connection. Coinbase's trade volume is high enough that a backfill
+# needs many pages, so reusing one session across the whole process (not
+# just one fetch call) turns what would be minutes of pure connection
+# overhead into a rounding error.
+_coinbase_session = requests.Session()
 ALPACA_WS_URL = "wss://stream.data.alpaca.markets/v2/iex"
 ALPACA_REST_URL = "https://data.alpaca.markets/v2"
 
@@ -381,18 +409,27 @@ def load_log(date_str):
 KRAKEN_REST_PAIRS = {"ETH": "ETHUSD", "BTC": "XBTUSD"}
 KRAKEN_TRADES_URL = "https://api.kraken.com/0/public/Trades"
 
-def fetch_kraken_trades_range(pair, since_ts, until_ts, progress=None):
+def fetch_kraken_trades_range(pair, since_ts, until_ts, progress=None, deadline=None):
     """Page forward through Kraken's public Trades endpoint from since_ts up
     to until_ts, returning a chronological list of (ts, price, qty, is_buy)
     tuples. Real historical prints, not synthetic — Kraken's public trade
     history goes back arbitrarily far for major pairs. Dedupes the one-trade
     overlap the API leaves at each page boundary. until_ts may be in the
     future (e.g. "now") — pagination just naturally stops once it catches up
-    to whatever's actually been traded so far."""
+    to whatever's actually been traded so far.
+
+    deadline (absolute time.time() cutoff, optional): stops paging once
+    reached, returning whatever's been gathered so far (a partial window,
+    not all the way back to since_ts) instead of blocking indefinitely.
+    Kraken itself is fast enough that this rarely engages in practice —
+    it's here mainly so fetch_trades_range() can enforce one shared time
+    budget across both crypto sources without special-casing either one."""
     since = int(since_ts * 1e9)
     out = []
     last_id = None
     for page in range(2000):   # safety cap, not expected to be hit
+        if deadline and time.time() >= deadline:
+            break
         try:
             r = requests.get(KRAKEN_TRADES_URL, params={"pair": pair, "since": since}, timeout=15)
             d = r.json()
@@ -429,6 +466,74 @@ def fetch_kraken_trades_since(pair, hours, progress=None):
     """Trailing-window convenience wrapper: from `hours` ago up to right now."""
     now = time.time()
     return fetch_kraken_trades_range(pair, now - hours * 3600, now, progress=progress)
+
+# ── COINBASE (second real crypto exchange — public, no API key needed) ─────
+def fetch_coinbase_trades_range(product_id, since_ts, until_ts, progress=None, deadline=None):
+    """Page backward through Coinbase Exchange's public trades endpoint
+    (trade_id-cursor based — no direct timestamp filter like Kraken's
+    `since`), collecting (ts, price, qty, is_buy) tuples for
+    [since_ts, until_ts]. Real historical prints, no key needed (confirmed
+    live: GET /products/<id>/trades returns 200 with no auth headers at all).
+
+    IMPORTANT: Coinbase's `side` field is the MAKER's side, not the
+    taker/aggressor's (confirmed against Coinbase's docs) — side=="sell"
+    means a resting sell/ask order got hit, i.e. the TAKER bought (an
+    up-tick). is_buy is therefore the FLIP of the raw field
+    (`t["side"] == "sell"`), matching Kraken/Phemex's convention where
+    is_buy already means "aggressive buy volume". Getting this backwards
+    would silently invert Coinbase's whole contribution to the aggregate
+    CVD with no visible error.
+
+    Always starts from the newest trade and pages backward — there's no way
+    to jump straight to an arbitrary point in time on this endpoint — skipping
+    anything newer than until_ts before it starts collecting. Cheap when
+    until_ts is close to "now" (the common case: session backfill, [S]
+    switch); costs extra pages the further until_ts is from "now" (e.g. an
+    old [G]oto target).
+
+    deadline (absolute time.time() cutoff, optional): stops paging once
+    reached, returning whatever's been gathered so far. Coinbase's BTC-USD
+    dust-trade volume is high enough (~15s of real fetch time per hour of
+    window, even after connection-reuse) that this is the fetcher that
+    actually needs the cap in practice — see fetch_trades_range()."""
+    out = []
+    after_cursor = None
+    for _ in range(5000):   # safety cap, not expected to be hit
+        if deadline and time.time() >= deadline:
+            break
+        params = {"limit": 1000}
+        if after_cursor is not None:
+            params["after"] = after_cursor
+        try:
+            r = _coinbase_session.get(f"{COINBASE_REST_URL}/products/{product_id}/trades",
+                              params=params, timeout=15)
+            page = r.json()
+        except Exception:
+            break
+        if not isinstance(page, list) or not page:
+            break
+        hit_old_end = False
+        for t in page:   # newest-first within the page
+            try:
+                ts = _parse_rfc3339(t["time"])
+                price = float(t["price"])
+                qty = float(t["size"])
+            except Exception:
+                continue
+            if ts > until_ts:
+                continue   # still ahead of the requested window — skip, keep paging back
+            if ts < since_ts:
+                hit_old_end = True
+                continue
+            out.append((ts, price, qty, t["side"] == "sell"))
+        if progress and out:
+            progress(len(out), datetime.fromtimestamp(out[-1][0]))
+        after_cursor = r.headers.get("cb-after")
+        if hit_old_end or not after_cursor:
+            break
+        time.sleep(0.2)   # polite pacing on the public endpoint
+    out.reverse()   # collected newest-to-oldest; callers expect chronological ascending
+    return out
 
 # ── ALPACA (equity/ETF trade data — free IEX feed, quote-rule classified) ──
 def _parse_rfc3339(ts_str):
@@ -532,32 +637,117 @@ def fetch_alpaca_trades_range(symbol, since_ts, until_ts, progress=None):
     raw_trades = _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=progress)
     return classify_trades_quote_rule(raw_trades, [])
 
-def fetch_trades_range(since_ts, until_ts, progress=None):
+def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
     """Dispatch to whichever data source SYMBOL actually belongs to — every
     caller (goto_to, extend_history_backward, backfill_trades) goes through
     this instead of hardcoding Kraken, so the entire ingest/bar-building
-    pipeline downstream is asset-class-agnostic."""
+    pipeline downstream is asset-class-agnostic.
+
+    Crypto fetches Kraken AND Coinbase concurrently (separate threads, not
+    sequential — Coinbase's dust-trade volume makes it far slower per hour
+    than Kraken, so running them in parallel lets Coinbase use nearly the
+    whole `deadline` budget instead of whatever's left over after Kraken
+    finishes first) and merge-sorts them into one chronological list before
+    returning — NOT a simple concatenation. ingest_trade()'s bucket-close
+    logic silently drops any trade that arrives "late" for an already-closed
+    bucket (see its docstring); replaying two sources back-to-back un-merged
+    would mean every trade from the second source that belongs earlier than
+    the first source's last bucket gets silently dropped, corrupting bars
+    instead of just erroring.
+
+    deadline (absolute time.time() cutoff, optional): under a deadline the
+    two sources can end up covering DIFFERENT depths (Kraken finishes the
+    full requested range in seconds; Coinbase may still be mid-fetch when
+    the deadline hits) — trimmed to the LATER (more recent) of the two
+    sources' own earliest-reached timestamps, so the returned window never
+    contains a stretch where only one exchange's data is present but gets
+    treated as if it were the same consistent aggregate as the rest. Phemex
+    has no historical trades API at all (unchanged limitation, see
+    backfill_trades' docstring), so it only ever contributes live, same as
+    before — unaffected by any of this."""
     if IS_CRYPTO:
-        return fetch_kraken_trades_range(KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=progress)
+        results = {}
+        progress_lock = threading.Lock()
+        def safe_progress(n, dt):
+            if progress:
+                with progress_lock:
+                    progress(n, dt)
+        def _fetch_kraken():
+            results["kraken"] = fetch_kraken_trades_range(
+                KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
+        def _fetch_coinbase():
+            results["coinbase"] = fetch_coinbase_trades_range(
+                COINBASE_PRODUCT_IDS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
+        t1 = threading.Thread(target=_fetch_kraken, daemon=True)
+        t2 = threading.Thread(target=_fetch_coinbase, daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        kraken_trades = results.get("kraken", [])
+        coinbase_trades = results.get("coinbase", [])
+        # Only a source that actually returned something can veto how far
+        # back the OTHER source's data is trusted — a source returning
+        # nothing doesn't necessarily mean "reached zero coverage", it can
+        # also mean "ran out of deadline before reaching this window at
+        # all" (real case: Coinbase always pages backward from its own
+        # newest trade, so under a tight deadline, asking for an
+        # already-old until_ts — exactly what extend_history_backward
+        # does on every call past the first — can burn the whole budget
+        # just skipping past everything newer than until_ts, collecting
+        # nothing). Treating that as "0 coverage" and using it to discard
+        # the other source's perfectly good data would be strictly worse
+        # than not having deadline-trimming at all. So: an empty result
+        # opts OUT of the trim decision entirely, not in at until_ts.
+        starts = [since_ts]
+        if kraken_trades:
+            starts.append(kraken_trades[0][0])
+        if coinbase_trades:
+            starts.append(coinbase_trades[0][0])
+        effective_since = max(starts)
+        combined = [t for t in (kraken_trades + coinbase_trades) if t[0] >= effective_since]
+        combined.sort(key=lambda t: t[0])
+        return combined
     return fetch_alpaca_trades_range(SYMBOL, since_ts, until_ts, progress=progress)
 
-def fetch_trades_since(hours, progress=None):
+def fetch_trades_since(hours, progress=None, deadline=None):
     """Trailing-window wrapper, asset-class-aware: equities' free-tier REST
     is 15-minute delayed (crypto's isn't), so "now" would otherwise ask for
     data that doesn't exist yet — capped accordingly. The live WebSocket
     feed picks up the remaining gap in real time regardless."""
     now = time.time()
     until_ts = now if IS_CRYPTO else now - 900
-    return fetch_trades_range(now - hours * 3600, until_ts, progress=progress)
+    return fetch_trades_range(now - hours * 3600, until_ts, progress=progress, deadline=deadline)
+
+INITIAL_BACKFILL_BUDGET_SECS = 22   # target ceiling is 30s; set at 22 here because
+                                    # the deadline is only checked BETWEEN pages —
+                                    # whatever page/thread is already in flight when
+                                    # it fires still has to finish (measured
+                                    # ~1-4s of real overshoot beyond the deadline
+                                    # across test runs, occasionally more under
+                                    # network variance). Cold-start / [S] switch /
+                                    # interval switch — all "fresh start" scenarios,
+                                    # capped so the app is always usable quickly
+                                    # regardless of how far back the ideal
+                                    # session-anchor window would otherwise reach.
+                                    # Whatever doesn't fit loads on demand via
+                                    # extend_history_backward() as the user scrolls
+                                    # back past the loaded edge.
 
 def backfill_trades(hours, progress=None, reset=True):
     """Reconstruct bars/CVD from real historical trade data before live feeds
-    start — Kraken for crypto, Alpaca (IEX, quote-rule classified) for
-    equities/ETFs, via fetch_trades_since(). Runs the exact same
-    ingest_trade() path as live trades, so the resulting bars are exact, not
-    approximated — just single-exchange/single-feed for this stretch either
-    way (Phemex has no historical trades API; Alpaca's free tier is IEX-only,
-    see module docstring for both).
+    start — Kraken+Coinbase (merged chronologically) for crypto, Alpaca (IEX,
+    quote-rule classified) for equities/ETFs, via fetch_trades_since(). Runs
+    the exact same ingest_trade() path as live trades, so the resulting bars
+    are exact, not approximated — crypto is just missing Phemex for this
+    stretch (it has no historical trades API; Alpaca's free tier is
+    IEX-only, see module docstring for both).
+
+    Bounded by INITIAL_BACKFILL_BUDGET_SECS — `hours` is still the IDEAL
+    request (e.g. all the way back to the 19:00 CT session anchor), but the
+    actual amount loaded is whatever fits in that time budget; the rest is
+    picked up transparently later by extend_history_backward() once the user
+    scrolls near the loaded edge (see GOTO_EDGE_TRIGGER). Every current
+    caller of this function (cold start, [S] symbol switch, in-app interval
+    switch) is a "fresh start" scenario, so this budget applies unconditionally.
 
     reset=True (default) truncates today's on-disk log and clears in-memory
     state first, so the backfill always supersedes whatever partial/stray log
@@ -567,7 +757,7 @@ def backfill_trades(hours, progress=None, reset=True):
     is strictly better than resuming a stale local file. Nothing is touched
     until the fetch actually returns data, so a network hiccup can't wipe
     real history."""
-    trades = fetch_trades_since(hours, progress=progress)
+    trades = fetch_trades_since(hours, progress=progress, deadline=time.time() + INITIAL_BACKFILL_BUDGET_SECS)
     if not trades:
         return 0
     if reset:
@@ -614,7 +804,7 @@ def initialize_today(progress=None):
     if BACKFILL_HOURS > 0:
         n = backfill_trades(BACKFILL_HOURS, progress=progress, reset=True)
         if n:
-            src = "Kraken" if IS_CRYPTO else "Alpaca (IEX)"
+            src = "Kraken+Coinbase" if IS_CRYPTO else "Alpaca (IEX)"
             since_str = datetime.fromtimestamp(time.time() - BACKFILL_HOURS * 3600).strftime('%H:%M:%S')
             return f"backfilled {n} {src} trades since {since_str}"
     existing = load_log(TODAY_STR)
@@ -668,10 +858,11 @@ class State:
         self.log_err = None
         self.phemex_status = "connecting…"
         self.kraken_status = "connecting…"
+        self.coinbase_status = "connecting…"
         self.alpaca_status = "connecting…"   # only used for equity/ETF symbols
         self.last_price = None
         self.session = 0
-        self.backfill_boundary_ts = None   # set once: everything <= this is Kraken-only
+        self.backfill_boundary_ts = None   # set once: everything <= this is Kraken+Coinbase only (no Phemex)
         self.history_loading_older = False   # guards extend_history_backward from overlapping itself
         self.pending_shift = 0    # bars just prepended by extend_history_backward,
                                   # not yet folded into the caller's view index
@@ -964,6 +1155,16 @@ def goto_to(target_ts, progress=None):
         state.pending_shift += len(new_bars)
     return True
 
+EXTEND_BACKWARD_BUDGET_SECS = 10   # target ceiling is 15s; set at 10 here for
+                                   # the same in-flight-page overshoot margin as
+                                   # INITIAL_BACKFILL_BUDGET_SECS (measured up to
+                                   # ~4s overshoot on an unlucky page under real
+                                   # network variance). GOTO_WINDOW_HOURS below is
+                                   # just the ideal ask ceiling; how far back a call
+                                   # actually reaches depends on how fast that
+                                   # stretch fetches (quiet periods reach further,
+                                   # busy ones less)
+
 def extend_history_backward():
     """Fetch the chunk immediately before the oldest currently-loaded bar and
     prepend it — triggered whenever panning gets near the start of
@@ -971,7 +1172,9 @@ def extend_history_backward():
     initial 19:00 CT backfill, a [G]oto fetch, or a previous call to this
     same function. Runs in a background thread; safe to call even if it
     finds nothing (the boundary still advances so we don't re-fetch the
-    same empty range forever)."""
+    same empty range forever). Bounded by EXTEND_BACKWARD_BUDGET_SECS so a
+    single scroll-triggered fetch never blocks the UI for long — scrolling
+    further just triggers another call for the next chunk."""
     with state.lock:
         if state.history_loading_older or not (state.history or state.live):
             return
@@ -980,7 +1183,7 @@ def extend_history_backward():
         old_since = oldest_bar["ts"]
         join_baseline = oldest_bar["cvd_open"]
     new_since = old_since - GOTO_WINDOW_HOURS * 3600
-    trades = fetch_trades_range(new_since, old_since, progress=None)
+    trades = fetch_trades_range(new_since, old_since, progress=None, deadline=time.time() + EXTEND_BACKWARD_BUDGET_SECS)
     new_bars, raw_final = build_bars_from_trades(trades, 0.0)
     if new_bars:
         shift = join_baseline - raw_final
@@ -995,13 +1198,14 @@ def extend_history_backward():
         state.pending_shift += len(new_bars)   # caller's view index must shift by this
 
 def start_feeds(session):
-    """Start the live WS feed(s) for the current SYMBOL — Phemex+Kraken (true
-    dual-exchange aggregate) for crypto, or the single Alpaca IEX feed for
-    equities/ETFs. Shared by curses_main and headless_main so a [S]ymbol
+    """Start the live WS feed(s) for the current SYMBOL — Phemex+Kraken+Coinbase
+    (true triple-exchange aggregate) for crypto, or the single Alpaca IEX feed
+    for equities/ETFs. Shared by curses_main and headless_main so a [S]ymbol
     switch and a fresh launch use identically-behaving startup logic."""
     if IS_CRYPTO:
         threading.Thread(target=ws_kraken, args=(session,), daemon=True).start()
         threading.Thread(target=ws_phemex, args=(session,), daemon=True).start()
+        threading.Thread(target=ws_coinbase, args=(session,), daemon=True).start()
     else:
         threading.Thread(target=ws_alpaca, args=(session,), daemon=True).start()
 
@@ -1165,6 +1369,80 @@ def ws_phemex(session):
         backoff = min(backoff * 2, 30)
         _ping_stop.set()
         _ping_stop.clear()
+
+# ── COINBASE TRADE FEED ──────────────────────────────────────────────────────
+def ws_coinbase(session):
+    product_id = COINBASE_PRODUCT_IDS[SYMBOL]
+
+    def stale():
+        return state.session != session
+
+    def on_open(ws):
+        ws.send(json.dumps({"type": "subscribe",
+                             "channels": [{"name": "matches", "product_ids": [product_id]}]}))
+        with state.lock:
+            if stale(): return
+            state.coinbase_status = "live"
+
+    def on_message(ws, message):
+        if stale(): return
+        try:
+            msg = json.loads(message)
+        except Exception:
+            return
+        mtype = msg.get("type")
+        if mtype == "error":
+            with state.lock:
+                if stale(): return
+                state.coinbase_status = f"err: {str(msg.get('message', ''))[:30]}"
+            return
+        # "last_match" fires once right after subscribing (a snapshot of
+        # whatever traded just before we connected) — skip it, same reason
+        # ws_kraken/ws_phemex skip their own snapshot-on-connect quirks: real
+        # history comes from backfill_trades(), not a surprise replay here
+        # that could land out of order relative to what backfill already covered.
+        if mtype != "match":
+            return
+        try:
+            ts = _parse_rfc3339(msg["time"])
+            price = float(msg["price"])
+            qty = float(msg["size"])
+            # side is the MAKER's side (see fetch_coinbase_trades_range's
+            # docstring) — flip it to get the taker/aggressor side
+            is_buy = msg["side"] == "sell"
+        except Exception:
+            return
+        with state.lock:
+            if stale(): return
+            ingest_trade(ts, price, qty, is_buy)
+            state.coinbase_status = "live"
+
+    def on_error(ws, err):
+        if stale(): return
+        with state.lock:
+            if stale(): return
+            state.coinbase_status = f"err: {str(err)[:30]}"
+
+    def on_close(ws, code, msg):
+        if stale(): return
+        with state.lock:
+            if stale(): return
+            state.coinbase_status = "reconnecting…"
+
+    backoff = 1
+    while not stale():
+        ws_app = websocket.WebSocketApp(
+            COINBASE_WS_URL, on_open=on_open, on_message=on_message,
+            on_error=on_error, on_close=on_close,
+        )
+        ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        if stale():
+            break
+        with state.lock:
+            if stale(): break
+            state.coinbase_status = f"reconnecting… ({backoff}s)"
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
 
 # ── ALPACA TRADE FEED (equities/ETFs — single source, quote-rule classified) ─
 def ws_alpaca(session):
@@ -1689,14 +1967,14 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
         last_price = state.last_price
         last_cvd = _cvd_ohlc(visible[-1])[3] if visible else 0.0
         last_delta = visible[-1].get("delta", 0.0) if visible else 0.0
-        feed_status = (f"Phemex:{state.phemex_status}  Kraken:{state.kraken_status}" if IS_CRYPTO
+        feed_status = (f"Phemex:{state.phemex_status}  Kraken:{state.kraken_status}  Coinbase:{state.coinbase_status}" if IS_CRYPTO
                        else f"Alpaca(IEX):{state.alpaca_status}")
         info = (f" px:{fmt_price(last_price)}  CVD:{last_cvd:+,.2f}  Δbar:{last_delta:+,.2f}  "
                 f"{feed_status}  log:{state.log_rows}  {status_line}")
     if state.backfill_boundary_ts:
         boundary = datetime.fromtimestamp(state.backfill_boundary_ts).strftime("%H:%M:%S")
         if IS_CRYPTO:
-            info += f"  |  Kraken-only before {boundary}, aggregate after"
+            info += f"  |  Kraken+Coinbase-only before {boundary}, Phemex-inclusive aggregate after"
         else:
             info += f"  |  backfilled before {boundary} (Alpaca IEX, quote-rule classified throughout)"
     safe_add(win, h - 1, 0, info.ljust(w), cp(P_STATUS))
@@ -1832,7 +2110,7 @@ def curses_main(stdscr):
     else:
         def _progress(n, last_dt):
             h, w = stdscr.getmaxyx()
-            src = "Kraken" if IS_CRYPTO else "Alpaca"
+            src = "Kraken+Coinbase" if IS_CRYPTO else "Alpaca"
             msg = f"Backfilling {BACKFILL_HOURS:g}h from {src}… {n} trades ({last_dt.strftime('%H:%M:%S')})"
             stdscr.erase()
             safe_add(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg, cp(P_CYAN))
@@ -1888,6 +2166,7 @@ def curses_main(stdscr):
                         state.backfill_boundary_ts = None
                         state.phemex_status = "connecting…"
                         state.kraken_status = "connecting…"
+                        state.coinbase_status = "connecting…"
                         state.alpaca_status = "connecting…"
                         csv_state.live = None
                         csv_state.day_str = None

@@ -93,8 +93,10 @@ Usage:
 
 In-app: ←/→ pan time by a few columns, PgUp/PgDn pan time by a screenful.
 ↑/↓ scroll the price axis by one strike, [/] scroll it by a page, {/} jump to
-the highest/lowest strike in the grid. End resets both axes back to live
-(auto-following the latest column, auto-centered on the current strike).
+the highest/lowest strike in the grid. [Z] or [End] resets: jumps back to the
+live edge (time axis) and re-centers on whatever strike is nearest the current
+spot (price axis) — both views' auto-follow default, in one keystroke either
+way, however far you've scrolled off in either direction.
 [R] refreshes now (live mode) or reloads the log from disk (history mode, in
 case another instance is still writing to it).
 
@@ -103,12 +105,14 @@ GEX $ on the Y axis) matching the Barchart-style "Gamma Exposure by Strike"
 chart, with call gamma (blue) and put gamma (orange) as separate bars per
 strike — no aggregate line. [N] toggles that view into NET mode: one bar per
 strike (call+put combined) instead of two, green if positive / red if negative
-(same convention as the interval map's dots). Always shows the latest fetched
-column (this view has no time axis to pause on); ←/→/PgUp/PgDn/↑/↓/[/]/{/} all
-scroll through strikes here instead (reusing the same "which strike is
-centered" state as the interval map's price-axis scroll — panning in one view
-carries over to the other). Max Pain / Net GEX / Zero Gamma read the same
-either way.
+(same convention as the interval map's dots). A yellow vertical line marks the
+current spot (in the gap between strikes if it's not sitting exactly on one),
+alongside the white dashed Zero Gamma/GEX Flip line. Always shows the latest
+fetched column (this view has no time axis to pause on);
+←/→/PgUp/PgDn/↑/↓/[/]/{/} all scroll through strikes here instead (reusing the
+same "which strike is centered" state as the interval map's price-axis scroll
+— panning in one view carries over to the other). Max Pain / Net GEX / Zero
+Gamma read the same either way.
 
 [S] opens a one-line prompt to type any symbol (not case-sensitive) — ETH/BTC
 route to Deribit, anything else is tried as a CBOE-listed equity/ETF ticker
@@ -1020,7 +1024,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
         refresh_hint = "r=reload" if HISTORICAL_MODE else "r=refresh"
         vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-        hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  End=live  "
+        hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
                 f"g=by-strike  s=symbol  p=screenshot  [{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
         safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
 
@@ -1054,7 +1058,7 @@ def draw_by_strike(win, history, grid, meta, status, ui):
         legend = [
             ("█ ", cp(P_GREEN, bold=True)), ("net +gamma (call-dominated)  ", cp(P_DIM, dim=True)),
             ("█ ", cp(P_RED, bold=True)), ("net -gamma (put-dominated)  ", cp(P_DIM, dim=True)),
-            ("yellow", cp(P_ATM, bold=True)), ("=current strike  ", cp(P_DIM, dim=True)),
+            ("yellow", cp(P_ATM, bold=True)), ("=current price (strike label + line)  ", cp(P_DIM, dim=True)),
             ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes  ", cp(P_DIM, dim=True)),
             ("|", cp(P_DEFAULT, bold=True)), ("=GEX flip level", cp(P_DIM, dim=True)),
         ]
@@ -1062,7 +1066,7 @@ def draw_by_strike(win, history, grid, meta, status, ui):
         legend = [
             ("█ ", cp(P_BLUE, bold=True)), ("call gamma  ", cp(P_DIM, dim=True)),
             ("█ ", cp(P_ORANGE, bold=True)), ("put gamma  ", cp(P_DIM, dim=True)),
-            ("yellow", cp(P_ATM, bold=True)), ("=current strike  ", cp(P_DIM, dim=True)),
+            ("yellow", cp(P_ATM, bold=True)), ("=current price (strike label + line)  ", cp(P_DIM, dim=True)),
             ("cyan", cp(P_CYAN, bold=True)), ("=GEX flip strikes  ", cp(P_DIM, dim=True)),
             ("|", cp(P_DEFAULT, bold=True)), ("=GEX flip level", cp(P_DIM, dim=True)),
         ]
@@ -1147,6 +1151,16 @@ def draw_by_strike(win, history, grid, meta, status, ui):
             for ry in range(top, h - bottom_reserved):
                 safe_add(win, ry, flip_col, "|", cp(P_DEFAULT, bold=True))
 
+    # Price reference — a yellow vertical line at the (possibly between-strikes) column
+    # for the current spot, same placement logic as the flip line. Drawn after it (so
+    # price wins the single cell where they'd otherwise coincide) but still before the
+    # bars, so a bar on the same column shows through on top of either line.
+    price_lo, price_hi = bounding_strikes(grid_sorted, spot)
+    price_col = resolve_marker_col(price_lo, price_hi, col_of)
+    if price_col is not None:
+        for ry in range(top, h - bottom_reserved):
+            safe_add(win, ry, price_col, ":", cp(P_ATM, bold=True))
+
     # Zero baseline — dim reference line spanning the chart, drawn before the bars so a
     # bar at a near-zero strike still shows visibly on top of it.
     for cx in range(y_axis_w, w - 1):
@@ -1220,7 +1234,7 @@ def draw_by_strike(win, history, grid, meta, status, ui):
     else:
         exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
         vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-        hint = (f" q=quit  r=refresh  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  End=center  "
+        hint = (f" q=quit  r=refresh  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
                 f"g=interval map  n=net/separate  s=symbol  p=screenshot  "
                 f"[{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
         safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
@@ -1513,7 +1527,10 @@ def curses_main(stdscr):
                         view_end_idx = min(len(history), view_end_idx + PAGE_STEP)
                         if view_end_idx >= len(history):
                             live_follow = True
-            elif key == curses.KEY_END:
+            elif key in (curses.KEY_END, ord('z'), ord('Z')):
+                # Reset: jump back to the live edge (time axis) and re-center on
+                # whatever strike is nearest the current spot (price axis) — both
+                # views' "auto-follow" default, in one keystroke either way.
                 with lock:
                     live_follow = True
                     vert_follow = True

@@ -102,6 +102,10 @@ What it shows, per price level per bar:
   long as that price falls within the currently visible vertical window),
   so you can see where the live price sits relative to whatever you're
   looking at.
+  Net Delta row: each bar's total buy_vol - sell_vol, shown bold in its own
+  row directly beneath that bar's cells (above the time axis) — green when
+  positive, red when negative, plain when exactly zero. Same number already
+  used for the "visible Δ" status-bar figure, just broken out per-bar.
 
 Price scale is $1.00 (--tick) increments by default — but if any SINGLE bar
 currently on screen has its own traded (high-low) range too tall to show at
@@ -1647,6 +1651,17 @@ def fmt_lvl_qty(q):
         return f"{q:.1f}"
     return f"{q:.2f}"
 
+def fmt_delta(d):
+    if d == 0:
+        return "0"
+    sign = "+" if d > 0 else "-"
+    mag = abs(d)
+    if mag >= 1000:
+        return f"{sign}{mag:,.0f}"
+    if mag >= 10:
+        return f"{sign}{mag:.1f}"
+    return f"{sign}{mag:.2f}"
+
 def fmt_time(ts):
     fine = BAR_MODE == "volume" or BAR_SECS < 300
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S" if fine else "%H:%M")
@@ -1705,7 +1720,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
         live_bar = state.live
 
     top_reserved = 1
-    bottom_reserved = 2
+    bottom_reserved = 3   # net-delta row + time axis + status bar
     axis_w = AXIS_W
     plot_h = h - top_reserved - bottom_reserved
     plot_w = max(1, w - axis_w)
@@ -1876,8 +1891,22 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
         if live_row_y is not None and not has_live_cell:
             safe_add(win, live_row_y, cx, LIVE_LINE_CH * (COL_W - 1), cp(P_YELLOW, dim=True))
 
+    # net delta row — one row directly under each bar's own cells, above
+    # the time axis: that bar's total buy_vol - sell_vol, bold and
+    # color-coded (green positive / red negative / plain zero)
+    delta_row = h - bottom_reserved
+    for i, bar in enumerate(visible):
+        delta = bar["delta"]
+        if delta > 0:
+            delta_color = cp(P_GREEN, bold=True)
+        elif delta < 0:
+            delta_color = cp(P_RED, bold=True)
+        else:
+            delta_color = cp(P_DEFAULT, bold=True)
+        safe_add(win, delta_row, col_x[i], fmt_delta(delta).center(COL_W - 1), delta_color)
+
     # time axis
-    axis_row = h - bottom_reserved
+    axis_row = delta_row + 1
     for i, bar in enumerate(visible):
         lbl = fmt_time(bar["ts"])
         safe_add(win, axis_row, col_x[i], lbl.center(COL_W - 1), cp(P_DIM))

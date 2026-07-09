@@ -94,6 +94,11 @@ i_pwr_label   = input.string("Power Hour","", inline="pwr",   group="Sessions")
 i_pwr_ses     = input.session("1400-1500", "", inline="pwr",   group="Sessions")
 i_pwr_col     = input.color(color.new(color.fuchsia, 80), "", inline="pwr",   group="Sessions")
 
+i_show_eod    = input.bool(true,  "", inline="eod",   group="Sessions")
+i_eod_label   = input.string("EOD",       "", inline="eod",   group="Sessions")
+i_eod_ses     = input.session("1600-1800", "", inline="eod",   group="Sessions")
+i_eod_col     = input.color(color.new(color.orange,  80), "", inline="eod",   group="Sessions")
+
 i_show_eeod   = input.bool(true,  "", inline="eeod",  group="Sessions")
 i_eeod_label  = input.string("EEOD",      "", inline="eeod",  group="Sessions")
 i_eeod_ses    = input.session("1830-2359", "", inline="eeod",  group="Sessions")
@@ -419,6 +424,7 @@ float _s_ndo   = i_show_sess and i_show_ndo   ? math.sign(nz(time(_tf, i_ndo_ses
 float _s_morn  = i_show_sess and i_show_morn  ? math.sign(nz(time(_tf, i_morn_ses,  i_sess_tz))) : 0.0
 float _s_lunch = i_show_sess and i_show_lunch ? math.sign(nz(time(_tf, i_lunch_ses, i_sess_tz))) : 0.0
 float _s_pwr   = i_show_sess and i_show_pwr   ? math.sign(nz(time(_tf, i_pwr_ses,   i_sess_tz))) : 0.0
+float _s_eod   = i_show_sess and i_show_eod   ? math.sign(nz(time(_tf, i_eod_ses,   i_sess_tz))) : 0.0
 float _s_eeod  = i_show_sess and i_show_eeod  ? math.sign(nz(time(_tf, i_eeod_ses,  i_sess_tz))) : 0.0
 
 float _excl_raw    = math.sign(nz(time(_tf, i_excl_ses, i_sess_tz)))
@@ -468,6 +474,7 @@ get_range(_s_ndo,   i_ndo_label,   i_ndo_col,  line.style_dotted, false, false)
 get_range(_s_morn,  i_morn_label,  i_morn_col, line.style_dotted, false, false)
 get_range(_s_lunch, i_lunch_label, i_lunch_col, line.style_dotted, false, false)
 get_range(_s_pwr,   i_pwr_label,   i_pwr_col,  line.style_dotted, false, false)
+get_range(_s_eod,   i_eod_label,   i_eod_col,  line.style_dotted, false, false)
 get_range(_s_eeod,  i_eeod_label,  i_eeod_col, line.style_dotted, false, false)
 // Exclusion: full-height background (unmissable) + optional bordered box
 bgcolor(_s_excl == 1.0 ? color.new(i_excl_col, 80) : na, title="Exclusion Zone")

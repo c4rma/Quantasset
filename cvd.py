@@ -667,21 +667,57 @@ def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
     before — unaffected by any of this."""
     if IS_CRYPTO:
         results = {}
-        progress_lock = threading.Lock()
-        def safe_progress(n, dt):
-            if progress:
-                with progress_lock:
-                    progress(n, dt)
+        # Worker threads must NEVER call the caller's `progress` directly —
+        # in curses_main it touches stdscr (erase/addstr/refresh), and
+        # curses/ncurses is only safe to drive from the thread that owns
+        # the screen (the main thread there). A real interactive launch
+        # hung indefinitely after this was first written calling progress()
+        # straight from both fetch threads (confirmed: process alive,
+        # accumulating real CPU time, but never got past backfill — the
+        # bug wasn't caught by earlier testing because that always used
+        # progress=None or a plain print callback, never the actual
+        # curses-touching one). Fix: threads only record their own latest
+        # (n, dt) into `latest`; the ORIGINAL calling thread (the caller's
+        # own thread — main thread for curses_main, since backfill runs
+        # there synchronously) polls it and is the only one that ever
+        # invokes the real progress() callback.
+        latest = {}
+        progress_state_lock = threading.Lock()
+        def make_tracker(key):
+            def tracker(n, dt):
+                with progress_state_lock:
+                    latest[key] = (n, dt)
+            return tracker
         def _fetch_kraken():
             results["kraken"] = fetch_kraken_trades_range(
-                KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
+                KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=make_tracker("kraken"), deadline=deadline)
         def _fetch_coinbase():
             results["coinbase"] = fetch_coinbase_trades_range(
-                COINBASE_PRODUCT_IDS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
+                COINBASE_PRODUCT_IDS[SYMBOL], since_ts, until_ts, progress=make_tracker("coinbase"), deadline=deadline)
         t1 = threading.Thread(target=_fetch_kraken, daemon=True)
         t2 = threading.Thread(target=_fetch_coinbase, daemon=True)
         t1.start(); t2.start()
+        last_reported = None
+        def _relay_progress():
+            nonlocal last_reported
+            if not progress:
+                return
+            with progress_state_lock:
+                snapshot = dict(latest)
+            if not snapshot:
+                return
+            total_n = sum(v[0] for v in snapshot.values())
+            latest_dt = max(v[1] for v in snapshot.values())
+            if (total_n, latest_dt) != last_reported:
+                progress(total_n, latest_dt)
+                last_reported = (total_n, latest_dt)
+        while t1.is_alive() or t2.is_alive():
+            _relay_progress()
+            time.sleep(0.1)
         t1.join(); t2.join()
+        _relay_progress()   # final flush — the last update might have landed
+                            # right as the threads finished, after the loop's
+                            # last check but before this
         kraken_trades = results.get("kraken", [])
         coinbase_trades = results.get("coinbase", [])
         # Only a source that actually returned something can veto how far
@@ -1688,6 +1724,8 @@ def zoom_step(size, direction):
 BTD_LOOKBACK = 10
 BTD_SIGMA = 3.0
 
+LIVE_LINE_CH = "─"   # live-price line on the price panel, matching footprint.py's
+
 def compute_btd_signals(bars, lookback=BTD_LOOKBACK, sigma=BTD_SIGMA):
     """Returns {index: {"buy": tier|None, "sell": tier|None}} for every bar
     in `bars` that qualifies (index >= lookback, matching chart.py's own
@@ -1747,11 +1785,12 @@ def compute_btd_signals(bars, lookback=BTD_LOOKBACK, sigma=BTD_SIGMA):
     return signals
 
 def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_idx=-1, fmt_fn=None,
-                  btd_signals=None):
+                  btd_signals=None, live_price=None):
     """Shared OHLC candlestick renderer — used for both the price panel and
     the CVD panel (candles built from cvd_open/high/low/close) so the two
-    panels share identical visual language. Returns (vmin, vmax) of the
-    value range actually plotted, for the caller's axis-label ticks.
+    panels share identical visual language. Returns (vmin, vmax, live_row) —
+    live_row (see live_price below) is returned so the caller can avoid
+    overwriting that row with a regular axis tick label.
 
     cursor_idx (crosshair, like charthacker.py/quantasset_chart.py): if it
     names a visible column, that candle is highlighted yellow and a dotted
@@ -1777,7 +1816,17 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
     sell as reversed magenta just above the high wick — tier 1 = single
     cell, tier 2 = 1-wide x 2-tall, tier 3 = 3-wide x 2-tall, matching
     chart.py's exact tier shapes. Marked cells are added to `occupied` so
-    the crosshair's guide lines skip over them instead of overwriting."""
+    the crosshair's guide lines skip over them instead of overwriting.
+
+    live_price (same feature as footprint.py's live price line/box, just
+    adapted to this app's right-side axis instead of footprint's left-side
+    one): when given and it falls within [vmin, vmax], draws a dashed line
+    across the whole panel at that row (skipping any occupied cell, same as
+    the crosshair does — runs behind the data, never through it) plus a
+    "▶<price>" tag on the right axis in reverse-video so it reads as a solid
+    tag. Stays visible even when scrolled back into history, as long as that
+    price still falls within whatever range is currently on screen — it
+    simply doesn't appear otherwise, same as any other value would be."""
     highs = [ohlc_fn(b)[1] for b in visible]
     lows  = [ohlc_fn(b)[2] for b in visible]
     vmax, vmin = max(highs), min(lows)
@@ -1789,6 +1838,8 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         frac = (v - vmin) / (vmax - vmin)
         r = int(round((1 - frac) * (n_rows - 1)))
         return rows[max(0, min(n_rows - 1, r))]
+
+    live_row = to_row(live_price) if (live_price is not None and vmin <= live_price <= vmax) else None
 
     def _w(y, x, s, attr):
         win.addstr(y, x, s, attr)
@@ -1862,7 +1913,19 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         if fmt_fn:
             safe_add(win, cursor_row, plot_w + 1, fmt_fn(cursor_val), cp(P_YELLOW, bold=True))
 
-    return vmin, vmax
+    # live price line/box — drawn last so it sits on top of everything else
+    # already in `occupied` (candles, BTD markers, crosshair), but still
+    # never overwrites an actual candle glyph itself, same rule as the
+    # crosshair's own guide lines
+    if live_row is not None:
+        for c2 in range(plot_w):
+            if (live_row, c2) not in occupied:
+                _w(live_row, c2, LIVE_LINE_CH, cp(P_YELLOW, dim=True))
+        if fmt_fn:
+            safe_add(win, live_row, plot_w + 1, f"▶{fmt_fn(live_price)}",
+                     cp(P_YELLOW, bold=True) | curses.A_REVERSE)
+
+    return vmin, vmax, live_row
 
 # ── DRAW ──────────────────────────────────────────────────────────────────
 def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd=False):
@@ -1912,11 +1975,14 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
     def _price_ohlc(b):
         return b["o"], b["h"], b["l"], b["c"]
 
-    pmin, pmax = draw_candles(win, visible, price_rows, _price_ohlc, plot_w,
-                              cursor_idx=cursor_idx, fmt_fn=fmt_price, btd_signals=btd_signals)
+    pmin, pmax, live_row = draw_candles(win, visible, price_rows, _price_ohlc, plot_w,
+                              cursor_idx=cursor_idx, fmt_fn=fmt_price, btd_signals=btd_signals,
+                              live_price=state.last_price)
     prows = len(price_rows)
     for tick_frac in (0.0, 0.5, 1.0):
         r = price_rows[int(round(tick_frac * (prows - 1)))]
+        if r == live_row:
+            continue   # the live-price tag already occupies this row — don't overwrite it
         p = pmax - tick_frac * (pmax - pmin)
         safe_add(win, r, plot_w + 1, fmt_price(p), cp(P_DIM))
 
@@ -1928,7 +1994,7 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
         lo = b.get("cvd_low", min(o, c))
         return o, hi, lo, c
 
-    cmin, cmax = draw_candles(win, visible, cvd_rows, _cvd_ohlc, plot_w, zero_line=True,
+    cmin, cmax, _ = draw_candles(win, visible, cvd_rows, _cvd_ohlc, plot_w, zero_line=True,
                               cursor_idx=cursor_idx, fmt_fn=fmt_qty)
     crows = len(cvd_rows)
     for tick_frac in (0.0, 0.5, 1.0):

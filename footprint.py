@@ -496,7 +496,22 @@ def load_log(date_str):
                     pass
     except FileNotFoundError:
         pass
-    return bars
+    # sort + dedup by ts: extend_history_backward logs OLDER bars for a
+    # bucket AFTER newer buckets are already on disk (appending, not
+    # rewriting, is simplest and cheapest), so physical file order isn't
+    # guaranteed to be chronological — always resolve that here rather
+    # than relying on write order. Dedup keeps the LAST occurrence for a
+    # given ts, since a later write for the same bucket (e.g. _close_live
+    # finally closing a bar gap-fill had already logged a partial version
+    # of) is the more complete one.
+    bars.sort(key=lambda b: b["ts"])
+    deduped = []
+    for b in bars:
+        if deduped and deduped[-1]["ts"] == b["ts"]:
+            deduped[-1] = b
+        else:
+            deduped.append(b)
+    return deduped
 
 # ── HISTORICAL BACKFILL (Kraken + Coinbase REST — Phemex has no history API) ─
 def fetch_kraken_trades_range(pair, since_ts, until_ts, progress=None, deadline=None):
@@ -764,18 +779,55 @@ def backfill_trades(hours, progress=None, reset=True):
     return len(trades)
 
 def initialize_today(progress=None):
+    """Prefer resuming from today's already-logged bars over a fresh REST
+    backfill. The log now captures everything a session ever shows — see
+    _log_bars(), which extend_history_backward()/fill_equity_gap() also
+    write through — so a relaunch mid-session can load almost instantly
+    from disk and only needs to fetch the (usually small) gap since the
+    log's last bar, instead of re-fetching and re-bucketing the whole day
+    from scratch every time. Falls back to a full backfill only when
+    there's no usable log yet (first launch of the day)."""
+    existing = load_log(TODAY_STR)
+    if existing:
+        last_bar = existing[-1]
+        since_ts = last_bar["ts"]
+        now = time.time()
+        until_ts = now if IS_CRYPTO else now - 900   # equities: 15-min REST delay
+        trades = []
+        if until_ts > since_ts:
+            trades = fetch_trades_range(since_ts, until_ts, progress=progress,
+                                         deadline=time.time() + INITIAL_BACKFILL_BUDGET_SECS)
+        with state.lock:
+            if trades:
+                # rebuild the log's last bucket from a fresh, authoritative
+                # REST fetch rather than trusting whatever the live feed
+                # had captured before the process stopped — drop the stale
+                # copy first so it isn't drawn twice (once from history,
+                # once as the freshly reconstructed live bar)
+                state.history = list(existing[:-1])
+                state.live = None
+                for ts, price, qty, is_buy in trades:
+                    ingest_trade(ts, price, qty, is_buy)
+                state.backfill_boundary_ts = trades[-1][0]
+            else:
+                # nothing new, or the fetch was skipped/came back empty —
+                # keep the log's last bar exactly as recorded rather than
+                # risk losing real data to a fetch that returned nothing
+                state.history = list(existing)
+                state.live = None
+                state.backfill_boundary_ts = since_ts
+            state.log_rows = len(state.history)
+            state.log_err = None
+            state.gap_fill_done = False
+            state.gap_fill_loading = False
+        suffix = f", caught up {len(trades)} newer trades" if trades else ""
+        return f"resumed {len(existing)} bars from today's log{suffix}"
     if BACKFILL_HOURS > 0:
         n = backfill_trades(BACKFILL_HOURS, progress=progress, reset=True)
         if n:
             src = "Kraken+Coinbase" if IS_CRYPTO else "Alpaca (IEX)"
             since_str = datetime.fromtimestamp(time.time() - BACKFILL_HOURS * 3600).strftime('%H:%M:%S')
             return f"backfilled {n} {src} trades since {since_str}"
-    existing = load_log(TODAY_STR)
-    if existing:
-        with state.lock:
-            for row in existing:
-                state.history.append(row)
-        return f"resumed {len(existing)} bars from today's log (backfill unavailable)"
     return "starting fresh — no backfill, no existing log"
 
 EXTEND_WINDOW_HOURS = 6    # how much real history to request per backward extend
@@ -870,6 +922,7 @@ def extend_history_backward():
             new_bars = [b for b in new_bars if b["ts"] < cutoff]
             if new_bars:
                 state.history = new_bars + state.history
+                _log_bars(new_bars)
     finally:
         with state.lock:
             state.history_loading_older = False
@@ -923,6 +976,7 @@ def fill_equity_gap():
                     combined = state.history + new_bars
                     combined.sort(key=lambda b: b["ts"])
                     state.history = combined
+                    _log_bars(new_bars)
     finally:
         with state.lock:
             state.gap_fill_loading = False
@@ -1035,6 +1089,24 @@ def _close_live():
         state.log_err = None
     else:
         state.log_err = err
+
+def _log_bars(bars):
+    """Append several already-finalized bars to today's log in one go.
+    Caller holds state.lock. Used by extend_history_backward() and
+    fill_equity_gap(), which each add a batch of bars that were never
+    routed through _close_live() (they're built via the isolated
+    _build_bars(), not ingest_trade()) and so were never persisted —
+    without this, scroll-back history and the equity gap-fill only ever
+    lived in memory for that one session. Physical write order doesn't
+    need to be chronological (extend_history_backward's bars are OLDER
+    than what's already on disk) since load_log() sorts on read."""
+    for bar in bars:
+        ok, err = append_log(bar)
+        if ok:
+            state.log_rows += 1
+            state.log_err = None
+        else:
+            state.log_err = err
 
 def ingest_trade(ts, price, qty, is_buy):
     """Fold one trade print into the live bar's OHLC + per-price-level

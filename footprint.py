@@ -89,6 +89,10 @@ What it shows, per price level per bar:
   POC (Point of Control): the price level with the most total volume
   (bid+ask) in that bar — marked with a yellow ◆ in the left gutter and the
   whole "<bid> x <ask>" cell underlined, regardless of imbalance status.
+  Open/Close markers: each bar's own left gutter also gets a ○ at its open
+  price's row and a ● at its close price's row (green if it closed at/above
+  its open, red otherwise) — same gutter POC uses; POC wins if a row is
+  both, and close wins over open if they land on the same row.
   Big Trades filter (--big-trade-size, default 100, [B] to change): any
   bid/ask number whose OWN volume is >= the threshold turns cyan-bold —
   independent of imbalance, though an imbalanced number that's ALSO a big
@@ -1692,6 +1696,8 @@ AXIS_W = 10       # left-side price-axis gutter width — a module constant
 VSTEP = 5         # ticks per Up/Down press
 VSTEP_BIG = 25    # ticks per PgUp/PgDn press
 POC_MARKER = "◆"
+OPEN_MARKER = "○"    # hollow circle — this bar's open price row
+CLOSE_MARKER = "●"   # filled circle — this bar's close price row
 LIVE_LINE_CH = "─"   # live-price line, drawn only through empty cells
 
 def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
@@ -1826,6 +1832,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
         levels = bar["levels"]
         cx = col_x[i]
         has_live_cell = False
+        poc_g = None
         if levels:
             glevels = group_levels(levels, group_size)
             imbalances = compute_imbalances(glevels)
@@ -1884,6 +1891,26 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
                 safe_add(win, row_y, x0 + len(bid_txt) + len(mid), ask_txt, ask_color)
                 if is_poc:
                     safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
+
+        # open/close markers — this bar's own left gutter, one row for its
+        # open price (hollow circle) and one for its close (filled circle,
+        # coloured by direction: green if it closed at/above where it
+        # opened, red otherwise) — same gutter convention as POC's diamond.
+        # If a row is BOTH the POC and an open/close price, POC wins
+        # (already the more information-dense signal here — same
+        # precedence Big Trades yields to imbalance colouring above); if
+        # open and close land on the same row, close wins (drawn second).
+        open_g = round(bar["o"] / TICK) // group_size
+        close_g = round(bar["c"] / TICK) // group_size
+        if open_g != poc_g:
+            r_i = group_to_row.get(open_g)
+            if r_i is not None:
+                safe_add(win, top_reserved + r_i, cx, OPEN_MARKER, cp(P_CYAN))
+        if close_g != poc_g:
+            r_i = group_to_row.get(close_g)
+            if r_i is not None:
+                close_color = cp(P_GREEN, bold=True) if bar["c"] >= bar["o"] else cp(P_RED, bold=True)
+                safe_add(win, top_reserved + r_i, cx, CLOSE_MARKER, close_color)
 
         # live price line — drawn through this column only where there's no
         # real cell already sitting at that exact row, so it never overwrites

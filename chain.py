@@ -238,7 +238,8 @@ def fpct(mark, last):
     return f"{arrow}{abs(pct):.1f}%", (1 if pct >= 0 else -1)
 
 def fstrike(strike, atm):
-    s = f"${strike:,.0f}"
+    is_whole = (strike == int(strike))
+    s = f"${strike:,.0f}" if is_whole else f"${strike:,.2f}"
     if strike == atm:
         return s + " ◆"
     return s

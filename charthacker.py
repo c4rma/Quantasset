@@ -71,38 +71,186 @@ KRAKEN_WS_PAIRS   = {"ETH": "ETH/USD", "BTC": "BTC/USD"}
 
 FEEDS = ("phemex", "kraken")   # cycle order for [F] key
 
-def cur_interval():
-    return INTERVALS[state.interval_idx] if hasattr(state, "interval_idx") else INTERVALS[0]
-
+# ── free-form interval system ────────────────────────────────────────────────
+# [I] used to cycle a fixed preset list; now it opens a text prompt (see
+# interval_dialog()) accepting ANY interval — "45s", "5m", "4h", "7d", "1y",
+# etc. — same free-form syntax cvd.py/footprint.py use for their [I] prompt.
+#
+# The exchanges/feeds themselves don't offer arbitrary kline resolutions
+# (Phemex/Kraken/Yahoo each only support a fixed menu, and NONE offer weekly/
+# monthly/yearly bars server-side). Rather than guess which exotic resolution
+# values each API happens to accept, every interval is built by CLIENT-SIDE
+# resampling from one of two BASE resolutions that are universally supported
+# and already proven-working in this file: 1 MINUTE for anything under a day,
+# 1 DAY for anything a day or more — see base_fetch_resolution(). A display
+# interval is therefore always snapped to the nearest whole minute (< 1 day)
+# or whole day (>= 1 day); true sub-minute bars aren't achievable without a
+# raw trade-tick rebuild (that's the "full rearchitecture" option that was
+# explicitly declined in favor of this simpler approach).
 def cur_resolution():
-    """Phemex resolution in seconds for current interval."""
-    return cur_interval()[1]
+    """Display-candle width in seconds — the interval actually shown on
+    screen. Everything EXCEPT the raw fetch/WS layer should use this (VWAP/
+    VP/ER/sessions gating, the header countdown, time-axis formatting, etc).
+    The fetch/WS layer uses base_fetch_resolution() instead — see above."""
+    return state.interval_secs
 
-def cur_kraken_interval():
-    """Kraken interval in minutes."""
-    return cur_interval()[2]
+def base_fetch_resolution() -> int:
+    """The resolution actually requested from the exchange/feed — always 60
+    (1m) for display intervals under a day, or 86400 (1D) for a day and up.
+    Every supported display interval is an exact whole multiple of one of
+    these two, so the display candles are built by grouping consecutive base
+    candles (see resample_closed_candles() / _Resampler)."""
+    return 86400 if state.interval_secs >= 86400 else 60
 
-def cur_ws_interval():
-    """WebSocket subscription interval in minutes (Kraken v2 ohlc channel)."""
-    return cur_interval()[3]
+def base_kraken_minutes() -> int:
+    """Kraken's OHLC `interval` param (minutes) for the BASE fetch resolution."""
+    return base_fetch_resolution() // 60
 
-def cur_label():
-    return cur_interval()[0]
+def parse_interval_input(raw: str) -> int | None:
+    """
+    Parse a free-form interval string into whole seconds, or None if it
+    can't be parsed at all. Accepts a number followed by a unit letter:
+      s = seconds   m = minutes   h/H = hours   d/D = days   y/Y = years (365d)
+    e.g. "45s", "5m", "4h", "1d", "7d", "30d", "1y". The result is snapped to
+    the nearest whole minute (if under a day) or whole day (if a day or
+    more) — see the module comment above for why. Snapping never fails; the
+    caller (interval_dialog) shows the RESOLVED value so the snap is never a
+    silent surprise.
+    """
+    raw = raw.strip()
+    if len(raw) < 2:
+        return None
+    unit = raw[-1].lower()
+    try:
+        num = float(raw[:-1])
+    except ValueError:
+        return None
+    if num <= 0:
+        return None
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "y": 365 * 86400}.get(unit)
+    if mult is None:
+        return None
+    secs = num * mult
+    if secs < 86400:
+        return max(1, round(secs / 60)) * 60
+    return max(1, round(secs / 86400)) * 86400
+
+def format_interval_secs(secs: int) -> str:
+    """Human label for a resolved interval — 300->'5m', 14400->'4H',
+    86400->'1D', 604800->'7D', 31536000->'1Y'."""
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}H" if secs % 3600 == 0 else f"{secs // 60}m"
+    if secs % (365 * 86400) == 0:
+        return f"{secs // (365 * 86400)}Y"
+    return f"{secs // 86400}D"
+
+class _Resampler:
+    """
+    Groups a live stream of BASE-resolution candles (fed one at a time, in
+    arrival order — either a newly-closed base candle or the currently-
+    forming one, which may be fed repeatedly as it updates) into DISPLAY-
+    resolution candles. Used by ws_phemex/ws_kraken/ws_yahoo so each only
+    needs to stream at its natively-supported base resolution while still
+    supporting whatever interval the user actually asked for via [I].
+
+    Re-feeding the same still-forming base candle (same ts) replaces its
+    entry in place rather than accumulating on top of it, so volume/OHLC
+    never double-counts as a base candle updates tick by tick.
+    """
+    def __init__(self, interval_secs: int):
+        self.interval_secs = interval_secs
+        self.bucket_ts = None   # display-bucket start ts of the open group
+        self.members   = []     # base candles currently in that bucket
+
+    def seed(self, display_candle):
+        """Continue an already-built display candle (e.g. the last one
+        loaded via REST/resample_closed_candles) instead of starting fresh —
+        call once before the first feed() so a live update doesn't wrongly
+        reset the accumulated open/high/low/volume for a bucket that's
+        already partially filled."""
+        if display_candle is None:
+            return
+        self.bucket_ts = display_candle.ts
+        self.members = [display_candle]
+
+    def feed(self, base_candle):
+        """Absorb one base-resolution candle. Returns (closed, live):
+        `closed` is a finished display Candle if this feed just sealed the
+        previous bucket (else None); `live` is the current in-progress
+        display Candle (never None once anything has been fed)."""
+        bucket = base_candle.ts - (base_candle.ts % self.interval_secs)
+        closed = None
+        if self.bucket_ts is not None and bucket != self.bucket_ts:
+            closed = self._build(is_closed=True)
+            self.members = []
+        self.bucket_ts = bucket
+        if self.members and self.members[-1].ts == base_candle.ts:
+            self.members[-1] = base_candle
+        else:
+            self.members.append(base_candle)
+        return closed, self._build(is_closed=False)
+
+    def _build(self, is_closed: bool):
+        if not self.members:
+            return None
+        return Candle(
+            ts=self.bucket_ts,
+            o=self.members[0].o,
+            h=max(m.h for m in self.members),
+            l=min(m.l for m in self.members),
+            c=self.members[-1].c,
+            v=sum(m.v for m in self.members),
+            closed=is_closed,
+        )
+
+def resample_closed_candles(base_candles: list, interval_secs: int) -> list:
+    """Batch-resample a flat list of already-closed BASE candles (used by
+    the REST fetchers, via fetch_candles()) into interval_secs-wide candles.
+    For incremental live resampling (WS feeds), see _Resampler instead."""
+    if not base_candles or interval_secs <= 0:
+        return []
+    out, cur = [], None
+    for c in base_candles:
+        bucket = c.ts - (c.ts % interval_secs)
+        if cur is None or cur.ts != bucket:
+            if cur is not None:
+                out.append(cur)
+            cur = Candle(ts=bucket, o=c.o, h=c.h, l=c.l, c=c.c, v=c.v, closed=True)
+        else:
+            cur.h = max(cur.h, c.h)
+            cur.l = min(cur.l, c.l)
+            cur.c = c.c
+            cur.v += c.v
+    if cur is not None:
+        out.append(cur)
+    return out
+
+def _apply_resampled(closed, live):
+    """Apply one _Resampler.feed() result to state.candles/state.live,
+    matching the convention every ws_* function already used for native-
+    resolution data: a bucket that's still the same as the last entry in
+    state.candles updates IN PLACE (state.live stays None so all_candles
+    doesn't double-count it); a genuinely new bucket becomes state.live.
+    Caller must already hold state.lock."""
+    if closed is not None:
+        if state.candles and state.candles[-1].ts == closed.ts:
+            state.candles[-1] = closed
+        else:
+            state.candles.append(closed)
+    if live is not None and state.candles and state.candles[-1].ts == live.ts:
+        state.candles[-1] = live
+        state.live = None
+    else:
+        state.live = live
 
 MAX_CANDLES   = 3000    # 48h × 60 = 2880 candles at 1m, plus headroom
 REST_LIMIT    = 500     # fetch up to 500 candles per request
 REFRESH_DELAY = 0.05   # ~20 fps — reduces CPU and terminal write pressure
-
-# Interval table: label → (phemex_resolution_secs, kraken_interval_mins, ws_interval_mins)
-INTERVALS = [
-    ("1m",   60,     1,   1),
-    ("3m",   180,    3,   3),
-    ("15m",  900,    15,  15),
-    ("1H",   3600,   60,  60),
-    ("4H",   14400,  240, 240),
-    ("1D",   86400,  1440,1440),
-]
-INTERVAL_IDX = 0   # default: 1m
+ER_MANUAL_IV  = 50.0    # last-resort fallback IV % — only used if the live
+                         # source (Deribit DVOL / CBOE iv30) has no data for
+                         # the symbol, e.g. it has no listed options chain
 
 # ── Phemex auth ────────────────────────────────────────────────────────────────
 def _phemex_headers(path: str, query: str = "", body: str = "") -> dict:
@@ -171,6 +319,10 @@ C_ALERT     = 37   # alert box / triggered
 C_VWAP      = 16   # VWAP line
 C_VWAP_BAND = 17   # 0.5σ shaded band
 C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
+# Expected Range (IV-implied daily move) colors
+C_ER_UP     = 43   # upper levels — green
+C_ER_DOWN   = 44   # lower levels — red
+C_ER_STOP   = 45   # ±150% hard-stop lines — magenta
 
 # Global mode assets:
 #   (label, phemex_symbol, kraken_pair, yahoo_symbol, color_pair)
@@ -229,7 +381,14 @@ class ChartState:
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
         self.show_vp       = True    # volume profile overlay toggle
         self.show_vwap    = True    # VWAP + SD bands overlay toggle
-        self.interval_idx  = 0       # index into INTERVALS list
+        self.show_er      = False   # Expected Range (IV-implied) overlay toggle
+        self.er_iv         = 0.0    # cached annualised IV % for the active asset
+                                     # (Deribit DVOL for ETH/BTC, CBOE iv30 for
+                                     # everything else; iv_monitor_loop keeps
+                                     # this fresh so draw() never blocks)
+        self.interval_secs = 60      # display-candle width in seconds — set
+                                      # via [I] (interval_dialog); see
+                                      # cur_resolution()/base_fetch_resolution()
         self.history_loading = False # True while background history fetch running
         self.chart_mode    = "candle" # "candle" | "line"
         self.show_help    = False   # help overlay visible
@@ -284,7 +443,7 @@ def fetch_phemex(asset: str, before_ts: int = 0) -> list:
     Row: [timestamp, interval, lastClose, open, high, low, close, volume, turnover]
     """
     symbol     = PHEMEX_SYMBOLS[asset]
-    resolution = cur_resolution()
+    resolution = base_fetch_resolution()
 
     if before_ts:
         path  = "/exchange/public/md/v2/kline/list"
@@ -344,7 +503,7 @@ def fetch_kraken(asset: str, before_ts: int = 0) -> list:
     Kraken returns oldest-first from `since` timestamp.
     """
     pair     = KRAKEN_REST_PAIRS[asset]
-    interval = cur_kraken_interval()
+    interval = base_kraken_minutes()
     url      = f"{KRAKEN_REST_URL}/0/public/OHLC"
     params   = {"pair": pair, "interval": interval}
     if before_ts:
@@ -414,7 +573,7 @@ def fetch_yahoo(asset: str, before_ts: int = 0) -> list:
     prior session's RTH-only total still roughly tracks its ETH total while
     a live partial session is much more sensitive to what's missing.
     """
-    resolution     = cur_resolution()
+    resolution     = base_fetch_resolution()
     interval, rng  = _yahoo_resolution_params(resolution)
     url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{asset}"
     params = {"interval": interval, "range": rng, "includePrePost": "true"}
@@ -457,11 +616,13 @@ def fetch_yahoo(asset: str, before_ts: int = 0) -> list:
 
 def fetch_candles(asset: str, feed: str, before_ts: int = 0) -> list:
     """Single dispatch point for history fetches — routes ETH/BTC through
-    Phemex/Kraken as before, anything else through Yahoo."""
-    if not is_crypto_symbol(asset):
-        return fetch_yahoo(asset, before_ts=before_ts)
-    return (fetch_kraken(asset, before_ts=before_ts) if feed == "kraken"
+    Phemex/Kraken as before, anything else through Yahoo. Each fetcher
+    always requests base_fetch_resolution() (1m/1D); resampled here to
+    whatever display interval the user actually asked for via [I]."""
+    base = (fetch_yahoo(asset, before_ts=before_ts) if not is_crypto_symbol(asset)
+            else fetch_kraken(asset, before_ts=before_ts) if feed == "kraken"
             else fetch_phemex(asset, before_ts=before_ts))
+    return resample_closed_candles(base, state.interval_secs)
 
 def ws_yahoo(asset: str, session: int):
     """
@@ -469,34 +630,44 @@ def ws_yahoo(asset: str, session: int):
     state.candles/state.live contract as ws_phemex/ws_kraken so the rest of
     the app doesn't need to know the feed type.
 
-    Yahoo never populates the still-forming bar with real OHLCV — that slot
-    stays null until the bar closes. Instead it appends a trailing real-time
-    quote tick (o=h=l=c=last trade price, v=0) stamped to the actual poll
-    time, not the bar grid. That tick is snapped onto its bar boundary and
-    aggregated into our own developing candle (open=first tick this bar,
-    high/low=running extremes, close=latest) so it renders as a normal
-    forming candle instead of a new degenerate bar every poll. Once Yahoo
-    publishes the authoritative aligned bar for that timestamp, it supersedes
-    the approximation.
+    Yahoo never populates the still-forming BASE bar with real OHLCV — that
+    slot stays null until the bar closes. Instead it appends a trailing
+    real-time quote tick (o=h=l=c=last trade price, v=0) stamped to the
+    actual poll time, not the bar grid. That tick is snapped onto its base
+    bar boundary and aggregated into our own developing base candle
+    (open=first tick this bar, high/low=running extremes, close=latest) so
+    it behaves like a normal forming bar instead of a new degenerate one
+    every poll. Once Yahoo publishes the authoritative aligned bar for that
+    timestamp, it supersedes the approximation.
+
+    That base-candle stream (always 1m sub-day / 1D day+, see
+    base_fetch_resolution()) is then fed through a _Resampler to build
+    state.candles/state.live at whatever interval the user actually asked
+    for via [I] — this two-layer scheme is what lets [I] accept ANY interval
+    on a feed that itself only natively serves a handful of fixed
+    resolutions.
     """
     POLL_SECS = 5
 
     def stale() -> bool:
         return state.session != session
 
-    resolution      = cur_resolution()
+    resolution      = base_fetch_resolution()
     interval, _rng  = _yahoo_resolution_params(resolution)
     bar_secs        = _YAHOO_BAR_SECS.get(interval, resolution)
 
+    resampler = _Resampler(state.interval_secs)
     with state.lock:
         if stale(): return
+        if state.candles:
+            resampler.seed(state.candles[-1])
         last_aligned_ts = state.candles[-1].ts if state.candles else 0
         state.status    = "Live"
         state.error     = ""
 
     while not stale():
         try:
-            fresh = fetch_yahoo(asset)
+            fresh = fetch_yahoo(asset)   # base-resolution candles (1m/1D)
         except Exception:
             fresh = []
 
@@ -516,24 +687,18 @@ def ws_yahoo(asset: str, session: int):
                 if stale(): return
                 new_aligned = [c for c in fresh if c.ts > last_aligned_ts]
                 for c in new_aligned:
-                    if state.candles and state.candles[-1].ts == c.ts:
-                        state.candles[-1] = c
-                    else:
-                        state.candles.append(c)
+                    closed, live = resampler.feed(c)
+                    _apply_resampled(closed, live)
                 if new_aligned:
                     last_aligned_ts = new_aligned[-1].ts
-                    state.live = None
 
                 if tick is not None:
                     bucket = tick.ts - (tick.ts % bar_secs)
                     if bucket > last_aligned_ts:
-                        if state.live is None or state.live.ts != bucket:
-                            state.live = Candle(ts=bucket, o=tick.c, h=tick.c,
-                                                 l=tick.c, c=tick.c, v=0, closed=False)
-                        else:
-                            state.live.h = max(state.live.h, tick.c)
-                            state.live.l = min(state.live.l, tick.c)
-                            state.live.c = tick.c
+                        base_dev = Candle(ts=bucket, o=tick.c, h=tick.c,
+                                          l=tick.c, c=tick.c, v=0, closed=False)
+                        closed, live = resampler.feed(base_dev)
+                        _apply_resampled(closed, live)
                         state.last_price = tick.c
                 elif state.candles:
                     state.last_price = state.candles[-1].c
@@ -558,10 +723,21 @@ def ws_kraken(asset: str, session: int):
     def stale() -> bool:
         return state.session != session
 
+    # Kraken streams at the BASE resolution (1m sub-day / 1D day+, see
+    # base_fetch_resolution()); this resampler groups those base candles
+    # into whatever display interval the user picked via [I]. Seeded from
+    # whatever's already loaded (the initial REST fetch, already resampled
+    # by fetch_candles()) so the first live update continues that bucket
+    # instead of wrongly resetting its accumulated open/high/low/volume.
+    resampler = _Resampler(state.interval_secs)
+    with state.lock:
+        if state.candles:
+            resampler.seed(state.candles[-1])
+
     def on_open(ws):
         ws.send(json.dumps({
             "method": "subscribe",
-            "params": {"channel": "ohlc", "symbol": [pair], "interval": cur_ws_interval()},
+            "params": {"channel": "ohlc", "symbol": [pair], "interval": base_kraken_minutes()},
         }))
         with state.lock:
             if stale(): return
@@ -604,15 +780,8 @@ def ws_kraken(asset: str, session: int):
                 state.last_price = c.c
                 if state.asset == "ETH": state.last_price_eth = c.c
                 if state.asset == "BTC": state.last_price_btc = c.c
-                if state.candles and state.candles[-1].ts == ts_open:
-                    state.candles[-1] = c
-                    state.live = None
-                else:
-                    if state.live and state.live.ts != ts_open:
-                        prev        = state.live
-                        prev.closed = True
-                        state.candles.append(prev)
-                    state.live = c
+                closed, live = resampler.feed(c)
+                _apply_resampled(closed, live)
                 state.status = "Live"
                 state.error  = ""
 
@@ -670,11 +839,23 @@ def ws_phemex(asset: str, session: int):
     def stale() -> bool:
         return state.session != session
 
+    # Phemex streams at the BASE resolution (1m sub-day / 1D day+, see
+    # base_fetch_resolution()); this resampler groups those base candles
+    # (both the initial snapshot AND every incremental update) into whatever
+    # display interval the user picked via [I]. Seeded from whatever's
+    # already loaded (the initial REST fetch, already resampled by
+    # fetch_candles()) so the first live update continues that bucket
+    # instead of wrongly resetting its accumulated open/high/low/volume.
+    resampler = _Resampler(state.interval_secs)
+    with state.lock:
+        if state.candles:
+            resampler.seed(state.candles[-1])
+
     def on_open(ws):
         sub = json.dumps({
             "id": 1,
             "method": "kline_p.subscribe",
-            "params": [symbol, cur_resolution()]
+            "params": [symbol, base_fetch_resolution()]
         })
         ws.send(sub)
         with state.lock:
@@ -710,16 +891,19 @@ def ws_phemex(asset: str, session: int):
             if stale(): return
 
             if msg_type == "snapshot":
-                # Snapshot: newest-first → sort ascending by timestamp
-                rows = sorted(klines, key=lambda r: r[0])
+                # Snapshot: newest-first → sort ascending by timestamp. Rows
+                # older than the resampler's already-seeded bucket are
+                # redundant with what the initial REST fetch already loaded.
+                rows   = sorted(klines, key=lambda r: r[0])
+                _floor = resampler.bucket_ts if resampler.bucket_ts is not None else 0
                 for row in rows[-REST_LIMIT:]:
                     ts = row[0]
-                    c  = Candle(ts=ts, o=row[3], h=row[4], l=row[5],
-                                c=row[6], v=row[7], closed=True)
-                    if not state.candles or ts > state.candles[-1].ts:
-                        state.candles.append(c)
-                    elif ts == state.candles[-1].ts:
-                        state.candles[-1] = c
+                    if ts < _floor:
+                        continue
+                    c = Candle(ts=ts, o=row[3], h=row[4], l=row[5],
+                               c=row[6], v=row[7], closed=True)
+                    closed, live = resampler.feed(c)
+                    _apply_resampled(closed, live)
                 if state.candles:
                     state.last_price = state.candles[-1].c
                 state.status = "Live"
@@ -734,16 +918,8 @@ def ws_phemex(asset: str, session: int):
                     state.last_price = c.c
                     if state.asset == "ETH": state.last_price_eth = c.c
                     if state.asset == "BTC": state.last_price_btc = c.c
-
-                    if state.candles and state.candles[-1].ts == ts:
-                        state.candles[-1] = c
-                        state.live = None
-                    else:
-                        if state.live and state.live.ts != ts:
-                            prev        = state.live
-                            prev.closed = True
-                            state.candles.append(prev)
-                        state.live = c
+                    closed, live = resampler.feed(c)
+                    _apply_resampled(closed, live)
                     state.status = "Live"
 
     # ── app-level heartbeat ───────────────────────────────────────────────────
@@ -815,8 +991,8 @@ def ws_phemex(asset: str, session: int):
     _ping_ws[0] = None
 
 # ── feed manager ──────────────────────────────────────────────────────────────
-def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
-    """Start (or restart) the data feed. feed/interval_idx="" means keep current."""
+def start_feed(asset: str, feed: str = "", interval_secs: int = -1):
+    """Start (or restart) the data feed. feed/interval_secs=-1 means keep current."""
     old_ws = state.ws
     if old_ws:
         try:
@@ -827,8 +1003,8 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
     with state.lock:
         if feed:
             state.feed = feed
-        if interval_idx >= 0:
-            state.interval_idx = interval_idx
+        if interval_secs >= 0:
+            state.interval_secs = interval_secs
         my_feed             = state.feed
         state.session      += 1
         my_session          = state.session
@@ -840,6 +1016,7 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
         state.history_loading = False
         state.vert_offset    = 0   # new symbol/interval/feed — stale vertical
                                     # pan could be nonsensical at a new scale
+        state.er_iv          = 0.0 # stale IV from a different asset would be wrong
 
     candles = fetch_candles(asset, my_feed)
 
@@ -865,7 +1042,7 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
     # All other intervals: preload 500 candles.
     with state.lock:
         state.history_loading = True
-    if cur_resolution() == 60:
+    if base_fetch_resolution() == 60:
         threading.Thread(
             target=preload_48h, args=(my_session,), daemon=True).start()
     else:
@@ -930,7 +1107,6 @@ def preload_48h(session: int):
     Updates status with progress so the user can see loading is happening.
     """
     TARGET_SECS = 48 * 3600   # 48 hours in seconds
-    resolution  = cur_resolution()
 
     while True:
         with state.lock:
@@ -1077,6 +1253,9 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
     curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_ER_UP,     curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_ER_DOWN,   curses.COLOR_RED,     -1)
+    curses.init_pair(C_ER_STOP,   curses.COLOR_MAGENTA, -1)
 
 # ── formatting ────────────────────────────────────────────────────────────────
 def price_fmt(p: float, asset: str = "") -> str:
@@ -1109,6 +1288,96 @@ def smart_price_labels(lo: float, hi: float, asset: str) -> list:
         labels.append((p, price_fmt(p, asset)))
         p = round(p + step, 10)
     return labels
+
+# ── Expected Range (IV-implied daily move) ──────────────────────────────────────
+# Ported from the ChartHacker TradingView Pine indicator / charthacker-web's
+# backend/indicators/expected_range.py — same math, same levels. Pine is
+# sandboxed and can't reach outside TradingView, so the original indicator had
+# to take IV as a manual input for non-crypto symbols; this app can make real
+# HTTP requests, so both IV sources are live: Deribit DVOL for crypto, CBOE's
+# iv30 (30-day constant-maturity implied vol) for everything else.
+DVOL_URL = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+CBOE_IV_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+_dvol_cache: dict = {}      # ccy    -> (value, fetched_at) — 5min TTL below
+_cboe_iv_cache: dict = {}   # symbol -> (value, fetched_at)
+_DVOL_TTL     = 300
+_CBOE_IV_TTL  = 300
+
+def _fetch_dvol(ccy: str) -> float | None:
+    """Deribit's annualised implied-vol index for ETH/BTC (DVOL)."""
+    now    = time.time()
+    cached = _dvol_cache.get(ccy)
+    if cached and now - cached[1] < _DVOL_TTL:
+        return cached[0]
+    try:
+        now_ms = int(now * 1000)
+        r = requests.get(DVOL_URL, params={
+            "currency": ccy, "start_timestamp": now_ms - 7200000,
+            "end_timestamp": now_ms, "resolution": "3600",
+        }, timeout=8)
+        data = (r.json().get("result") or {}).get("data") or []
+        if data:
+            val = float(data[-1][4])    # last candle close = current DVOL
+            _dvol_cache[ccy] = (val, now)
+            return val
+    except Exception:
+        pass
+    return cached[0] if cached else None
+
+def _fetch_cboe_iv(symbol: str) -> float | None:
+    """CBOE delayed-quotes options chain iv30 — real per-symbol 30-day
+    implied vol (VIX-style %) for equities/ETFs/indices. Same source
+    opt_dashboard.py and charthacker-web's Options Flow panel use. Returns
+    None (not a guess) if the symbol has no listed options chain on CBOE —
+    the caller falls back to ER_MANUAL_IV in that case."""
+    now    = time.time()
+    cached = _cboe_iv_cache.get(symbol)
+    if cached and now - cached[1] < _CBOE_IV_TTL:
+        return cached[0]
+    try:
+        r = requests.get(CBOE_IV_URL.format(symbol),
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = r.json().get("data") or {}
+        iv30 = float(data.get("iv30"))
+        if iv30 > 0:
+            _cboe_iv_cache[symbol] = (iv30, now)
+            return iv30
+    except Exception:
+        pass
+    return cached[0] if cached else None
+
+def iv_monitor_loop():
+    """Background: keeps state.er_iv fresh for the active asset so draw()
+    (the render thread) never blocks on a network call. Deribit DVOL for
+    ETH/BTC, CBOE iv30 for everything else — state.er_iv only gets written
+    on a successful fetch, so a symbol with no options chain just leaves it
+    at 0 and the Expected Range block falls back to ER_MANUAL_IV."""
+    while True:
+        with state.lock:
+            asset = state.asset
+        iv = _fetch_dvol(asset) if asset in PHEMEX_SYMBOLS else _fetch_cboe_iv(asset)
+        if iv:
+            with state.lock:
+                state.er_iv = iv
+        time.sleep(20)
+
+def compute_er(open_price: float, iv: float) -> dict | None:
+    """
+    Expected Range levels from a session open, given annualised IV (%).
+      daily_move = IV / sqrt(365) / 100
+      level±N%   = open ± open * daily_move * N   for N in 20/40/60/80/100/150
+    Returns {"pct": one-day move %, "upper": {N: price}, "lower": {N: price}}.
+    """
+    if not open_price or not iv or iv <= 0:
+        return None
+    daily_move = iv / math.sqrt(365) / 100.0
+    pct        = math.floor(iv / math.sqrt(365) * 100) / 100
+    dist       = open_price * daily_move
+    return {
+        "pct":   pct,
+        "upper": {p: open_price + dist * (p / 100.0)  for p in (20, 40, 60, 80, 100, 150)},
+        "lower": {p: open_price + dist * (-p / 100.0) for p in (20, 40, 60, 80, 100, 150)},
+    }
 
 # ── double-buffer ──────────────────────────────────────────────────────────────
 EMPTY_CELL = (" ", 0, 0)
@@ -1544,7 +1813,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         color_scheme      = state.color_scheme
         show_vp           = state.show_vp
         show_vwap         = state.show_vwap
-        interval_idx      = state.interval_idx
+        show_er           = state.show_er
+        er_iv             = state.er_iv
+        interval_secs     = state.interval_secs
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
         show_help         = state.show_help
@@ -1693,7 +1964,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     now_epoch   = int(time.time())
     secs_left   = cur_resolution() - (now_epoch % cur_resolution())
     countdown   = f"  {secs_left:02d}s" if status == "Live" else ""
-    ivl_label  = INTERVALS[interval_idx][0]
+    ivl_label  = format_interval_secs(interval_secs)
     status_str  = f"| {status}{countdown}  {ivl_label}  {now_str} "
     db.puts(0, cols - len(status_str) - 1, status_str,
             bull_pair() if status == "Live" else bear_pair(), curses.A_BOLD)
@@ -1734,7 +2005,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 curses.A_BOLD | curses.A_REVERSE)
         col += 14
 
-    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [B]ER  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1778,7 +2049,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             db.puts(gr, chart_r + 1, f"{lbl:<{PRICE_W}}", C_LABEL)
 
     # ── VOLUME PROFILE — current + previous session ─────────────────────────
-    if show_vp and visible and chart_h > 0:
+    # Session-based indicators (VP/VWAP/ER/BTD) don't make sense on candles
+    # wider than an hour — a single 1D/7D/30D/1Y bar can span many sessions,
+    # so "session POC" or "today's expected range" stops meaning anything.
+    if show_vp and visible and chart_h > 0 and cur_resolution() <= 3600:
         _prev_start, _prev_end, _curr_start = session_bounds()
         _is_1m = (cur_resolution() == 60)
 
@@ -1862,7 +2136,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 else:
                     vp[ptb(c.c)] += bv
 
-            mx    = max(vp) or 1.0
+            # `mx` is only ever used to look itself up via vp.index() below —
+            # unlike draw_vp_bars' mrv (which divides by it), nothing here
+            # divides by mx, so it must stay the REAL max, even 0.0. A
+            # session with all-zero-volume candles (e.g. thin extended-hours
+            # stock bars) legitimately has max(vp)==0.0; substituting a fake
+            # 1.0 here made vp.index(mx) raise ValueError since 1.0 was never
+            # actually in vp — that's the QQQ/ETH-hours crash this fixes.
+            mx    = max(vp)
             tv    = sum(vp)
             pi    = vp.index(mx)
             poc_p = s_lo + (pi / (VP_BUCKETS - 1)) * s_range
@@ -2039,7 +2320,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             _deferred_vp = {"vah": vah_price, "val": val_price, "poc": poc_price}
 
     # ── VWAP + STANDARD DEVIATION BANDS — current + previous session ────────
-    if show_vwap and visible and chart_h > 0:
+    if show_vwap and visible and chart_h > 0 and cur_resolution() <= 3600:
         _pstart, _pend, _cstart = session_bounds()
         _is_1m_vwap = (cur_resolution() == 60)
 
@@ -2170,6 +2451,66 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     _axis_lbl(_vw_last + 2.5*_sd_last, "+2.5s",C_VWAP_SD2, curses.A_DIM)
                     _axis_lbl(_vw_last - 2.5*_sd_last, "-2.5s",C_VWAP_SD2, curses.A_DIM)
 
+    # ── EXPECTED RANGE (IV-implied daily move) — current session only ───────
+    # ±20/40/60/80% soft levels (dim dashed), ±100% bound (bold), ±150% hard
+    # stop (bold magenta), anchored to the session open. er_iv is real,
+    # live IV for whatever's on screen (Deribit DVOL for crypto, CBOE iv30
+    # otherwise, refreshed by iv_monitor_loop) — ER_MANUAL_IV is only a
+    # last-resort fallback for symbols with no listed options chain on CBOE.
+    if show_er and visible and chart_h > 0 and cur_resolution() <= 3600:
+        _er_pstart, _er_pend, _er_cstart = session_bounds()
+        _er_iv = er_iv if er_iv > 0 else ER_MANUAL_IV
+        _er_sess_candles = [c for c in all_candles if c.ts >= _er_cstart]
+
+        if _er_sess_candles and _er_iv and _er_iv > 0:
+            _er_open = _er_sess_candles[0].o
+            _er = compute_er(_er_open, _er_iv)
+
+            _er_col_start = chart_r
+            _er_start_c   = chart_r - n_vis
+            for _ei, _ec in enumerate(visible):
+                if _ec.ts >= _er_cstart:
+                    _er_col_start = _er_start_c + _ei
+                    break
+            _er_cs = max(0, _er_col_start)
+
+            def _er_row(p):
+                if hi_p == lo_p: return chart_top + chart_h // 2
+                r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+                return max(chart_top, min(chart_bot - 1, chart_top + r))
+
+            def _er_line(price, ch, pair, line_attrs, label):
+                """Draw the level bar (line_attrs controls its weight) plus,
+                if labeled, an axis tick + a boxed (reverse-video) label —
+                same two-part style draw_hlines() uses for horizontal lines."""
+                row = _er_row(price)
+                if not (chart_top <= row < chart_bot): return
+                for c2 in range(_er_cs, chart_r):
+                    if db.buf[row][c2][0] in (" ", ".", "-"):
+                        db.put(row, c2, ch, pair, line_attrs)
+                if label:
+                    lbl_text = f"{label} {price_fmt(price, asset)}"
+                    db.put(row, chart_r, "+", pair, curses.A_BOLD)
+                    db.puts(row, chart_r + 1,
+                            f"{lbl_text:<{PRICE_W}}"[:PRICE_W],
+                            pair, curses.A_BOLD | curses.A_REVERSE)
+
+            if _er:
+                # Solid block glyph (same "█" used for candle bodies) so every
+                # level reads as a colored bar at a glance — only the 40/80/
+                # 100/150% levels are shown (20/60 dropped, they were just
+                # unlabeled clutter). Bold for the ±100%/±150% bound and
+                # hard-stop lines, normal weight for ±40/80%.
+                _u, _l = _er["upper"], _er["lower"]
+                _er_line(_u[40],  "█", C_ER_UP,   curses.A_NORMAL, "+40%")
+                _er_line(_u[80],  "█", C_ER_UP,   curses.A_NORMAL, "+80%")
+                _er_line(_l[40],  "█", C_ER_DOWN, curses.A_NORMAL, "-40%")
+                _er_line(_l[80],  "█", C_ER_DOWN, curses.A_NORMAL, "-80%")
+                _er_line(_u[100], "█", C_ER_UP,   curses.A_BOLD,   "+100%")
+                _er_line(_l[100], "█", C_ER_DOWN, curses.A_BOLD,   "-100%")
+                _er_line(_u[150], "█", C_ER_STOP, curses.A_BOLD,   "+150%")
+                _er_line(_l[150], "█", C_ER_STOP, curses.A_BOLD,   "-150%")
+                _er_line(_er_open, ":", C_LABEL,  curses.A_DIM,    "EOpen")
 
     # ── SESSIONS INDICATOR ───────────────────────────────────────────────────
     # Shows session windows as price-range boxes with a bottom indicator bar.
@@ -2386,7 +2727,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     #   T2 (>σ+1.5): double block ██ bold
     #   T3 (>σ+3.0): triple block ███ reversed — maximum contrast
     BTD_COOLDOWN = 1   # suppress only immediate repeat (same candle index)
-    if show_btd and n_all >= btd_lookback + 2:
+    if show_btd and n_all >= btd_lookback + 2 and cur_resolution() <= 3600:
         _clist   = all_candles
         _buy_iv  = []
         _sell_iv = []
@@ -2603,7 +2944,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         n_alerts = len(state.alerts)
         _feed_tag  = feed.upper() if is_crypto_symbol(asset) else "YAHOO"
         _scr_tag   = f"  [SCROLLED {vert_offset:+d}, Esc to reset]" if vert_offset else ""
-        footer   = (f" [E] Symbol  [F] Feed: {_feed_tag}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [U] Save  [Q] Quit"
+        _er_shown  = er_iv if er_iv > 0 else ER_MANUAL_IV
+        er_tag     = f"ER:ON({_er_shown:.0f}%IV)" if show_er else "ER:OFF"
+        footer   = (f" [E] Symbol  [F] Feed: {_feed_tag}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [B] {er_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [U] Save  [Q] Quit"
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {_feed_tag}{auth_tag}{cinfo}{err_str}{hist_tag}{_scr_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
         if vert_offset:
@@ -2876,6 +3219,76 @@ def symbol_dialog(stdscr, rows: int, cols: int) -> str:
             stdscr.timeout(50)
             return raw
         error_msg = f"'{raw}' not found — try again or Esc to cancel"
+
+
+def interval_dialog(stdscr, rows: int, cols: int) -> int | None:
+    """
+    Prompt for a free-form interval — same syntax as cvd.py/footprint.py's
+    [I] prompt: a number + unit letter (s/m/h/d/y), e.g. "45s", "5m", "4h",
+    "1d", "7d", "30d", "1y". Returns the resolved seconds value (see
+    parse_interval_input — it snaps to the nearest whole minute under a day,
+    or whole day at a day and up), or None if cancelled/invalid.
+    """
+    prompt    = " Interval (e.g. 45s, 5m, 4h, 1d, 7d, 30d, 1y):  "
+    box_w     = max(len(prompt) + 16, 55)
+    error_msg = ""
+
+    while True:
+        box_h = 4 if error_msg else 3
+        box_y = rows // 2 - box_h // 2
+        box_x = max(0, cols // 2 - box_w // 2)
+
+        curses.curs_set(1)
+        curses.echo()
+        stdscr.nodelay(False)
+
+        for r in range(box_h):
+            stdscr.addstr(box_y + r, box_x,
+                          " " * min(box_w, cols - box_x),
+                          curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        stdscr.addstr(box_y + 1, box_x, prompt,
+                      curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        if error_msg:
+            stdscr.addstr(box_y + 2, box_x, f" {error_msg}"[:box_w],
+                          curses.color_pair(C_SESS_EXCL) | curses.A_BOLD)
+        stdscr.refresh()
+
+        input_buf = []
+        input_x   = box_x + len(prompt)
+        while True:
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            code = ord(ch) if isinstance(ch, str) else ch
+            if code in (27,):                         # Escape — cancel
+                curses.noecho(); curses.curs_set(0); stdscr.timeout(50)
+                return None
+            elif code in (10, 13, curses.KEY_ENTER):   # Enter — confirm
+                break
+            elif code in (curses.KEY_BACKSPACE, 127, 8):
+                if input_buf:
+                    input_buf.pop()
+                    stdscr.addstr(box_y + 1, input_x + len(input_buf), " ",
+                                  curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            elif 32 <= code <= 126 and len(input_buf) < 10:
+                input_buf.append(chr(code))
+                stdscr.addstr(box_y + 1, input_x + len(input_buf) - 1,
+                              chr(code), curses.color_pair(C_CURSOR) | curses.A_BOLD)
+            stdscr.refresh()
+
+        curses.noecho()
+        curses.curs_set(0)
+        raw = "".join(input_buf).strip()
+        if not raw:
+            stdscr.timeout(50)
+            return None
+
+        secs = parse_interval_input(raw)
+        if secs is not None:
+            stdscr.timeout(50)
+            return secs
+        error_msg = f"'{raw}' not valid — use <N>s/m/h/d/y, e.g. 5m or 30d"
 
 
 def parse_jump_target(s: str) -> int:
@@ -3756,7 +4169,7 @@ def draw_hline_list_overlay(db, rows, cols, hlines, sel):
         for c in range(box_w):
             db.put(box_y + r, box_x + c, " ", C_HEADER)
 
-    title = " Drawings  [N]new  [D]del  [E]edit  [UpDn]sel  [`]close "
+    title = " Drawings  [N]new  [D]del  [O]edit  [UpDn]sel  [`]close "
     db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
             curses.A_BOLD | curses.A_REVERSE)
     db.puts(box_y + 1, box_x + 1,
@@ -3775,7 +4188,7 @@ def draw_hline_list_overlay(db, rows, cols, hlines, sel):
         db.puts(box_y + 2 + hi, box_x + 1, lbl_s[:box_w - 2], pair, attrs)
 
     db.puts(box_y + box_h - 1, box_x + 1,
-            f" {len(hlines)} line(s)   [N]new  [D]del  [E]edit  [`]close"[:box_w - 2],
+            f" {len(hlines)} line(s)   [N]new  [D]del  [O]edit  [`]close"[:box_w - 2],
             C_AXIS, curses.A_DIM)
 
 # ── Draw active trade lines ────────────────────────────────────────────────────
@@ -4358,7 +4771,7 @@ def draw_alert_list_overlay(db, rows, cols, sel):
             db.put(box_y + r, box_x + c, " ", C_HEADER)
 
     # Title
-    title = " Alert List   [N] new  [D] delete  [E] edit  [↑↓] select  [A] close "
+    title = " Alert List   [N] new  [D] delete  [O] edit  [↑↓] select  [A] close "
     db.puts(box_y, box_x, title.center(box_w)[:box_w], C_ALERT,
             curses.A_BOLD | curses.A_REVERSE)
 
@@ -4515,79 +4928,54 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading,
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [
     ("ASSETS & FEED", [
-        ("[E]",        "Enter symbol  (any crypto or stock ticker)"),
-        ("[F]",        "Cycle data feed  (PHEMEX ↔ KRAKEN, crypto only)"),
-        ("[I]",        "Cycle interval   (1m → 3m → 15m → 1H → 4H → 1D)"),
+        ("[E]",        "Enter symbol — any crypto or stock ticker"),
+        ("",           "  ETH/BTC → live Phemex/Kraken WS. Anything else → Yahoo (polled)."),
+        ("[F]",        "Cycle data feed  (PHEMEX ↔ KRAKEN — crypto only, no-op otherwise)"),
+        ("[I]",        "Enter interval — any value, e.g. 45s, 5m, 4h, 1d, 7d, 30d, 1y"),
+        ("",           "  VP/VWAP/ER/BTD only load for intervals of 1h or under."),
     ]),
     ("NAVIGATION", [
-        ("[←] [→]",   "Move cursor 1 candle at a time"),
-        ("[[] []]",   "Move cursor 10 candles at a time"),
-        ("[{] [}]",   "Move cursor 50 candles at a time"),
+        ("[←] [→]",    "Move cursor 1 candle at a time"),
+        ("[[] []]",    "Move cursor 10 candles at a time"),
+        ("[{] [}]",    "Move cursor 50 candles at a time"),
         ("[Shift+←/→]","Move cursor 10 candles (if terminal supports)"),
         ("[Ctrl+←/→]", "Move cursor 50 candles (if terminal supports)"),
-        ("[↑] [↓]",    "Scroll price axis up/down (see levels off-screen)"),
-        ("[Esc]",      "Snap back to live (exit cursor mode + vertical scroll)"),
+        ("[↑] [↓]",    "Scroll price axis up/down — uncapped, reveals levels off-screen"),
         ("[G]",        "Jump to date/time  (YYYY-MM-DD HH:MM or HH:MM)"),
+        ("[Esc]",      "Snap back to live — exits cursor mode AND resets vertical scroll"),
     ]),
     ("CHART DISPLAY", [
         ("[L]",        "Toggle chart mode  (CANDLE ↔ LINE)"),
-        ("[C]",        "Toggle candle colors  (B/W ↔ R/G)"),
+        ("[C]",        "Toggle candle colors  (B/W ↔ R/G) — instant on all platforms"),
         ("[W]",        "Toggle VWAP + standard deviation bands"),
         ("[V]",        "Toggle Volume Profile overlay"),
+        ("[B]",        "Toggle Expected Range overlay (IV-implied daily move)"),
         ("[T]",        "Toggle Big Trade Detector  (volume anomaly circles)"),
+        ("[S]",        "Toggle Sessions indicator  (NDO/Morn/Excl/Lunch/PWR/EOD/EEOD)"),
     ]),
     ("INDICATORS", [
-        ("VWAP",       "Volume Weighted Avg Price (session-anchored 19:00 CT)"),
-        ("+.5s/-.5s",  "±0.5 std dev band (cyan shading)"),
-        ("+2s/-2s",    "±2 std dev lines (yellow)"),
-        ("+2.5s/-2.5s","±2.5 std dev lines (dim yellow)"),
-        ("POC",        "Point of Control (highest volume price, yellow)"),
-        ("VAH/VAL",    "Value Area High/Low (70% of session volume, magenta)"),
-        ("S",          "Period separator (19:00 CT session open)"),
-    ]),
-    ("ALERT CONDITIONS", [
-        ("Price Cross", "Alert when price crosses a set level up or down"),
-        ("Indicator",   "Alert when price touches VWAP/SD/VAH/VAL/POC (no line drawn)"),
-        ("Big Trade",   "Alert on any BTD signal candle close (no line drawn)"),
-        ("Over-Ext Up", "Price >= +2sd AND Big Sell closes (no line drawn)"),
-        ("Over-Ext Dn", "Price <= -2sd AND Big Buy closes (no line drawn)"),
-        ("Auto-delete", "Price cross alerts delete after firing; others persist"),
+        ("VWAP",         "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
+        ("+.5s/-.5s",    "±0.5 std dev band  (cyan shading)"),
+        ("+2s/-2s",      "±2 std dev lines  (yellow)"),
+        ("+2.5s/-2.5s",  "±2.5 std dev lines  (dim yellow)"),
+        ("POC",          "Point of Control — highest-volume price  (yellow)"),
+        ("VAH/VAL",      "Value Area High/Low — 70% of session volume  (magenta)"),
+        ("ER +40%/+80%", "Expected Range soft levels, green  (session open + IV move)"),
+        ("ER -40%/-80%", "Expected Range soft levels, red"),
+        ("ER ±100%",     "Expected Range bound  (bold) — 1-day IV move"),
+        ("ER ±150%",     "Expected Range hard-stop levels  (magenta, bold)"),
+        ("",             "  Crypto IV = live Deribit DVOL. Stocks/other = live CBOE iv30."),
+        ("S",            "Period separator  (19:00 CT session open)"),
     ]),
     ("DRAWINGS", [
         ("[`]",        "Toggle Drawings list (backtick key)"),
-        ("[|]",        "Draw horizontal line (pipe = Shift+backslash)"),
+        ("[|]",        "Draw horizontal line (pipe = Shift+\\), optional alert"),
         ("[\\]",       "Position tool (backslash) — entry/SL/TP lines"),
-        ("[N]",        "New line (when drawings list open)"),
-        ("[D]",        "Delete selected line"),
-        ("[E]",        "Edit selected line"),
-        ("[Z]",        "Clear all trade lines and position tools"),
-    ]),
-    ("EXTRA", [
-        ("VWAP",       "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
-        ("±0.5σ",      "0.5 std dev band  (shaded cyan region around VWAP)"),
-        ("±2σ",        "2 std dev lines   (yellow)"),
-        ("±2.5σ",      "2.5 std dev lines (dim yellow)"),
-        ("POC",        "Point of Control  (highest volume price, yellow)"),
-        ("VAH/VAL",    "Value Area High/Low  (70% of session volume, magenta)"),
-        ("S",          "Period separator  (19:00 CT session open)"),
-    ]),
-    ("SESSIONS & ALERTS", [
-        ("[S]",        "Toggle Sessions indicator (NDO/Morning/Excl/Lunch/PWR/EOD/EEOD)"),
-        ("[A]",        "Open/close Alert list overlay (chart stays live)"),
-        ("[N]",        "New alert (only when alert list is open)"),
-        ("[D]",        "Delete selected alert (only when alert list is open)"),
-        ("[E]",        "Edit selected alert (only when alert list is open)"),
-        ("[.]",        "Dismiss alert popup"),
-        ("[↑][↓]",     "Navigate alert list / drawings list / econ calendar"),
-        ("[Esc]",      "Close calendar / dismiss popup / snap to live"),
-    ]),
-    ("DRAWINGS", [
-        ("[`]",       "Toggle Drawings list (backtick key)"),
-        ("[|]",        "Draw horizontal line (pipe key  Shift+\\)"),
-        ("[N]",        "New line (when drawings list open)"),
-        ("[D]",        "Delete selected line (when drawings list open)"),
-        ("[↑][↓]",     "Navigate drawings list"),
-        ("Line+Alert", "Optional alert created at line price"),
+        ("[N]",        "New line/position (when a list overlay is open)"),
+        ("[D]",        "Delete selected line/alert (when a list overlay is open)"),
+        ("[O]",        "Edit selected line/alert (when a list overlay is open)"),
+        ("[↑][↓]",     "Navigate drawings list / alert list / econ calendar"),
+        ("[Z]",        "Clear all trade lines AND position tools"),
     ]),
     ("POSITION TOOL", [
         ("[\\]",       "Open position tool (backslash key)"),
@@ -4595,26 +4983,38 @@ HELP_SECTIONS = [
         ("SL",         "Defaults to entry - 15 pts"),
         ("TP",         "Defaults to entry + 50 pts"),
         ("Alerts",     "Optional TP/SL alerts auto-created"),
-        ("[Z]",        "Clear all position tools and trade lines"),
+    ]),
+    ("ALERTS", [
+        ("[A]",        "Open/close Alert list overlay (chart stays live)"),
+        ("[N]",        "New alert (only when alert list is open)"),
+        ("[D]",        "Delete selected alert (only when alert list is open)"),
+        ("[O]",        "Edit selected alert (only when alert list is open)"),
+        ("[.]",        "Dismiss alert popup"),
+        ("Price Cross","Alert when price crosses a set level up or down"),
+        ("Indicator",  "Alert when price touches VWAP/SD/VAH/VAL/POC (no line drawn)"),
+        ("Big Trade",  "Alert on any BTD signal candle close (no line drawn)"),
+        ("Over-Ext Up","Price >= +2sd AND Big Sell closes (no line drawn)"),
+        ("Over-Ext Dn","Price <= -2sd AND Big Buy closes (no line drawn)"),
+        ("Auto-delete","Price cross alerts delete after firing; others persist"),
     ]),
     ("ECONOMIC CALENDAR", [
         ("[K]",        "Open/close Economic Calendar  (US events)"),
-        ("[R]",        "Refresh data (when calendar open)"),
         ("[Y]",        "Switch to Yesterday events"),
-        ("[T]",        "Switch to Today events  (default)"),
-        ("[N]ext",     "Switch to Tomorrow events"),
-        ("[W]eek",     "Switch to This Week events"),
+        ("[T]",        "Switch to Today events  (default) — [T] toggles BTD when closed"),
+        ("[N]",        "Switch to Tomorrow events — [N] is New line/alert when closed"),
+        ("[W]",        "Switch to This Week events — [W] toggles VWAP when closed"),
+        ("[R]",        "Refresh data (when calendar open)"),
         ("[1][2][3]",  "Toggle * / ** / *** impact filter"),
         ("[↑][↓]",     "Scroll event list"),
         ("[P]",        "Screenshot of calendar"),
     ]),
-    ("TRADING  [X]", [
+    ("TRADING", [
         ("[X]",        "Open trade dialog (Buy/Sell Market or Limit)"),
-        ("[Z]",        "Clear all trade lines from chart"),
         ("Sizes",      "Enter Phemex contracts + XLTRADE lots"),
         ("SL/TP",      "Enter as points or exact price"),
         ("Submit",     "Runs copycat.py — lines appear on chart immediately"),
         ("Monitor",    "Trade lines auto-update from Phemex position data"),
+        ("[Z]",        "Clear all trade lines AND position tools"),
     ]),
     ("GLOBAL / MACRO MODE", [
         ("[M]",        "Toggle Global performance chart (all 8 assets vs BTC baseline)"),
@@ -4623,9 +5023,9 @@ HELP_SECTIONS = [
     ]),
     ("UTILITIES", [
         ("[P]",        "Screenshot → screenshots/quantasset_YYYYMMDD_HHMMSS.txt"),
-        ("[G]",        "Jump to date/time  (opens input box, YYYY-MM-DD HH:MM or HH:MM)"),
+        ("[U]",        "Save chart state — hlines, position tools, alerts → chart_state.json"),
         ("[H] / [?]",  "Toggle this help box"),
-        ("[Q]",        "Quit ChartHacker"),
+        ("[Q]",        "Quit ChartHacker  (prompts to save unsaved changes)"),
     ]),
 ]
 
@@ -5241,6 +5641,7 @@ def main(stdscr):
     threading.Thread(target=start_feed, args=(state.asset,), daemon=True).start()
     threading.Thread(target=alert_monitor, daemon=True).start()
     threading.Thread(target=_bg_ticker_loop, daemon=True).start()
+    threading.Thread(target=iv_monitor_loop, daemon=True).start()
     threading.Thread(target=check_open_position_on_startup, daemon=True).start()
     # Start trade monitor immediately — auto-plots any existing positions/orders
     if PHEMEX_API_KEY:
@@ -5267,7 +5668,7 @@ def main(stdscr):
             keys = [-1]   # no input — still run draw/refresh
 
         restart_feed = False
-        new_interval_idx = -1
+        new_interval_secs = -1
 
         for key in keys:
             if key == curses.KEY_RESIZE:
@@ -5298,7 +5699,10 @@ def main(stdscr):
                 idx      = FEEDS.index(state.feed)
                 new_feed = FEEDS[(idx + 1) % len(FEEDS)]
             elif key in (ord("i"), ord("I")):
-                new_interval_idx = (state.interval_idx + 1) % len(INTERVALS)
+                _entered_ivl = interval_dialog(stdscr, rows, cols)
+                db.prev = None
+                if _entered_ivl is not None and _entered_ivl != state.interval_secs:
+                    new_interval_secs = _entered_ivl
             elif key in (ord("c"), ord("C")):
                 with state.lock:
                     state.color_scheme = "rg" if state.color_scheme == "bw" else "bw"
@@ -5310,6 +5714,10 @@ def main(stdscr):
             elif key in (ord("v"), ord("V")):
                 with state.lock:
                     state.show_vp = not state.show_vp
+                db.prev = None
+            elif key in (ord("b"), ord("B")):
+                with state.lock:
+                    state.show_er = not state.show_er
                 db.prev = None
             elif key in (ord("w"), ord("W")):
                 with state.lock:
@@ -5480,7 +5888,11 @@ def main(stdscr):
                         if not state.alerts:
                             state.alert_triggered = []
                             state.show_alert_popup = False
-            elif key in (ord("e"), ord("E")):
+            elif key in (ord("o"), ord("O")):
+                # Edit selected line/alert. NOTE: was previously bound to
+                # [E], but [E] now always opens the Symbol dialog first in
+                # this same elif chain, which made this branch permanently
+                # unreachable dead code — rebound to [O] to actually work.
                 with state.lock:
                     _hl_edit_open = state.show_hline_list
                     _hl_edit_sel  = state.hline_sel
@@ -5504,7 +5916,7 @@ def main(stdscr):
                             if 0 <= _sel < len(state.alerts):
                                 state.alerts[_sel] = _edited
                     db.prev = None
-                    
+
             elif key in (ord("k"), ord("K")):
                 with state.lock:
                     state.show_econ_cal = not state.show_econ_cal
@@ -5594,7 +6006,8 @@ def main(stdscr):
                     elif not state.global_mode:
                         # No overlay open — vertical chart scroll (pan the
                         # price window up to reveal levels above the candles).
-                        state.vert_offset = min(20, state.vert_offset + 1)
+                        # Uncapped — keeps panning as far as the user scrolls.
+                        state.vert_offset = state.vert_offset + 1
                 db.prev = None
             elif key == curses.KEY_DOWN:
                 with state.lock:
@@ -5609,7 +6022,7 @@ def main(stdscr):
                     elif state.show_econ_cal:
                         state.econ_scroll = state.econ_scroll + 1
                     elif not state.global_mode:
-                        state.vert_offset = max(-20, state.vert_offset - 1)
+                        state.vert_offset = state.vert_offset - 1
                 db.prev = None
             elif key in (curses.KEY_LEFT,
                           curses.KEY_SLEFT,   # Shift+Left (most terminals)
@@ -5700,8 +6113,8 @@ def main(stdscr):
             if new_feed:
                 state.feed = new_feed
                 restart_feed = True
-            if new_interval_idx >= 0:
-                state.interval_idx = new_interval_idx
+            if new_interval_secs >= 0:
+                state.interval_secs = new_interval_secs
                 restart_feed = True
 
         if restart_feed:

@@ -165,6 +165,7 @@ C_SESS_EXCL = 33   # Exclusion   09:00-10:00  red (Wed/Thu)
 C_SESS_LUNCH= 34   # Lunchtime   11:30-13:30  yellow
 C_SESS_PWR  = 35   # Power Hour  14:00-15:00  magenta
 C_SESS_EOD  = 36   # EEOD        18:30-00:00  red (non-tradable)
+C_SESS_CLOSE= 42   # EOD         16:00-18:00  green
 # Alert color
 C_ALERT     = 37   # alert box / triggered
 C_VWAP      = 16   # VWAP line
@@ -1071,6 +1072,7 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_SESS_LUNCH,curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_SESS_PWR,  curses.COLOR_MAGENTA, -1)
     curses.init_pair(C_SESS_EOD,  curses.COLOR_RED,     -1)
+    curses.init_pair(C_SESS_CLOSE,curses.COLOR_GREEN,   -1)
     curses.init_pair(C_ALERT,     curses.COLOR_YELLOW,  curses.COLOR_RED)
     curses.init_pair(C_VWAP,      curses.COLOR_WHITE,  -1)
     curses.init_pair(C_VWAP_BAND, curses.COLOR_CYAN,   -1)
@@ -1711,6 +1713,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         ("Morn",  8*60+30, 10*60+30, C_SESS_MORN, None),
         ("Lunch", 11*60+30,13*60+30, C_SESS_LUNCH,None),
         ("PWR",   14*60,   15*60,   C_SESS_PWR,  None),
+        ("EOD",   16*60,   18*60,   C_SESS_CLOSE,None),
         ("EEOD",  18*60+30,23*60+59, C_SESS_EOD,  None),   # non-tradable
     ]
     _cur_sess_lbl  = ""
@@ -2183,6 +2186,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             ("Excl",  (9,  0), (10, 0), C_SESS_EXCL,  [2, 3]),
             ("Lunch", (11,30), (13,30), C_SESS_LUNCH,  None),
             ("PWR",   (14, 0), (15, 0), C_SESS_PWR,   None),
+            ("EOD",   (16, 0), (18, 0), C_SESS_CLOSE, None),
             ("EEOD",  (18,30), (23,59), C_SESS_EOD,   None),
         ]
         _sc_sess = chart_r - n_vis
@@ -4568,7 +4572,7 @@ HELP_SECTIONS = [
         ("S",          "Period separator  (19:00 CT session open)"),
     ]),
     ("SESSIONS & ALERTS", [
-        ("[S]",        "Toggle Sessions indicator (NDO/Morning/Excl/Lunch/PWR/EOD)"),
+        ("[S]",        "Toggle Sessions indicator (NDO/Morning/Excl/Lunch/PWR/EOD/EEOD)"),
         ("[A]",        "Open/close Alert list overlay (chart stays live)"),
         ("[N]",        "New alert (only when alert list is open)"),
         ("[D]",        "Delete selected alert (only when alert list is open)"),

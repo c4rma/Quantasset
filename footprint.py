@@ -1786,6 +1786,33 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
     half = plot_h // 2
     top_group = group_center + half
     bot_group = top_group - plot_h + 1
+
+    if vfollow_price and last_price is not None and hscroll_bars == 0:
+        # The midpoint-of-visible-levels centering above can still leave
+        # the live price OUTSIDE the window during a fast, sustained
+        # multi-bar move: no single bar is "outsized" (group_size above
+        # only widens for one genuinely oversized candle), but the
+        # combined span across all visible bars can still be taller than
+        # plot_h. AT THE LIVE EDGE specifically (hscroll_bars == 0 — NOT
+        # just vfollow_price, which stays True even scrolled back into
+        # history, deliberately centering on whatever old bars are
+        # visible rather than chasing a live price that isn't even in
+        # view there — see the regression test for that), the live price
+        # must always be on screen — shift the window just enough to
+        # bring it back in (rather than lose it), even if that pushes the
+        # oldest visible bars off the opposite edge. No-op in the common
+        # case where the live price already falls inside the computed
+        # window.
+        live_group_now = round(last_price / TICK) // group_size
+        if live_group_now > top_group:
+            shift = live_group_now - top_group
+            top_group += shift
+            bot_group += shift
+        elif live_group_now < bot_group:
+            shift = bot_group - live_group_now
+            top_group -= shift
+            bot_group -= shift
+
     row_groups = list(range(top_group, bot_group - 1, -1))
     group_to_row = {g: r_i for r_i, g in enumerate(row_groups)}
 

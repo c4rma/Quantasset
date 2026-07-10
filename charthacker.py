@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Quantasset Terminal Chart
-TradingView-style terminal charting for ETH and BTC
-Feeds: Phemex REST + WebSocket (hedged USDT perps)  [default, IP-bound]
-       Kraken  REST + WebSocket v2 (USD pairs)       [use on Termux / non-whitelisted IPs]
-Switch feeds live with [F]. Auth: reads PHEMEX_API_KEY / PHEMEX_API_SECRET from .env.
+TradingView-style terminal charting for any crypto or stock symbol
+Feeds: Phemex REST + WebSocket (hedged USDT perps, ETH/BTC only) [default, IP-bound]
+       Kraken  REST + WebSocket v2 (USD pairs, ETH/BTC only)     [use on Termux / non-whitelisted IPs]
+       Yahoo Finance REST polling (any other symbol — stocks, indices, ETFs, other crypto)
+Enter any symbol with [E]. Switch Phemex/Kraken live with [F] (crypto only).
+Auth: reads PHEMEX_API_KEY / PHEMEX_API_SECRET from .env.
 Flicker-free double-buffer curses rendering
 """
 
@@ -219,6 +221,10 @@ class ChartState:
         self.cursor_offset    = 0   # keep for compat, unused now
         self.view_offset      = 0   # pan: candles hidden on right
         self.cursor_col_idx   = -1  # -1 = no cursor (live mode)
+        self.vert_offset      = 0   # vertical pan: +N/-N step counts, shifts the
+                                     # auto-scaled price window up/down so bands,
+                                     # VP levels, hlines etc. above/below the
+                                     # candle range become visible ([↑]/[↓])
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
         self.show_vp       = True    # volume profile overlay toggle
         self.show_vwap    = True    # VWAP + SD bands overlay toggle
@@ -369,6 +375,174 @@ def fetch_kraken(asset: str, before_ts: int = 0) -> list:
         with state.lock:
             state.error = f"Kraken REST: {type(e).__name__}: {str(e)[:40]}"
         return []
+
+# ── Yahoo Finance feed (any symbol not in PHEMEX_SYMBOLS) ──────────────────────
+# Phemex/Kraken only ever listed ETH and BTC here. Any other ticker — a stock,
+# an index, an ETF, or a crypto pair Phemex doesn't carry — routes through
+# Yahoo's free v8 chart REST endpoint instead. No auth, no WS: candles are
+# fetched via REST and "live" is simulated by polling (see ws_yahoo below).
+_YAHOO_BAR_SECS = {"1m": 60, "2m": 120, "5m": 300, "15m": 900, "60m": 3600, "1d": 86400}
+
+def _yahoo_resolution_params(resolution: int) -> tuple:
+    """Map ChartHacker resolution (sec) → Yahoo (interval, usable range)."""
+    if resolution <= 60:    return "1m", "7d"      # 1m only goes back ~7d on Yahoo
+    if resolution <= 180:   return "2m", "60d"
+    if resolution <= 300:   return "5m", "60d"
+    if resolution <= 900:   return "15m", "60d"
+    if resolution <= 3600:  return "60m", "730d"
+    if resolution <= 14400: return "60m", "730d"
+    return "1d", "max"
+
+def is_crypto_symbol(asset: str) -> bool:
+    """True for symbols with a live Phemex/Kraken feed (ETH, BTC). Anything
+    else — stocks, indices, ETFs, other crypto pairs — goes through Yahoo."""
+    return asset in PHEMEX_SYMBOLS
+
+def fetch_yahoo(asset: str, before_ts: int = 0) -> list:
+    """
+    Fetch candles for a non-Phemex symbol from Yahoo's v8 chart endpoint.
+    Yahoo can't page arbitrarily far back — before_ts just filters the widest
+    available window rather than requesting an explicit older slice, so
+    preload/scroll-back naturally stops once that window is exhausted.
+
+    includePrePost=true so the candle set matches TradingView's default
+    "Extended Trading Hours" session — leaving this false silently drops all
+    pre-market/after-hours candles, which understates volume and skews
+    session-based indicators (Volume Profile POC/VAH/VAL, session VWAP) for
+    the still-forming current session specifically, since a fully-closed
+    prior session's RTH-only total still roughly tracks its ETH total while
+    a live partial session is much more sensitive to what's missing.
+    """
+    resolution     = cur_resolution()
+    interval, rng  = _yahoo_resolution_params(resolution)
+    url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{asset}"
+    params = {"interval": interval, "range": rng, "includePrePost": "true"}
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                          params=params, timeout=12)
+        data   = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            with state.lock:
+                state.error = f"Yahoo: no data for {asset}"
+            return []
+        chart  = result[0]
+        ts     = chart.get("timestamp", []) or []
+        q      = (chart.get("indicators", {}).get("quote", [{}]) or [{}])[0]
+        opens  = q.get("open",   []) or []
+        highs  = q.get("high",   []) or []
+        lows   = q.get("low",    []) or []
+        closes = q.get("close",  []) or []
+        vols   = q.get("volume", []) or []
+        candles = []
+        for i, t in enumerate(ts):
+            o = opens[i]  if i < len(opens)  else None
+            h = highs[i]  if i < len(highs)  else None
+            l = lows[i]   if i < len(lows)   else None
+            c = closes[i] if i < len(closes) else None
+            v = vols[i]   if i < len(vols)   else 0
+            if None in (o, h, l, c):
+                continue
+            candles.append(Candle(ts=t, o=o, h=h, l=l, c=c, v=v or 0, closed=True))
+        if before_ts:
+            candles = [c for c in candles if c.ts < before_ts]
+        with state.lock:
+            state.error = ""
+        return candles
+    except Exception as e:
+        with state.lock:
+            state.error = f"Yahoo REST: {type(e).__name__}: {str(e)[:40]}"
+        return []
+
+def fetch_candles(asset: str, feed: str, before_ts: int = 0) -> list:
+    """Single dispatch point for history fetches — routes ETH/BTC through
+    Phemex/Kraken as before, anything else through Yahoo."""
+    if not is_crypto_symbol(asset):
+        return fetch_yahoo(asset, before_ts=before_ts)
+    return (fetch_kraken(asset, before_ts=before_ts) if feed == "kraken"
+            else fetch_phemex(asset, before_ts=before_ts))
+
+def ws_yahoo(asset: str, session: int):
+    """
+    Poll-based "live" feed for non-Phemex symbols — applies the same
+    state.candles/state.live contract as ws_phemex/ws_kraken so the rest of
+    the app doesn't need to know the feed type.
+
+    Yahoo never populates the still-forming bar with real OHLCV — that slot
+    stays null until the bar closes. Instead it appends a trailing real-time
+    quote tick (o=h=l=c=last trade price, v=0) stamped to the actual poll
+    time, not the bar grid. That tick is snapped onto its bar boundary and
+    aggregated into our own developing candle (open=first tick this bar,
+    high/low=running extremes, close=latest) so it renders as a normal
+    forming candle instead of a new degenerate bar every poll. Once Yahoo
+    publishes the authoritative aligned bar for that timestamp, it supersedes
+    the approximation.
+    """
+    POLL_SECS = 5
+
+    def stale() -> bool:
+        return state.session != session
+
+    resolution      = cur_resolution()
+    interval, _rng  = _yahoo_resolution_params(resolution)
+    bar_secs        = _YAHOO_BAR_SECS.get(interval, resolution)
+
+    with state.lock:
+        if stale(): return
+        last_aligned_ts = state.candles[-1].ts if state.candles else 0
+        state.status    = "Live"
+        state.error     = ""
+
+    while not stale():
+        try:
+            fresh = fetch_yahoo(asset)
+        except Exception:
+            fresh = []
+
+        if stale():
+            return
+
+        if not fresh:
+            with state.lock:
+                if not stale():
+                    state.status = "Reconnecting..."
+        else:
+            tick = None
+            if fresh[-1].ts % bar_secs != 0:
+                tick = fresh.pop()
+
+            with state.lock:
+                if stale(): return
+                new_aligned = [c for c in fresh if c.ts > last_aligned_ts]
+                for c in new_aligned:
+                    if state.candles and state.candles[-1].ts == c.ts:
+                        state.candles[-1] = c
+                    else:
+                        state.candles.append(c)
+                if new_aligned:
+                    last_aligned_ts = new_aligned[-1].ts
+                    state.live = None
+
+                if tick is not None:
+                    bucket = tick.ts - (tick.ts % bar_secs)
+                    if bucket > last_aligned_ts:
+                        if state.live is None or state.live.ts != bucket:
+                            state.live = Candle(ts=bucket, o=tick.c, h=tick.c,
+                                                 l=tick.c, c=tick.c, v=0, closed=False)
+                        else:
+                            state.live.h = max(state.live.h, tick.c)
+                            state.live.l = min(state.live.l, tick.c)
+                            state.live.c = tick.c
+                        state.last_price = tick.c
+                elif state.candles:
+                    state.last_price = state.candles[-1].c
+                state.status = "Live"
+                state.error  = ""
+
+        for _ in range(POLL_SECS):
+            if stale():
+                return
+            time.sleep(1)
 
 # ── Kraken WebSocket v2 ────────────────────────────────────────────────────────
 def ws_kraken(asset: str, session: int):
@@ -663,8 +837,10 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
         state.live          = None
         state.last_price    = 0.0
         state.history_loading = False
+        state.vert_offset    = 0   # new symbol/interval/feed — stale vertical
+                                    # pan could be nonsensical at a new scale
 
-    candles = fetch_kraken(asset) if my_feed == "kraken" else fetch_phemex(asset)
+    candles = fetch_candles(asset, my_feed)
 
     with state.lock:
         if state.session != my_session:
@@ -675,7 +851,10 @@ def start_feed(asset: str, feed: str = "", interval_idx: int = -1):
             state.last_price = candles[-1].c
         state.status = "Connecting..." if candles else "REST failed"
 
-    ws_fn = ws_kraken if my_feed == "kraken" else ws_phemex
+    if not is_crypto_symbol(asset):
+        ws_fn = ws_yahoo
+    else:
+        ws_fn = ws_kraken if my_feed == "kraken" else ws_phemex
     t = threading.Thread(target=ws_fn, args=(asset, my_session), daemon=True)
     t.start()
     state.ws_thread = t
@@ -719,9 +898,7 @@ def preload_500(session: int):
         with state.lock:
             state.error = f"Preloading... {n}/{TARGET}"
 
-        candles = (fetch_kraken(asset, before_ts=oldest_ts)
-                   if my_feed == "kraken"
-                   else fetch_phemex(asset, before_ts=oldest_ts))
+        candles = fetch_candles(asset, my_feed, before_ts=oldest_ts)
         candles = [c for c in candles if c.ts < oldest_ts]
         if not candles:
             break
@@ -782,9 +959,7 @@ def preload_48h(session: int):
             if state.session == session:
                 state.error = f"Preloading 48h... {pct}%"
 
-        candles = (fetch_kraken(asset, before_ts=oldest_ts)
-                   if my_feed == "kraken"
-                   else fetch_phemex(asset, before_ts=oldest_ts))
+        candles = fetch_candles(asset, my_feed, before_ts=oldest_ts)
 
         candles = [c for c in candles if c.ts < oldest_ts]
         if not candles:
@@ -821,9 +996,7 @@ def fetch_history_before(session: int):
         my_feed   = state.feed
         asset     = state.asset
 
-    candles = (fetch_kraken(asset, before_ts=oldest_ts)
-               if my_feed == "kraken"
-               else fetch_phemex(asset, before_ts=oldest_ts))
+    candles = fetch_candles(asset, my_feed, before_ts=oldest_ts)
 
     # Filter to only truly older candles
     candles = [c for c in candles if c.ts < oldest_ts]
@@ -904,8 +1077,16 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_VWAP_SD2,  curses.COLOR_YELLOW, -1)
 
 # ── formatting ────────────────────────────────────────────────────────────────
-def price_fmt(p: float, asset: str) -> str:
-    return f"{p:,.1f}" if asset == "BTC" else f"{p:,.2f}"
+def price_fmt(p: float, asset: str = "") -> str:
+    """Magnitude-adaptive decimal places so arbitrary symbols (penny stocks,
+    micro-cap alts, high-priced indices) all display sensibly — not just the
+    two hardcoded ETH/BTC cases this used to special-case. `asset` kept for
+    call-site compatibility but no longer used."""
+    ap = abs(p)
+    if ap >= 10_000: return f"{p:,.1f}"
+    if ap >= 1:       return f"{p:,.2f}"
+    if ap >= 0.01:    return f"{p:,.4f}"
+    return f"{p:,.6f}"
 
 def vol_fmt(v: float) -> str:
     if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
@@ -1429,6 +1610,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     with state.lock:
         view_offset    = state.view_offset
         cursor_col_idx = state.cursor_col_idx
+        vert_offset    = state.vert_offset
 
     # Clamp view_offset so we never go past the oldest candle
     view_offset = max(0, min(n_all - 1, view_offset))
@@ -1477,6 +1659,15 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         pad  = max(span * 0.05, hi_p * 0.0005)
         lo_p -= pad
         hi_p += pad
+        if vert_offset:
+            # Vertical scroll ([↑]/[↓]): pan the auto-scaled window up/down by
+            # a fraction of its own span per step, WITHOUT changing its size —
+            # this reveals indicator levels (VWAP bands, VP, hlines, alerts)
+            # that sit above/below the candles' own high/low range, since
+            # every overlay below reuses this same lo_p/hi_p via p2r().
+            _shift = vert_offset * (hi_p - lo_p) * 0.15
+            lo_p += _shift
+            hi_p += _shift
     else:
         lo_p, hi_p = 0.0, 1.0
 
@@ -1492,7 +1683,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     db.puts(0, 2, "Q U A N T A S S E T  |  ChartHacker", C_HEADER, curses.A_BOLD)
 
-    badge = f" {feed.upper()} "
+    badge = f" {feed.upper() if is_crypto_symbol(asset) else 'YAHOO'} "
     db.puts(0, cols - len(badge) - 22, badge, C_ASSET_SEL, curses.A_BOLD)
 
     now_str = datetime.now().strftime("%m/%d/%Y  %H:%M:%S")
@@ -1506,10 +1697,9 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             bull_pair() if status == "Live" else bear_pair(), curses.A_BOLD)
 
     col = 2
-    for a in ("ETH", "BTC"):
-        lbl = f" {a}/USDT "
-        db.puts(1, col, lbl, C_ASSET_SEL if a == asset else C_HEADER, curses.A_BOLD)
-        col += len(lbl) + 1
+    sym_lbl = f" {asset}/USDT " if is_crypto_symbol(asset) else f" {asset} "
+    db.puts(1, col, sym_lbl, C_ASSET_SEL, curses.A_BOLD)
+    col += len(sym_lbl) + 1
 
     # Current session badge — shows which session is active right now
     _now_h = datetime.now()
@@ -1541,7 +1731,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 curses.A_BOLD | curses.A_REVERSE)
         col += 14
 
-    db.puts(1, col + 1, f"[E]TH  [B]TC  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [Esc]live  [P]shot  [U]save  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -1755,31 +1945,6 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             lbl = f"{label}{label_suffix} {price_fmt(price, asset)}"
             db.puts(row, chart_r + 1, f"{lbl:<{PRICE_W}}", pair, attrs)
 
-        def virgin_line(price, char, pair, attrs, label,
-                        start_col, candles_after, col_offset):
-            """
-            Draw a virgin level: extends from start_col rightward until
-            a candle's high/low trades through the price level.
-            """
-            row = chart_top + price_to_row(price)
-            if not (chart_top <= row < chart_bot): return
-            end_col = chart_r  # default: extend to right edge
-            for j, c in enumerate(candles_after):
-                col = col_offset + j
-                if col < 0 or col >= chart_r: continue
-                # Level is "touched" when candle high crosses above or low crosses below
-                if c.h >= price >= c.l:
-                    end_col = col
-                    break
-            for c2 in range(max(0, start_col), min(chart_r, end_col + 1)):
-                if db.buf[row][c2][0] in (" ", ".", "-"):
-                    db.put(row, c2, char, pair, attrs)
-            # Axis label only if line reaches right edge (still virgin)
-            if end_col >= chart_r - 1:
-                db.puts(row, chart_r, "+", pair, attrs)
-                lbl = f"p{label} {price_fmt(price, asset)}"
-                db.puts(row, chart_r + 1, f"{lbl:<{PRICE_W}}", pair, attrs)
-
         # ── Compute session column boundaries in visible window ───────────────
         start_col_base = chart_r - n_vis   # column of oldest visible candle
 
@@ -1796,10 +1961,6 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             if _vc.ts >= _curr_start:
                 curr_col_start = start_col_base + _i
                 break
-
-        # Candles in visible[] belonging to the current session
-        curr_vis_candles = [c for c in visible if c.ts >= _curr_start]
-        curr_col_offset  = chart_r - len(curr_vis_candles)
 
         # ── PREVIOUS SESSION VP ───────────────────────────────────────────────
         prev_result = compute_vp(prev_sess_candles)
@@ -1822,14 +1983,6 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                                 min(chart_r, curr_col_start)):
                     if db.buf[_row][c2][0] in (" ", ".", "-", _ch):
                         db.put(_row, c2, _ch, _pr, curses.A_DIM)
-
-            # Virgin POC/VAH/VAL — extend from curr session start until touched
-            virgin_line(p_poc, "=", C_VP_POC, curses.A_DIM,
-                        "POC", curr_col_start, curr_vis_candles, curr_col_offset)
-            virgin_line(p_vah, "~", C_VP_VA, curses.A_DIM,
-                        "VAH", curr_col_start, curr_vis_candles, curr_col_offset)
-            virgin_line(p_val, "~", C_VP_VA, curses.A_DIM,
-                        "VAL", curr_col_start, curr_vis_candles, curr_col_offset)
 
         # ── HISTORICAL SESSIONS VP (older than prev session) ─────────────────
         # Draw each historical session's profile anchored to its own start col.
@@ -2444,9 +2597,14 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         btd_tag  = "T:ON" if show_btd else "T:OFF"
         sess_tag = "S:ON" if show_sessions else "S:OFF"
         n_alerts = len(state.alerts)
-        footer   = (f" [E] ETH  [B] BTC  [F] Feed: {feed.upper()}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [U] Save  [Q] Quit"
-                    f"   {len(all_candles)} candles  sess:{_n_sess}  {feed.upper()}{auth_tag}{cinfo}{err_str}{hist_tag}")
+        _feed_tag  = feed.upper() if is_crypto_symbol(asset) else "YAHOO"
+        _scr_tag   = f"  [SCROLLED {vert_offset:+d}, Esc to reset]" if vert_offset else ""
+        footer   = (f" [E] Symbol  [F] Feed: {_feed_tag}  [C] {scheme_tag}  [I] {ivl_label}  [L] {mode_tag}  [W] {vwap_tag}  [V] {vp_tag}  [T] {btd_tag}  [S] {sess_tag}  [A] {n_alerts}alrt  [U] Save  [Q] Quit"
+                    f"   {len(all_candles)} candles  sess:{_n_sess}  {_feed_tag}{auth_tag}{cinfo}{err_str}{hist_tag}{_scr_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], C_AXIS)
+        if vert_offset:
+            db.puts(footer_row, len(footer) - len(_scr_tag), _scr_tag,
+                    C_CURSOR, curses.A_BOLD)
 
     # Alert evaluation runs in alert_monitor() background thread
     # ── ALERT OVERLAY ────────────────────────────────────────────────────────
@@ -2583,7 +2741,7 @@ def jump_to_dialog(stdscr, db: "DoubleBuffer", rows: int, cols: int) -> str:
         try:
             ch = stdscr.get_wch()
         except Exception:
-            break
+            continue
         if isinstance(ch, str):
             code = ord(ch)
         else:
@@ -2610,6 +2768,110 @@ def jump_to_dialog(stdscr, db: "DoubleBuffer", rows: int, cols: int) -> str:
     curses.curs_set(0)
     stdscr.timeout(50)
     return "".join(input_buf).strip()
+
+
+def _collect_symbol_input(stdscr, rows: int, cols: int, error_msg: str = "") -> str:
+    """One raw-input pass for the symbol box — factored out of symbol_dialog
+    so a failed validation can redraw the box with an error line and loop
+    back into input without duplicating the box-drawing/key-collection code."""
+    prompt = " Symbol (crypto or stock, e.g. ETH, AAPL, TSLA):  "
+    box_w  = max(len(prompt) + 16, 50)
+    box_h  = 4 if error_msg else 3
+    box_y  = rows // 2 - box_h // 2
+    box_x  = max(0, cols // 2 - box_w // 2)
+
+    curses.curs_set(1)
+    curses.echo()
+    stdscr.nodelay(False)
+
+    for r in range(box_h):
+        stdscr.addstr(box_y + r, box_x,
+                      " " * min(box_w, cols - box_x),
+                      curses.color_pair(C_CURSOR) | curses.A_BOLD)
+    stdscr.addstr(box_y + 1, box_x, prompt,
+                  curses.color_pair(C_CURSOR) | curses.A_BOLD)
+    if error_msg:
+        stdscr.addstr(box_y + 2, box_x, f" {error_msg}"[:box_w],
+                      curses.color_pair(C_SESS_EXCL) | curses.A_BOLD)
+    stdscr.refresh()
+
+    input_buf = []
+    input_x   = box_x + len(prompt)
+    while True:
+        try:
+            ch = stdscr.get_wch()
+        except Exception:
+            continue
+        code = ord(ch) if isinstance(ch, str) else ch
+        if code in (27,):                         # Escape — cancel
+            input_buf = []
+            break
+        elif code in (10, 13, curses.KEY_ENTER):   # Enter — confirm
+            break
+        elif code in (curses.KEY_BACKSPACE, 127, 8):
+            if input_buf:
+                input_buf.pop()
+                stdscr.addstr(box_y + 1, input_x + len(input_buf), " ",
+                              curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        elif 32 <= code <= 126 and len(input_buf) < 15:
+            input_buf.append(chr(code).upper())
+            stdscr.addstr(box_y + 1, input_x + len(input_buf) - 1,
+                          chr(code).upper(), curses.color_pair(C_CURSOR) | curses.A_BOLD)
+        stdscr.refresh()
+
+    curses.noecho()
+    curses.curs_set(0)
+    return "".join(input_buf).strip()
+
+
+def symbol_dialog(stdscr, rows: int, cols: int) -> str:
+    """
+    Prompt for any ticker symbol (crypto or stock) and return it validated,
+    or "" if the user cancelled with Escape. ETH/BTC are always valid
+    (native Phemex/Kraken feed); anything else is checked with a quick Yahoo
+    Finance probe so a typo doesn't silently switch to a dead chart — on a
+    miss, the box redraws with an error and the user can retry or cancel.
+    """
+    error_msg = ""
+    while True:
+        raw = _collect_symbol_input(stdscr, rows, cols, error_msg)
+        if not raw:
+            stdscr.timeout(50)
+            return ""
+
+        if raw in PHEMEX_SYMBOLS:
+            stdscr.timeout(50)
+            return raw
+
+        # Non-crypto (or crypto Phemex doesn't list) — probe Yahoo before
+        # committing, since a bad symbol would otherwise switch the chart to
+        # a permanently empty feed.
+        box_w = max(len(" Symbol (crypto or stock, e.g. ETH, AAPL, TSLA):  ") + 16, 50)
+        box_y = rows // 2 - 1
+        box_x = max(0, cols // 2 - box_w // 2)
+        try:
+            stdscr.addstr(box_y + 2, box_x, " Checking symbol..."[:box_w],
+                          curses.color_pair(C_LABEL) | curses.A_DIM)
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+        try:
+            probe = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{raw}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                params={"interval": "1d", "range": "5d"},
+                timeout=10,
+            )
+            result = probe.json().get("chart", {}).get("result", [])
+            found  = bool(result and result[0].get("timestamp"))
+        except Exception:
+            found = False
+
+        if found:
+            stdscr.timeout(50)
+            return raw
+        error_msg = f"'{raw}' not found — try again or Esc to cancel"
 
 
 def parse_jump_target(s: str) -> int:
@@ -2673,9 +2935,7 @@ def jump_to_ts(target_ts: int, session: int):
             # Need to fetch older data
             with state.lock:
                 state.error = f"Fetching history..."
-            new_c = (fetch_kraken(asset, before_ts=oldest)
-                     if my_feed == "kraken"
-                     else fetch_phemex(asset, before_ts=oldest))
+            new_c = fetch_candles(asset, my_feed, before_ts=oldest)
             new_c = [c for c in new_c if c.ts < oldest]
             if not new_c:
                 break
@@ -3573,9 +3833,17 @@ def trade_monitor_loop():
     while True:
         time.sleep(3)
 
-        try:
-            sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
+        sym = PHEMEX_SYMBOLS.get(state.asset)
+        if sym is None:
+            # Currently-viewed symbol isn't Phemex-tradeable (a stock or a
+            # crypto pair Phemex doesn't list) — nothing to monitor here.
+            # Drop monitor-created lines so a stale ETH/BTC position doesn't
+            # linger drawn on an unrelated chart; keep manually-drawn ones.
+            with state.lock:
+                state.trade_lines = [tl for tl in state.trade_lines if not tl.get("_id")]
+            continue
 
+        try:
             # ── Fetch open positions ───────────────────────────────────────────
             path_  = "/g-accounts/accountPositions"
             query_ = "currency=USDT"
@@ -4243,9 +4511,8 @@ def draw_econ_cal_overlay(db, rows, cols, events, loading,
 # ── help dialog ───────────────────────────────────────────────────────────────
 HELP_SECTIONS = [
     ("ASSETS & FEED", [
-        ("[E]",        "Switch to ETH/USDT"),
-        ("[B]",        "Switch to BTC/USDT"),
-        ("[F]",        "Cycle data feed  (PHEMEX ↔ KRAKEN)"),
+        ("[E]",        "Enter symbol  (any crypto or stock ticker)"),
+        ("[F]",        "Cycle data feed  (PHEMEX ↔ KRAKEN, crypto only)"),
         ("[I]",        "Cycle interval   (1m → 3m → 15m → 1H → 4H → 1D)"),
     ]),
     ("NAVIGATION", [
@@ -4254,7 +4521,8 @@ HELP_SECTIONS = [
         ("[{] [}]",   "Move cursor 50 candles at a time"),
         ("[Shift+←/→]","Move cursor 10 candles (if terminal supports)"),
         ("[Ctrl+←/→]", "Move cursor 50 candles (if terminal supports)"),
-        ("[Esc]",      "Snap back to live (exit cursor mode)"),
+        ("[↑] [↓]",    "Scroll price axis up/down (see levels off-screen)"),
+        ("[Esc]",      "Snap back to live (exit cursor mode + vertical scroll)"),
         ("[G]",        "Jump to date/time  (YYYY-MM-DD HH:MM or HH:MM)"),
     ]),
     ("CHART DISPLAY", [
@@ -4271,7 +4539,6 @@ HELP_SECTIONS = [
         ("+2.5s/-2.5s","±2.5 std dev lines (dim yellow)"),
         ("POC",        "Point of Control (highest volume price, yellow)"),
         ("VAH/VAL",    "Value Area High/Low (70% of session volume, magenta)"),
-        ("pPOC/pVAH/pVAL","Previous session levels — extend as virgin lines"),
         ("S",          "Period separator (19:00 CT session open)"),
     ]),
     ("ALERT CONDITIONS", [
@@ -4298,7 +4565,6 @@ HELP_SECTIONS = [
         ("±2.5σ",      "2.5 std dev lines (dim yellow)"),
         ("POC",        "Point of Control  (highest volume price, yellow)"),
         ("VAH/VAL",    "Value Area High/Low  (70% of session volume, magenta)"),
-        ("pPOC/pVAH/pVAL", "Previous session levels — extend as virgin lines"),
         ("S",          "Period separator  (19:00 CT session open)"),
     ]),
     ("SESSIONS & ALERTS", [
@@ -4806,17 +5072,26 @@ def _bg_ticker_loop():
                 _active = state.asset
                 _lp     = state.last_price
 
-            # Mirror active asset into its dedicated price field
+            # Mirror active asset into its dedicated price field. Only ETH/BTC
+            # have a meaningful field to mirror into — an arbitrary symbol's
+            # price must never be written into last_price_eth/btc, or Macro
+            # mode's ETH/BTC lines would show whatever stock is on screen.
             if _active == "ETH":
                 with state.lock:
                     state.last_price_eth = _lp
                 _need_sym  = "BTCUSDT"
                 _need_attr = "last_price_btc"
-            else:
+            elif _active == "BTC":
                 with state.lock:
                     state.last_price_btc = _lp
                 _need_sym  = "ETHUSDT"
                 _need_attr = "last_price_eth"
+            else:
+                # Non-Phemex symbol active — keep watching BTC's dedicated WS
+                # (arbitrary pick); ETH's ticker just holds its last value
+                # until the user switches back to ETH or BTC.
+                _need_sym  = "BTCUSDT"
+                _need_attr = "last_price_btc"
 
             # If the inactive WS is not connected to the right symbol, open one
             if _inactive_sym[0] != _need_sym:
@@ -4851,9 +5126,11 @@ def check_open_position_on_startup():
     # Brief wait so the feed has time to connect and populate state.asset
     time.sleep(2)
 
-    try:
-        sym = PHEMEX_SYMBOLS.get(state.asset, "ETHUSDT")
+    sym = PHEMEX_SYMBOLS.get(state.asset)
+    if sym is None:
+        return   # active symbol isn't Phemex-tradeable — nothing to check
 
+    try:
         # Fetch open positions
         _path  = "/g-accounts/accountPositions"
         _query = "currency=USDT"
@@ -5007,11 +5284,12 @@ def main(stdscr):
             new_asset = None
             new_feed  = None
             if key in (ord("e"), ord("E")):
-                if state.asset != "ETH":
-                    new_asset = "ETH"
-            elif key in (ord("b"), ord("B")):
-                if state.asset != "BTC":
-                    new_asset = "BTC"
+                _entered_sym = symbol_dialog(stdscr, rows, cols)
+                db.prev = None
+                with state.lock:
+                    _cur_asset = state.asset
+                if _entered_sym and _entered_sym != _cur_asset:
+                    new_asset = _entered_sym
             elif key in (ord("f"), ord("F")):
                 idx      = FEEDS.index(state.feed)
                 new_feed = FEEDS[(idx + 1) % len(FEEDS)]
@@ -5309,6 +5587,11 @@ def main(stdscr):
                         state.alert_list_sel = max(0, state.alert_list_sel - 1)
                     elif state.show_econ_cal:
                         state.econ_scroll = max(0, state.econ_scroll - 1)
+                    elif not state.global_mode:
+                        # No overlay open — vertical chart scroll (pan the
+                        # price window up to reveal levels above the candles).
+                        state.vert_offset = min(20, state.vert_offset + 1)
+                db.prev = None
             elif key == curses.KEY_DOWN:
                 with state.lock:
                     if state.show_hline_list:
@@ -5321,6 +5604,9 @@ def main(stdscr):
                         state.help_scroll = state.help_scroll + 1
                     elif state.show_econ_cal:
                         state.econ_scroll = state.econ_scroll + 1
+                    elif not state.global_mode:
+                        state.vert_offset = max(-20, state.vert_offset - 1)
+                db.prev = None
             elif key in (curses.KEY_LEFT,
                           curses.KEY_SLEFT,   # Shift+Left (most terminals)
                           541, 545,            # Ctrl+Left (xterm / Windows)
@@ -5395,6 +5681,7 @@ def main(stdscr):
                     else:
                         state.cursor_col_idx = -1
                         state.view_offset    = 0
+                        state.vert_offset    = 0
             elif key == ord("."):  # period — dismiss alert popup
                 with state.lock:
                     if state.alert_triggered:

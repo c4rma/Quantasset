@@ -342,6 +342,13 @@ C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
 C_ER_UP     = 43   # upper levels — green
 C_ER_DOWN   = 44   # lower levels — red
 C_ER_STOP   = 45   # ±150% hard-stop lines — magenta
+# The ER 40%-80% fill/level lines share the "█" glyph with real candle
+# bodies, so any OTHER overlay that wants to draw over "background" cells
+# but never over a real candle needs to distinguish the two by color pair,
+# not character. Module-level so every such overlay (session borders, the
+# live/cursor price line, horizontal lines, ...) can share one definition
+# instead of each redefining its own local copy.
+ER_FILL_PAIRS = (C_ER_UP, C_ER_DOWN, C_ER_STOP)
 
 # Global mode assets:
 #   (label, phemex_symbol, kraken_pair, yahoo_symbol, color_pair)
@@ -2817,13 +2824,13 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     _cell0 = db.buf[_r][_c0]
                     if chart_top <= _r < chart_bot and (
                             _cell0[0] in (" ", ":", ".") or
-                            (_cell0[0] == "█" and _cell0[1] in (C_ER_UP, C_ER_DOWN, C_ER_STOP))):
+                            (_cell0[0] == "█" and _cell0[1] in ER_FILL_PAIRS)):
                         db.put(_r, _c0, "|", _scol, curses.A_BOLD)
                 for _r in range(_r_top, _r_bot + 1):
                     _cell1 = db.buf[_r][_c1]
                     if chart_top <= _r < chart_bot and (
                             _cell1[0] in (" ", ":", ".") or
-                            (_cell1[0] == "█" and _cell1[1] in (C_ER_UP, C_ER_DOWN, C_ER_STOP))):
+                            (_cell1[0] == "█" and _cell1[1] in ER_FILL_PAIRS)):
                         db.put(_r, _c1, "|", _scol, curses.A_BOLD)
                 if _c0 + 1 < chart_r:
                     db.puts(_r_top, _c0 + 1, _sname, _scol, curses.A_BOLD)
@@ -2917,11 +2924,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── LIVE PRICE LINE (drawn after candles so it's always visible) ──────────
     # Overwrites VP bars, VWAP lines, etc. but never erases candle characters.
     # The axis label always renders on top with a contrasting background.
-    _CANDLE_CHARS = {"█", "│", "─"}   # never overwrite these...
-    _ER_FILL_PAIRS = (C_ER_UP, C_ER_DOWN, C_ER_STOP)   # ...unless it's really
-                                        # ER fill/lines wearing the same glyph
-                                        # (same "█" as a candle body) — color
-                                        # pair is what actually tells them apart
+    _CANDLE_CHARS = {"█", "│", "─"}   # never overwrite these... unless it's
+                                       # really ER fill/lines wearing the same
+                                       # glyph (see module-level ER_FILL_PAIRS,
+                                       # distinguished by color pair)
     # ── PRICE / CURSOR LINE (drawn last — always on top) ─────────────────────
     # The axis label overwrites everything at that row unconditionally so it's
     # always readable even when VWAP/VP labels land on the same price level.
@@ -2939,7 +2945,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 # a candle body, so a reversed block there would just blend
                 # into the fill instead of reading as a clean line — down to
                 # a crisp "-" dash, same as it already gets over blank cells.
-                if _cur_ch in (" ", "-", ".") or (_cur_ch == "█" and _cell[1] in _ER_FILL_PAIRS):
+                if _cur_ch in (" ", "-", ".") or (_cur_ch == "█" and _cell[1] in ER_FILL_PAIRS):
                     _draw_ch = "-"
                 else:
                     _draw_ch = _cur_ch
@@ -2959,7 +2965,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         if chart_top <= pr < chart_bot:
             for c2 in range(chart_r):
                 _cell = db.buf[pr][c2]
-                if _cell[0] not in _CANDLE_CHARS or _cell[1] in _ER_FILL_PAIRS:
+                if _cell[0] not in _CANDLE_CHARS or _cell[1] in ER_FILL_PAIRS:
                     db.put(pr, c2, "-", C_CURSOR, curses.A_BOLD)
             lbl_str = f" {price_fmt(selected.c, asset):<{PRICE_W - 1}}"
             db.put(pr, chart_r, ">", C_CURSOR, curses.A_BOLD)
@@ -3243,13 +3249,18 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         if _av <= 0:  continue
         _ar = chart_top + p2r(_av)
         if not (chart_top <= _ar < chart_bot):  continue
-        # Draw dashed line only on empty/background cells
+        # Draw dashed line only on empty/background cells — also punches
+        # through the ER 40%-80% fill/lines (see ER_FILL_PAIRS) without ever
+        # overwriting a real candle body (same "█" glyph, distinguished by
+        # color pair).
         for _ac2 in range(0, chart_r, 2):
-            if db.buf[_ar][_ac2][0] in (" ", ".", ":"):  
+            _acell = db.buf[_ar][_ac2]
+            if _acell[0] in (" ", ".", ":") or (_acell[0] == "█" and _acell[1] in ER_FILL_PAIRS):
                 db.put(_ar, _ac2, "-", C_ALERT, curses.A_DIM)
         # Label at right axis (only if row is not already occupied)
-        _lbl_col = max(0, chart_r - 16)
-        if db.buf[_ar][_lbl_col][0] in (" ", "-", "."):
+        _lbl_col  = max(0, chart_r - 16)
+        _lbl_cell = db.buf[_ar][_lbl_col]
+        if _lbl_cell[0] in (" ", "-", ".") or (_lbl_cell[0] == "█" and _lbl_cell[1] in ER_FILL_PAIRS):
             _al_lbl = f" A:{_av:.2f}"[:16]
             db.puts(_ar, _lbl_col, _al_lbl, C_ALERT, curses.A_BOLD)
 
@@ -4395,9 +4406,14 @@ def draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines):
         row   = chart_top + p2r(price)
         if not (chart_top <= row < chart_bot):
             continue
-        # Dashes across the full chart area (skip occupied cells so candles stay readable)
+        # Dashes across the full chart area (skip occupied cells so candles
+        # stay readable) — also punches through the ER 40%-80% fill/lines
+        # specifically (same "█" glyph as a candle body, distinguished by
+        # color pair — see ER_FILL_PAIRS) without ever overwriting a REAL
+        # candle body.
         for col in range(chart_r):
-            if db.buf[row][col][0] in (" ", ".", ":"):
+            _cell = db.buf[row][col]
+            if _cell[0] in (" ", ".", ":") or (_cell[0] == "█" and _cell[1] in ER_FILL_PAIRS):
                 db.put(row, col, "-", C_VWAP, curses.A_DIM)
         # Label in the right-axis area — always rendered, never conditional on chart content.
         # Format: "+  LABEL PRICE" or "+  PRICE" matching the style of VWAP/VP labels.

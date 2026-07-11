@@ -6044,7 +6044,7 @@ def main(stdscr):
                             state.hlines.append(_hl2)
                             if _hl2.get("alert"):
                                 _hdir2 = "price_cross_up" if _hl2["price"] > state.last_price else "price_cross_down"
-                            state.alerts.append({
+                                state.alerts.append({
                                     "name": _hl2.get("label") or f"Line {_hl2['price']:.2f}",
                                     "conditions": [{"type": _hdir2, "value": _hl2["price"]}],
                                     "message": f"Price reached {_hl2['price']:.2f}",

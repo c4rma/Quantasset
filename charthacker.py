@@ -400,7 +400,7 @@ class ChartState:
         self.color_scheme  = "bw"   # "bw" = blue/white  |  "rg" = red/green
         self.show_vp       = True    # volume profile overlay toggle
         self.show_vwap    = True    # VWAP + SD bands overlay toggle
-        self.show_er      = False   # Expected Range (IV-implied) overlay toggle
+        self.show_er      = True    # Expected Range (IV-implied) overlay toggle
         self.er_iv         = 0.0    # cached annualised IV % for the active asset
                                      # (Deribit DVOL for ETH/BTC, CBOE iv30 for
                                      # everything else; iv_monitor_loop keeps
@@ -1446,7 +1446,14 @@ def iv_monitor_loop():
                         with state.lock:
                             if state.asset == asset:   # still the same asset
                                 state.dvol_history = hist
-                _last_hist_refresh = now
+                    # Only stamp the refresh time when candles actually
+                    # existed to fetch against — if this check raced ahead
+                    # of state.candles being populated (very likely right at
+                    # app launch, or right after any symbol/interval switch
+                    # clears it), stamping here anyway would block the next
+                    # real attempt for a full 5 minutes even though usable
+                    # candle data might show up 1 loop iteration (20s) later.
+                    _last_hist_refresh = now
         else:
             iv = _fetch_cboe_iv(asset)
             if iv:
@@ -2170,7 +2177,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 curses.A_BOLD | curses.A_REVERSE)
         col += 14
 
-    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [B]ER  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [R]edraw  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [B]ER  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [J]center  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [R]edraw  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -2671,11 +2678,18 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             def _er_line(price, ch, pair, line_attrs, label):
                 """Draw the level bar (line_attrs controls its weight) plus,
                 if labeled, an axis tick + a boxed (reverse-video) label —
-                same two-part style draw_hlines() uses for horizontal lines."""
+                same two-part style draw_hlines() uses for horizontal lines.
+                ":" included in the overwrite guard alongside blank/./- —
+                every use of ":" elsewhere (VWAP's ±0.5σ band, the period
+                separator, crosshair guides) is a dim background reference
+                marker, never anything that needs protecting from an ER
+                level — without this, EOpen's own ":" marker (and any block
+                line landing on the same row) could get silently blocked
+                wherever VWAP's band happened to already occupy that cell."""
                 row = _er_row(price)
                 if not (chart_top <= row < chart_bot): return
                 for c2 in range(_er_cs, chart_r):
-                    if db.buf[row][c2][0] in (" ", ".", "-"):
+                    if db.buf[row][c2][0] in (" ", ".", "-", ":"):
                         db.put(row, c2, ch, pair, line_attrs)
                 if label:
                     lbl_text = f"{label} {price_fmt(price, asset)}"
@@ -2684,13 +2698,33 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                             f"{lbl_text:<{PRICE_W}}"[:PRICE_W],
                             pair, curses.A_BOLD | curses.A_REVERSE)
 
+            def _er_fill(price_a, price_b, pair):
+                """Same solid "█" block the level lines use, dim-weighted,
+                shading every row between two price levels — only ever
+                touches still-blank cells, so candles and every other
+                indicator (drawn later, or already drawn earlier this frame)
+                stay fully visible on top of it. Runs AFTER the _u[40]/_u[80]/
+                _l[40]/_l[80] _er_line() calls below so those boundary rows
+                are already claimed (non-blank) by the crisp NORMAL-weight
+                level bar before this dims in the rows strictly between them
+                — otherwise the fill would block the boundary line from ever
+                drawing there (both use "█", so _er_line()'s own overwrite
+                guard would see the fill and skip it)."""
+                row_hi = _er_row(max(price_a, price_b))
+                row_lo = _er_row(min(price_a, price_b))
+                for r in range(row_hi, row_lo + 1):
+                    if not (chart_top <= r < chart_bot): continue
+                    for c2 in range(_er_cs, chart_r):
+                        if db.buf[r][c2][0] == " ":
+                            db.put(r, c2, "█", pair, curses.A_DIM)
+
             if _er:
+                _u, _l = _er["upper"], _er["lower"]
                 # Solid block glyph (same "█" used for candle bodies) so every
                 # level reads as a colored bar at a glance — only the 40/80/
                 # 100/150% levels are shown (20/60 dropped, they were just
                 # unlabeled clutter). Bold for the ±100%/±150% bound and
                 # hard-stop lines, normal weight for ±40/80%.
-                _u, _l = _er["upper"], _er["lower"]
                 _er_line(_u[40],  "█", C_ER_UP,   curses.A_NORMAL, "+40%")
                 _er_line(_u[80],  "█", C_ER_UP,   curses.A_NORMAL, "+80%")
                 _er_line(_l[40],  "█", C_ER_DOWN, curses.A_NORMAL, "-40%")
@@ -2699,6 +2733,10 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 _er_line(_l[100], "█", C_ER_DOWN, curses.A_BOLD,   "-100%")
                 _er_line(_u[150], "█", C_ER_STOP, curses.A_BOLD,   "+150%")
                 _er_line(_l[150], "█", C_ER_STOP, curses.A_BOLD,   "-150%")
+                # Fill the 40%-80% band, both sides — after the boundary
+                # lines above so those rows stay crisp (see _er_fill docstring).
+                _er_fill(_u[40], _u[80], C_ER_UP)
+                _er_fill(_l[40], _l[80], C_ER_DOWN)
                 _er_line(_er_open, ":", C_LABEL,  curses.A_DIM,    "EOpen")
 
     # ── SESSIONS INDICATOR ───────────────────────────────────────────────────
@@ -2771,11 +2809,21 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                     for _bc in range(_c0, _c1 + 1):
                         if 0 <= _bc < chart_r:
                             db.put(_r_bot, _bc, "-", _scol, curses.A_BOLD)
+                # Session borders also punch through the ER 40%-80% fill/
+                # lines specifically (same "█" glyph as candle bodies, so
+                # distinguish by color pair — C_ER_UP/DOWN/STOP — rather than
+                # character, to avoid ever overwriting a REAL candle body).
                 for _r in range(_r_top, _r_bot + 1):
-                    if chart_top <= _r < chart_bot and db.buf[_r][_c0][0] in (" ", ":", "."):
+                    _cell0 = db.buf[_r][_c0]
+                    if chart_top <= _r < chart_bot and (
+                            _cell0[0] in (" ", ":", ".") or
+                            (_cell0[0] == "█" and _cell0[1] in (C_ER_UP, C_ER_DOWN, C_ER_STOP))):
                         db.put(_r, _c0, "|", _scol, curses.A_BOLD)
                 for _r in range(_r_top, _r_bot + 1):
-                    if chart_top <= _r < chart_bot and db.buf[_r][_c1][0] in (" ", ":", "."):
+                    _cell1 = db.buf[_r][_c1]
+                    if chart_top <= _r < chart_bot and (
+                            _cell1[0] in (" ", ":", ".") or
+                            (_cell1[0] == "█" and _cell1[1] in (C_ER_UP, C_ER_DOWN, C_ER_STOP))):
                         db.put(_r, _c1, "|", _scol, curses.A_BOLD)
                 if _c0 + 1 < chart_r:
                     db.puts(_r_top, _c0 + 1, _sname, _scol, curses.A_BOLD)
@@ -2869,7 +2917,11 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── LIVE PRICE LINE (drawn after candles so it's always visible) ──────────
     # Overwrites VP bars, VWAP lines, etc. but never erases candle characters.
     # The axis label always renders on top with a contrasting background.
-    _CANDLE_CHARS = {"█", "│", "─"}   # never overwrite these
+    _CANDLE_CHARS = {"█", "│", "─"}   # never overwrite these...
+    _ER_FILL_PAIRS = (C_ER_UP, C_ER_DOWN, C_ER_STOP)   # ...unless it's really
+                                        # ER fill/lines wearing the same glyph
+                                        # (same "█" as a candle body) — color
+                                        # pair is what actually tells them apart
     # ── PRICE / CURSOR LINE (drawn last — always on top) ─────────────────────
     # The axis label overwrites everything at that row unconditionally so it's
     # always readable even when VWAP/VP labels land on the same price level.
@@ -2880,9 +2932,17 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             # so the line is a solid bright band across the entire chart width
             _pl_attrs = curses.A_BOLD | curses.A_REVERSE
             for c2 in range(chart_r):
-                _cur_ch = db.buf[pr][c2][0]
-                # Keep candle body chars but apply highlight attrs over them
-                _draw_ch = _cur_ch if _cur_ch not in (" ", "-", ".") else "-"
+                _cell   = db.buf[pr][c2]
+                _cur_ch = _cell[0]
+                # Keep REAL candle body chars (reversed color washes over
+                # them, shape stays) but flatten ER fill/lines — same "█" as
+                # a candle body, so a reversed block there would just blend
+                # into the fill instead of reading as a clean line — down to
+                # a crisp "-" dash, same as it already gets over blank cells.
+                if _cur_ch in (" ", "-", ".") or (_cur_ch == "█" and _cell[1] in _ER_FILL_PAIRS):
+                    _draw_ch = "-"
+                else:
+                    _draw_ch = _cur_ch
                 db.put(pr, c2, _draw_ch, C_PRICE_LINE, _pl_attrs)
             # Right axis label — white-on-blue bold, full width
             lbl_str = f" {price_fmt(last_price, asset):<{PRICE_W - 1}}"
@@ -2898,7 +2958,8 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         pr = chart_top + p2r(selected.c)
         if chart_top <= pr < chart_bot:
             for c2 in range(chart_r):
-                if db.buf[pr][c2][0] not in _CANDLE_CHARS:
+                _cell = db.buf[pr][c2]
+                if _cell[0] not in _CANDLE_CHARS or _cell[1] in _ER_FILL_PAIRS:
                     db.put(pr, c2, "-", C_CURSOR, curses.A_BOLD)
             lbl_str = f" {price_fmt(selected.c, asset):<{PRICE_W - 1}}"
             db.put(pr, chart_r, ">", C_CURSOR, curses.A_BOLD)
@@ -5131,6 +5192,7 @@ HELP_SECTIONS = [
         ("[Ctrl+←/→]", "Move cursor 50 candles (if terminal supports)"),
         ("[↑] [↓]",    "Scroll price axis up/down — uncapped, reveals levels off-screen"),
         ("[G]",        "Jump to date/time  (YYYY-MM-DD HH:MM or HH:MM)"),
+        ("[J]",        "Center — resets vertical price scale to auto (like TV's axis double-click)"),
         ("[Esc]",      "Snap back to live — exits cursor mode AND resets vertical scroll"),
     ]),
     ("CHART DISPLAY", [
@@ -6183,6 +6245,15 @@ def main(stdscr):
                 with state.lock:
                     state.error = ("Chart saved to chart_state.json" if ok
                                    else state.error)   # save_chart_state sets error on fail
+                db.prev = None
+            elif key in (ord("j"), ord("J")):
+                # Center — TradingView's "double-click the price axis"
+                # behavior: reset the vertical price scale back to auto
+                # (undo any [↑]/[↓] pan), WITHOUT touching horizontal
+                # position at all. Just "the way it looked scrolling
+                # normally" wherever you currently are — no candle-snapping.
+                with state.lock:
+                    state.vert_offset = 0
                 db.prev = None
             elif key in (ord("g"), ord("G")):
                 # Temporarily pause and open jump-to dialog

@@ -233,17 +233,36 @@ def _apply_resampled(closed, live):
     resolution data: a bucket that's still the same as the last entry in
     state.candles updates IN PLACE (state.live stays None so all_candles
     doesn't double-count it); a genuinely new bucket becomes state.live.
-    Caller must already hold state.lock."""
+    Caller must already hold state.lock.
+
+    A WS reconnect resends a fresh "snapshot" WITHOUT bumping state.session
+    (only a user-triggered restart does that), and the same _Resampler
+    instance survives the reconnect — so a close-out event computed from
+    data spanning the reconnect gap can race against an incremental tick
+    that already advanced state.candles further. Confirmed via diagnostic
+    log (2026-07-10): this produced a genuinely non-monotonic state.candles
+    (an older timestamp appended after a newer one), which is what the
+    "duplicate everything" glitch actually was — corrupted candle DATA, not
+    a stale terminal redraw. Enforcing strict monotonicity here — silently
+    dropping anything that would move backward — is a hard guarantee
+    regardless of the exact race, unlike trying to prevent every possible
+    interleaving upstream."""
     if closed is not None:
         if state.candles and state.candles[-1].ts == closed.ts:
             state.candles[-1] = closed
-        else:
+        elif not state.candles or closed.ts > state.candles[-1].ts:
             state.candles.append(closed)
-    if live is not None and state.candles and state.candles[-1].ts == live.ts:
+        # else: closed.ts is <= the last stored candle — stale/out-of-order,
+        # drop it rather than corrupt ordering.
+    if live is None:
+        return
+    if state.candles and state.candles[-1].ts == live.ts:
         state.candles[-1] = live
         state.live = None
-    else:
+    elif not state.candles or live.ts >= state.candles[-1].ts:
         state.live = live
+    # else: live.ts is older than the last stored candle — stale, drop it
+    # (leave state.live as whatever it already was).
 
 MAX_CANDLES   = 3000    # 48h × 60 = 2880 candles at 1m, plus headroom
 REST_LIMIT    = 500     # fetch up to 500 candles per request
@@ -725,16 +744,24 @@ def ws_kraken(asset: str, session: int):
 
     # Kraken streams at the BASE resolution (1m sub-day / 1D day+, see
     # base_fetch_resolution()); this resampler groups those base candles
-    # into whatever display interval the user picked via [I]. Seeded from
-    # whatever's already loaded (the initial REST fetch, already resampled
-    # by fetch_candles()) so the first live update continues that bucket
-    # instead of wrongly resetting its accumulated open/high/low/volume.
+    # into whatever display interval the user picked via [I]. Recreated and
+    # reseeded on EVERY (re)connect in on_open — not just once at thread
+    # start — so an automatic WS reconnect (which does NOT bump
+    # state.session; only a user-triggered restart does) never resumes from
+    # a stale bucket tracked before the reconnect gap. A stale resampler
+    # racing a live tick that already advanced state.candles further is what
+    # produced a genuinely non-monotonic state.candles (confirmed via
+    # diagnostic log, 2026-07-10) — the "duplicate everything" glitch was
+    # corrupted candle data, not a stale terminal redraw. _apply_resampled()
+    # also hard-enforces monotonicity as a backstop regardless.
     resampler = _Resampler(state.interval_secs)
-    with state.lock:
-        if state.candles:
-            resampler.seed(state.candles[-1])
 
     def on_open(ws):
+        nonlocal resampler
+        resampler = _Resampler(state.interval_secs)
+        with state.lock:
+            if state.candles:
+                resampler.seed(state.candles[-1])
         ws.send(json.dumps({
             "method": "subscribe",
             "params": {"channel": "ohlc", "symbol": [pair], "interval": base_kraken_minutes()},
@@ -842,16 +869,24 @@ def ws_phemex(asset: str, session: int):
     # Phemex streams at the BASE resolution (1m sub-day / 1D day+, see
     # base_fetch_resolution()); this resampler groups those base candles
     # (both the initial snapshot AND every incremental update) into whatever
-    # display interval the user picked via [I]. Seeded from whatever's
-    # already loaded (the initial REST fetch, already resampled by
-    # fetch_candles()) so the first live update continues that bucket
-    # instead of wrongly resetting its accumulated open/high/low/volume.
+    # display interval the user picked via [I]. Recreated and reseeded on
+    # EVERY (re)connect in on_open — not just once at thread start — so an
+    # automatic WS reconnect (which does NOT bump state.session; only a
+    # user-triggered restart does) never resumes from a stale bucket tracked
+    # before the reconnect gap. A stale resampler racing a live tick that
+    # already advanced state.candles further is what produced a genuinely
+    # non-monotonic state.candles (confirmed via diagnostic log, 2026-07-10)
+    # — the "duplicate everything" glitch was corrupted candle data, not a
+    # stale terminal redraw. _apply_resampled() also hard-enforces
+    # monotonicity as a backstop regardless.
     resampler = _Resampler(state.interval_secs)
-    with state.lock:
-        if state.candles:
-            resampler.seed(state.candles[-1])
 
     def on_open(ws):
+        nonlocal resampler
+        resampler = _Resampler(state.interval_secs)
+        with state.lock:
+            if state.candles:
+                resampler.seed(state.candles[-1])
         sub = json.dumps({
             "id": 1,
             "method": "kline_p.subscribe",
@@ -1629,6 +1664,77 @@ def load_global_data(session: int, initial: bool = False):
 
 GLOBAL_REFRESH_SECS = 30
 
+# ── Diagnostic dump — the "glitch & duplicate everything" resize bug ───────────
+# Three fix attempts (clearok, resizeterm, endwin+refresh) have NOT resolved
+# this per direct user testing. Rather than guess a fourth time, this writes
+# real evidence to disk so the next occurrence can actually be diagnosed:
+#   1. Called automatically right when a resize is detected (before AND after
+#      the recovery attempt), to see what state.candles/layout look like at
+#      the exact moment of the glitch.
+#   2. ALSO called from [R] (the user's existing "something's wrong, help"
+#      reflex) so a report doesn't depend on catching the exact resize
+#      instant — press [R] when it's glitched and the dump is already there.
+DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resize_debug.log")
+
+def _dump_diagnostics(stdscr, reason: str):
+    """Append a snapshot of layout + candle-data state to DEBUG_LOG. Never
+    raises — a failed diagnostic write must not crash the app."""
+    try:
+        with state.lock:
+            candles_snap = list(state.candles)
+            live         = state.live
+            session      = state.session
+            asset        = state.asset
+            feed         = state.feed
+            interval_s   = state.interval_secs
+            view_offset  = state.view_offset
+            cursor_idx   = state.cursor_col_idx
+            vert_off     = state.vert_offset
+            n_vis        = state.n_vis
+            hist_loading = state.history_loading
+            status       = state.status
+            error        = state.error
+
+        try:
+            real_rows, real_cols = stdscr.getmaxyx()
+        except Exception:
+            real_rows, real_cols = -1, -1
+
+        lines = [
+            f"=== {datetime.now():%Y-%m-%d %H:%M:%S} — {reason} ===",
+            f"terminal getmaxyx(): rows={real_rows} cols={real_cols}",
+            f"asset={asset} feed={feed} interval_secs={interval_s} session={session} status={status!r} error={error!r}",
+            f"view_offset={view_offset} cursor_col_idx={cursor_idx} vert_offset={vert_off} n_vis={n_vis} history_loading={hist_loading}",
+            f"len(state.candles)={len(candles_snap)}  state.live={'yes @ ts='+str(live.ts) if live else 'None'}",
+        ]
+
+        if candles_snap:
+            first, last = candles_snap[0], candles_snap[-1]
+            lines.append(f"first candle: ts={first.ts} ({datetime.fromtimestamp(first.ts)})  o={first.o} h={first.h} l={first.l} c={first.c} v={first.v}")
+            lines.append(f"last  candle: ts={last.ts} ({datetime.fromtimestamp(last.ts)})  o={last.o} h={last.h} l={last.l} c={last.c} v={last.v}")
+
+            # Check for duplicate or out-of-order timestamps — would prove
+            # state.candles itself is corrupted, not just mis-rendered.
+            dupes, disorder = [], []
+            for i in range(1, len(candles_snap)):
+                prev_ts, cur_ts = candles_snap[i - 1].ts, candles_snap[i].ts
+                if cur_ts == prev_ts:
+                    dupes.append((i, cur_ts))
+                elif cur_ts < prev_ts:
+                    disorder.append((i, prev_ts, cur_ts))
+            if dupes:
+                lines.append(f"!!! DUPLICATE timestamps found: {len(dupes)} — first few: {dupes[:10]}")
+            if disorder:
+                lines.append(f"!!! OUT-OF-ORDER timestamps found: {len(disorder)} — first few: {disorder[:10]}")
+            if not dupes and not disorder:
+                lines.append("candle timestamps: monotonic, no duplicates — state.candles itself looks clean")
+
+        lines.append("")
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
 # ── Chart-state persistence ────────────────────────────────────────────────────
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chart_state.json")
 
@@ -2005,7 +2111,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
                 curses.A_BOLD | curses.A_REVERSE)
         col += 14
 
-    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [B]ER  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [H]elp  [Q]uit", C_HEADER)
+    db.puts(1, col + 1, f"[E]Symbol  [F]eed  [C]olor  [W]AP  [V]P  [B]ER  [T]rades  [I]{ivl_label}  [L]ine  [M]macro  [G]oto  [<][>]x1  [[]x10  [{{}}]x50  [↑↓]scroll  [Esc]live  [P]shot  [U]save  [R]edraw  [H]elp  [Q]uit", C_HEADER)
 
     # Error line — shown in row 2 when no candles, otherwise OHLCV
     if not visible and error:
@@ -2026,15 +2132,30 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         else:
             ts_lbl = ""
         cursor_tag = f"  [{ts_lbl}]" if in_cursor_mode else ""
+        # DVOL for crypto (Deribit) / IV for everything else (CBOE iv30) —
+        # same live value the Expected Range indicator uses (er_iv), shown
+        # here unconditionally (like O/H/L/C/Vol) regardless of whether the
+        # ER overlay itself is toggled on. Omitted until a real fetch lands.
+        iv_tag = (f"  {'DVOL' if is_crypto_symbol(asset) else 'IV'} {er_iv:.1f}%"
+                   if er_iv and er_iv > 0 else "")
         ohlcv = (f"  O {price_fmt(lc.o, asset)}"
                  f"  H {price_fmt(lc.h, asset)}"
                  f"  L {price_fmt(lc.l, asset)}"
                  f"  C {price_fmt(lc.c, asset)}"
                  f"  {arrow}{abs(chg):.2f} ({pct:+.2f}%)"
-                 f"  Vol {vol_fmt(lc.v)}"
-                 f"{cursor_tag}")
+                 f"  Vol {vol_fmt(lc.v)}")
         ohlc_pair = C_CURSOR if in_cursor_mode else (bull_pair() if bull else bear_pair())
         db.puts(2, 2, ohlcv, ohlc_pair, curses.A_BOLD)
+        _iv_col = 2 + len(ohlcv)
+        if iv_tag:
+            # Magenta — same color family as the Expected Range ±150%
+            # hard-stop lines (C_ER_STOP), which are themselves driven by
+            # this same IV value, so DVOL/IV pops out from the rest of the
+            # bull/bear-colored OHLCV line instead of blending in.
+            db.puts(2, _iv_col, iv_tag, C_ER_STOP, curses.A_BOLD)
+            _iv_col += len(iv_tag)
+        if cursor_tag:
+            db.puts(2, _iv_col, cursor_tag, ohlc_pair, curses.A_BOLD)
 
     # ── PRICE AXIS ────────────────────────────────────────────────────────────
     price_labels = smart_price_labels(lo_p, hi_p, asset)
@@ -5024,6 +5145,7 @@ HELP_SECTIONS = [
     ("UTILITIES", [
         ("[P]",        "Screenshot → screenshots/quantasset_YYYYMMDD_HHMMSS.txt"),
         ("[U]",        "Save chart state — hlines, position tools, alerts → chart_state.json"),
+        ("[R]",        "Force a full redraw — fixes stale/duplicated visuals without restarting"),
         ("[H] / [?]",  "Toggle this help box"),
         ("[Q]",        "Quit ChartHacker  (prompts to save unsaved changes)"),
     ]),
@@ -5959,6 +6081,24 @@ def main(stdscr):
                     start_global(_g_sess)
                 elif _in_econ:
                     threading.Thread(target=load_econ_calendar, daemon=True).start()
+                else:
+                    # Plain chart view — [R] is otherwise unused here, so
+                    # repurpose it as a manual "force full redraw" escape
+                    # hatch for the rare terminal-desync glitch (stale/
+                    # duplicated content that a resize can leave behind —
+                    # see the resize handler below) without needing to kill
+                    # and relaunch the app. A redraw of an already-correct
+                    # screen is invisible by definition, so flash a footer
+                    # confirmation — otherwise there's no way to tell the
+                    # keypress registered at all.
+                    # Also dumps diagnostics — this is the user's existing
+                    # "something's wrong" reflex, so capture evidence here
+                    # too instead of only at the exact resize instant.
+                    _dump_diagnostics(stdscr, "[R] pressed by user — manual redraw / diagnostic dump")
+                    db.prev = None
+                    stdscr.clearok(True)
+                    with state.lock:
+                        state.error = f"Forced full redraw — logged to {os.path.basename(DEBUG_LOG)}"
             elif key in (ord("h"), ord("H"), ord("?")):
                 with state.lock:
                     state.show_help = not state.show_help
@@ -6137,9 +6277,26 @@ def main(stdscr):
 
         new_rows, new_cols = stdscr.getmaxyx()
         if new_rows != rows or new_cols != cols:
-            rows, cols = new_rows, new_cols
+            _dump_diagnostics(stdscr, f"RESIZE DETECTED {rows}x{cols} -> {new_rows}x{new_cols} (before recovery)")
+            # resizeterm() alone (tried previously) updates curses' LINES/
+            # COLS globals but doesn't reliably resync PDCurses' underlying
+            # Windows Console buffer state — a known weak spot specific to
+            # windows-curses, not present in real ncurses (Termux). The
+            # robust recovery for this class of bug is a genuine teardown +
+            # reinit: endwin() releases curses' hold on the terminal
+            # entirely, and the next refresh() re-initializes it completely
+            # from scratch — the same thing that happens at process restart
+            # (which is the only thing that's fixed this so far), just
+            # without actually restarting the process.
+            try:
+                curses.endwin()
+            except curses.error:
+                pass
+            stdscr.refresh()
+            rows, cols = stdscr.getmaxyx()   # re-query AFTER reinit
             db = DoubleBuffer(rows, cols)
-            # db.prev=None forces full redraw via diff — no blank flash
+            stdscr.clearok(True)
+            _dump_diagnostics(stdscr, "RESIZE recovery complete (after endwin+refresh)")
 
         _result = draw(stdscr, db, rows, cols)
 

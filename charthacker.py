@@ -405,6 +405,11 @@ class ChartState:
                                      # (Deribit DVOL for ETH/BTC, CBOE iv30 for
                                      # everything else; iv_monitor_loop keeps
                                      # this fresh so draw() never blocks)
+        self.dvol_history  = {}     # {bucket_ts: dvol_value} — crypto only,
+                                     # refreshed every 5min by iv_monitor_loop;
+                                     # lets the OHLC header show accurate
+                                     # historical DVOL for a cursor-selected
+                                     # candle instead of always today's live IV
         self.interval_secs = 60      # display-candle width in seconds — set
                                       # via [I] (interval_dialog); see
                                       # cur_resolution()/base_fetch_resolution()
@@ -1052,6 +1057,7 @@ def start_feed(asset: str, feed: str = "", interval_secs: int = -1):
         state.vert_offset    = 0   # new symbol/interval/feed — stale vertical
                                     # pan could be nonsensical at a new scale
         state.er_iv          = 0.0 # stale IV from a different asset would be wrong
+        state.dvol_history    = {} # ditto for the historical DVOL series
 
     candles = fetch_candles(asset, my_feed)
 
@@ -1359,6 +1365,29 @@ def _fetch_dvol(ccy: str) -> float | None:
         pass
     return cached[0] if cached else None
 
+def _fetch_dvol_history(ccy: str, start_ts: int, end_ts: int) -> dict:
+    """
+    Historical Deribit DVOL series (hourly buckets) spanning [start_ts,
+    end_ts] (unix seconds) — used so scrolling the cursor back to a past
+    candle shows what DVOL actually WAS then, not today's live value.
+    Returns {bucket_ts: dvol_value}. Crypto (Deribit) only — CBOE's
+    delayed-quotes endpoint (used for non-crypto IV) has no historical
+    series, so non-crypto symbols only ever show the current live IV
+    regardless of cursor position; see the OHLC-header lookup in draw().
+    """
+    try:
+        r = requests.get(DVOL_URL, params={
+            "currency": ccy,
+            "start_timestamp": int(start_ts * 1000),
+            "end_timestamp":   int(end_ts * 1000),
+            "resolution": "3600",
+        }, timeout=12)
+        rows = (r.json().get("result") or {}).get("data") or []
+        # each row: [timestamp_ms, open, high, low, close]
+        return {int(row[0] / 1000): float(row[4]) for row in rows}
+    except Exception:
+        return {}
+
 def _fetch_cboe_iv(symbol: str) -> float | None:
     """CBOE delayed-quotes options chain iv30 — real per-symbol 30-day
     implied vol (VIX-style %) for equities/ETFs/indices. Same source
@@ -1386,14 +1415,43 @@ def iv_monitor_loop():
     (the render thread) never blocks on a network call. Deribit DVOL for
     ETH/BTC, CBOE iv30 for everything else — state.er_iv only gets written
     on a successful fetch, so a symbol with no options chain just leaves it
-    at 0 and the Expected Range block falls back to ER_MANUAL_IV."""
+    at 0 and the Expected Range block falls back to ER_MANUAL_IV.
+
+    Also periodically refreshes state.dvol_history (crypto only, every 5min
+    — DVOL doesn't move fast enough to need the live-value's 20s cadence)
+    spanning whatever candle range is currently loaded, so the OHLC header
+    can show accurate historical DVOL for whatever candle the cursor is on."""
+    _last_hist_refresh = 0.0
     while True:
         with state.lock:
             asset = state.asset
-        iv = _fetch_dvol(asset) if asset in PHEMEX_SYMBOLS else _fetch_cboe_iv(asset)
-        if iv:
-            with state.lock:
-                state.er_iv = iv
+        if asset in PHEMEX_SYMBOLS:
+            iv = _fetch_dvol(asset)
+            if iv:
+                with state.lock:
+                    state.er_iv = iv
+            now = time.time()
+            if now - _last_hist_refresh > 300:
+                with state.lock:
+                    candles_snap = list(state.candles)
+                if candles_snap:
+                    # Cap to the most recent 30 days — a "1y" interval view
+                    # would otherwise ask Deribit for years of hourly
+                    # buckets in one request. Older candles simply won't
+                    # have a historical DVOL value available (iv_tag stays
+                    # blank for those), which is an acceptable trade-off.
+                    _hist_start = max(candles_snap[0].ts, candles_snap[-1].ts - 30 * 86400)
+                    hist = _fetch_dvol_history(asset, _hist_start, candles_snap[-1].ts + 3600)
+                    if hist:
+                        with state.lock:
+                            if state.asset == asset:   # still the same asset
+                                state.dvol_history = hist
+                _last_hist_refresh = now
+        else:
+            iv = _fetch_cboe_iv(asset)
+            if iv:
+                with state.lock:
+                    state.er_iv = iv
         time.sleep(20)
 
 def compute_er(open_price: float, iv: float) -> dict | None:
@@ -1921,6 +1979,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         show_vwap         = state.show_vwap
         show_er           = state.show_er
         er_iv             = state.er_iv
+        dvol_history      = state.dvol_history
         interval_secs     = state.interval_secs
         history_loading   = state.history_loading
         chart_mode        = state.chart_mode
@@ -2133,11 +2192,20 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             ts_lbl = ""
         cursor_tag = f"  [{ts_lbl}]" if in_cursor_mode else ""
         # DVOL for crypto (Deribit) / IV for everything else (CBOE iv30) —
-        # same live value the Expected Range indicator uses (er_iv), shown
-        # here unconditionally (like O/H/L/C/Vol) regardless of whether the
-        # ER overlay itself is toggled on. Omitted until a real fetch lands.
-        iv_tag = (f"  {'DVOL' if is_crypto_symbol(asset) else 'IV'} {er_iv:.1f}%"
-                   if er_iv and er_iv > 0 else "")
+        # shown unconditionally (like O/H/L/C/Vol) regardless of whether the
+        # ER overlay itself is toggled on. When the cursor has a candle
+        # selected, show what DVOL actually WAS at that point in time (from
+        # dvol_history, hourly buckets) instead of today's live value — CBOE
+        # has no historical iv30 series, so non-crypto always shows the
+        # current live IV regardless of cursor position. Omitted entirely
+        # until a real value is available (no fetch yet / no options chain).
+        if in_cursor_mode and selected and is_crypto_symbol(asset) and dvol_history:
+            _hist_ts = max((t for t in dvol_history if t <= selected.ts), default=None)
+            _iv_val  = dvol_history.get(_hist_ts) if _hist_ts is not None else None
+        else:
+            _iv_val = er_iv if er_iv and er_iv > 0 else None
+        iv_tag = (f"  {'DVOL' if is_crypto_symbol(asset) else 'IV'} {_iv_val:.1f}%"
+                   if _iv_val else "")
         ohlcv = (f"  O {price_fmt(lc.o, asset)}"
                  f"  H {price_fmt(lc.h, asset)}"
                  f"  L {price_fmt(lc.l, asset)}"

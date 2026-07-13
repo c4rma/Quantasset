@@ -326,9 +326,9 @@ if i_show_vp and i_vp_period == "Day"
             _dv_vah := _dv_rlo + (_vhi + 1.0) * _dv_step
             _dv_val := _dv_rlo + _vli         * _dv_step
 
-plot(i_show_vp and i_vp_hist_mode ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=i_poc_width,     style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=i_poc_width,     style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)
@@ -818,10 +818,10 @@ if barstate.islast and i_show_vp
                 f_vp_render_boxes(_s, false, _pw, i_vp_offset)
                 int _lx2 = _s.end_bi
                 int _lx1 = math.max(_s.start_bi, bar_index - 4900)
-                if i_show_poc and not i_vp_hist_mode
+                if i_show_poc
                     _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))
-                if i_show_vah_val and not i_vp_hist_mode
+                if i_show_vah_val
                     _vp_vah_lns.push(line.new(_lx1, _s.vah_p, _lx2, _s.vah_p,
                                                color=i_vah_val_col, width=i_vah_val_width))
                     _vp_val_lns.push(line.new(_lx1, _s.val_p, _lx2, _s.val_p,
@@ -869,10 +869,10 @@ if barstate.islast and i_show_vp
                 f_vp_render_boxes(_s, false, _pw_c, i_vp_offset)
                 int _lx2c = _s.end_bi
                 int _lx1c = math.max(_s.start_bi, bar_index - 4900)
-                if i_show_poc and not i_vp_hist_mode
+                if i_show_poc
                     _vp_poc_lns.push(line.new(_lx1c, _s.poc_p, _lx2c, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))
-                if i_show_vah_val and not i_vp_hist_mode
+                if i_show_vah_val
                     _vp_vah_lns.push(line.new(_lx1c, _s.vah_p, _lx2c, _s.vah_p,
                                                color=i_vah_val_col, width=i_vah_val_width))
                     _vp_val_lns.push(line.new(_lx1c, _s.val_p, _lx2c, _s.val_p,

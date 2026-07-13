@@ -567,9 +567,11 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         erase_line()
         sys.stdout.write(f"    {'Sentiment':<20} {sentiment}")
 
-        # Check for sentiment change and play alert
+        # Alert only when the ratio crosses INTO a signal zone (< 0.98 BULLISH
+        # or > 1.02 BEARISH) — not on the way back to NEUTRAL.
         label = _get_sentiment(ratio)
-        if _prev_sentiment.get(ccy) is not None and _prev_sentiment[ccy] != label:
+        if (_prev_sentiment.get(ccy) is not None
+                and _prev_sentiment[ccy] != label and label != 'NEUTRAL'):
             _play_alert()
         _prev_sentiment[ccy] = label
 
@@ -622,9 +624,11 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
             f"{rc}{BLD}{ratio:>7.2f}{RST}{CYN}{iv_str:>8}{RST}{MAG}{em_str:>10}{RST}  {eq_sent}"
         )
 
-        # Sentiment-change alert (shared with crypto)
+        # Alert only when the ratio crosses INTO a signal zone (< 0.98 BULLISH
+        # or > 1.02 BEARISH) — not on the way back to NEUTRAL.
         label = _get_sentiment(ratio)
-        if _prev_sentiment.get(sym) is not None and _prev_sentiment[sym] != label:
+        if (_prev_sentiment.get(sym) is not None
+                and _prev_sentiment[sym] != label and label != 'NEUTRAL'):
             _play_alert()
         _prev_sentiment[sym] = label
 

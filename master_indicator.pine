@@ -257,8 +257,12 @@ var float   _dv_poc  = na
 var float   _dv_vah  = na
 var float   _dv_val  = na
 
-if i_show_vp and i_vp_period == "Day"
-    bool _dv_new = _vp_16ct or na(_dv_rlo)
+if i_show_vp
+    bool    _dv_reset = (i_vp_period == "Day" and _vp_16ct) or (i_vp_period == "Custom" and _vp_cust_tod)
+    float[] _dv_hi    = i_vp_period == "Day" ? _vp_d_hi  : _vp_c_hi
+    float[] _dv_lo    = i_vp_period == "Day" ? _vp_d_lo  : _vp_c_lo
+    float[] _dv_vol   = i_vp_period == "Day" ? _vp_d_vol : _vp_c_vol
+    bool _dv_new = _dv_reset or na(_dv_rlo)
     bool _dv_out = not _dv_new and (low < _dv_rlo or high > _dv_rhi)
     if _dv_new
         _dv_rlo  := low
@@ -273,10 +277,10 @@ if i_show_vp and i_vp_period == "Day"
         _dv_step := _r > 0 ? _r / i_vp_rows : syminfo.mintick * i_vp_rows
         _dv_bkts := array.new_float(i_vp_rows, 0.0)
     bool _dv_rebuild = _dv_new or _dv_out
-    int  _dv_nb = _vp_d_hi.size()
+    int  _dv_nb = _dv_hi.size()
     if _dv_rebuild and _dv_nb > 0 and _dv_step > 0
         for _bi = 0 to _dv_nb - 1
-            float _lh = _vp_d_hi.get(_bi), float _ll = _vp_d_lo.get(_bi), float _lv = _vp_d_vol.get(_bi)
+            float _lh = _dv_hi.get(_bi), float _ll = _dv_lo.get(_bi), float _lv = _dv_vol.get(_bi)
             if _lh > _ll
                 int _s = math.max(int(math.floor((_ll - _dv_rlo) / _dv_step)), 0)
                 int _e = math.min(int(math.floor((_lh - _dv_rlo) / _dv_step)), i_vp_rows - 1)
@@ -289,7 +293,7 @@ if i_show_vp and i_vp_period == "Day"
                         => _dv_step / (_lh - _ll)
                     _dv_bkts.set(_pi, _dv_bkts.get(_pi) + _lv * _pp)
     else if not _dv_rebuild and _dv_nb > 0 and _dv_step > 0
-        float _lh = _vp_d_hi.get(_dv_nb - 1), float _ll = _vp_d_lo.get(_dv_nb - 1), float _lv = _vp_d_vol.get(_dv_nb - 1)
+        float _lh = _dv_hi.get(_dv_nb - 1), float _ll = _dv_lo.get(_dv_nb - 1), float _lv = _dv_vol.get(_dv_nb - 1)
         if _lh > _ll
             int _s = math.max(int(math.floor((_ll - _dv_rlo) / _dv_step)), 0)
             int _e = math.min(int(math.floor((_lh - _dv_rlo) / _dv_step)), i_vp_rows - 1)
@@ -326,9 +330,9 @@ if i_show_vp and i_vp_period == "Day"
             _dv_vah := _dv_rlo + (_vhi + 1.0) * _dv_step
             _dv_val := _dv_rlo + _vli         * _dv_step
 
-plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=i_poc_width,     style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
-plot(i_show_vp and i_vp_hist_mode and not barstate.islast ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_poc : na, "Dev POC", color=i_poc_col,     linewidth=i_poc_width,     style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_vah : na, "Dev VAH", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
+plot(i_show_vp and i_vp_hist_mode ? _dv_val : na, "Dev VAL", color=i_vah_val_col, linewidth=i_vah_val_width, style=plot.style_stepline)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VWAP + STANDARD DEVIATION BANDS  (Welford online variance)

@@ -822,10 +822,10 @@ if barstate.islast and i_show_vp
                 f_vp_render_boxes(_s, false, _pw, i_vp_offset)
                 int _lx2 = _s.end_bi
                 int _lx1 = math.max(_s.start_bi, bar_index - 4900)
-                if i_show_poc
+                if i_show_poc and not i_vp_hist_mode
                     _vp_poc_lns.push(line.new(_lx1, _s.poc_p, _lx2, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))
-                if i_show_vah_val
+                if i_show_vah_val and not i_vp_hist_mode
                     _vp_vah_lns.push(line.new(_lx1, _s.vah_p, _lx2, _s.vah_p,
                                                color=i_vah_val_col, width=i_vah_val_width))
                     _vp_val_lns.push(line.new(_lx1, _s.val_p, _lx2, _s.val_p,
@@ -834,22 +834,24 @@ if barstate.islast and i_show_vp
         // Render current session
         f_vp_render_boxes(_cur, _cur_right, _pw, i_vp_offset)
         int _cur_lx2 = _cur_right ? bar_index + i_vp_offset + _pw : bar_index
-        if i_show_poc
+        if i_show_poc and not i_vp_hist_mode
             _vp_poc_lns.push(line.new(_cur.start_bi, _cur.poc_p, _cur_lx2, _cur.poc_p,
                                        color=i_poc_col, width=i_poc_width))
+        if i_show_poc
             _vp_poc_lbl := label.new(_cur_lx2, _cur.poc_p,
                                      " POC: " + str.tostring(_cur.poc_p, format.mintick),
                                      textcolor=i_poc_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-        if i_show_vah_val
+        if i_show_vah_val and not i_vp_hist_mode
             _vp_vah_lns.push(line.new(_cur.start_bi, _cur.vah_p, _cur_lx2, _cur.vah_p,
                                        color=i_vah_val_col, width=i_vah_val_width))
+            _vp_val_lns.push(line.new(_cur.start_bi, _cur.val_p, _cur_lx2, _cur.val_p,
+                                       color=i_vah_val_col, width=i_vah_val_width))
+        if i_show_vah_val
             _vp_vah_lbl := label.new(_cur_lx2, _cur.vah_p,
                                      " VAH: " + str.tostring(_cur.vah_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-            _vp_val_lns.push(line.new(_cur.start_bi, _cur.val_p, _cur_lx2, _cur.val_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
             _vp_val_lbl := label.new(_cur_lx2, _cur.val_p,
                                      " VAL: " + str.tostring(_cur.val_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
@@ -873,10 +875,10 @@ if barstate.islast and i_show_vp
                 f_vp_render_boxes(_s, false, _pw_c, i_vp_offset)
                 int _lx2c = _s.end_bi
                 int _lx1c = math.max(_s.start_bi, bar_index - 4900)
-                if i_show_poc
+                if i_show_poc and not i_vp_hist_mode
                     _vp_poc_lns.push(line.new(_lx1c, _s.poc_p, _lx2c, _s.poc_p,
                                                color=i_poc_col, width=i_poc_width))
-                if i_show_vah_val
+                if i_show_vah_val and not i_vp_hist_mode
                     _vp_vah_lns.push(line.new(_lx1c, _s.vah_p, _lx2c, _s.vah_p,
                                                color=i_vah_val_col, width=i_vah_val_width))
                     _vp_val_lns.push(line.new(_lx1c, _s.val_p, _lx2c, _s.val_p,
@@ -884,22 +886,24 @@ if barstate.islast and i_show_vp
 
         f_vp_render_boxes(_cur_c, _cur_right_c, _pw_c, i_vp_offset)
         int _cur_lx2_c = _cur_right_c ? bar_index + i_vp_offset + _pw_c : bar_index
-        if i_show_poc
+        if i_show_poc and not i_vp_hist_mode
             _vp_poc_lns.push(line.new(_cur_c.start_bi, _cur_c.poc_p, _cur_lx2_c, _cur_c.poc_p,
                                        color=i_poc_col, width=i_poc_width))
+        if i_show_poc
             _vp_poc_lbl := label.new(_cur_lx2_c, _cur_c.poc_p,
                                      " POC: " + str.tostring(_cur_c.poc_p, format.mintick),
                                      textcolor=i_poc_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-        if i_show_vah_val
+        if i_show_vah_val and not i_vp_hist_mode
             _vp_vah_lns.push(line.new(_cur_c.start_bi, _cur_c.vah_p, _cur_lx2_c, _cur_c.vah_p,
                                        color=i_vah_val_col, width=i_vah_val_width))
+            _vp_val_lns.push(line.new(_cur_c.start_bi, _cur_c.val_p, _cur_lx2_c, _cur_c.val_p,
+                                       color=i_vah_val_col, width=i_vah_val_width))
+        if i_show_vah_val
             _vp_vah_lbl := label.new(_cur_lx2_c, _cur_c.vah_p,
                                      " VAH: " + str.tostring(_cur_c.vah_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,
                                      color=color.new(color.black, 100), size=size.tiny)
-            _vp_val_lns.push(line.new(_cur_c.start_bi, _cur_c.val_p, _cur_lx2_c, _cur_c.val_p,
-                                       color=i_vah_val_col, width=i_vah_val_width))
             _vp_val_lbl := label.new(_cur_lx2_c, _cur_c.val_p,
                                      " VAL: " + str.tostring(_cur_c.val_p, format.mintick),
                                      textcolor=i_vah_val_col, style=label.style_label_left,

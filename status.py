@@ -857,6 +857,19 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     def near(level):
         return level is not None and abs(price - level) <= tol
 
+    # Shared 3-tier distance coloring (green <= tol, yellow tol < d <=
+    # yellow_ceiling, red beyond) — used by both GEX Flip and gamma clusters'
+    # distance text below.
+    yellow_ceiling = gamma_yellow_tol if gamma_yellow_tol is not None else gamma_tol
+
+    def dist_color(dist):
+        if dist <= tol:
+            return GRN
+        elif dist <= yellow_ceiling:
+            return YLW
+        else:
+            return RED
+
     if export:
         vah, val, poc = export.get("vah"), export.get("val"), export.get("poc")
         vwap = export.get("vwap")
@@ -920,8 +933,10 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     bt, st, active = compute_bt_st(chain["strikes"], is_crypto, pcvr_gt1, price)
     bt_green = active == "BT" and bt is not None and price >= bt and near(bt)
     st_green = active == "ST" and st is not None and price <= st and near(st)
-    rows.append(("BT", f"${bt:,.2f}" if bt is not None else "n/a", bt_green))
-    rows.append(("ST", f"${st:,.2f}" if st is not None else "n/a", st_green))
+    # BT/ST values are always colored green/red respectively (buy/sell
+    # territory), independent of the row's own light/condition.
+    rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}" if bt is not None else "n/a", bt_green))
+    rows.append(("ST", f"{RED}{BLD}${st:,.2f}{RST}" if st is not None else "n/a", st_green))
 
     rows.append(("Prev EOD Close", f"${prev_close:,.2f}" if prev_close is not None else "n/a", near(prev_close)))
 
@@ -929,14 +944,19 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         gex_flip = gex_export["gex_flip"]
     else:
         gex_flip = compute_gex_flip(chain, is_crypto)
-    rows.append(("GEX Flip", f"${gex_flip:,.2f}" if gex_flip is not None else "n/a", near(gex_flip)))
+    if gex_flip is not None:
+        gflip_dist = abs(price - gex_flip)
+        gflip_col = dist_color(gflip_dist)
+        gex_flip_str = f"${gex_flip:,.2f} ({gflip_col}{BLD}${gflip_dist:,.2f} away{RST})"
+    else:
+        gex_flip_str = "n/a"
+    rows.append(("GEX Flip", gex_flip_str, near(gex_flip)))
 
     # Row's own light follows the ORIGINAL rule (unchanged): green if ANY of
     # the shown clusters is within gamma_tol. The per-cluster DISTANCE TEXT
     # gets its own separate green/yellow/red coloring (green <= tol, yellow
     # tol < d <= gamma_yellow_tol, red beyond) — a distinct, purely cosmetic
     # scheme layered on top, not a replacement for the row's light.
-    yellow_ceiling = gamma_yellow_tol if gamma_yellow_tol is not None else gamma_tol
     if gex_export and gex_export.get("gex_by_strike"):
         nearest = clusters_from_gex_export(gex_export, price, n=2)
     else:
@@ -945,12 +965,7 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         hit = any(dist <= gamma_tol for _k, _t, dist in nearest)
         segs = []
         for k, t, dist in nearest:
-            if dist <= tol:
-                dcol = GRN
-            elif dist <= yellow_ceiling:
-                dcol = YLW
-            else:
-                dcol = RED
+            dcol = dist_color(dist)
             segs.append(f"${k:,.2f} ({t[0]}, {dcol}{BLD}${dist:,.2f} away{RST})")
         cluster_str = ", ".join(segs)
     else:

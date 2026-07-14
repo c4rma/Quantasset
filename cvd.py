@@ -1573,7 +1573,7 @@ def ws_alpaca(session):
         backoff = min(backoff * 2, 60)
 
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
-P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_MAGENTA = range(1, 9)
+P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_MAGENTA, P_BLUE = range(1, 10)
 
 def init_colors():
     curses.start_color()
@@ -1587,6 +1587,17 @@ def init_colors():
     curses.init_pair(P_RED,     curses.COLOR_RED,    BG)
     curses.init_pair(P_STATUS,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
     curses.init_pair(P_MAGENTA, curses.COLOR_MAGENTA, BG)   # BTD sell signal (buy uses P_CYAN)
+    curses.init_pair(P_BLUE,    curses.COLOR_BLUE,   BG)    # [C] blue/white candle scheme (down)
+
+# [C] key: candle color scheme. "green_red" (default) = green/red like most
+# charting tools; "blue_white" = white for up, blue for down (user's chosen
+# mapping — NOT the reverse; asked explicitly since there's no universal
+# convention for which of the two colors should mean bullish here, unlike
+# green/red where up=green is essentially universal).
+CANDLE_COLORS = {
+    "green_red":  {"up": P_GREEN,   "down": P_RED},
+    "blue_white": {"up": P_DEFAULT, "down": P_BLUE},
+}
 
 def cp(pair, bold=False, dim=False):
     a = curses.color_pair(pair)
@@ -1785,12 +1796,17 @@ def compute_btd_signals(bars, lookback=BTD_LOOKBACK, sigma=BTD_SIGMA):
     return signals
 
 def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_idx=-1, fmt_fn=None,
-                  btd_signals=None, live_price=None):
+                  btd_signals=None, live_price=None, color_scheme="green_red"):
     """Shared OHLC candlestick renderer — used for both the price panel and
     the CVD panel (candles built from cvd_open/high/low/close) so the two
     panels share identical visual language. Returns (vmin, vmax, live_row) —
     live_row (see live_price below) is returned so the caller can avoid
     overwriting that row with a regular axis tick label.
+
+    color_scheme ([C] key, see CANDLE_COLORS): which color pair means
+    bullish (close>=open) vs bearish for the candle body/wick — doesn't
+    affect anything else (crosshair, BTD markers, live-price line all keep
+    their own fixed colors regardless of scheme).
 
     cursor_idx (crosshair, like charthacker.py/quantasset_chart.py): if it
     names a visible column, that candle is highlighted yellow and a dotted
@@ -1855,7 +1871,8 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
         r_hi, r_lo, r_op, r_cl = to_row(hi), to_row(lo), to_row(o), to_row(c)
         is_cursor = (i == cursor_idx)
         up = c >= o
-        color = cp(P_YELLOW, bold=True) if is_cursor else (cp(P_GREEN, bold=True) if up else cp(P_RED, bold=True))
+        scheme = CANDLE_COLORS[color_scheme]
+        color = cp(P_YELLOW, bold=True) if is_cursor else cp(scheme["up"] if up else scheme["down"], bold=True)
         for r in range(r_hi, r_lo + 1):
             _w(r, i, "│", cp(P_DIM))
             occupied.add((r, i))
@@ -1927,8 +1944,25 @@ def draw_candles(win, visible, rows, ohlc_fn, plot_w, zero_line=False, cursor_id
 
     return vmin, vmax, live_row
 
+def fmt_bar_progress(live, now=None):
+    """Status-header text describing how close the CURRENTLY FORMING bar
+    (`live`) is to closing: a countdown for time bars, or an
+    accumulated/threshold ratio for volume bars — same feature and format
+    as footprint.py's own fmt_bar_progress(). Returns None if there's no
+    live bar to report on (before the first trade of a session, or in
+    --date historical playback, which has no live bar at all)."""
+    if live is None:
+        return None
+    if BAR_MODE == "time":
+        now = now if now is not None else time.time()
+        remaining = max(0, (live["ts"] + BAR_SECS) - now)
+        mins, secs = divmod(int(remaining), 60)
+        return f"closes in {mins}:{secs:02d}"
+    accumulated = live["buy_vol"] + live["sell_vol"]
+    return f"{fmt_qty(accumulated)} / {VOL_THRESHOLD:g}"
+
 # ── DRAW ──────────────────────────────────────────────────────────────────
-def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd=False):
+def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd=False, color_scheme="green_red"):
     """Returns n_vis — the number of bars actually rendered this frame — so
     the caller can track it for the NEXT frame's crosshair/pan arithmetic
     (the exact visible count depends on terminal width, only known here)."""
@@ -1939,7 +1973,10 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
 
     zoom_tag = f"  zoom:{zoom_group}x" if zoom_group > 1 else ""
     btd_tag = "  BTD:ON" if show_btd else ""
-    header = f" AGGREGATE CVD — {SYMBOL}  bar:{INTERVAL_LABEL}{zoom_tag}{btd_tag}  "
+    color_tag = "  colors:blue/white" if color_scheme == "blue_white" else ""
+    bar_progress = fmt_bar_progress(live_bar)
+    progress_tag = f"  |  {bar_progress}" if bar_progress else ""
+    header = f" AGGREGATE CVD — {SYMBOL}  bar:{INTERVAL_LABEL}{zoom_tag}{btd_tag}{color_tag}{progress_tag}  "
     safe_add(win, 0, 0, header.ljust(w), cp(P_STATUS))
 
     all_bars = bars + ([live_bar] if live_bar else [])
@@ -1977,7 +2014,7 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
 
     pmin, pmax, live_row = draw_candles(win, visible, price_rows, _price_ohlc, plot_w,
                               cursor_idx=cursor_idx, fmt_fn=fmt_price, btd_signals=btd_signals,
-                              live_price=state.last_price)
+                              live_price=state.last_price, color_scheme=color_scheme)
     prows = len(price_rows)
     for tick_frac in (0.0, 0.5, 1.0):
         r = price_rows[int(round(tick_frac * (prows - 1)))]
@@ -1995,7 +2032,7 @@ def draw(win, bars, live_bar, status_line, cursor_idx=-1, zoom_group=1, show_btd
         return o, hi, lo, c
 
     cmin, cmax, _ = draw_candles(win, visible, cvd_rows, _cvd_ohlc, plot_w, zero_line=True,
-                              cursor_idx=cursor_idx, fmt_fn=fmt_qty)
+                              cursor_idx=cursor_idx, fmt_fn=fmt_qty, color_scheme=color_scheme)
     crows = len(cvd_rows)
     for tick_frac in (0.0, 0.5, 1.0):
         r = cvd_rows[int(round(tick_frac * (crows - 1)))]
@@ -2166,6 +2203,7 @@ def curses_main(stdscr):
     last_n_vis = 0      # bars actually rendered last frame — for cursor activation/pan math
     zoom_group = 1      # [+]/[-]: how many real bars are merged into 1 displayed candle
     show_btd = False    # [T]: Big Trade Detector overlay on the price panel
+    color_scheme = "green_red"   # [C]: candle color scheme, see CANDLE_COLORS
     screenshot_msg = None   # [P]: transient confirmation, shown for 5s
     screenshot_until = 0
 
@@ -2197,6 +2235,8 @@ def curses_main(stdscr):
                 state.cvd_offset = state.raw_cvd
         elif key in (ord('t'), ord('T')):
             show_btd = not show_btd
+        elif key in (ord('c'), ord('C')):
+            color_scheme = "blue_white" if color_scheme == "green_red" else "green_red"
         elif key in (ord('+'), ord('=')):
             zoom_group = zoom_step(zoom_group, -1)
         elif key in (ord('-'), ord('_')):
@@ -2376,7 +2416,7 @@ def curses_main(stdscr):
             sl = f"{screenshot_msg}  |  {sl}"
 
         last_n_vis = draw(stdscr, draw_bars, draw_live, sl, cursor_idx=cursor_idx,
-                          zoom_group=zoom_group, show_btd=show_btd) or 0
+                          zoom_group=zoom_group, show_btd=show_btd, color_scheme=color_scheme) or 0
         curses.doupdate()
 
     stop_alpaca_ws()   # release Alpaca's connection slot immediately on quit,

@@ -1486,6 +1486,116 @@ def compute_er(open_price: float, iv: float) -> dict | None:
         "lower": {p: open_price + dist * (-p / 100.0) for p in (20, 40, 60, 80, 100, 150)},
     }
 
+# ── Status export (for status.py) ────────────────────────────────────────────
+# While this app runs normally (UI unaffected), periodically write the active
+# asset's live-computed session indicators to status_<ASSET>.json next to
+# this script, so status.py's HPL rules can read the exact values this chart
+# is showing instead of recomputing them from its own independent REST
+# snapshot — the two will never be bit-for-bit identical otherwise, since
+# this app accumulates live WebSocket ticks and status.py only polls. BT/ST,
+# gamma clusters, and PCVR still come from status.py's own options-chain
+# fetches — this only covers the price-candle-derived levels (VAH/VAL/POC/
+# VWAP/SD bands/session open/previous close), which is where the two
+# disagreed. Run a second instance of this app on the other asset (ETH/QQQ)
+# for status.py to pick up both exports.
+STATUS_EXPORT_DIR      = os.path.dirname(os.path.abspath(__file__))
+STATUS_EXPORT_INTERVAL = 5   # seconds
+
+def _status_export_session_open_ts() -> float:
+    """Fixed daily 19:00 CT anchor, independent of session_bounds()'s
+    resolution-dependent anchor (weekly/monthly at >=4H/1D) — the export
+    always uses the same daily session status.py itself anchors to,
+    regardless of what interval this chart is currently displaying."""
+    import datetime as _dt
+    n = datetime.now()
+    today_open = datetime(n.year, n.month, n.day, 19, 0, 0)
+    if n < today_open:
+        return (today_open - _dt.timedelta(days=1)).timestamp()
+    return today_open.timestamp()
+
+def _status_export_prev_eod_close(asset: str, curr_open_ts: float):
+    """Close at 16:00 CT the day before curr_open_ts (curr_open_ts - 3h) —
+    matches status.py's own "Previous EOD Close" definition exactly.
+    A dedicated fetch, NOT the Global-mode fetch_global_asset_phemex/yahoo
+    helpers above — those only pull a short trailing window (good enough for
+    a macro overview, but not guaranteed to reach back to yesterday's 16:00
+    CT), so this queries an explicit historical window around target_ts
+    instead (Phemex's /kline/list range endpoint for crypto, Yahoo's 5-day
+    chart range for everything else)."""
+    target_ts = curr_open_ts - 3 * 3600
+    try:
+        if is_crypto_symbol(asset):
+            path_  = "/exchange/public/md/v2/kline/list"
+            query_ = (f"symbol={PHEMEX_SYMBOLS[asset]}&resolution=60"
+                      f"&from={int(target_ts) - 3600}&to={int(target_ts) + 60}&limit=100")
+            r = requests.get(f"{PHEMEX_REST_URL}{path_}?{query_}",
+                              headers=_phemex_headers(path_, query_), timeout=12)
+            data = r.json()
+            if data.get("code") != 0:
+                return None
+            rows = data.get("data", {}).get("rows", [])   # oldest-first
+            return float(rows[-1][5]) if rows else None
+        else:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{asset}",
+                              headers={"User-Agent": "Mozilla/5.0"},
+                              params={"interval": "1m", "range": "5d", "includePrePost": "true"},
+                              timeout=12)
+            res = r.json()["chart"]["result"][0]
+            ts_list = res.get("timestamp") or []
+            closes  = res["indicators"]["quote"][0]["close"]
+            before  = [(t, c) for t, c in zip(ts_list, closes) if t <= target_ts and c is not None]
+            return float(before[-1][1]) if before else None
+    except Exception:
+        return None
+
+def status_export_loop():
+    """Background: every STATUS_EXPORT_INTERVAL seconds, write the active
+    asset's live indicator snapshot to status_<ASSET>.json. Never blocks or
+    crashes the app — any failure just skips that cycle's write."""
+    _cached_key = None    # (asset, curr_open_ts) the cached prev-close is for
+    _cached_prev_close = None
+    while True:
+        try:
+            with state.lock:
+                asset        = state.asset
+                candles_snap = list(state.candles)
+                spot         = state.last_price
+                iv           = state.er_iv
+                levels       = dict(state.indicator_levels)
+
+            curr_open_ts     = _status_export_session_open_ts()
+            session_candles  = [c for c in candles_snap if c.ts >= curr_open_ts]
+            session_open     = session_candles[0].o if session_candles else None
+
+            key = (asset, curr_open_ts)
+            if _cached_key != key:
+                _cached_prev_close = _status_export_prev_eod_close(asset, curr_open_ts)
+                _cached_key = key
+
+            if session_open is not None and levels:
+                payload = {
+                    "asset": asset,
+                    "updated_at": time.time(),
+                    "spot": spot,
+                    "session_open": session_open,
+                    "iv": iv,
+                    "prev_eod_close": _cached_prev_close,
+                    **levels,
+                }
+                path     = os.path.join(STATUS_EXPORT_DIR, f"status_{asset}.json")
+                # Per-PID tmp filename — two instances of this app landing on
+                # the same asset (not unusual for this repo) would otherwise
+                # share one tmp filename and can hit a Windows sharing
+                # violation writing it at the same moment, silently failing
+                # forever if their intervals stay in phase.
+                tmp_path = f"{path}.{os.getpid()}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, path)   # atomic on both POSIX and Windows
+        except Exception:
+            pass
+        time.sleep(STATUS_EXPORT_INTERVAL)
+
 # ── double-buffer ──────────────────────────────────────────────────────────────
 EMPTY_CELL = (" ", 0, 0)
 
@@ -2635,6 +2745,18 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
             if _last_curr:
                 _vw_last, _sd_last = _vwap_map[_last_curr.ts]
                 if _vw_last > 0:
+                    # Feeds state.indicator_levels the same way _deferred_vp
+                    # does below for VAH/VAL/POC — previously referenced via
+                    # "_deferred_vwap_lvl" in vars() further down but never
+                    # actually assigned anywhere, so VWAP/SD never reached
+                    # indicator_levels (silently breaking the SD-touch alert
+                    # types too, since those read it). Fixed here.
+                    _deferred_vwap_lvl = {
+                        "vwap": _vw_last,
+                        "sd_p05": _vw_last + 0.5 * _sd_last, "sd_m05": _vw_last - 0.5 * _sd_last,
+                        "sd_p2":  _vw_last + 2.0 * _sd_last, "sd_m2":  _vw_last - 2.0 * _sd_last,
+                        "sd_p25": _vw_last + 2.5 * _sd_last, "sd_m25": _vw_last - 2.5 * _sd_last,
+                    }
                     def _pr_ax(p):
                         if hi_p == lo_p: return chart_h // 2
                         r = int((1.0 - (p - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
@@ -5894,6 +6016,35 @@ def check_open_position_on_startup():
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
+    # This app is keyboard-only — never enabled mouse reporting, but a
+    # left-click can still make the TERMINAL send a raw multi-byte mouse
+    # escape sequence straight into the input stream if mouse tracking
+    # happens to be on at the terminal/console level (its default state
+    # varies by platform/terminal). Since the main loop just reads
+    # getch()/get_wch() one code at a time with no mouse awareness, each
+    # byte of that sequence gets misread as its own keystroke — a burst of
+    # unrelated key handlers firing back to back, with no way to "escape"
+    # since the garbage keeps getting consumed on later frames too.
+    # Explicitly disabling mouse reporting here stops the terminal from
+    # ever generating that sequence in the first place.
+    try:
+        curses.mousemask(0)
+    except curses.error:
+        pass
+    # curses.mousemask(0) only tells CURSES not to enable mouse tracking
+    # ITSELF — if the terminal was already left in a mouse-tracking mode
+    # from BEFORE this app started (a prior session that didn't clean up,
+    # a terminal profile default, etc.), curses has no reason to send the
+    # "turn it off" ANSI sequence, since as far as curses knows nothing
+    # needs to change. Send the raw disable sequences directly, covering
+    # every common mouse-tracking mode, so the terminal stops generating
+    # click/motion reports regardless of what state it was already in.
+    try:
+        sys.stdout.write(
+            "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l")
+        sys.stdout.flush()
+    except Exception:
+        pass
     # Use timeout instead of nodelay — waits up to 50ms for input then
     # returns -1. Much gentler on terminals (especially Termux) than
     # spinning getch() in a busy loop. Gives ~20fps max frame rate.
@@ -5910,6 +6061,7 @@ def main(stdscr):
     threading.Thread(target=alert_monitor, daemon=True).start()
     threading.Thread(target=_bg_ticker_loop, daemon=True).start()
     threading.Thread(target=iv_monitor_loop, daemon=True).start()
+    threading.Thread(target=status_export_loop, daemon=True).start()
     threading.Thread(target=check_open_position_on_startup, daemon=True).start()
     # Start trade monitor immediately — auto-plots any existing positions/orders
     if PHEMEX_API_KEY:
@@ -5935,12 +6087,36 @@ def main(stdscr):
         if not keys:
             keys = [-1]   # no input — still run draw/refresh
 
+        # Defensive filter: a raw byte sequence curses doesn't recognize
+        # (e.g. a mouse click/motion report the terminal sent despite the
+        # disable sequences above — some terminals re-enable it, or ignore
+        # the request) shows up here as a burst of individual codes starting
+        # with ESC (27), all landing in the SAME ~50ms poll window. A human
+        # pressing the actual Escape key essentially never has more input
+        # already queued up in that same instant. Treat "ESC immediately
+        # followed by other keys in one batch" as garbage: keep the leading
+        # ESC (still honored as a real Escape press) and drop the rest,
+        # rather than feeding unrelated bytes into the key handlers below.
+        if len(keys) > 1 and keys[0] == 27:
+            keys = [27]
+
         restart_feed = False
         new_interval_secs = -1
 
         for key in keys:
             if key == curses.KEY_RESIZE:
                 # Just note resize — handled at end of loop without clearing
+                continue
+            if key == curses.KEY_MOUSE:
+                # Belt-and-suspenders alongside mousemask(0) at startup — if
+                # a mouse event reaches here anyway, drain it via getmouse()
+                # so its data doesn't leak into later getch() calls and get
+                # misread as keystrokes, then ignore it (this app is
+                # keyboard-only).
+                try:
+                    curses.getmouse()
+                except curses.error:
+                    pass
                 continue
             if key in (ord("q"), ord("Q")):
                 _save_choice = _save_prompt_dialog(stdscr, rows, cols)

@@ -12,7 +12,10 @@ landing on a strike's own row only when price exactly equals that strike.
               these strikes act as magnets / pin / support-resistance.
   Red dot   = negative gamma (put-dominated). Dealer hedging amplifies moves —
               price accelerates through these zones.
-  Dot size  = magnitude of net GEX at that strike, scaled against the session max.
+  Dot size  = magnitude of net GEX at that strike, scaled against the largest
+              magnitude seen *up to that moment* — frozen at the time each
+              column was gathered, so a later, bigger spike elsewhere never
+              retroactively shrinks or grows a dot that's already on screen.
 
 GEX(strike) = Σ [gamma × open_interest × contract_mult × spot² × 0.01], calls
 positive, puts negative — the standard "dealer is long calls / short puts"
@@ -502,6 +505,52 @@ def check_flip_jump(prev_col, new_col):
     sign = "+" if delta > 0 else "-"
     return f"⚠ flip jumped {sign}{fstrike(abs(delta))} @ {new_col['ts'].strftime('%H:%M:%S')} (logged)"
 
+# ── Status export (for status.py) ────────────────────────────────────────────
+# A SEPARATE file from charthacker.py's own status_<SYMBOL>.json export
+# (status_<SYMBOL>_gex.json) — charthacker.py and this app could both be
+# running for the same symbol at once, and each independently overwriting
+# the exact same filename would race/clobber the other's fields. status.py
+# reads both and merges what each has.
+#
+# Why this exists: status.py's own gamma-cluster tier classification
+# recomputes its scale_max fresh every single refresh from just that one
+# snapshot, so a strike sitting right at the Medium/Large threshold can drop
+# out and back in from ordinary snapshot-to-snapshot noise even though the
+# real underlying exposure barely moved — this app's own scale_max instead
+# grows across the WHOLE session (frozen per-column at ingestion, never
+# retroactively rescaled — see do_fetch/_load_into), giving a stable
+# classification that doesn't flicker. Exporting it lets status.py use that
+# stable number instead of its own volatile one. Also exports the smoothed
+# GEX flip for the same reason (averaged over SMOOTH_N columns already).
+STATUS_EXPORT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def export_status_snapshot(col, scale_max, flip_level):
+    """Best-effort, non-blocking — any failure here must never interrupt the
+    live fetch/render loop."""
+    try:
+        payload = {
+            "asset": SYMBOL,
+            "updated_at": time.time(),
+            "spot": col["spot"],
+            "scale_max": scale_max,
+            "gex_by_strike": col.get("gex") or {},
+            "gex_flip": flip_level,
+        }
+        path = os.path.join(STATUS_EXPORT_DIR, f"status_{SYMBOL}_gex.json")
+        # Per-PID tmp filename — if a second gex.py instance is running on the
+        # SAME symbol (this happens; not even unusual for this repo), two
+        # processes sharing one tmp filename can hit a Windows sharing
+        # violation trying to open the same file at once, silently failing
+        # every write forever if their intervals stay in phase. A private tmp
+        # file per process avoids that entirely; the final os.replace onto
+        # the shared `path` is still atomic either way (last writer wins).
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)   # atomic on both POSIX and Windows
+    except Exception:
+        pass
+
 def smoothed_max_pain_and_flip(history, end_idx, n):
     """Average Max Pain and the GEX-flip level over the last n raw columns ending at
     end_idx, to absorb single-snapshot OI/IV artifacts (see check_flip_jump/module
@@ -944,7 +993,10 @@ def draw(win, history, grid, scale_max, meta, status, ui):
             if cx >= w - 1:
                 break
             net = col["gex"].get(strike, 0.0)
-            ch, attr = dot_repr(net, scale_max)
+            # Each column sizes its own dots against the scale frozen at the moment IT
+            # was gathered (see _load_into/do_fetch) — not the current, possibly-since-
+            # grown scale_max — so historical dots never retroactively shrink or grow.
+            ch, attr = dot_repr(net, col.get("scale_at_ingest") or scale_max)
             safe_add(win, row, cx, ch, attr)
             cx += COL_W
 
@@ -974,7 +1026,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         target_row = resolve_marker_row(lo_s, hi_s, row_of)
         net_src = lo_s if lo_s == hi_s or abs(spot_c - lo_s) <= abs(spot_c - hi_s) else hi_s
         if target_row is not None and top <= target_row < h - bottom_reserved:
-            ch, attr = price_marker_repr(col["gex"].get(net_src, 0.0), scale_max)
+            ch, attr = price_marker_repr(col["gex"].get(net_src, 0.0), col.get("scale_at_ingest") or scale_max)
             safe_add(win, target_row, cx, ch, attr)
 
     # ── Time axis ────────────────────────────────────────────────────────
@@ -1335,8 +1387,14 @@ def curses_main(stdscr):
             if last_expiry is not None and c.get("expiry_label") != last_expiry:
                 scale_max = 0.0
             last_expiry = c.get("expiry_label")
-            history.append(c)
             scale_max = max(scale_max, local_max)
+            # Frozen at ingestion — draw() sizes THIS column's dots against the scale
+            # that existed at the moment it was gathered, not whatever scale_max has
+            # since grown to. Without this, a later, bigger spike anywhere retroactively
+            # shrinks every older dot on screen even though its own value never changed —
+            # exactly the "historical data got adjusted" symptom this must never do.
+            c["scale_at_ingest"] = scale_max
+            history.append(c)
         if history:
             last = history[-1]
             meta = {"spot": last["spot"], "expiry_label": last.get("expiry_label") or "—",
@@ -1372,8 +1430,12 @@ def curses_main(stdscr):
                 # expiry's naturally smaller scale shouldn't be dwarfed by the old one's.
                 if prev_col is not None and prev_col.get("expiry_label") != col.get("expiry_label"):
                     scale_max = 0.0
-                history.append(col)
                 scale_max = max(scale_max, local_max)
+                # Frozen at ingestion (see _load_into's comment) — this column always
+                # renders at this scale from now on, never retroactively rescaled by a
+                # later, bigger spike elsewhere.
+                col["scale_at_ingest"] = scale_max
+                history.append(col)
                 meta = {k: v for k, v in d.items() if k != "strikes"}
                 error_msg = ""
                 last_fetch = time.time()
@@ -1390,6 +1452,18 @@ def curses_main(stdscr):
                         diag_count += 1
                         diag_msg = msg
                         diag_msg_time = time.time()
+                try:
+                    # history is a deque (bounded, HISTORY_MAXLEN) — it doesn't
+                    # support slicing, which smoothed_max_pain_and_flip does
+                    # internally. draw()'s existing calls to this function work
+                    # because the render path already converts to a plain list
+                    # (cur_history = list(history)) before ever calling it; this
+                    # is the one call site that talks to the raw deque directly.
+                    _hist_list = list(history)
+                    _mp, _flip = smoothed_max_pain_and_flip(_hist_list, len(_hist_list), SMOOTH_N)
+                except Exception:
+                    _flip = None
+                export_status_snapshot(col, scale_max, _flip)
         except Exception as e:
             with lock:
                 if epoch == fetch_epoch:
@@ -1622,6 +1696,12 @@ def headless_main():
           f"every {REFRESH_SEC}s -> {log_path(datetime.now().strftime('%m_%d_%Y'))}")
     print("Ctrl+C to stop.")
     prev_col = None
+    # Small rolling window purely to feed smoothed_max_pain_and_flip and a
+    # growing scale_max for export_status_snapshot — this mode has no grid/
+    # curses state to reuse, so it tracks just enough of its own to match the
+    # live UI's stable (not per-snapshot-volatile) tier classification.
+    export_history = []
+    scale_max = 0.0
     while True:
         t0 = time.time()
         ts = datetime.now()
@@ -1641,6 +1721,18 @@ def headless_main():
                 msg = check_flip_jump(prev_col, col)
                 if msg:
                     print(f"  {msg}")
+            if prev_col is not None and prev_col.get("expiry_label") != col.get("expiry_label"):
+                scale_max = 0.0
+            local_max = max((abs(v) for v in col["gex"].values()), default=0.0)
+            scale_max = max(scale_max, local_max)
+            export_history.append(col)
+            if len(export_history) > SMOOTH_N + 10:
+                export_history.pop(0)
+            try:
+                _mp, _flip = smoothed_max_pain_and_flip(export_history, len(export_history), SMOOTH_N)
+            except Exception:
+                _flip = None
+            export_status_snapshot(col, scale_max, _flip)
             prev_col = col
         except Exception as e:
             print(f"[{ts.strftime('%H:%M:%S')}] fetch error: {e}")

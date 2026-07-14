@@ -5,7 +5,11 @@ BASE_URL = "https://raw.githubusercontent.com/c4rma/Quantasset/refs/heads/main"
 
 
 def main():
-    filename = input("Enter filename (without .py extension): ").strip()
+    if len(sys.argv) != 2:
+        print("Usage: grabber.py [FILENAME]")
+        sys.exit(1)
+
+    filename = sys.argv[1].strip()
 
     if not filename or not filename.replace("_", "").replace("-", "").isalnum():
         print("Invalid filename. Use only letters, numbers, hyphens, and underscores.")

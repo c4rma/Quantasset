@@ -3,7 +3,7 @@
 footprint.py — terminal bid x ask footprint (order-flow) chart, crypto + equities
 
 Usage:
-  python footprint.py [SYMBOL] [--interval <N>s|<N>m|<N>V] [--tick N]
+  python footprint.py [SYMBOL] [--interval <N>s|<N>m|<N>V|<N>T] [--tick N]
                        [--imbalance N] [--stack N] [--min-imbalance-vol N]
                        [--big-trade-size N] [--backfill-hours N]
                        [--date MM_DD_YYYY] [--headless]
@@ -43,22 +43,29 @@ set ALPACA_API_KEY_ID_FOOTPRINT/ALPACA_API_SECRET_KEY_FOOTPRINT in .env —
 footprint.py prefers these over the shared keys when present, giving it an
 independent connection slot so both tools can stream equities at once.
 
---interval takes any of three forms (trailing letter picks the unit, N is
+--interval takes any of four forms (trailing letter picks the unit, N is
 any positive number): "<N>s" seconds (e.g. 45s), "<N>m" minutes (e.g. 5m,
-0.5m), or "<N>V" a VOLUME bar — closes once combined buy+sell volume within
-it reaches N units of the base asset instead of on a wall-clock boundary
-(e.g. 500V — same convention as cvd.py's volume bars in this repo). Default
-5m, --tick 1.00, --imbalance 3.0 (300%), --stack 3, --min-imbalance-vol 0,
---big-trade-size 100.
+0.5m), "<N>V" a VOLUME bar — closes once combined buy+sell volume within it
+reaches N units of the base asset instead of on a wall-clock boundary (e.g.
+500V — same convention as cvd.py's volume bars in this repo) — or "<N>T" a
+TICK bar — closes once N individual trade prints have landed in it,
+regardless of elapsed time or volume (e.g. 100T). Tick bars are the third
+classic bar-sampling method alongside time and volume bars, useful for
+crypto and equities alike since they normalize for how often trades are
+actually printing rather than how much time passed or how much size
+traded. (Unrelated to --tick / the [T] key, the price-increment/$
+resolution setting — "tick BAR" here means a bar-closing rule based on
+trade COUNT, not the price axis.) Default 5m, --tick 1.00, --imbalance 3.0
+(300%), --stack 3, --min-imbalance-vol 0, --big-trade-size 100.
 
 [I] opens a text prompt to change the bar interval in-app (same <N>s/<N>m/
-<N>V syntax as --interval) without restarting — types the new interval once
-and switches directly to it, rather than cycling through a fixed list and
-waiting for a full backfill at every interval in between just to reach the
-one you actually wanted. Rebuilds history the same way a fresh launch with
-that --interval would. Everything else in this file works identically
+<N>V/<N>T syntax as --interval) without restarting — types the new interval
+once and switches directly to it, rather than cycling through a fixed list
+and waiting for a full backfill at every interval in between just to reach
+the one you actually wanted. Rebuilds history the same way a fresh launch
+with that --interval would. Everything else in this file works identically
 regardless of how the interval was set (imbalance/stack/POC/grid-widening
-all operate the same on a volume bar's levels as a time bar's).
+all operate the same on a volume or tick bar's levels as a time bar's).
 
 [T] opens the same kind of text prompt for the price increment (--tick) —
 type any positive $ amount (e.g. "0.25", "1", "10") and it rebuilds history
@@ -158,13 +165,26 @@ the background and prepends it — keep scrolling left and it keeps loading,
 same lazy-load-on-demand convention cvd.py uses.
 
 Navigation: [←/→] pan time 1 bar, [[/]] pan time 10 bars, [↑/↓] pan price,
-[PgUp/PgDn] pan price (bigger step), [Home]/[L] return to live, [C] re-center
-vertically without leaving your current scroll position, [S] change symbol
-(crypto or equity), [I] change bar interval, [T] change price increment,
-[M] change imbalance ratio, [B] change Big Trades size, [P] screenshot,
-[Q]/Esc quit.
+[PgUp/PgDn] pan price (bigger step), [Home]/[L]/Esc return to live, [C]
+re-center vertically without leaving your current scroll position, [Z]/[X]
+move a crosshair one candle left/right, [S] change symbol (crypto or
+equity), [I] change bar interval, [T] change price increment, [M] change
+imbalance ratio, [B] change Big Trades size, [P] screenshot, [Q] quit.
 
-Known scope limit: no crosshair/goto.
+[Z]/[X] crosshair: selects a single candle (bar) and shows its OHLC + net
+delta in the status bar, updating one bar at a time as you press [Z] (left,
+toward history) or [X] (right, toward the live edge) — either key activates
+the crosshair on first press if it isn't already active, starting from
+whatever bar currently sits at the right edge of the view. The selected
+bar's time-axis label and net-delta cell are shown in reverse-video, plus a
+dim vertical line runs the full height of its left gutter — the ONE column
+position no bid/ask cell text ever occupies (POC/open/close markers use it
+too), so the line never overwrites real cell data; it simply skips whatever
+row already has one of those markers. If the crosshair moves past either
+edge of the currently visible window, the view pans along with it
+automatically. Plain [←/→]/[[/]] panning or any of [Home]/[L]/[I]/[T]/[S]
+deactivates the crosshair, since those move or rebuild the whole view
+rather than one selected bar.
 """
 
 import sys
@@ -249,12 +269,19 @@ args = [a for a in args if a != "--headless"]
 
 def parse_interval(raw):
     """Decode a bar-interval spec into (label, mode, secs, threshold), or
-    None if invalid. Three forms, matched by the trailing unit letter:
+    None if invalid. Four forms, matched by the trailing unit letter:
       "<N>s" -> time bar, N seconds (any positive number, e.g. "45s")
       "<N>m" -> time bar, N minutes (e.g. "5m", "10m", "0.5m")
       "<N>V" -> volume bar, closes once combined buy+sell volume in it
                 reaches N units of the base asset (e.g. "500V") — same
                 convention as cvd.py's volume bars in this repo.
+      "<N>T" -> tick bar, closes once N individual trade prints have
+                landed in it, regardless of elapsed time or volume (e.g.
+                "100T") — the third classic bar-sampling method alongside
+                time and volume bars. Unrelated to the price-tick ($
+                increment) setting despite the shared letter — that's
+                --tick / the [T] key, a completely different axis
+                (vertical price resolution vs. this, a bar-closing rule).
     Shared by the CLI --interval flag and the in-app [I] prompt so both
     accept exactly the same syntax."""
     if not raw or len(raw) < 2:
@@ -279,6 +306,11 @@ def parse_interval(raw):
         return f"{num_part}m", "time", secs, None
     if unit == "v":
         return f"{num_part}V", "volume", None, num
+    if unit == "t":
+        count = int(round(num))
+        if count < 1:
+            return None
+        return f"{count}T", "tick", None, count
     return None
 
 INTERVAL_LABEL = "5m"
@@ -290,11 +322,11 @@ if "--interval" in args:
         print("--interval requires a value"); sys.exit(1)
     parsed = parse_interval(lbl)
     if parsed is None:
-        print("--interval must be like <N>s, <N>m, or <N>V (e.g. 45s, 5m, 500V)")
+        print("--interval must be like <N>s, <N>m, <N>V, or <N>T (e.g. 45s, 5m, 500V, 100T)")
         sys.exit(1)
     INTERVAL_LABEL = parsed[0]
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
-_, BAR_MODE, BAR_SECS, VOL_THRESHOLD = parse_interval(INTERVAL_LABEL)
+_, BAR_MODE, BAR_SECS, BAR_THRESHOLD = parse_interval(INTERVAL_LABEL)
 
 # Crypto symbols route through Phemex+Kraken+Coinbase (real triple-exchange
 # aggregate); anything else is treated as a US equity/ETF ticker routed
@@ -568,7 +600,12 @@ def _parse_rfc3339(ts_str):
     ts_str = ts_str.rstrip("Z")
     if "." in ts_str:
         base, frac = ts_str.split(".")
-        ts_str = f"{base}.{frac[:6]}"
+        # Python's fromisoformat (< 3.11) requires the fractional-seconds
+        # part to be EXACTLY 3 or 6 digits — truncating alone isn't enough
+        # when the source trims trailing zeros (Alpaca does this; a real
+        # example crashed here: "...30.01172" is 5 digits). Zero-pad to 6
+        # first, then truncate, so any length source timestamp parses.
+        ts_str = f"{base}.{(frac + '000000')[:6]}"
     return datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc).timestamp()
 
 def fetch_coinbase_trades_range(product_id, since_ts, until_ts, progress=None, deadline=None):
@@ -618,15 +655,21 @@ def fetch_coinbase_trades_range(product_id, since_ts, until_ts, progress=None, d
 def _alpaca_headers():
     return {"APCA-API-KEY-ID": ALPACA_API_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY}
 
-def _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=None):
+def _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=None, deadline=None):
     """Historical trade prints (IEX feed) — (ts, price, size), no side yet.
     Calls progress() after every page so a slow fetch for a liquid symbol
-    still shows visible movement instead of looking hung."""
+    still shows visible movement instead of looking hung. deadline (time.
+    time() cutoff) stops paging early, returning whatever's gathered so
+    far — same convention as the Kraken/Coinbase fetchers, needed so
+    extend_history_backward's overall time budget is actually honored for
+    equities too (this used to have no deadline at all)."""
     out = []
     page_token = None
     start_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
     end_iso = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
     for _ in range(2000):
+        if deadline and time.time() >= deadline:
+            break
         params = {"symbols": symbol, "start": start_iso, "end": end_iso, "limit": 10000, "feed": "iex"}
         if page_token:
             params["page_token"] = page_token
@@ -683,7 +726,7 @@ def classify_trades_quote_rule(raw_trades, quotes):
         prev_price, prev_side = price, is_buy
     return out
 
-def fetch_alpaca_trades_range(symbol, since_ts, until_ts, progress=None):
+def fetch_alpaca_trades_range(symbol, since_ts, until_ts, progress=None, deadline=None):
     """Real historical Alpaca trade prints, classified into the same (ts,
     price, qty, is_buy) shape the crypto fetchers produce. IEX feed only
     (free tier) — a real but honest ceiling of roughly 1-3% of total US
@@ -699,10 +742,10 @@ def fetch_alpaca_trades_range(symbol, since_ts, until_ts, progress=None):
     classification via ws_alpaca's own continuously-updated running quote,
     which has none of this scaling problem since it only ever sees new
     updates as they arrive, never a historical backlog."""
-    raw_trades = _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=progress)
+    raw_trades = _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, progress=progress, deadline=deadline)
     return classify_trades_quote_rule(raw_trades, [])
 
-def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
+def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None, include_coinbase=True):
     """Dispatch to whichever data source SYMBOL actually belongs to — every
     caller (backfill_trades, extend_history_backward) goes through this
     instead of hardcoding an exchange, so the entire ingest/bar-building
@@ -713,7 +756,25 @@ def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
     prints for an already-closed bucket, so an unsorted replay would
     silently corrupt bars). See cvd.py's fetch_trades_range for the same
     pattern/reasoning. Phemex has no historical trades API at all, so it
-    only ever contributes live prints, same as before."""
+    only ever contributes live prints, same as before.
+
+    include_coinbase=False skips Coinbase entirely — for extend_history_
+    backward() specifically, which requests windows ending well BEFORE
+    "now". Coinbase's public trades endpoint has no way to jump to an
+    arbitrary timestamp: it only pages backward from the most recent
+    trade, filtering as it goes, so reaching a window that's hours in the
+    past means paging through (and discarding) everything more recent
+    first. Since this call blocks on BOTH threads (t1.join(); t2.join()),
+    a struggling Coinbase burns the entire deadline for zero trades even
+    though Kraken (which DOES support jumping straight to any since_ts)
+    finishes almost immediately — measured: Kraken returned 1,332 trades
+    in 0.7s for a 1h ETH window 5h in the past, while Coinbase spent the
+    full 20s budget on the same window and returned nothing. Initial
+    backfill (backfill_trades/fetch_trades_since) always requests a
+    window ending at ~now, where Coinbase's "start from now" pagination
+    IS the efficient case, so it keeps using both exchanges by default —
+    same acceptance-of-partial-exchange-coverage-for-older-data tradeoff
+    already made for Phemex, which has no historical API at all."""
     if IS_CRYPTO:
         results = {}
         progress_lock = threading.Lock()
@@ -724,13 +785,16 @@ def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
         def _fetch_kraken():
             results["kraken"] = fetch_kraken_trades_range(
                 KRAKEN_REST_PAIRS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
-        def _fetch_coinbase():
-            results["coinbase"] = fetch_coinbase_trades_range(
-                COINBASE_PRODUCT_IDS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
-        t1 = threading.Thread(target=_fetch_kraken, daemon=True)
-        t2 = threading.Thread(target=_fetch_coinbase, daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        threads = [threading.Thread(target=_fetch_kraken, daemon=True)]
+        if include_coinbase:
+            def _fetch_coinbase():
+                results["coinbase"] = fetch_coinbase_trades_range(
+                    COINBASE_PRODUCT_IDS[SYMBOL], since_ts, until_ts, progress=safe_progress, deadline=deadline)
+            threads.append(threading.Thread(target=_fetch_coinbase, daemon=True))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         kraken_trades = results.get("kraken", [])
         coinbase_trades = results.get("coinbase", [])
         starts = [since_ts]
@@ -742,7 +806,7 @@ def fetch_trades_range(since_ts, until_ts, progress=None, deadline=None):
         combined = [t for t in (kraken_trades + coinbase_trades) if t[0] >= effective_since]
         combined.sort(key=lambda t: t[0])
         return combined
-    return fetch_alpaca_trades_range(SYMBOL, since_ts, until_ts, progress=progress)
+    return fetch_alpaca_trades_range(SYMBOL, since_ts, until_ts, progress=progress, deadline=deadline)
 
 def fetch_trades_since(hours, progress=None, deadline=None):
     """Trailing-window wrapper, asset-class-aware: equities' free-tier REST
@@ -838,8 +902,39 @@ def initialize_today(progress=None):
             return f"backfilled {n} {src} trades since {since_str}"
     return "starting fresh — no backfill, no existing log"
 
-EXTEND_WINDOW_HOURS = 6    # how much real history to request per backward extend
-EXTEND_BUDGET_SECS = 20    # time budget for that one fetch
+EXTEND_START_WINDOW_HOURS = 1     # size of the FIRST chunk a backward extend
+                                  # requests. Was a single fixed 6h window —
+                                  # for a busy symbol (crypto, hundreds of
+                                  # trades/min) that always maxed out
+                                  # EXTEND_BUDGET_SECS just paging through
+                                  # it (felt like "forever" for one click's
+                                  # worth of history), while for a quiet
+                                  # window (e.g. an equity's overnight/
+                                  # weekend closure) it could come back
+                                  # with almost nothing ("just a couple
+                                  # candles") despite spanning 6 real hours.
+                                  # Starting small and growing (below) fixes
+                                  # both: a busy symbol satisfies
+                                  # EXTEND_MIN_BARS from this first small,
+                                  # fast chunk alone; a dead chunk costs
+                                  # very little time (nothing to page
+                                  # through) and just triggers the next,
+                                  # larger chunk immediately.
+EXTEND_WINDOW_GROWTH = 3          # each subsequent chunk (if still short of
+                                  # EXTEND_MIN_BARS) requests this many times
+                                  # more real time than the last
+EXTEND_MAX_WINDOW_HOURS = 24 * 14 # hard ceiling on how far back a single
+                                  # extend() call will keep growing in
+                                  # search of EXTEND_MIN_BARS (2 weeks —
+                                  # covers even a long holiday closure)
+EXTEND_MIN_BARS = 100      # keep requesting bigger chunks until at least
+                           # this many new bars are ready to prepend, or
+                           # EXTEND_BUDGET_SECS/EXTEND_MAX_WINDOW_HOURS is
+                           # hit — one click's worth of scrolling should
+                           # reliably buy several screens of history, not
+                           # just a couple of columns
+EXTEND_BUDGET_SECS = 20    # overall wall-clock budget for the whole
+                           # adaptive search above, not just one chunk
 EDGE_TRIGGER_BARS = 5      # how close to the oldest loaded bar (in on-screen
                            # columns) before triggering the next extend
 
@@ -881,7 +976,11 @@ def _build_bars(trades):
             cell[0] += qty
             live["sell_vol"] += qty
         live["delta"] = live["buy_vol"] - live["sell_vol"]
-        if BAR_MODE == "volume" and (live["buy_vol"] + live["sell_vol"]) >= VOL_THRESHOLD:
+        live["n_trades"] += 1
+        if BAR_MODE == "volume" and (live["buy_vol"] + live["sell_vol"]) >= BAR_THRESHOLD:
+            bars.append(live)
+            live = None
+        elif BAR_MODE == "tick" and live["n_trades"] >= BAR_THRESHOLD:
             bars.append(live)
             live = None
     return bars
@@ -904,7 +1003,26 @@ def extend_history_backward():
     resolution, so committing them after a switch would silently mix
     differently-bucketed bars into the freshly-rebuilt history; bailing out
     is safe since switch_interval/switch_tick already did their own fresh
-    backfill by the time this would otherwise notice."""
+    backfill by the time this would otherwise notice.
+
+    Requests progressively LARGER chunks of real time, moving backward
+    from the oldest loaded bar, until at least EXTEND_MIN_BARS new bars
+    are ready to prepend (or the overall EXTEND_BUDGET_SECS/
+    EXTEND_MAX_WINDOW_HOURS ceiling is hit) — see EXTEND_START_WINDOW_HOURS'
+    comment for why a single fixed-size window doesn't work well across
+    both a busy symbol (maxes out the time budget on one small window) and
+    a quiet one (a fixed window can land entirely inside a dead/closed
+    period and yield almost nothing).
+
+    Crypto: fetches Kraken only (include_coinbase=False), not the usual
+    Kraken+Coinbase aggregate — see fetch_trades_range's own docstring for
+    why: Coinbase's public API can't jump to an arbitrary past timestamp,
+    only page backward from "now", which is hugely wasteful once the
+    target window is more than a few minutes old (as it always is here).
+    Same already-accepted tradeoff as Phemex having no history API at
+    all — older/scrolled-back bars are Kraken-only; state.
+    backfill_boundary_ts's "Kraken+Coinbase-only before X" status message
+    is about the INITIAL backfill specifically and is unaffected by this."""
     started_interval, started_tick = INTERVAL_LABEL, TICK
     with state.lock:
         if state.history_loading_older or not state.history:
@@ -912,12 +1030,27 @@ def extend_history_backward():
         state.history_loading_older = True
         oldest_ts = state.history[0]["ts"]
     try:
-        until_ts = oldest_ts
-        since_ts = until_ts - EXTEND_WINDOW_HOURS * 3600
-        trades = fetch_trades_range(since_ts, until_ts, deadline=time.time() + EXTEND_BUDGET_SECS)
-        if not trades or INTERVAL_LABEL != started_interval or TICK != started_tick:
-            return
-        new_bars = _build_bars(trades)
+        deadline = time.time() + EXTEND_BUDGET_SECS
+        cursor = oldest_ts        # end of the next chunk to request
+        window_hours = EXTEND_START_WINDOW_HOURS
+        hours_covered = 0.0
+        all_trades = []
+        new_bars = []
+        while True:
+            since_ts = cursor - window_hours * 3600
+            trades = fetch_trades_range(since_ts, cursor, deadline=deadline, include_coinbase=False)
+            if INTERVAL_LABEL != started_interval or TICK != started_tick:
+                return
+            if trades:
+                all_trades = trades + all_trades   # older chunk goes in front
+                new_bars = _build_bars(all_trades)
+            cursor = since_ts
+            hours_covered += window_hours
+            if (len(new_bars) >= EXTEND_MIN_BARS or time.time() >= deadline
+                    or hours_covered >= EXTEND_MAX_WINDOW_HOURS):
+                break
+            window_hours = min(EXTEND_MAX_WINDOW_HOURS - hours_covered,
+                                window_hours * EXTEND_WINDOW_GROWTH)
         if not new_bars:
             return
         with state.lock:
@@ -990,12 +1123,12 @@ def fill_equity_gap():
             state.gap_fill_loading = False
 
 def switch_interval(label, mode, secs, threshold, progress=None):
-    """Change bar shape (time or volume) while the app keeps running — the
+    """Change bar shape (time, volume, or tick) while the app keeps running — the
     live WS feeds (Phemex/Kraken/Coinbase) are untouched, only the
     bar-shape globals change and history is rebuilt from scratch for the
     new shape via the same backfill-from-00:00-CT-or-resume path used at
     cold start."""
-    global INTERVAL_LABEL, BAR_MODE, BAR_SECS, VOL_THRESHOLD
+    global INTERVAL_LABEL, BAR_MODE, BAR_SECS, BAR_THRESHOLD
     with state.lock:
         state.history.clear()
         state.live = None
@@ -1004,7 +1137,7 @@ def switch_interval(label, mode, secs, threshold, progress=None):
         state.backfill_boundary_ts = None
         state.gap_fill_done = False
         state.gap_fill_loading = False
-        INTERVAL_LABEL, BAR_MODE, BAR_SECS, VOL_THRESHOLD = label, mode, secs, threshold
+        INTERVAL_LABEL, BAR_MODE, BAR_SECS, BAR_THRESHOLD = label, mode, secs, threshold
     return initialize_today(progress=progress)
 
 def switch_tick(new_tick, progress=None):
@@ -1069,7 +1202,9 @@ def _bucket_ts(ts):
 
 def _new_bar(ts, price):
     return {"ts": ts, "o": price, "h": price, "l": price, "c": price,
-            "buy_vol": 0.0, "sell_vol": 0.0, "delta": 0.0, "levels": {}}
+            "buy_vol": 0.0, "sell_vol": 0.0, "delta": 0.0, "levels": {},
+            "n_trades": 0}   # tick-bar close counter — see ingest_trade();
+                             # unused (and not persisted) for time/volume bars
 
 def _close_live():
     """Finalize state.live into history + log. Caller holds state.lock.
@@ -1122,9 +1257,11 @@ def ingest_trade(ts, price, qty, is_buy):
 
     Time bars: bucket-floor by wall clock, drop late/out-of-order prints for
     an already-closed bucket (same as cvd.py). Volume bars: accumulate until
-    combined buy+sell volume reaches VOL_THRESHOLD; the trade that crosses
+    combined buy+sell volume reaches BAR_THRESHOLD; the trade that crosses
     the threshold closes its bar IN FULL (not split), and the next trade
-    opens a fresh one — same convention as cvd.py's "<N>V" bars."""
+    opens a fresh one — same convention as cvd.py's "<N>V" bars. Tick bars:
+    same convention but counting individual trade PRINTS instead of volume
+    — the Nth print in a bar closes it in full."""
     live = state.live
     if BAR_MODE == "time":
         bucket_ts = _bucket_ts(ts)
@@ -1154,9 +1291,14 @@ def ingest_trade(ts, price, qty, is_buy):
         cell[0] += qty
         live["sell_vol"] += qty
     live["delta"] = live["buy_vol"] - live["sell_vol"]
+    live["n_trades"] += 1
     state.last_price = price
 
-    if BAR_MODE == "volume" and (live["buy_vol"] + live["sell_vol"]) >= VOL_THRESHOLD:
+    if BAR_MODE == "volume" and (live["buy_vol"] + live["sell_vol"]) >= BAR_THRESHOLD:
+        _close_live()
+        state.live = None
+        return
+    if BAR_MODE == "tick" and live["n_trades"] >= BAR_THRESHOLD:
         _close_live()
         state.live = None
         return
@@ -1667,15 +1809,16 @@ def fmt_delta(d):
     return f"{sign}{mag:.2f}"
 
 def fmt_time(ts):
-    fine = BAR_MODE == "volume" or BAR_SECS < 300
+    fine = BAR_MODE in ("volume", "tick") or BAR_SECS < 300
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S" if fine else "%H:%M")
 
 def fmt_bar_progress(live, now=None):
     """Status-header text describing how close the CURRENTLY FORMING bar
-    (`live`) is to closing: a countdown for time bars, or an
-    accumulated/threshold ratio for volume bars. Returns None if there's no
-    live bar to report on (before the first trade of a session, or in
-    --date historical playback, which has no live bar at all)."""
+    (`live`) is to closing: a countdown for time bars, an accumulated/
+    threshold volume ratio for volume bars, or a trade-count/threshold
+    ratio for tick bars. Returns None if there's no live bar to report on
+    (before the first trade of a session, or in --date historical
+    playback, which has no live bar at all)."""
     if live is None:
         return None
     if BAR_MODE == "time":
@@ -1683,8 +1826,10 @@ def fmt_bar_progress(live, now=None):
         remaining = max(0, (live["ts"] + BAR_SECS) - now)
         mins, secs = divmod(int(remaining), 60)
         return f"closes in {mins}:{secs:02d}"
+    if BAR_MODE == "tick":
+        return f"{live['n_trades']} / {BAR_THRESHOLD:g} ticks"
     accumulated = live["buy_vol"] + live["sell_vol"]
-    return f"{fmt_lvl_qty(accumulated)} / {VOL_THRESHOLD:g}"
+    return f"{fmt_lvl_qty(accumulated)} / {BAR_THRESHOLD:g}"
 
 # ── DRAW ──────────────────────────────────────────────────────────────────
 CELL_TXT_W = 15   # "1,234.5 x 1,234.5"-worst-case text width
@@ -1699,9 +1844,17 @@ POC_MARKER = "◆"
 OPEN_MARKER = "○"    # hollow circle — this bar's open price row
 CLOSE_MARKER = "●"   # filled circle — this bar's close price row
 LIVE_LINE_CH = "─"   # live-price line, drawn only through empty cells
+CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair, drawn down the selected
+                          # bar's left gutter only (never through cell text)
 
-def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
+def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshair_bar_idx=None):
     """Renders one frame. Returns the number of bar-columns actually drawn.
+
+    crosshair_bar_idx, when not None, is "N bars back from the newest" —
+    same addressing convention as hscroll_bars — identifying the single
+    bar the [Z]/[X] crosshair currently has selected. curses_main keeps it
+    within the visible window (adjusting hscroll_bars itself as needed),
+    so this only has to look it up among the bars already being drawn.
 
     Fixed-height vertical window: always exactly plot_h rows (fills the
     terminal), centered on vscroll_center (or the live price, when
@@ -1742,6 +1895,14 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
     end = max(n, min(len(all_bars), len(all_bars) - hscroll_bars))
     start = max(0, end - n)
     visible = all_bars[start:end]
+
+    crosshair_i = None
+    crosshair_bar = None
+    if crosshair_bar_idx is not None:
+        abs_idx = len(all_bars) - 1 - crosshair_bar_idx
+        if start <= abs_idx < end:
+            crosshair_i = abs_idx - start
+            crosshair_bar = all_bars[abs_idx]
 
     if vfollow_price:
         # Always center on the MIDPOINT of the traded range across ALL
@@ -1945,9 +2106,36 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
         if live_row_y is not None and not has_live_cell:
             safe_add(win, live_row_y, cx, LIVE_LINE_CH * (COL_W - 1), cp(P_YELLOW, dim=True))
 
+        # [Z]/[X] crosshair vertical line: runs down the visual CENTER of
+        # the selected bar's own column (not the left gutter — that's
+        # already POC/open/close markers' spot) so it reads as centered on
+        # the candle rather than hugging its left edge. There's no single
+        # x position within the cell-text area that's guaranteed blank on
+        # every row (bid/ask text is centered with variable padding, so
+        # the exact center column IS covered by digits on some rows, e.g.
+        # a worst-case-width "1,234.5 x 1,234.5"), so this checks
+        # _shadow_buf — the same buffer safe_add() maintains for
+        # screenshots — to see whether anything's ALREADY been drawn at
+        # that exact cell (real cell text, a marker, the live line above)
+        # before drawing the crosshair character there; if so, it skips
+        # that one row rather than overwriting real data, same
+        # non-destructive principle as the live price line, just decided
+        # per-cell instead of via a fixed reserved column.
+        if i == crosshair_i:
+            center_x = cx + COL_W // 2
+            if 0 <= center_x < w:
+                for r_i in range(plot_h):
+                    row_y = top_reserved + r_i
+                    if _shadow_buf[row_y][center_x] == " ":
+                        safe_add(win, row_y, center_x, CROSSHAIR_LINE_CH, cp(P_CYAN, dim=True))
+
     # net delta row — one row directly under each bar's own cells, above
     # the time axis: that bar's total buy_vol - sell_vol, bold and
-    # color-coded (green positive / red negative / plain zero)
+    # color-coded (green positive / red negative / plain zero). The
+    # crosshair's column ([Z]/[X]) gets reverse-video here too, alongside
+    # its time-axis label below and the gutter line drawn above — all
+    # three make the selected column unambiguous; OHLC for the selected
+    # bar is shown in the status bar.
     delta_row = h - bottom_reserved
     for i, bar in enumerate(visible):
         delta = bar["delta"]
@@ -1957,13 +2145,16 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
             delta_color = cp(P_RED, bold=True)
         else:
             delta_color = cp(P_DEFAULT, bold=True)
+        if i == crosshair_i:
+            delta_color |= curses.A_REVERSE
         safe_add(win, delta_row, col_x[i], fmt_delta(delta).center(COL_W - 1), delta_color)
 
     # time axis
     axis_row = delta_row + 1
     for i, bar in enumerate(visible):
         lbl = fmt_time(bar["ts"])
-        safe_add(win, axis_row, col_x[i], lbl.center(COL_W - 1), cp(P_DIM))
+        axis_color = cp(P_DIM) | (curses.A_REVERSE if i == crosshair_i else 0)
+        safe_add(win, axis_row, col_x[i], lbl.center(COL_W - 1), axis_color)
 
     # status bar
     buy_tot = sum(b["buy_vol"] for b in visible)
@@ -1972,6 +2163,10 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars):
                    else f"Alpaca(IEX):{state.alpaca_status}")
     info = (f" px:{fmt_price(last_price)}  visible Δ:{buy_tot - sell_tot:+,.2f} "
             f"(buy:{buy_tot:,.2f} sell:{sell_tot:,.2f})  {feed_status}  log:{state.log_rows}  {status_line}")
+    if crosshair_bar is not None:
+        cb = crosshair_bar
+        info = (f" ✛[{fmt_time(cb['ts'])}] O:{fmt_price(cb['o'])} H:{fmt_price(cb['h'])} "
+                f"L:{fmt_price(cb['l'])} C:{fmt_price(cb['c'])} Δ:{fmt_delta(cb['delta'])}  |  {info.lstrip()}")
     if state.backfill_boundary_ts:
         boundary = datetime.fromtimestamp(state.backfill_boundary_ts).strftime("%H:%M:%S")
         if IS_CRYPTO:
@@ -2012,7 +2207,7 @@ def _prompt_text(stdscr, prompt):
         stdscr.nodelay(True)
 
 def _prompt_interval(stdscr):
-    return _prompt_text(stdscr, "Interval (e.g. 45s, 5m, 500V): ")
+    return _prompt_text(stdscr, "Interval (e.g. 45s, 5m, 500V, 100T): ")
 
 def _prompt_tick(stdscr):
     return _prompt_text(stdscr, "Price increment $ (e.g. 1, 0.25, 10): ")
@@ -2027,6 +2222,23 @@ def _prompt_symbol(stdscr):
     raw = _prompt_text(stdscr, "Symbol — crypto (ETH, BTC) or equity/ETF ticker: ")
     return raw.strip().upper() if raw else None
 
+def _crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est, historical_mode):
+    """Keep the [Z]/[X] crosshair bar inside the current view, panning
+    (hscroll_bars) just enough to follow it past either edge — same "N
+    bars back from newest" addressing as hscroll_bars itself, so the
+    view's right edge is bar hscroll_bars and its left edge is bar
+    hscroll_bars+n_est-1. Returns the (possibly adjusted) pair. Pure
+    function — pulled out of curses_main's key loop so this arithmetic is
+    directly testable without a real curses screen."""
+    crosshair_bar_idx = max(0, min(crosshair_bar_idx, max(0, total - 1)))
+    if crosshair_bar_idx < hscroll_bars:
+        hscroll_bars = crosshair_bar_idx
+    elif crosshair_bar_idx > hscroll_bars + n_est - 1:
+        hscroll_bars = max(0, crosshair_bar_idx - (n_est - 1))
+    if not historical_mode:
+        hscroll_bars = max(0, min(hscroll_bars, max(0, total - n_est)))
+    return crosshair_bar_idx, hscroll_bars
+
 # ── MAIN LOOPS ────────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global SYMBOL, IS_CRYPTO
@@ -2038,6 +2250,9 @@ def curses_main(stdscr):
     hscroll_bars = 0
     vfollow_price = True
     vscroll_center = 0
+    crosshair_active = False
+    crosshair_bar_idx = 0   # "N bars back from newest" — same addressing
+                            # as hscroll_bars; meaningless until crosshair_active
     screenshot_msg = None
     screenshot_until = 0
 
@@ -2067,16 +2282,37 @@ def curses_main(stdscr):
 
     while True:
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q'), 27):
+        if key in (ord('q'), ord('Q')):
             break
         elif key == curses.KEY_LEFT:
             hscroll_bars += 1
+            crosshair_active = False
         elif key == ord('['):
             hscroll_bars += 10
+            crosshair_active = False
         elif key == curses.KEY_RIGHT:
             hscroll_bars = max(0, hscroll_bars - 1)
+            crosshair_active = False
         elif key == ord(']'):
             hscroll_bars = max(0, hscroll_bars - 10)
+            crosshair_active = False
+        elif key in (ord('z'), ord('Z')):
+            # [Z]/[X] move a one-bar crosshair left/right, showing that
+            # bar's OHLC in the status bar — independent of (and disabled
+            # by) the plain arrow/[/] panning above, which moves the whole
+            # view rather than a single selected bar. First press
+            # activates the crosshair at the current right edge of the
+            # view; the view itself auto-scrolls (see below) to keep the
+            # crosshair on screen as it moves past either edge.
+            if not crosshair_active:
+                crosshair_active = True
+                crosshair_bar_idx = hscroll_bars
+            crosshair_bar_idx += 1   # clamped against total bars below
+        elif key in (ord('x'), ord('X')):
+            if not crosshair_active:
+                crosshair_active = True
+                crosshair_bar_idx = hscroll_bars
+            crosshair_bar_idx = max(0, crosshair_bar_idx - 1)
         elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
             step = VSTEP_BIG if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else VSTEP
             direction = 1 if key in (curses.KEY_UP, curses.KEY_PPAGE) else -1
@@ -2086,9 +2322,10 @@ def curses_main(stdscr):
                 base = vscroll_center
             vscroll_center = base + direction * step
             vfollow_price = False
-        elif key in (curses.KEY_HOME, ord('l'), ord('L')):
+        elif key in (curses.KEY_HOME, ord('l'), ord('L'), 27):
             hscroll_bars = 0
             vfollow_price = True
+            crosshair_active = False
         elif key in (ord('c'), ord('C')):
             # Re-center vertically without touching horizontal position —
             # [Home]/[L] also jumps back to the live edge (hscroll_bars=0),
@@ -2108,7 +2345,7 @@ def curses_main(stdscr):
             if raw_interval is not None:
                 parsed = parse_interval(raw_interval)
                 if parsed is None:
-                    status_line = f"Invalid interval '{raw_interval}' — use <N>s, <N>m, or <N>V"
+                    status_line = f"Invalid interval '{raw_interval}' — use <N>s, <N>m, <N>V, or <N>T"
                     init_shown_at = time.time()
                 else:
                     next_label, next_mode, next_secs, next_threshold = parsed
@@ -2122,6 +2359,7 @@ def curses_main(stdscr):
                     init_shown_at = time.time()
                     hscroll_bars = 0
                     vfollow_price = True
+                    crosshair_active = False
         elif key in (ord('t'), ord('T')) and not HISTORICAL_MODE:
             raw_tick = _prompt_tick(stdscr)
             if raw_tick is not None:
@@ -2140,6 +2378,7 @@ def curses_main(stdscr):
                     init_shown_at = time.time()
                     hscroll_bars = 0
                     vfollow_price = True
+                    crosshair_active = False
         elif key in (ord('m'), ord('M')):
             raw_ratio = _prompt_imbalance(stdscr)
             if raw_ratio is not None:
@@ -2202,12 +2441,15 @@ def curses_main(stdscr):
                     start_feeds(session)
                     hscroll_bars = 0
                     vfollow_price = True
+                    crosshair_active = False
                 init_shown_at = time.time()
 
-        if not HISTORICAL_MODE:
-            with state.lock:
-                total = len(state.history) + (1 if state.live else 0)
+        with state.lock:
+            total = len(state.history) + (1 if state.live else 0)
+        hh, ww = stdscr.getmaxyx()
+        n_est = max(1, max(1, ww - AXIS_W) // COL_W)
 
+        if not HISTORICAL_MODE:
             # Clamp hscroll_bars to what's actually loaded. Without this it
             # could grow past the point where panning has any visible effect
             # (draw() itself has always clamped the DISPLAYED window, but
@@ -2216,8 +2458,6 @@ def curses_main(stdscr):
             # [Right] just decremented that runaway number with zero visible
             # change until it wandered back into range — the exact "locked
             # in place, can't scroll forward" symptom this fixes).
-            hh, ww = stdscr.getmaxyx()
-            n_est = max(1, max(1, ww - AXIS_W) // COL_W)
             hscroll_bars = max(0, min(hscroll_bars, max(0, total - n_est)))
 
             # Trigger the next backward extend once the oldest VISIBLE bar is
@@ -2250,6 +2490,10 @@ def curses_main(stdscr):
                     and time.time() >= state.backfill_boundary_ts + EQUITY_GAP_SECS):
                 threading.Thread(target=fill_equity_gap, daemon=True).start()
 
+        if crosshair_active:
+            crosshair_bar_idx, hscroll_bars = _crosshair_clamp(
+                crosshair_bar_idx, hscroll_bars, total, n_est, HISTORICAL_MODE)
+
         if HISTORICAL_MODE:
             sl = status_line
         else:
@@ -2259,7 +2503,8 @@ def curses_main(stdscr):
         if screenshot_msg and time.time() < screenshot_until:
             sl = f"{screenshot_msg}  |  {sl}"
 
-        draw(stdscr, sl, vscroll_center, vfollow_price, hscroll_bars)
+        draw(stdscr, sl, vscroll_center, vfollow_price, hscroll_bars,
+             crosshair_bar_idx=crosshair_bar_idx if crosshair_active else None)
         curses.doupdate()
 
     stop_alpaca_ws()   # release Alpaca's connection slot immediately on quit,

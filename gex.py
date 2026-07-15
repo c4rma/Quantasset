@@ -96,10 +96,11 @@ Usage:
 
 In-app: ←/→ pan time by a few columns, PgUp/PgDn pan time by a screenful.
 ↑/↓ scroll the price axis by one strike, [/] scroll it by a page, {/} jump to
-the highest/lowest strike in the grid. [Z] or [End] resets: jumps back to the
-live edge (time axis) and re-centers on whatever strike is nearest the current
-spot (price axis) — both views' auto-follow default, in one keystroke either
-way, however far you've scrolled off in either direction.
+the highest/lowest strike in the grid. [Z], [End], or [Esc] resets: jumps back
+to the live edge (time axis) and re-centers on whatever strike is nearest the
+current spot (price axis) — both views' auto-follow default, in one keystroke
+either way, however far you've scrolled off in either direction. Esc does NOT
+quit — only [Q] does.
 [R] refreshes now (live mode) or reloads the log from disk (history mode, in
 case another instance is still writing to it).
 
@@ -1076,7 +1077,7 @@ def draw(win, history, grid, scale_max, meta, status, ui):
         exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
         refresh_hint = "r=reload" if HISTORICAL_MODE else "r=refresh"
         vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-        hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
+        hint = (f" q=quit  {refresh_hint}  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End/Esc=reset  "
                 f"g=by-strike  s=symbol  p=screenshot  [{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
         safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
 
@@ -1286,7 +1287,7 @@ def draw_by_strike(win, history, grid, meta, status, ui):
     else:
         exp_tag = "ALL-EXP" if ALL_EXP else "0DTE"
         vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-        hint = (f" q=quit  r=refresh  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
+        hint = (f" q=quit  r=refresh  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End/Esc=reset  "
                 f"g=interval map  n=net/separate  s=symbol  p=screenshot  "
                 f"[{SYMBOL}] [{exp_tag}] {vert_tag} {status}")
         safe_add(win, bot, 0, hint.ljust(w - 1)[:w - 1], cp(P_STATUS))
@@ -1543,7 +1544,7 @@ def curses_main(stdscr):
             elif key != -1 and 32 <= key < 127 and len(symbol_input_buf) < 10:
                 symbol_input_buf += chr(key)
         else:
-            if key in (ord('q'), ord('Q'), 27):
+            if key in (ord('q'), ord('Q')):
                 break
             if key in (ord('r'), ord('R')):
                 if HISTORICAL_MODE:
@@ -1601,10 +1602,11 @@ def curses_main(stdscr):
                         view_end_idx = min(len(history), view_end_idx + PAGE_STEP)
                         if view_end_idx >= len(history):
                             live_follow = True
-            elif key in (curses.KEY_END, ord('z'), ord('Z')):
+            elif key in (curses.KEY_END, ord('z'), ord('Z'), 27):
                 # Reset: jump back to the live edge (time axis) and re-center on
                 # whatever strike is nearest the current spot (price axis) — both
-                # views' "auto-follow" default, in one keystroke either way.
+                # views' "auto-follow" default, in one keystroke either way. Esc is
+                # included here (not quit) — only 'q'/'Q' exits the program now.
                 with lock:
                     live_follow = True
                     vert_follow = True

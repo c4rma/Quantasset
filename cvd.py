@@ -127,7 +127,7 @@ In-app:
       day's own 19:00 CT session open through whatever's currently the
       oldest loaded bar) and prepends it — CVD is rebased so the join is
       continuous, not anchored at an arbitrary offset. The view then centers
-      on the requested time. [L] / End jumps back to the live edge.
+      on the requested time. [L] / End / Esc jumps back to the live edge.
   [I] switches to a different interval on the fly — type any --interval spec
       (1m, 3m, 500V, ...) and hit Enter. Rebuilds bar history for the new
       shape (same backfill-from-19:00-CT path as a fresh launch); the WS
@@ -147,7 +147,7 @@ In-app:
       status bar shows its exact O/H/L/C and CVD O/H/L/C instead of the
       live "last" readout. Panning right back past the true live edge exits
       the crosshair automatically.
-  [L] / End jumps back to the live candle (also exits Goto mode/crosshair).
+  [L] / End / Esc jumps back to the live candle (also exits Goto mode/crosshair).
   [+] / [-] (or [=] / [_]) zoom in/out — merges every N real bars into one
       displayed candle at each zoom-out step (pure visual OHLC/CVD
       aggregation via merge_bars; the underlying --interval, log, and CSV
@@ -171,7 +171,7 @@ In-app:
       resets all state, and reloads/backfills the new symbol from scratch —
       same live-swap mechanism as [I]'s interval switch, just for the
       underlying instrument instead of the bar shape.
-  [Q] / Esc quits.
+  [Q] quits. Esc jumps back to live (same as [L] / End), not quit.
 """
 
 import sys
@@ -2228,7 +2228,7 @@ def curses_main(stdscr):
 
     while True:
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q'), 27):
+        if key in (ord('q'), ord('Q')):
             break
         elif key in (ord('z'), ord('Z')):
             with state.lock:
@@ -2301,7 +2301,7 @@ def curses_main(stdscr):
                 step, cursor_idx, view_end_idx, total, last_n_vis, allow_exit_to_live=True)
             if exited:
                 live_follow = True
-        elif key in (curses.KEY_END, ord('l'), ord('L')):
+        elif key in (curses.KEY_END, ord('l'), ord('L'), 27):
             live_follow = True
             cursor_idx = -1
         elif key in (ord('g'), ord('G')) and not HISTORICAL_MODE:

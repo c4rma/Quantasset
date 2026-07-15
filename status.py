@@ -8,21 +8,33 @@ be checked by hand across multiple other tools in this repo.
 
   1. Session          — in a tradable kill zone right now? (reuses
                          opt_dashboard.py's exact KILL_ZONES/exclusion logic)
-  2. DVOL             — ETH's Deribit 30d IV index, plus the Layer 1 position
-                         sizing and Layer 2 cap it maps to (fixed lookup table)
+  2. Volatility       — ETH's Deribit 30d IV index (DVOL), plus the Layer 1
+                         position sizing / Layer 2 cap it maps to (fixed
+                         lookup table), and QQQ's CBOE iv30
   3. PCVR             — put/call volume ratio of the nearest-expiry chain for
                          TLT (08:45-15:00 CT) or BTC (all other times) — this
                          single ratio is the shared ">1.00"/"<1.00" regime
                          signal every conditional HPL rule below reads.
   4. HPLs             — High-Probability Levels, evaluated separately for ETH
                          (Deribit + Phemex) and QQQ (CBOE + Yahoo), 15 rules
-                         each: VAH, VAL, POC, +2/2.5sd, -2/2.5sd, 0.5sd band,
-                         VWAP, ER 40-80% band, ER 100%, ER 150%, BT, ST,
-                         Previous EOD Close, GEX Flip, Medium/Large Gamma
-                         Clusters (shows the 2 clusters closest to live price
-                         and each one's distance, not every qualifying strike).
+                         each, grouped for display into Volume (VAH, VAL,
+                         POC, +2/2.5sd, -2/2.5sd, 0.5sd band, VWAP), Expected
+                         Range (40-80% band, 100%, 150%), Options (BT, ST,
+                         GEX Flip, Medium/Large Gamma Clusters — shows the 2
+                         clusters closest to live price, not every qualifying
+                         strike), and Miscellaneous (Previous EOD Close).
+                         QQQ's rows show CLOSED (not ACTIVE/INACTIVE) from
+                         15:00 CT to 08:44 CT the next morning.
+  5. Targets          — BT + every Large gamma cluster above price when
+                         PCVR < 0.98, or ST + every Large gamma cluster below
+                         price when PCVR > 1.02, in green. QQQ only during its
+                         own 08:45-15:00 CT hours; ETH always.
 
-Every rule renders GREEN when its condition is met right now, RED otherwise.
+Every rule renders ACTIVE (green) when its condition is met right now,
+INACTIVE (red) otherwise. A centered "EXECUTE WHEN READY" (green) / "HOLD"
+(red) line per instrument sits above the footer — READY only when there's an
+active session, PCVR is in an extreme zone (<=0.98 or >=1.02), and that
+instrument has at least one genuinely ACTIVE HPL row this cycle.
 
 BT/ST ("Buy Territory"/"Sell Territory"), per the user's spec: scan each
 instrument's OWN nearest-expiry chain, strikes ascending (lowest first).
@@ -47,18 +59,25 @@ tolerance, yellow out to $5.00 (ETH) / $0.35 (QQQ), red beyond that.
 
 Usage:
   python status.py [--interval SEC]
-    --interval SEC   refresh interval in seconds (default 30)
+    --interval SEC   refresh interval for the FULL data fetch — chains,
+                      candles, DVOL, PCVR (default 30). Live price (and
+                      everything derived purely from it — distances,
+                      near()/directional checks, Targets) updates on its own
+                      independent 2s cadence regardless of this setting, via
+                      tiny/cheap fetches (Deribit index price, Yahoo meta),
+                      so the dashboard shows real-time price movement between
+                      full refreshes instead of a price frozen at the last one.
 
 Data sources (all free, snapshot/REST — no websockets):
   ETH price/DVOL/chain  — Deribit REST
-  ETH session candles   — Phemex kline (1m, capped ~16.6h by Phemex's own
-                           limit=1000 ceiling — a session queried very late
-                           in its life may be missing its earliest hours;
-                           documented limitation, not a bug)
-  ETH previous close    — Phemex daily kline, most recent completed bar
+  ETH session candles   — Phemex kline/list, full current session in one call
+  ETH previous close    — current session's own open (crypto trades 24/7, so
+                           "previous close" == this session's open — same
+                           value as charthacker.py's "EOpen" line)
   QQQ price/chain/iv30  — CBOE delayed-quotes (~15m delay) + Yahoo (live spot)
   QQQ session candles   — Yahoo 1m/5d, includePrePost=true
-  QQQ previous close    — Yahoo chart meta.previousClose
+  QQQ previous close    — close of the 16:00 CT candle the prior day (a real
+                           market close, genuinely different from today's open)
   TLT/BTC PCVR chain    — CBOE (TLT) / Deribit (BTC), same nearest-expiry
                            pattern as chain.py/gex.py in this repo
 """
@@ -110,6 +129,42 @@ if "--interval" in args:
 # ── ANSI ─────────────────────────────────────────────────────────────────────
 RED = '\033[91m'; GRN = '\033[92m'; YLW = '\033[93m'; CYN = '\033[96m'
 MAG = '\033[95m'; BLD = '\033[1m';  DIM = '\033[2m';  RST = '\033[0m'
+
+# ── Alert sound (PCVR crossing into an extreme zone) ──────────────────────────
+def play_alert():
+    """Play alert.wav non-blocking from the same folder as this script — same
+    convention opt_dashboard.py already uses for its own sentiment alert."""
+    wav = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.wav")
+    if not os.path.exists(wav):
+        return
+    try:
+        if sys.platform == "win32":
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        else:
+            import subprocess
+            player = "afplay" if sys.platform == "darwin" else "aplay"
+            subprocess.Popen([player, wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+_pcvr_alert_zone = None   # None/"extreme"/"neutral" — tracks the LAST cycle's
+                          # zone so the alert only fires on entry into the
+                          # extreme zone, not on every refresh while sitting in it
+
+def check_pcvr_alert(data):
+    """Plays alert.wav once when PCVR crosses into <=0.98 or >=1.02 from the
+    neutral zone — edge-triggered, not level-triggered, so it doesn't replay
+    every single refresh cycle while the ratio just sits in that zone."""
+    global _pcvr_alert_zone
+    pcvr = data.get("pcvr")
+    if not pcvr:
+        return
+    ratio = pcvr["ratio"]
+    zone = "extreme" if (ratio <= 0.98 or ratio >= 1.02) else "neutral"
+    if zone == "extreme" and _pcvr_alert_zone != "extreme":
+        play_alert()
+    _pcvr_alert_zone = zone
 
 def move(row, col=1): sys.stdout.write(f'\033[{row};{col}H')
 def erase_line(): sys.stdout.write('\033[K')
@@ -285,6 +340,22 @@ def fetch_yahoo_meta(symbol):
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     return (float(price) if price else None,
             float(prev_close) if prev_close else None)
+
+PHEMEX_TICKER_URL = "https://api.phemex.com/md/v3/ticker/24hr"
+
+def fetch_eth_live_price():
+    """Fast, tiny fetch — Phemex's ETHUSDT perp last-traded price (lastRp),
+    same live-price source the rest of this repo's tools use (opt_dashboard.py,
+    gex.py's price marker), not Deribit's index — used by the independent
+    live-price poller (see live_price_loop)."""
+    try:
+        r = requests.get(PHEMEX_TICKER_URL, params={"symbol": "ETHUSDT"}, timeout=6)
+        r.raise_for_status()
+        result = r.json().get("result") or {}
+        price = result.get("lastRp") or result.get("markRp")
+        return float(price) if price is not None else None
+    except Exception:
+        return None
 
 def fetch_cboe_chain(symbol):
     """Nearest-expiry option chain. Returns
@@ -635,30 +706,17 @@ def fetch_phemex_session_candles(symbol="ETHUSDT", resolution=60):
         out.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
     return out
 
-def fetch_phemex_prev_close(symbol="ETHUSDT"):
-    """Close at 16:00 CT the day before the current session's 19:00 CT open
-    (confirmed against the user's own reference value) — "Previous EOD
-    Close" means the prior day's 16:00 CT close, not the 19:00 CT session
-    boundary or Yahoo/exchange's own "previous close" definition."""
-    _prev_open_ts, curr_open_ts = session_open_ts()
-    target_ts = curr_open_ts - 3 * 3600   # 19:00 CT - 3h = 16:00 CT
-    r = requests.get(PHEMEX_KLINE_LIST_URL, params={
-        "symbol": symbol, "resolution": 60,
-        "from": int(target_ts) - 3600, "to": int(target_ts) + 60, "limit": 100,
-    }, timeout=12)
-    r.raise_for_status()
-    d = r.json()
-    if d.get("code") != 0:
-        return None
-    rows = (d.get("data") or {}).get("rows") or []
-    return float(rows[-1][5]) if rows else None
-
 def session_prev_eod_close(candles, curr_open_ts):
-    """Close at 16:00 CT the day before curr_open_ts (curr_open_ts - 3h),
-    from an already-fetched candle series — same definition as
-    fetch_phemex_prev_close, reused for any instrument whose candles already
-    span far enough back (QQQ's 5-day Yahoo fetch does)."""
-    target_ts = curr_open_ts - 3 * 3600
+    """Close of the 15:59 CT candle the day before curr_open_ts (the last
+    candle of the regular trading day, right before 16:00 CT) — QQQ-specific
+    fallback for when no charthacker.py export is available (a real market
+    close is a genuinely different price from today's open, unlike crypto's
+    24/7 session where "previous close" == current session's own open — see
+    evaluate_hpls's is_crypto handling). Prefer reading this from a live
+    charthacker.py export when one exists — see evaluate_hpls's export
+    handling — since that's computed from the same live feed the chart
+    itself shows, not a separate REST snapshot."""
+    target_ts = curr_open_ts - 3 * 3600 - 60   # 15:59 CT, not 16:00 CT
     before = [c for c in candles if c[0] <= target_ts]
     return before[-1][4] if before else None
 
@@ -807,15 +865,26 @@ def read_gex_export(asset, max_age_sec=GEX_STATUS_EXPORT_MAX_AGE):
         pass
     return None
 
-def clusters_from_gex_export(gex_export, price, n=2):
-    """Same shape as nearest_gamma_clusters(), but classified against gex.py's
-    own STABLE, session-accumulated scale_max instead of a scale recomputed
-    fresh every cycle from just the current snapshot — that per-cycle
-    recompute is what let a strike sitting right at the Medium/Large boundary
+# HPL display grouping — evaluate_hpls() still returns rows in its own fixed
+# order; render() reorders/labels them into these categories purely for
+# display, so the underlying computation and this presentation grouping stay
+# decoupled (adding/renaming a category never touches evaluate_hpls).
+HPL_CATEGORIES = (
+    ("Volume", ("VAH", "VAL", "POC", "+2sd/2.5sd", "-2sd/2.5sd", "0.5sd band", "VWAP")),
+    ("Expected Range", ("ER 40-80% band", "ER 100%", "ER 150%")),
+    ("Options", ("BT", "ST", "GEX Flip", "Med/Large Gamma Clusters")),
+    ("Miscellaneous", ("Prev EOD Close",)),
+)
+
+def all_clusters_from_gex_export(gex_export):
+    """[(strike, tier), ...] sorted by strike — every Medium/Large cluster in
+    a gex.py export, classified against ITS stable, session-accumulated
+    scale_max (not a scale recomputed fresh every cycle from just the current
+    snapshot, which let a strike sitting right at the Medium/Large boundary
     flicker in and out between refreshes even though its real GEX barely
-    moved. gex.py's scale_max only grows across the session (frozen per-
-    column at ingestion), so a cluster it's already showing stays classified
-    the same way here too."""
+    moved — gex.py's scale_max only grows across the session, frozen per-
+    column at ingestion, so a cluster it's already showing stays classified
+    the same way here too)."""
     scale_max = gex_export.get("scale_max") or 0.0
     by_strike = gex_export.get("gex_by_strike") or {}
     clusters = []
@@ -823,18 +892,41 @@ def clusters_from_gex_export(gex_export, price, n=2):
         tier = magnitude_tier(float(net), scale_max)
         if tier:
             clusters.append((float(k_str), tier))
+    return sorted(clusters)
+
+def clusters_from_gex_export(gex_export, price, n=2):
+    """Same shape as nearest_gamma_clusters() — the `n` closest Medium/Large
+    clusters to price, from a gex.py export instead of a fresh computation."""
+    clusters = all_clusters_from_gex_export(gex_export)
     with_dist = [(k, t, abs(price - k)) for k, t in clusters]
     with_dist.sort(key=lambda x: x[2])
     return with_dist[:n]
 
-QQQ_CLOSE_CT_MIN = 15 * 60   # 15:00 CT — regular market close
+def large_clusters_directional(chain, is_crypto, gex_export, price):
+    """(above, below) — sorted lists of ALL Large-tier gamma cluster strikes
+    above/below current price, from whichever source (gex.py export if fresh,
+    else a live computation) evaluate_hpls would also use for this
+    instrument. Used by the Targets section — unlike the HPL row's "2
+    closest" display, targets want every qualifying Large cluster in the
+    relevant direction, not just the nearest ones."""
+    if gex_export and gex_export.get("gex_by_strike"):
+        clusters = all_clusters_from_gex_export(gex_export)
+    else:
+        clusters = gamma_clusters(chain["strikes"], chain["spot"], is_crypto)
+    above = sorted(k for k, t in clusters if t == "Large" and k > price)
+    below = sorted(k for k, t in clusters if t == "Large" and k < price)
+    return above, below
+
+QQQ_OPEN_CT_MIN  = 8 * 60 + 45   # 08:45 CT — regular market open
+QQQ_CLOSE_CT_MIN = 15 * 60       # 15:00 CT — regular market close
 
 def qqq_market_closed():
-    """True after 15:00 CT — QQQ's HPLs render as CLOSED/inactive past this
-    point rather than showing numbers computed against a market that isn't
-    actively trading anymore."""
+    """True from 15:00 CT through 08:29 CT the next day — QQQ's HPLs render
+    as CLOSED/inactive outside regular hours rather than showing numbers
+    computed against a market that isn't actively trading."""
     n = now_ct()
-    return (n.hour * 60 + n.minute) >= QQQ_CLOSE_CT_MIN
+    minutes = n.hour * 60 + n.minute
+    return not (QQQ_OPEN_CT_MIN <= minutes < QQQ_CLOSE_CT_MIN)
 
 # ── HPL evaluation for one instrument (ETH or QQQ) ────────────────────────────
 def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamma_tol, pcvr_gt1, is_crypto,
@@ -877,8 +969,6 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         sd_p2,  sd_m2  = export.get("sd_p2"),  export.get("sd_m2")
         sd_p25, sd_m25 = export.get("sd_p25"), export.get("sd_m25")
         session_open = export.get("session_open")
-        if export.get("prev_eod_close") is not None:
-            prev_close = export["prev_eod_close"]
         if export.get("iv") is not None:
             iv = export["iv"]
     else:
@@ -896,6 +986,22 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         _prev_ts, curr_open_ts = session_open_ts()
         open_candidates = [c for c in session_candles if c[0] >= curr_open_ts]
         session_open = open_candidates[0][1] if open_candidates else (session_candles[0][1] if session_candles else None)
+
+    # For crypto (24/7, no real market close), "Previous EOD Close" IS the
+    # current session's own open — this is exactly charthacker.py's "EOpen"
+    # line (_er_sess_candles[0].o), which the user confirmed is the value to
+    # use. Simpler and more reliable than fetching a specific boundary candle
+    # by timestamp (which had real off-by-one/definition bugs).
+    if is_crypto and session_open is not None:
+        prev_close = session_open
+    # Equities (QQQ): prefer a live charthacker.py export's own prev_eod_close
+    # (computed from the same live feed the chart shows) over status.py's own
+    # REST-snapshot fallback (session_prev_eod_close, already applied by the
+    # caller into the prev_close argument) — a real market close is a
+    # genuinely different price from today's open, so this does NOT fold
+    # into the is_crypto branch above.
+    elif export and export.get("prev_eod_close") is not None:
+        prev_close = export["prev_eod_close"]
 
     rows.append(("VAH", f"${vah:,.2f}" if vah is not None else "n/a",
                  vah is not None and price > vah and near(vah) and pcvr_gt1))
@@ -992,7 +1098,6 @@ def run_cycle():
             "pcvr": ex.submit(fetch_pcvr),
             "eth_chain": ex.submit(fetch_deribit_chain, "ETH"),
             "eth_candles": ex.submit(fetch_phemex_session_candles, "ETHUSDT", 60),
-            "eth_prev_close": ex.submit(fetch_phemex_prev_close, "ETHUSDT"),
             "qqq_chain": ex.submit(fetch_cboe_chain, "QQQ"),
             "qqq_candles": ex.submit(fetch_yahoo_candles, "QQQ", "5d", "1m"),
             "qqq_meta": ex.submit(fetch_yahoo_meta, "QQQ"),
@@ -1012,6 +1117,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _SEP_MARKER    = "\0SEP\0"      # placeholder — replaced with a full-width separator
 _TITLE_MARKER  = "\0TITLE\0"    # placeholder — replaced with the centered title
 _FOOTER_MARKER = "\0FOOTER\0"   # placeholder — replaced with the centered footer
+_STATUS_MARKER = "\0STATUS\0"   # placeholder — replaced with the centered final status
                                 # once the actual content width for this frame is known
 TITLE_TEXT = "BLACKJACK FRAMEWORK DASHBOARD"
 
@@ -1039,15 +1145,21 @@ def render(data, remaining=None):
     p(f"     {light(in_session)}  {DIM}{label}{RST}")
     p()
 
-    # 2. DVOL — no green/red rule defined for this one; blank-pad the light
-    # column so its text still lines up under the rows around it.
+    # 2. Volatility — no green/red rule defined for either row; blank-pad the
+    # light column so the text still lines up under the rows around it.
     dvol = data.get("dvol")
     l1, l2 = dvol_layers(dvol)
-    p(f"  {BLD}2. DVOL (ETH){RST}")
+    p(f"  {BLD}2. Volatility{RST}")
     if dvol is not None:
-        p(f"     {LIGHT_BLANK}  {CYN}{BLD}{dvol:>6.2f}{RST}   Layer 1: {YLW}{l1}{RST}   Layer 2: {MAG}{l2}{RST}")
+        p(f"     {LIGHT_BLANK}  {DIM}{'DVOL (ETH)':<12}{RST}{CYN}{BLD}{dvol:>6.2f}{RST}   "
+          f"Layer 1: {YLW}{l1}{RST}   Layer 2: {MAG}{l2}{RST}")
     else:
-        p(f"     {LIGHT_BLANK}  {DIM}unavailable{RST}")
+        p(f"     {LIGHT_BLANK}  {DIM}DVOL (ETH) unavailable{RST}")
+    qqq_iv = data.get("qqq_iv")
+    if qqq_iv is not None:
+        p(f"     {LIGHT_BLANK}  {DIM}{'IV (QQQ)':<12}{RST}{CYN}{BLD}{qqq_iv:>6.2f}{RST}")
+    else:
+        p(f"     {LIGHT_BLANK}  {DIM}IV (QQQ) unavailable{RST}")
     p()
 
     # 3. PCVR — no light row (just the text): green when ratio <= 0.98, red
@@ -1070,9 +1182,12 @@ def render(data, remaining=None):
     p(f"  {BLD}4. High-Probability Levels{RST}")
     # gtol = the ORIGINAL gamma-cluster row-light threshold (unchanged from
     # before this feature existed): $2.00 ETH / $0.35 QQQ. gyellow is only
-    # for the per-cluster distance-text coloring's yellow ceiling.
+    # for the per-cluster distance-text coloring's yellow ceiling. ETH has no
+    # prev_key — evaluate_hpls derives its prev-close from session_open
+    # (crypto's "previous close" == current session's own open).
+    active_status = {}   # inst_name -> "has >=1 real ACTIVE HPL row this cycle" (used by Final Status below)
     for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
-        ("ETH", "eth_price", "eth_chain", "eth_candles", "eth_prev_close", "eth_iv", 2.00, 2.00, 5.00, True),
+        ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
         ("QQQ", "qqq_price", "qqq_chain", "qqq_candles", "qqq_prev_close", "qqq_iv", 0.25, 0.35, 0.35, False),
     ):
         chain = data.get(chain_key)
@@ -1092,15 +1207,91 @@ def render(data, remaining=None):
         if not chain or price is None:
             p(f"        {LIGHT_BLANK}  {DIM}unavailable{RST}")
             p()
+            active_status[inst_name] = False
             continue
         p(f"        {LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
         rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
                               export=export, gamma_yellow_tol=gyellow, gex_export=gex_export)
         closed = inst_name == "QQQ" and qqq_market_closed()
-        for label_, level_str, ok in rows:
-            dot = light_closed() if closed else light(ok)
-            p(f"        {dot}  {label_:<26}{level_str}")
+        rows_by_label = {label_: (level_str, ok) for label_, level_str, ok in rows}
+        any_active = (not closed) and any(ok for _l, _v, ok in rows)
+        active_status[inst_name] = any_active
+        for cat_i, (cat_name, cat_labels) in enumerate(HPL_CATEGORIES):
+            if cat_i > 0:
+                p()
+            p(f"        {LIGHT_BLANK}  {DIM}{BLD}{cat_name}{RST}")
+            for label_ in cat_labels:
+                level_str, ok = rows_by_label.get(label_, ("n/a", False))
+                dot = light_closed() if closed else light(ok)
+                p(f"        {dot}  {label_:<26}{level_str}")
         p()
+
+    # 5. Targets — BT + Large clusters above price when PCVR < 0.98, or
+    # ST + Large clusters below price when PCVR > 1.02. QQQ only during its
+    # own 08:45-15:00 CT hours; ETH always (24/7 asset, no such gate).
+    p(f"  {BLD}5. Targets{RST}")
+    has_targets = {}   # inst_name -> "has >=1 real target this cycle" (used by Final Status below)
+    ratio = pcvr["ratio"] if pcvr else None
+    for inst_name, price_key, chain_key, is_crypto, gated in (
+        ("ETH", "eth_price", "eth_chain", True, False),
+        ("QQQ", "qqq_price", "qqq_chain", False, True),
+    ):
+        chain = data.get(chain_key)
+        price = data.get(price_key)
+        if gated and qqq_market_closed():
+            p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}CLOSED{RST}")
+            has_targets[inst_name] = False
+            continue
+        if not chain or price is None or ratio is None:
+            p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}unavailable{RST}")
+            has_targets[inst_name] = False
+            continue
+        gex_export = read_gex_export(inst_name)
+        # Only the $ price itself is colored (green) — labels ("BT"/"ST"/
+        # "Cluster") and the above/below tag stay plain/white. Tag describes
+        # where the TARGET sits relative to live price, not the other way.
+        def target_rel(level):
+            if level > price:
+                return "above"
+            elif level < price:
+                return "below"
+            else:
+                return "at"
+        targets = []
+        if ratio < 0.98:
+            bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            if bt is not None:
+                targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({DIM}{target_rel(bt)}{RST})")
+            above, _below = large_clusters_directional(chain, is_crypto, gex_export, price)
+            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({DIM}{target_rel(k)}{RST})" for k in above]
+        elif ratio > 1.02:
+            _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            if st is not None:
+                targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({DIM}{target_rel(st)}{RST})")
+            _above, below = large_clusters_directional(chain, is_crypto, gex_export, price)
+            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({DIM}{target_rel(k)}{RST})" for k in below]
+        has_targets[inst_name] = bool(targets)
+        if targets:
+            p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}{RST}{', '.join(targets)}")
+        else:
+            p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}no active targets{RST}")
+    p()
+
+    # Final Status — "EXECUTE WHEN READY" only when: an active session (1),
+    # PCVR is in an extreme zone (<=0.98 or >=1.02), this instrument has at
+    # least one genuinely ACTIVE HPL row this cycle (active_status, already
+    # False whenever QQQ is showing CLOSED), AND it has at least one real
+    # target above/below price for that same PCVR direction (has_targets,
+    # from section 5 above). Otherwise HOLD.
+    pcvr_extreme = bool(pcvr) and (pcvr["ratio"] <= 0.98 or pcvr["ratio"] >= 1.02)
+    def final_status_text(inst):
+        ready = in_session and pcvr_extreme and active_status.get(inst, False) and has_targets.get(inst, False)
+        word = f"{GRN}{BLD}EXECUTE WHEN READY{RST}" if ready else f"{RED}{BLD}HOLD{RST}"
+        return f"{BLD}{inst}:{RST} {word}"
+    status_line = f"{final_status_text('ETH')}     {final_status_text('QQQ')}"
+    p(_STATUS_MARKER)
+    deferred[_STATUS_MARKER] = status_line
+    p()
 
     p(_SEP_MARKER)
     ts = datetime.now().strftime("%H:%M:%S")
@@ -1121,15 +1312,17 @@ def render(data, remaining=None):
     # the edge of the data instead of falling short (or over-running) as row
     # content varies cycle to cycle.
     width = max((_visible_len(l) for l in lines
-                 if l not in (_SEP_MARKER, _TITLE_MARKER, _FOOTER_MARKER)), default=78)
+                 if l not in (_SEP_MARKER, _TITLE_MARKER, _FOOTER_MARKER, _STATUS_MARKER)), default=78)
     def centered(s):
         return " " * max(0, (width - _visible_len(s)) // 2) + s
     sep = f"{BLD}{CYN}{'─' * width}{RST}"
     title = f"{BLD}{CYN}{TITLE_TEXT.center(width)}{RST}"
     footer_centered = centered(deferred[_FOOTER_MARKER])
+    status_centered = centered(deferred[_STATUS_MARKER])
     lines = [sep if l == _SEP_MARKER else
              title if l == _TITLE_MARKER else
-             footer_centered if l == _FOOTER_MARKER else l
+             footer_centered if l == _FOOTER_MARKER else
+             status_centered if l == _STATUS_MARKER else l
              for l in lines]
 
     clr_inplace()
@@ -1149,6 +1342,42 @@ def assemble(raw):
     out["qqq_prev_close"] = session_prev_eod_close(raw.get("qqq_candles") or [], curr_open_ts)
     out["qqq_iv"] = qqq_chain["iv30"] if qqq_chain else None
     return out
+
+# ── Live price poller ──────────────────────────────────────────────────────
+# --interval controls the FULL data refresh (chains/candles/DVOL/PCVR — the
+# heavy fetches). Live price (and everything derived purely from price —
+# distances, near()/directional checks, targets) updates on its own much
+# faster, independent cadence, so the dashboard shows real-time price
+# movement between full refreshes rather than a price frozen at the last
+# full fetch. Deliberately its own tiny/cheap fetches (Deribit index price,
+# Yahoo meta — not the heavy chain/candle endpoints) so this stays safe to
+# run fast regardless of how long --interval is set to.
+LIVE_PRICE_INTERVAL = 2   # seconds
+
+_live_price_lock = threading.Lock()
+_live_prices = {"ETH": None, "QQQ": None}
+
+def live_price_loop():
+    while not _quit_evt.is_set():
+        eth_p = fetch_eth_live_price()
+        qqq_p = None
+        try:
+            qqq_p, _prev = fetch_yahoo_meta("QQQ")
+        except Exception:
+            pass
+        with _live_price_lock:
+            if eth_p is not None:
+                _live_prices["ETH"] = eth_p
+            if qqq_p is not None:
+                _live_prices["QQQ"] = qqq_p
+        for _ in range(int(LIVE_PRICE_INTERVAL / 0.2)):
+            if _quit_evt.is_set():
+                break
+            time.sleep(0.2)
+
+def get_live_prices():
+    with _live_price_lock:
+        return dict(_live_prices)
 
 # ── Keyboard control (non-blocking, matches opt_dashboard.py's convention) ───
 _quit_evt = threading.Event()
@@ -1189,10 +1418,12 @@ def main():
     hide_cursor()
     kb = threading.Thread(target=_keyboard_thread, daemon=True)
     kb.start()
+    threading.Thread(target=live_price_loop, daemon=True).start()
     try:
         while not _quit_evt.is_set():
             raw = run_cycle()
             data = assemble(raw)
+            check_pcvr_alert(data)
             _refresh_evt.clear()
             waited = 0.0
             last_shown = None
@@ -1200,7 +1431,19 @@ def main():
                 remaining = REFRESH_SEC - waited
                 shown = max(0, int(round(remaining)))
                 if shown != last_shown:
-                    render(data, remaining=remaining)
+                    # Overlay the independently-polled live price on top of
+                    # this cycle's otherwise-static data — everything derived
+                    # purely from price (distances, near()/directional checks,
+                    # targets) recomputes fresh against it on every redraw,
+                    # while chain/candle-derived levels stay from the last
+                    # full fetch until the next one.
+                    live = get_live_prices()
+                    display_data = dict(data)
+                    if live.get("ETH") is not None:
+                        display_data["eth_price"] = live["ETH"]
+                    if live.get("QQQ") is not None:
+                        display_data["qqq_price"] = live["QQQ"]
+                    render(display_data, remaining=remaining)
                     last_shown = shown
                 time.sleep(0.2)
                 waited += 0.2

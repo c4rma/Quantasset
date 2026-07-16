@@ -1329,7 +1329,12 @@ def render(data, remaining=None):
             targets += [f"Cluster ({t[0]}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in below]
         has_targets[inst_name] = bool(targets)
         if targets:
-            p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}{RST}{', '.join(targets)}")
+            # Max 2 targets per line — more than that on one line ran wider
+            # than the terminal and broke the whole dashboard's rendering.
+            for i in range(0, len(targets), 2):
+                chunk = targets[i:i + 2]
+                label = f"{DIM}{inst_name:<6}{RST}" if i == 0 else " " * 6
+                p(f"     {LIGHT_BLANK}  {label}{', '.join(chunk)}")
         else:
             p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}no active targets{RST}")
     p()

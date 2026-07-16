@@ -945,19 +945,19 @@ def clusters_from_gex_export(gex_export, price, n=2):
     with_dist.sort(key=lambda x: x[2])
     return with_dist[:n]
 
-def large_clusters_directional(chain, is_crypto, gex_export, price):
-    """(above, below) — sorted lists of ALL Large-tier gamma cluster strikes
-    above/below current price, from whichever source (gex.py export if fresh,
-    else a live computation) evaluate_hpls would also use for this
-    instrument. Used by the Targets section — unlike the HPL row's "2
-    closest" display, targets want every qualifying Large cluster in the
-    relevant direction, not just the nearest ones."""
+def gamma_cluster_targets_directional(chain, is_crypto, gex_export, price):
+    """(above, below) — sorted [(strike, tier), ...] for EVERY Medium or
+    Large gamma cluster above/below current price, from whichever source
+    (gex.py export if fresh, else a live computation) evaluate_hpls would
+    also use for this instrument. Used by the Targets section — unlike the
+    HPL row's "2 closest" display, targets want every qualifying cluster
+    (both tiers) in the relevant direction, not just the nearest Large ones."""
     if gex_export and gex_export.get("gex_by_strike"):
         clusters = all_clusters_from_gex_export(gex_export)
     else:
         clusters = gamma_clusters(chain["strikes"], chain["spot"], is_crypto)
-    above = sorted(k for k, t in clusters if t == "Large" and k > price)
-    below = sorted(k for k, t in clusters if t == "Large" and k < price)
+    above = sorted((k, t) for k, t in clusters if k > price)
+    below = sorted((k, t) for k, t in clusters if k < price)
     return above, below
 
 QQQ_OPEN_CT_MIN  = 8 * 60 + 45   # 08:45 CT — regular market open
@@ -1319,14 +1319,14 @@ def render(data, remaining=None):
             bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if bt is not None:
                 targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})")
-            above, _below = large_clusters_directional(chain, is_crypto, gex_export, price)
-            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k in above]
+            above, _below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
+            targets += [f"Cluster ({t[0]}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in above]
         elif ratio > 1.02:
             _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if st is not None:
                 targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})")
-            _above, below = large_clusters_directional(chain, is_crypto, gex_export, price)
-            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k in below]
+            _above, below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
+            targets += [f"Cluster ({t[0]}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in below]
         has_targets[inst_name] = bool(targets)
         if targets:
             p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}{RST}{', '.join(targets)}")

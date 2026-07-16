@@ -113,10 +113,15 @@ What it shows, per price level per bar:
   long as that price falls within the currently visible vertical window),
   so you can see where the live price sits relative to whatever you're
   looking at.
-  Net Delta row: each bar's total buy_vol - sell_vol, shown bold in its own
-  row directly beneath that bar's cells (above the time axis) — green when
-  positive, red when negative, plain when exactly zero. Same number already
-  used for the "visible Δ" status-bar figure, just broken out per-bar.
+  Per-bar table (Δ / VAH / VAL / POC): four small rows directly beneath
+  each bar's cells, above the time axis, row-labeled in the left gutter.
+  Δ — that bar's total buy_vol - sell_vol, bold, green/red/plain for
+  positive/negative/zero (same number the "visible Δ" status-bar figure
+  uses, just broken out per-bar). VAH/VAL — the Value Area's high and low
+  price bounds (compute_value_area(), same 70%-of-volume-around-the-POC
+  range VP mode shades blue/cyan). POC — that bar's Point of Control
+  price, yellow-bold (same number the ◆ marker already marks). All four
+  read "—" for a bar with no real trades.
 
 [V] toggles Volume Profile mode — pure display toggle, same instant-apply,
 no-rebuild convention as [M]/[B]. Replaces every bar's "<bid> x <ask>" cells
@@ -127,12 +132,14 @@ for sub-character precision, not just whole blocks). Colour marks the
 Value Area: the classic Volume Profile algorithm (compute_value_area) —
 starting at the POC, greedily expand toward whichever adjacent level (above
 or below) has more volume, until VALUE_AREA_FRACTION (70%, the standard
-default) of the bar's total volume is enclosed — shown in blue, lightest
-(bold) at the Value Area's outer edge, darkest (regular weight) at the
-POC; the remaining ~30% outer tails are dim gray. POC/open/close markers
-still show in the same left gutter, same precedence, as in the normal
-footprint view — VP mode only changes how the price-level cells themselves
-render, nothing
+default) of the bar's total volume is enclosed — shaded from cyan
+(lightest, at the Value Area's outer edge) to blue (darkest, at the POC) —
+two distinct colors rather than one color with a bold/dim attribute trick,
+since A_BOLD and A_DIM are each inconsistently supported across terminals
+(see the comment at this gradient's implementation); the remaining ~30%
+outer tails are dim gray. POC/open/close markers still show in the same
+left gutter, same precedence, as in the normal footprint view — VP mode
+only changes how the price-level cells themselves render, nothing
 else (imbalance/Big Trades highlighting doesn't apply here, since a profile
 bar shows combined volume, not a bid/ask split).
 
@@ -1925,6 +1932,7 @@ CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair, drawn down the selected
 VP_BLOCK_FULL = "█"
 VP_BLOCK_EIGHTHS = " ▏▎▍▌▋▊▉"   # index 0 (none) .. 7 (7/8) — index 8 would
                                 # be VP_BLOCK_FULL itself, one whole char
+TABLE_BORDER_CH = "─"   # divider row between the chart and the Δ/VAH/VAL/POC table
 
 def vp_bar_str(frac, max_width):
     """[V] Volume Profile: render `frac` (0..1, a level's volume relative
@@ -1974,7 +1982,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         live_bar = state.live
 
     top_reserved = 1
-    bottom_reserved = 3   # net-delta row + time axis + status bar
+    bottom_reserved = 7   # divider row, net-delta + VAH + VAL + POC rows, time axis, status bar
     axis_w = AXIS_W
     plot_h = h - top_reserved - bottom_reserved
     plot_w = max(1, w - axis_w)
@@ -1999,31 +2007,6 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             crosshair_i = abs_idx - start
             crosshair_bar = all_bars[abs_idx]
 
-    if vfollow_price:
-        # Always center on the MIDPOINT of the traded range across ALL
-        # currently visible bars — including at the live edge. Two real
-        # bugs came from special-casing the live edge to center on
-        # last_price directly: (1) last_price updates on EVERY trade tick,
-        # so the whole window shifted up/down on every single print even
-        # within an already-established range — visible flicker; (2) it
-        # skewed the window toward wherever the live price happens to sit,
-        # leaving OTHER visible bars (often at a meaningfully different
-        # price — normal for volume bars, or just an active session) cramped
-        # off-center instead of evenly fit in frame, the same skew problem
-        # already fixed for the scrolled-back case. Centering on the
-        # min/max of visible LEVELS (not tick-by-tick last price) only
-        # moves when a bar's range genuinely extends to a new high/low —
-        # same "recompute every frame but only really change when the data
-        # changes" principle as a normal candle chart's price axis.
-        all_visible_lvls = [lvl for bar in visible for lvl in bar["levels"]]
-        if all_visible_lvls:
-            center_lvl = (max(all_visible_lvls) + min(all_visible_lvls)) // 2
-        else:
-            center_lvl = round((last_price or visible[-1]["c"]) / TICK)
-    else:
-        center_lvl = vscroll_center
-    _last_center_lvl = center_lvl
-
     # "outsized candle" means one BAR's own high-low range doesn't fit — NOT
     # the combined span across every visible bar. Using the union across all
     # visible bars was wrong: at a longer interval (10m/15m) each column
@@ -2032,43 +2015,110 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     # which was incorrectly widening the grid on nothing more than an
     # interval switch. Keying off the tallest single bar's own range fixes
     # that — grouping now only kicks in for a genuine outsized candle.
+    # Computed BEFORE the vfollow_price centering below (which needs it).
     required_span = 1
     for bar in visible:
         lvls = bar["levels"]
         if lvls:
             required_span = max(required_span, max(lvls) - min(lvls) + 1)
     group_size = max(1, -(-required_span // plot_h)) if required_span > plot_h else 1
+    half = plot_h // 2
+
+    def _center_fits(candidate_center, all_visible_lvls):
+        """True if a vertical window centered on candidate_center (a raw
+        tick-level index) would show everything currently needed: every
+        visible bar's own traded levels, and — at the live edge — the
+        live price itself."""
+        g_center = candidate_center // group_size
+        top, bot = g_center + half, g_center + half - plot_h + 1
+        if all_visible_lvls:
+            if not (bot <= min(all_visible_lvls) // group_size
+                    and max(all_visible_lvls) // group_size <= top):
+                return False
+        if hscroll_bars == 0 and last_price is not None:
+            live_g = round(last_price / TICK) // group_size
+            if not (bot <= live_g <= top):
+                return False
+        return True
+
+    if vfollow_price:
+        all_visible_lvls = [lvl for bar in visible for lvl in bar["levels"]]
+        if _last_center_lvl is not None and _center_fits(_last_center_lvl, all_visible_lvls):
+            # Keep the EXISTING center exactly as-is — this is the
+            # default, common-case path. Recomputing "the ideal center"
+            # fresh every frame from the combined min/max of all visible
+            # bars sounds harmless ("only moves when the data genuinely
+            # changes"), but for an actively-trading live bar its own
+            # OWN range keeps growing with every single trade tick, and a
+            # fast tick-bar interval rolls bars in/out of the visible
+            # window constantly too — both make the "ideal center"
+            # shift on nearly every frame even though the current window
+            # still shows everything just fine, which reads as the chart
+            # continuously bouncing up/down (the actual bug reported).
+            # Only recompute when the CURRENT window would actually fail
+            # to show something.
+            center_lvl = _last_center_lvl
+        elif all_visible_lvls:
+            # Always center on the MIDPOINT of the traded range across ALL
+            # currently visible bars — including at the live edge. Two real
+            # bugs came from special-casing the live edge to center on
+            # last_price directly: (1) last_price updates on EVERY trade
+            # tick, so the whole window shifted up/down on every single
+            # print even within an already-established range — visible
+            # flicker; (2) it skewed the window toward wherever the live
+            # price happens to sit, leaving OTHER visible bars (often at a
+            # meaningfully different price — normal for volume bars, or
+            # just an active session) cramped off-center instead of evenly
+            # fit in frame, the same skew problem already fixed for the
+            # scrolled-back case.
+            center_lvl = (max(all_visible_lvls) + min(all_visible_lvls)) // 2
+        else:
+            center_lvl = round((last_price or visible[-1]["c"]) / TICK)
+        # The freshly recomputed center above might STILL not show the
+        # live price. AT THE LIVE EDGE specifically (hscroll_bars == 0 —
+        # NOT just vfollow_price, which stays True even scrolled back into
+        # history, deliberately centering on whatever old bars are visible
+        # rather than chasing a live price that isn't even in view there —
+        # see the regression test for that), the live price must always
+        # be on screen. How far to correct depends on how badly it
+        # misses:
+        #   - a NEAR miss (the required span is only slightly taller than
+        #     plot_h, e.g. off by a row or two — ordinary price drift
+        #     across a few columns) gets a MINIMAL nudge, just enough to
+        #     bring live into view, preserving as much of the other
+        #     visible bars as possible — a full recenter here would
+        #     reintroduce the "skewed toward live, other bars cramped"
+        #     bug this whole even-weighting design exists to avoid.
+        #   - a LARGE miss (more than half the window's height short —
+        #     e.g. resuming from a log whose visible bars span MULTIPLE
+        #     CALENDAR DAYS at a meaningfully different price, common for
+        #     a thin equity tick-bar interval where sparse overnight/
+        #     pre-market volume means few bars close) means the other
+        #     visible bars won't be usefully shown together with live
+        #     either way, so fully recenter on live instead of leaving it
+        #     squeezed against one edge with most of the window empty
+        #     (the original bug report this fallback exists for).
+        if hscroll_bars == 0 and last_price is not None:
+            g_center = center_lvl // group_size
+            top, bot = g_center + half, g_center + half - plot_h + 1
+            live_g = round(last_price / TICK) // group_size
+            if live_g > top:
+                shift = live_g - top
+            elif live_g < bot:
+                shift = bot - live_g
+            else:
+                shift = 0
+            if shift > half:
+                center_lvl = round(last_price / TICK)
+            elif shift > 0:
+                center_lvl += shift * group_size if live_g > top else -shift * group_size
+    else:
+        center_lvl = vscroll_center
+    _last_center_lvl = center_lvl
 
     group_center = center_lvl // group_size
-    half = plot_h // 2
     top_group = group_center + half
     bot_group = top_group - plot_h + 1
-
-    if vfollow_price and last_price is not None and hscroll_bars == 0:
-        # The midpoint-of-visible-levels centering above can still leave
-        # the live price OUTSIDE the window during a fast, sustained
-        # multi-bar move: no single bar is "outsized" (group_size above
-        # only widens for one genuinely oversized candle), but the
-        # combined span across all visible bars can still be taller than
-        # plot_h. AT THE LIVE EDGE specifically (hscroll_bars == 0 — NOT
-        # just vfollow_price, which stays True even scrolled back into
-        # history, deliberately centering on whatever old bars are
-        # visible rather than chasing a live price that isn't even in
-        # view there — see the regression test for that), the live price
-        # must always be on screen — shift the window just enough to
-        # bring it back in (rather than lose it), even if that pushes the
-        # oldest visible bars off the opposite edge. No-op in the common
-        # case where the live price already falls inside the computed
-        # window.
-        live_group_now = round(last_price / TICK) // group_size
-        if live_group_now > top_group:
-            shift = live_group_now - top_group
-            top_group += shift
-            bot_group += shift
-        elif live_group_now < bot_group:
-            shift = bot_group - live_group_now
-            top_group -= shift
-            bot_group -= shift
 
     row_groups = list(range(top_group, bot_group - 1, -1))
     group_to_row = {g: r_i for r_i, g in enumerate(row_groups)}
@@ -2113,14 +2163,22 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         safe_add(win, live_row_y, 0, live_label.rjust(axis_w - 1), cp(P_YELLOW, bold=True) | curses.A_REVERSE)
 
     # footprint cells
+    bar_stats = []   # per-bar (poc_price, vah_price, val_price) for the
+                      # VAH/VAL/POC table rows below — None for a bar with
+                      # no real trades
     for i, bar in enumerate(visible):
         levels = bar["levels"]
         cx = col_x[i]
         has_live_cell = False
         poc_g = None
+        va_low = va_high = None
         if levels:
             glevels = group_levels(levels, group_size)
             poc_g = compute_poc(glevels)
+            # Value Area (VAH/VAL) — computed for every bar regardless of
+            # VP_MODE, since the table below always shows it, not just
+            # the Volume Profile view.
+            va_low, va_high = compute_value_area(glevels, poc_g)
             has_live_cell = live_group in glevels
             # fill gaps strictly WITHIN this bar's own traded range with an
             # explicit "0 x 0" row so the ladder reads as continuous, rather
@@ -2145,7 +2203,6 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
                 # see compute_value_area), bolder the closer to the POC;
                 # dim gray = the ~30% outer tails. POC/open/close markers
                 # below are unchanged — same gutter, same precedence.
-                va_low, va_high = compute_value_area(glevels, poc_g)
                 max_vol = max((c[0] + c[1] for c in glevels.values()), default=0.0)
                 va_span = max(1, max(poc_g - va_low, va_high - poc_g)) if poc_g is not None else 1
                 for g, cell in display_levels.items():
@@ -2159,13 +2216,23 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
                     is_poc = (g == poc_g)
                     poc_attr = curses.A_UNDERLINE if is_poc else 0
                     if va_low <= g <= va_high:
-                        # gradient runs lightest (bold — reads as the
-                        # brighter/lighter shade in most terminals) at the
-                        # Value Area's outer edge, to darkest (regular
-                        # weight) at the POC.
+                        # gradient runs lightest (cyan) at the Value
+                        # Area's outer edge, to darkest (blue) at the POC.
+                        # Two distinct curses COLORS, not one color with
+                        # a bold/dim attribute trick — A_BOLD is
+                        # inconsistently remapped across terminals (many,
+                        # including some Termux themes, reinterpret "bold"
+                        # as "switch to the bright/high-intensity ANSI
+                        # palette entry", which can shift blue toward
+                        # purple instead of just brightening it), and
+                        # A_DIM is a complete no-op on Windows' curses
+                        # port (windows-curses/PDCurses always reports
+                        # A_DIM as 0). Two different named colors render
+                        # consistently on both without depending on
+                        # either attribute's platform-specific behavior.
                         dist = abs(g - poc_g) if poc_g is not None else 0
                         closeness = 1 - (dist / va_span)
-                        color = cp(P_BLUE, bold=(closeness <= 0.5)) | poc_attr
+                        color = cp(P_CYAN if closeness <= 0.5 else P_BLUE) | poc_attr
                     else:
                         color = cp(P_DIM, dim=True) | poc_attr
                     if bar_str:
@@ -2265,15 +2332,38 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
                     if _shadow_buf[row_y][center_x] == " ":
                         safe_add(win, row_y, center_x, CROSSHAIR_LINE_CH, cp(P_CYAN, dim=True))
 
-    # net delta row — one row directly under each bar's own cells, above
-    # the time axis: that bar's total buy_vol - sell_vol, bold and
-    # color-coded (green positive / red negative / plain zero). The
-    # crosshair's column ([Z]/[X]) gets reverse-video here too, alongside
-    # its time-axis label below and the gutter line drawn above — all
-    # three make the selected column unambiguous; OHLC for the selected
-    # bar is shown in the status bar.
-    delta_row = h - bottom_reserved
+        poc_price = poc_g * group_size * TICK if poc_g is not None else None
+        vah_price = va_high * group_size * TICK if va_high is not None else None
+        val_price = va_low * group_size * TICK if va_low is not None else None
+        bar_stats.append((poc_price, vah_price, val_price))
+
+    # divider row — a solid horizontal rule spanning the full window
+    # width, separating the candle/footprint area above from the small
+    # Δ/VAH/VAL/POC table below (drawn next).
+    border_row = h - bottom_reserved
+    safe_add(win, border_row, 0, TABLE_BORDER_CH * w, cp(P_DIM))
+
+    # small per-bar table — Net Delta, then Value Area High/Low, then
+    # POC — one row each, directly under each bar's own cells, above the
+    # time axis. Row-labeled in the left gutter (same column the price
+    # axis uses). VAH/VAL/POC are the same numbers already driving VP
+    # mode's shading and the POC diamond marker (compute_value_area()/
+    # compute_poc()), just broken out as plain per-bar price values
+    # regardless of chart mode — "—" for a bar with no real trades. The
+    # crosshair's column ([Z]/[X]) gets reverse-video on every row of
+    # this table, alongside its time-axis label below and the gutter line
+    # drawn above — all of it makes the selected column unambiguous;
+    # OHLC for the selected bar is shown in the status bar.
+    delta_row = border_row + 1
+    vah_row = delta_row + 1
+    val_row = delta_row + 2
+    poc_row = delta_row + 3
+    safe_add(win, delta_row, 0, "Δ".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, vah_row, 0, "VAH".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, val_row, 0, "VAL".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, poc_row, 0, "POC".rjust(axis_w - 1), cp(P_DIM))
     for i, bar in enumerate(visible):
+        rev = curses.A_REVERSE if i == crosshair_i else 0
         delta = bar["delta"]
         if delta > 0:
             delta_color = cp(P_GREEN, bold=True)
@@ -2281,12 +2371,15 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             delta_color = cp(P_RED, bold=True)
         else:
             delta_color = cp(P_DEFAULT, bold=True)
-        if i == crosshair_i:
-            delta_color |= curses.A_REVERSE
-        safe_add(win, delta_row, col_x[i], fmt_delta(delta).center(COL_W - 1), delta_color)
+        safe_add(win, delta_row, col_x[i], fmt_delta(delta).center(COL_W - 1), delta_color | rev)
+
+        poc_price, vah_price, val_price = bar_stats[i]
+        safe_add(win, vah_row, col_x[i], fmt_price(vah_price).center(COL_W - 1), cp(P_DIM) | rev)
+        safe_add(win, val_row, col_x[i], fmt_price(val_price).center(COL_W - 1), cp(P_DIM) | rev)
+        safe_add(win, poc_row, col_x[i], fmt_price(poc_price).center(COL_W - 1), cp(P_YELLOW, bold=True) | rev)
 
     # time axis
-    axis_row = delta_row + 1
+    axis_row = poc_row + 1
     for i, bar in enumerate(visible):
         lbl = fmt_time(bar["ts"])
         axis_color = cp(P_DIM) | (curses.A_REVERSE if i == crosshair_i else 0)
@@ -2377,7 +2470,7 @@ def _crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est, historical_m
 
 # ── MAIN LOOPS ────────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global SYMBOL, IS_CRYPTO, VP_MODE
+    global SYMBOL, IS_CRYPTO, VP_MODE, _last_center_lvl
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -2472,6 +2565,9 @@ def curses_main(stdscr):
             hscroll_bars = 0
             vfollow_price = True
             crosshair_active = False
+            _last_center_lvl = None   # force a fresh recompute, don't
+                                      # reuse a center left over from
+                                      # wherever the manual scroll was
         elif key in (ord('c'), ord('C')):
             # Re-center vertically without touching horizontal position —
             # [Home]/[L] also jumps back to the live edge (hscroll_bars=0),
@@ -2480,8 +2576,13 @@ def curses_main(stdscr):
             # currently are. Any Up/Down/PgUp/PgDn press disables
             # auto-centering permanently (by design — it's a manual
             # override) until re-enabled; this is that re-enable, usable at
-            # any time regardless of scroll position.
+            # any time regardless of scroll position. Clears
+            # _last_center_lvl so draw() actually recomputes a fresh
+            # center on the very next frame instead of silently reusing
+            # whatever it was before the manual vertical scroll started
+            # (which would make this key appear to do nothing).
             vfollow_price = True
+            _last_center_lvl = None
         elif key in (ord('v'), ord('V')):
             # Volume Profile toggle — pure display mode, no rebuild needed
             # (same instant-apply convention as [M]/[B]): draw() just
@@ -2511,6 +2612,7 @@ def curses_main(stdscr):
                     hscroll_bars = 0
                     vfollow_price = True
                     crosshair_active = False
+                    _last_center_lvl = None   # stale relative to the OLD tick/interval scale
         elif key in (ord('t'), ord('T')) and not HISTORICAL_MODE:
             raw_tick = _prompt_tick(stdscr)
             if raw_tick is not None:
@@ -2530,6 +2632,7 @@ def curses_main(stdscr):
                     hscroll_bars = 0
                     vfollow_price = True
                     crosshair_active = False
+                    _last_center_lvl = None   # stale relative to the OLD tick scale
         elif key in (ord('m'), ord('M')):
             raw_ratio = _prompt_imbalance(stdscr)
             if raw_ratio is not None:
@@ -2593,6 +2696,7 @@ def curses_main(stdscr):
                     hscroll_bars = 0
                     vfollow_price = True
                     crosshair_active = False
+                    _last_center_lvl = None   # stale relative to the OLD symbol's price
                 init_shown_at = time.time()
 
         with state.lock:

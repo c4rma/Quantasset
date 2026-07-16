@@ -118,6 +118,24 @@ What it shows, per price level per bar:
   positive, red when negative, plain when exactly zero. Same number already
   used for the "visible Δ" status-bar figure, just broken out per-bar.
 
+[V] toggles Volume Profile mode — pure display toggle, same instant-apply,
+no-rebuild convention as [M]/[B]. Replaces every bar's "<bid> x <ask>" cells
+with a single gradient-shaded horizontal bar per price row, length
+proportional to that level's combined bid+ask volume relative to the bar's
+own busiest level (see vp_bar_str() — uses eighth-block Unicode characters
+for sub-character precision, not just whole blocks). Colour marks the
+Value Area: the classic Volume Profile algorithm (compute_value_area) —
+starting at the POC, greedily expand toward whichever adjacent level (above
+or below) has more volume, until VALUE_AREA_FRACTION (70%, the standard
+default) of the bar's total volume is enclosed — shown in blue, lightest
+(bold) at the Value Area's outer edge, darkest (regular weight) at the
+POC; the remaining ~30% outer tails are dim gray. POC/open/close markers
+still show in the same left gutter, same precedence, as in the normal
+footprint view — VP mode only changes how the price-level cells themselves
+render, nothing
+else (imbalance/Big Trades highlighting doesn't apply here, since a profile
+bar shows combined volume, not a bid/ask split).
+
 Price scale is $1.00 (--tick) increments by default — but if any SINGLE bar
 currently on screen has its own traded (high-low) range too tall to show at
 that resolution, the grid automatically widens (adjacent $1 levels
@@ -167,9 +185,10 @@ same lazy-load-on-demand convention cvd.py uses.
 Navigation: [←/→] pan time 1 bar, [[/]] pan time 10 bars, [↑/↓] pan price,
 [PgUp/PgDn] pan price (bigger step), [Home]/[L]/Esc return to live, [C]
 re-center vertically without leaving your current scroll position, [Z]/[X]
-move a crosshair one candle left/right, [S] change symbol (crypto or
-equity), [I] change bar interval, [T] change price increment, [M] change
-imbalance ratio, [B] change Big Trades size, [P] screenshot, [Q] quit.
+move a crosshair one candle left/right, [V] toggle Volume Profile mode,
+[S] change symbol (crypto or equity), [I] change bar interval, [T] change
+price increment, [M] change imbalance ratio, [B] change Big Trades size,
+[P] screenshot, [Q] quit.
 
 [Z]/[X] crosshair: selects a single candle (bar) and shows its OHLC + net
 delta in the status bar, updating one bar at a time as you press [Z] (left,
@@ -442,6 +461,14 @@ if "--big-trade-size" in args:
         print("--big-trade-size requires a positive number"); sys.exit(1)
     BIG_TRADE_SIZE = parsed_big
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+
+VP_MODE = False   # [V] Volume Profile: replaces each bar's "<bid> x <ask>"
+                  # cells with a gradient-shaded horizontal bar per price
+                  # level (length ~ that level's share of the bar's volume)
+                  # instead — see compute_value_area() and draw()'s VP_MODE
+                  # branch. Purely a display toggle, no rebuild needed
+                  # (same instant-apply convention as IMBALANCE_RATIO/
+                  # BIG_TRADE_SIZE — draw() just reads it fresh every frame).
 
 LOAD_DATE = None
 if "--date" in args:
@@ -1717,8 +1744,45 @@ def compute_poc(levels):
         return None
     return max(levels, key=lambda lvl: levels[lvl][0] + levels[lvl][1])
 
+VALUE_AREA_FRACTION = 0.70   # standard VP default — see compute_value_area
+
+def compute_value_area(levels, poc_g, target_frac=VALUE_AREA_FRACTION):
+    """Standard Volume Profile Value Area: starting from the POC, expand a
+    contiguous [lo, hi] range one level at a time, each step adding
+    whichever ADJACENT level (just above hi, or just below lo) has MORE
+    volume — the classic "greedy expand toward the fatter side" algorithm
+    — until the accumulated volume reaches target_frac (70%) of the bar's
+    total, or there's nothing left to add on either side (a real gap in
+    the bar's own traded levels stops expansion in that direction; it
+    does NOT jump over the gap to reach volume further out). Returns
+    (va_low, va_high) inclusive group-index bounds, or (poc_g, poc_g) for
+    an empty bar or one with no real volume."""
+    if not levels or poc_g is None:
+        return poc_g, poc_g
+    total = sum(c[0] + c[1] for c in levels.values())
+    if total <= 0:
+        return poc_g, poc_g
+    lo = hi = poc_g
+    poc_cell = levels.get(poc_g, [0.0, 0.0])
+    acc = poc_cell[0] + poc_cell[1]
+    target = total * target_frac
+    while acc < target:
+        below = levels.get(lo - 1)
+        above = levels.get(hi + 1)
+        below_vol = (below[0] + below[1]) if below else -1.0
+        above_vol = (above[0] + above[1]) if above else -1.0
+        if below_vol < 0 and above_vol < 0:
+            break
+        if above_vol >= below_vol:
+            hi += 1
+            acc += above_vol
+        else:
+            lo -= 1
+            acc += below_vol
+    return lo, hi
+
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
-P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS = range(1, 8)
+P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_BLUE = range(1, 9)
 
 def init_colors():
     curses.start_color()
@@ -1731,6 +1795,7 @@ def init_colors():
     curses.init_pair(P_GREEN,   curses.COLOR_GREEN,  BG)
     curses.init_pair(P_RED,     curses.COLOR_RED,    BG)
     curses.init_pair(P_STATUS,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
+    curses.init_pair(P_BLUE,    curses.COLOR_BLUE,   BG)   # [V] Volume Profile value area
 
 def cp(pair, bold=False, dim=False):
     a = curses.color_pair(pair)
@@ -1739,6 +1804,17 @@ def cp(pair, bold=False, dim=False):
     return a
 
 _shadow_buf = None   # [P] screenshot support
+_last_center_lvl = None   # the center_lvl draw() actually rendered with
+                          # last frame — curses_main's [↑/↓] handler reads
+                          # this instead of recomputing from last_price, so
+                          # the FIRST manual scroll starts from wherever the
+                          # chart is already centered (which, while
+                          # vfollow_price is on, is the midpoint of visible
+                          # LEVELS, not last_price — see draw()'s vfollow_price
+                          # comment for why those two differ). Recomputing
+                          # from last_price made the view visibly jump to
+                          # that different position before the step was even
+                          # applied — the bug this fixes.
 
 def _shadow_put(y, x, s):
     if _shadow_buf is None:
@@ -1846,6 +1922,25 @@ CLOSE_MARKER = "●"   # filled circle — this bar's close price row
 LIVE_LINE_CH = "─"   # live-price line, drawn only through empty cells
 CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair, drawn down the selected
                           # bar's left gutter only (never through cell text)
+VP_BLOCK_FULL = "█"
+VP_BLOCK_EIGHTHS = " ▏▎▍▌▋▊▉"   # index 0 (none) .. 7 (7/8) — index 8 would
+                                # be VP_BLOCK_FULL itself, one whole char
+
+def vp_bar_str(frac, max_width):
+    """[V] Volume Profile: render `frac` (0..1, a level's volume relative
+    to the bar's own busiest level) as a left-aligned horizontal bar up to
+    max_width characters, using whole blocks plus one eighth-block
+    character for sub-character precision — same "smooth bar in a
+    monospace cell" trick sparkline/progress-bar libraries use, so even a
+    narrow difference in volume between two adjacent rows is visible
+    rather than rounding to the same whole-character width."""
+    frac = max(0.0, min(1.0, frac))
+    eighths_total = round(frac * max_width * 8)
+    full, rem = divmod(eighths_total, 8)
+    bar = VP_BLOCK_FULL * full
+    if rem:
+        bar += VP_BLOCK_EIGHTHS[rem]
+    return bar
 
 def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshair_bar_idx=None):
     """Renders one frame. Returns the number of bar-columns actually drawn.
@@ -1867,7 +1962,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     blank whenever the range was smaller than the terminal); the window
     itself never shrinks, only the per-row $ resolution ever changes, and
     only to grow."""
-    global _shadow_buf
+    global _shadow_buf, _last_center_lvl
     h, w = win.getmaxyx()
     win.erase()
     _shadow_buf = [[" "] * w for _ in range(h)]
@@ -1927,6 +2022,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             center_lvl = round((last_price or visible[-1]["c"]) / TICK)
     else:
         center_lvl = vscroll_center
+    _last_center_lvl = center_lvl
 
     # "outsized candle" means one BAR's own high-low range doesn't fit — NOT
     # the combined span across every visible bar. Using the union across all
@@ -1994,6 +2090,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     bar_progress = fmt_bar_progress(live_bar)
     header = (f" FOOTPRINT — {SYMBOL}  bar:{INTERVAL_LABEL} [I]  tick:${fmt_price(TICK)} [T]  "
               f"imb:{IMBALANCE_RATIO:g}x [M]  stack:{STACK_COUNT}+  big:${fmt_price(BIG_TRADE_SIZE)}+ [B]"
+              f"  vp:{'on' if VP_MODE else 'off'} [V]"
               f"{f'  grid:${fmt_price(TICK * group_size)}' if group_size > 1 else ''}"
               f"{f'  |  {bar_progress}' if bar_progress else ''}  ")
     safe_add(win, 0, 0, header.ljust(w), cp(P_STATUS))
@@ -2023,8 +2120,6 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         poc_g = None
         if levels:
             glevels = group_levels(levels, group_size)
-            imbalances = compute_imbalances(glevels)
-            stacked = compute_stacks(imbalances)
             poc_g = compute_poc(glevels)
             has_live_cell = live_group in glevels
             # fill gaps strictly WITHIN this bar's own traded range with an
@@ -2039,46 +2134,87 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             display_levels = dict(glevels)
             for g in range(min(glevels), max(glevels) + 1):
                 display_levels.setdefault(g, [0.0, 0.0])
-            for g, cell in display_levels.items():
-                r_i = group_to_row.get(g)
-                if r_i is None:
-                    continue
-                row_y = top_reserved + r_i
-                bid, ask = cell[0], cell[1]
-                bid_txt, ask_txt = fmt_lvl_qty(bid), fmt_lvl_qty(ask)
-                mid = " x "
-                pad = max(0, CELL_TXT_W - (len(bid_txt) + len(mid) + len(ask_txt)))
-                x0 = cx + 1 + pad // 2   # +1 for the marker gutter
 
-                direction = imbalances.get(g)
-                extra = curses.A_REVERSE if g in stacked else 0
-                is_poc = (g == poc_g)
-                poc_attr = curses.A_UNDERLINE if is_poc else 0
-                # Big Trades filter ([B]): a cell's own bid/ask volume >=
-                # BIG_TRADE_SIZE is highlighted cyan — independent of imbalance,
-                # but imbalance direction (a rarer, more specific signal) still
-                # takes priority when a level happens to be both. Cyan (not
-                # magenta) specifically because magenta reads too close to red
-                # at a glance — cyan sits far enough from both red and green to
-                # stay unambiguous.
-                if direction == "sell":
-                    bid_color = cp(P_RED, bold=True) | extra | poc_attr
-                elif bid >= BIG_TRADE_SIZE:
-                    bid_color = cp(P_CYAN, bold=True) | poc_attr
-                else:
-                    bid_color = cp(P_DEFAULT) | poc_attr
-                if direction == "buy":
-                    ask_color = cp(P_GREEN, bold=True) | extra | poc_attr
-                elif ask >= BIG_TRADE_SIZE:
-                    ask_color = cp(P_CYAN, bold=True) | poc_attr
-                else:
-                    ask_color = cp(P_DEFAULT) | poc_attr
+            if VP_MODE:
+                # [V] Volume Profile: one gradient-shaded horizontal bar
+                # per price row instead of "<bid> x <ask>" text — length ~
+                # that level's share of the bar's OWN busiest level's
+                # volume (real levels only, gap-filled 0-volume rows just
+                # render empty). Blue = inside the Value Area (the
+                # VALUE_AREA_FRACTION, 70%, of volume nearest the POC —
+                # see compute_value_area), bolder the closer to the POC;
+                # dim gray = the ~30% outer tails. POC/open/close markers
+                # below are unchanged — same gutter, same precedence.
+                va_low, va_high = compute_value_area(glevels, poc_g)
+                max_vol = max((c[0] + c[1] for c in glevels.values()), default=0.0)
+                va_span = max(1, max(poc_g - va_low, va_high - poc_g)) if poc_g is not None else 1
+                for g, cell in display_levels.items():
+                    r_i = group_to_row.get(g)
+                    if r_i is None:
+                        continue
+                    row_y = top_reserved + r_i
+                    vol = cell[0] + cell[1]
+                    frac = (vol / max_vol) if max_vol > 0 else 0.0
+                    bar_str = vp_bar_str(frac, CELL_TXT_W)
+                    is_poc = (g == poc_g)
+                    poc_attr = curses.A_UNDERLINE if is_poc else 0
+                    if va_low <= g <= va_high:
+                        # gradient runs lightest (bold — reads as the
+                        # brighter/lighter shade in most terminals) at the
+                        # Value Area's outer edge, to darkest (regular
+                        # weight) at the POC.
+                        dist = abs(g - poc_g) if poc_g is not None else 0
+                        closeness = 1 - (dist / va_span)
+                        color = cp(P_BLUE, bold=(closeness <= 0.5)) | poc_attr
+                    else:
+                        color = cp(P_DIM, dim=True) | poc_attr
+                    if bar_str:
+                        safe_add(win, row_y, cx + 1, bar_str, color)
+                    if is_poc:
+                        safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
+            else:
+                imbalances = compute_imbalances(glevels)
+                stacked = compute_stacks(imbalances)
+                for g, cell in display_levels.items():
+                    r_i = group_to_row.get(g)
+                    if r_i is None:
+                        continue
+                    row_y = top_reserved + r_i
+                    bid, ask = cell[0], cell[1]
+                    bid_txt, ask_txt = fmt_lvl_qty(bid), fmt_lvl_qty(ask)
+                    mid = " x "
+                    pad = max(0, CELL_TXT_W - (len(bid_txt) + len(mid) + len(ask_txt)))
+                    x0 = cx + 1 + pad // 2   # +1 for the marker gutter
 
-                safe_add(win, row_y, x0, bid_txt, bid_color)
-                safe_add(win, row_y, x0 + len(bid_txt), mid, cp(P_DIM) | poc_attr)
-                safe_add(win, row_y, x0 + len(bid_txt) + len(mid), ask_txt, ask_color)
-                if is_poc:
-                    safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
+                    direction = imbalances.get(g)
+                    extra = curses.A_REVERSE if g in stacked else 0
+                    is_poc = (g == poc_g)
+                    poc_attr = curses.A_UNDERLINE if is_poc else 0
+                    # Big Trades filter ([B]): a cell's own bid/ask volume >=
+                    # BIG_TRADE_SIZE is highlighted cyan — independent of imbalance,
+                    # but imbalance direction (a rarer, more specific signal) still
+                    # takes priority when a level happens to be both. Cyan (not
+                    # magenta) specifically because magenta reads too close to red
+                    # at a glance — cyan sits far enough from both red and green to
+                    # stay unambiguous.
+                    if direction == "sell":
+                        bid_color = cp(P_RED, bold=True) | extra | poc_attr
+                    elif bid >= BIG_TRADE_SIZE:
+                        bid_color = cp(P_CYAN, bold=True) | poc_attr
+                    else:
+                        bid_color = cp(P_DEFAULT) | poc_attr
+                    if direction == "buy":
+                        ask_color = cp(P_GREEN, bold=True) | extra | poc_attr
+                    elif ask >= BIG_TRADE_SIZE:
+                        ask_color = cp(P_CYAN, bold=True) | poc_attr
+                    else:
+                        ask_color = cp(P_DEFAULT) | poc_attr
+
+                    safe_add(win, row_y, x0, bid_txt, bid_color)
+                    safe_add(win, row_y, x0 + len(bid_txt), mid, cp(P_DIM) | poc_attr)
+                    safe_add(win, row_y, x0 + len(bid_txt) + len(mid), ask_txt, ask_color)
+                    if is_poc:
+                        safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
 
         # open/close markers — this bar's own left gutter, one row for its
         # open price (hollow circle) and one for its close (filled circle,
@@ -2241,7 +2377,7 @@ def _crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est, historical_m
 
 # ── MAIN LOOPS ────────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global SYMBOL, IS_CRYPTO
+    global SYMBOL, IS_CRYPTO, VP_MODE
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -2316,7 +2452,17 @@ def curses_main(stdscr):
         elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
             step = VSTEP_BIG if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else VSTEP
             direction = 1 if key in (curses.KEY_UP, curses.KEY_PPAGE) else -1
-            if vfollow_price:
+            # Base the FIRST manual scroll on wherever the chart is
+            # ALREADY centered (draw()'s own _last_center_lvl from the
+            # last frame), not on last_price directly — while
+            # vfollow_price is on, draw() centers on the midpoint of
+            # visible LEVELS, which is usually NOT the same value as
+            # last_price/TICK (see draw()'s vfollow_price comment). Using
+            # last_price here made the view visibly snap to that
+            # different position before the step was even applied.
+            if vfollow_price and _last_center_lvl is not None:
+                base = _last_center_lvl
+            elif vfollow_price:
                 base = round((state.last_price or 0) / TICK)
             else:
                 base = vscroll_center
@@ -2336,6 +2482,11 @@ def curses_main(stdscr):
             # override) until re-enabled; this is that re-enable, usable at
             # any time regardless of scroll position.
             vfollow_price = True
+        elif key in (ord('v'), ord('V')):
+            # Volume Profile toggle — pure display mode, no rebuild needed
+            # (same instant-apply convention as [M]/[B]): draw() just
+            # reads VP_MODE fresh every frame.
+            VP_MODE = not VP_MODE
         elif key in (ord('p'), ord('P')):
             fn = take_screenshot(stdscr)
             screenshot_msg = f"Screenshot: {os.path.basename(fn)}"

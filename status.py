@@ -166,6 +166,49 @@ def check_pcvr_alert(data):
         play_alert()
     _pcvr_alert_zone = zone
 
+# inst_name -> {"above_bt": bool_or_None, "below_st": bool_or_None} — tracks
+# whether price was already past the level on the LAST check, so the alert
+# only fires on the actual crossing (False->True), never while price just
+# sits past it, and never on first entry into the PCVR zone even if price
+# already happens to be past the level at that moment.
+_bt_st_cross_state = {}
+
+def check_bt_st_cross_alert(display_data, pcvr):
+    """Plays alert.wav when live price crosses ABOVE BT while PCVR >= 1.02,
+    or crosses BELOW ST while PCVR <= 0.98. Reads whatever live price is
+    currently in `display_data` (the live-price-overlaid dict, not the
+    slow-cadence fetch), so it reacts as fast as the live-price poller does,
+    same as the Targets section's own distance display."""
+    if not pcvr:
+        return
+    ratio = pcvr["ratio"]
+    for inst_name, price_key, chain_key, is_crypto in (
+        ("ETH", "eth_price", "eth_chain", True),
+        ("QQQ", "qqq_price", "qqq_chain", False),
+    ):
+        chain = display_data.get(chain_key)
+        price = display_data.get(price_key)
+        state = _bt_st_cross_state.setdefault(inst_name, {"above_bt": None, "below_st": None})
+        if not chain or price is None:
+            continue
+        bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+
+        if ratio >= 1.02 and bt is not None:
+            now_above = price > bt
+            if now_above and state["above_bt"] is False:
+                play_alert()
+            state["above_bt"] = now_above
+        else:
+            state["above_bt"] = None   # out of the watched regime — re-arm for next entry
+
+        if ratio <= 0.98 and st is not None:
+            now_below = price < st
+            if now_below and state["below_st"] is False:
+                play_alert()
+            state["below_st"] = now_below
+        else:
+            state["below_st"] = None
+
 def move(row, col=1): sys.stdout.write(f'\033[{row};{col}H')
 def erase_line(): sys.stdout.write('\033[K')
 def hide_cursor(): sys.stdout.write('\033[?25l')
@@ -1247,29 +1290,43 @@ def render(data, remaining=None):
             has_targets[inst_name] = False
             continue
         gex_export = read_gex_export(inst_name)
-        # Only the $ price itself is colored (green) — labels ("BT"/"ST"/
-        # "Cluster") and the above/below tag stay plain/white. Tag describes
-        # where the TARGET sits relative to live price, not the other way.
+        # Only the $ price itself and the above/below/distance tag are
+        # colored — labels ("BT"/"ST"/"Cluster") stay plain/white. Tag
+        # describes where the TARGET sits relative to live price (not the
+        # other way), plus the $ distance between them — recomputed fresh
+        # every render call against whatever the live-price poller currently
+        # has, so it updates in step with the live price, not just on full
+        # refreshes. Color: PCVR>=1.02 wants price falling toward ST, so a
+        # target BELOW price is green (still ahead) / above is red (passed);
+        # PCVR<=0.98 is the mirror (target ABOVE price is green).
         def target_rel(level):
+            dist = abs(level - price)
             if level > price:
-                return "above"
+                direction = "above"
             elif level < price:
-                return "below"
+                direction = "below"
             else:
-                return "at"
+                return f"{DIM}at price{RST}"
+            if ratio >= 1.02:
+                col = GRN if direction == "below" else RED
+            elif ratio <= 0.98:
+                col = GRN if direction == "above" else RED
+            else:
+                col = DIM
+            return f"{col}{BLD}{direction}, ${dist:,.2f} away{RST}"
         targets = []
         if ratio < 0.98:
             bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if bt is not None:
-                targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({DIM}{target_rel(bt)}{RST})")
+                targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})")
             above, _below = large_clusters_directional(chain, is_crypto, gex_export, price)
-            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({DIM}{target_rel(k)}{RST})" for k in above]
+            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k in above]
         elif ratio > 1.02:
             _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if st is not None:
-                targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({DIM}{target_rel(st)}{RST})")
+                targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})")
             _above, below = large_clusters_directional(chain, is_crypto, gex_export, price)
-            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({DIM}{target_rel(k)}{RST})" for k in below]
+            targets += [f"Cluster {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k in below]
         has_targets[inst_name] = bool(targets)
         if targets:
             p(f"     {LIGHT_BLANK}  {DIM}{inst_name:<6}{RST}{', '.join(targets)}")
@@ -1443,6 +1500,7 @@ def main():
                         display_data["eth_price"] = live["ETH"]
                     if live.get("QQQ") is not None:
                         display_data["qqq_price"] = live["QQQ"]
+                    check_bt_st_cross_alert(display_data, data.get("pcvr"))
                     render(display_data, remaining=remaining)
                     last_shown = shown
                 time.sleep(0.2)

@@ -123,7 +123,11 @@ What it shows, per price level per bar:
   H green / L red (the top/bottom of the bar's range), C green/red by
   direction (matching the ● marker). Δ — that bar's total buy_vol -
   sell_vol, bold, green/red/plain for positive/negative/zero (same number
-  the "visible Δ" status-bar figure uses, just broken out per-bar).
+  the "visible Δ" status-bar figure uses, just broken out per-bar), plus a
+  "(+)"/"(-)" marker showing whether THIS bar's Δ is greater/less than the
+  PREVIOUS bar's own Δ (a shift indicator, same "versus the prior bar"
+  convention the POC row already uses — blank for the first visible bar or
+  a tie).
   VAH/VAL — the Value Area's high and low price bounds
   (compute_value_area(), same 70%-of-volume-around-the-POC range VP mode
   shades). POC — that bar's Point of Control price (same number the ◆
@@ -2737,7 +2741,18 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             delta_color = cp(P_RED, bold=True)
         else:
             delta_color = cp(P_DEFAULT, bold=True)
-        safe_add(win, delta_row, col_x[i], fmt_delta(delta).center(COL_W - 1), delta_color | rev)
+        # (+)/(-) marker vs. the PREVIOUS bar's own delta -- a shift
+        # indicator, same "versus the prior bar" convention the POC row
+        # already uses, not a restatement of this bar's own sign (which
+        # the base value's color already shows)
+        prev_delta = visible[i - 1]["delta"] if i > 0 else None
+        if prev_delta is not None and delta > prev_delta:
+            delta_shift = " (+)"
+        elif prev_delta is not None and delta < prev_delta:
+            delta_shift = " (-)"
+        else:
+            delta_shift = ""
+        safe_add(win, delta_row, col_x[i], (fmt_delta(delta) + delta_shift).center(COL_W - 1), delta_color | rev)
 
         poc_price, vah_price, val_price = bar_stats[i]
         safe_add(win, vah_row, col_x[i], fmt_price(vah_price).center(COL_W - 1), cp(P_DIM) | rev)

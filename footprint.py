@@ -6,7 +6,7 @@ Usage:
   python footprint.py [SYMBOL] [--interval <N>s|<N>m|<N>V|<N>T] [--tick N]
                        [--imbalance N] [--stack N] [--min-imbalance-vol N]
                        [--big-trade-size N] [--btd-lookback N] [--btd-sigma N]
-                       [--backfill-hours N]
+                       [--backfill-hours N] [--backfill-budget-secs N]
                        [--date MM_DD_YYYY] [--headless]
 
 SYMBOL is either a crypto ticker (ETH, BTC — routed through Phemex+Kraken+
@@ -650,6 +650,21 @@ if "--backfill-hours" in args:
 if BACKFILL_HOURS is None:
     BACKFILL_HOURS = max(0.0, (time.time() - _session_start_ts()) / 3600.0)
 
+# Time budget for the initial REST backfill -- independent of BACKFILL_HOURS
+# (which controls how far back to request, not how long fetching is allowed
+# to take). On a slower connection (e.g. mobile data on Termux), the default
+# budget lets fewer REST pages complete than on a fast connection, so the
+# backfill can end up thinner/less complete even when requesting the same
+# BACKFILL_HOURS. Override with a larger value on slower devices.
+BACKFILL_BUDGET_SECS = None
+if "--backfill-budget-secs" in args:
+    i = args.index("--backfill-budget-secs")
+    try:
+        BACKFILL_BUDGET_SECS = max(1.0, float(args[i + 1]))
+    except (IndexError, ValueError):
+        print("--backfill-budget-secs requires a number"); sys.exit(1)
+    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+
 TODAY_STR       = datetime.now().strftime("%m_%d_%Y")
 VIEW_DATE       = LOAD_DATE or TODAY_STR
 HISTORICAL_MODE = LOAD_DATE is not None and LOAD_DATE != TODAY_STR
@@ -1065,7 +1080,8 @@ def fetch_trades_since(hours, progress=None, deadline=None):
     until_ts = now if IS_CRYPTO else now - 900
     return fetch_trades_range(now - hours * 3600, until_ts, progress=progress, deadline=deadline)
 
-INITIAL_BACKFILL_BUDGET_SECS = 30   # was 15s — too little history loaded meant
+INITIAL_BACKFILL_BUDGET_SECS = BACKFILL_BUDGET_SECS if BACKFILL_BUDGET_SECS is not None else 30
+                                    # was 15s — too little history loaded meant
                                     # scrolling back hit the oldest loaded bar
                                     # (and had to wait on extend_history_backward)
                                     # too quickly. Whatever still doesn't fit in

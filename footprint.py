@@ -5,7 +5,8 @@ footprint.py — terminal bid x ask footprint (order-flow) chart, crypto + equit
 Usage:
   python footprint.py [SYMBOL] [--interval <N>s|<N>m|<N>V|<N>T] [--tick N]
                        [--imbalance N] [--stack N] [--min-imbalance-vol N]
-                       [--big-trade-size N] [--backfill-hours N]
+                       [--big-trade-size N] [--btd-lookback N] [--btd-sigma N]
+                       [--backfill-hours N]
                        [--date MM_DD_YYYY] [--headless]
 
 SYMBOL is either a crypto ticker (ETH, BTC — routed through Phemex+Kraken+
@@ -56,7 +57,8 @@ actually printing rather than how much time passed or how much size
 traded. (Unrelated to --tick / the [T] key, the price-increment/$
 resolution setting — "tick BAR" here means a bar-closing rule based on
 trade COUNT, not the price axis.) Default 5m, --tick 1.00, --imbalance 3.0
-(300%), --stack 3, --min-imbalance-vol 0, --big-trade-size 100.
+(300%), --stack 3, --min-imbalance-vol 0, --big-trade-size 100,
+--btd-lookback 10, --btd-sigma 3.0.
 
 [I] opens a text prompt to change the bar interval in-app (same <N>s/<N>m/
 <N>V/<N>T syntax as --interval) without restarting — types the new interval
@@ -113,15 +115,22 @@ What it shows, per price level per bar:
   long as that price falls within the currently visible vertical window),
   so you can see where the live price sits relative to whatever you're
   looking at.
-  Per-bar table (Δ / VAH / VAL / POC): four small rows directly beneath
-  each bar's cells, above the time axis, row-labeled in the left gutter.
-  Δ — that bar's total buy_vol - sell_vol, bold, green/red/plain for
-  positive/negative/zero (same number the "visible Δ" status-bar figure
-  uses, just broken out per-bar). VAH/VAL — the Value Area's high and low
-  price bounds (compute_value_area(), same 70%-of-volume-around-the-POC
-  range VP mode shades blue/cyan). POC — that bar's Point of Control
-  price, yellow-bold (same number the ◆ marker already marks). All four
-  read "—" for a bar with no real trades.
+  Per-bar table (O / H / L / C / Δ / VAH / VAL / POC): eight small rows
+  directly beneath each bar's cells, above the time axis, row-labeled in
+  the left gutter, same order the crosshair's status-bar readout uses.
+  O/H/L/C — that bar's open/high/low/close, all bold so they stand out
+  from the more muted VAH/VAL rows below: O cyan (matching the ○ marker),
+  H green / L red (the top/bottom of the bar's range), C green/red by
+  direction (matching the ● marker). Δ — that bar's total buy_vol -
+  sell_vol, bold, green/red/plain for positive/negative/zero (same number
+  the "visible Δ" status-bar figure uses, just broken out per-bar).
+  VAH/VAL — the Value Area's high and low price bounds
+  (compute_value_area(), same 70%-of-volume-around-the-POC range VP mode
+  shades). POC — that bar's Point of Control price (same number the ◆
+  marker already marks), bold green/red versus the PREVIOUS bar's own POC
+  (rising/falling value area over time — same convention as Δ and C),
+  plain when there's no previous bar to compare against.
+  All eight read "—" for a bar with no real trades.
 
 [V] toggles Volume Profile mode — pure display toggle, same instant-apply,
 no-rebuild convention as [M]/[B]. Replaces every bar's "<bid> x <ask>" cells
@@ -143,6 +152,40 @@ only changes how the price-level cells themselves render, nothing
 else (imbalance/Big Trades highlighting doesn't apply here, since a profile
 bar shows combined volume, not a bid/ask split).
 
+[D] toggles the Big Trade Detector (BTD, --btd-lookback default 10 bars,
+[K] to change live without restarting — a whole number of bars, since
+it's a slice length, not a threshold; --btd-sigma default 3.0, [G] to
+change live — a free-form decimal, since it's a sensitivity threshold, not
+a count) — pure display toggle, same instant-apply convention as
+[V]/[M]/[B]. Ported from charthacker.py's BTD, but more accurate here:
+charthacker only has OHLCV candles, so it has to APPROXIMATE each candle's
+buy/sell volume split from where the close landed within the high-low
+range; footprint.py already has each bar's REAL trade-classified
+buy_vol/sell_vol (the same numbers the Δ row and "<bid> x <ask>" cells
+use), so BTD compares genuine volume, not a shape guess. For each bar
+(once BTD_LOOKBACK prior bars exist), compute_btd_tier() z-scores that
+bar's buy_vol against the PRIOR btd_lookback bars' buy_vol (same
+independently for sell_vol; btd_sigma sets the sensitivity) — a signal
+fires (tier 1/2/3, increasingly many standard deviations above the mean)
+when the current bar's volume on that side is a
+genuine outlier versus its own recent history. Signals draw into a FIXED
+strip (BTD_STRIP_ROWS rows) reserved at the very bottom of the price
+ladder, directly above the O/H/L/C table — buy cyan, sell magenta — at the
+same constant screen row for every bar, rather than floating near each
+bar's own (constantly different) low/high; that reserved strip is never
+part of the price ladder's own grid, so it never collides with real
+footprint cell data no matter where a bar's actual price sits. Deliberately
+BIG (5 characters wide x 1 row tall at tier 1, growing to 9 wide x 3 tall
+at tier 3, growing upward from the strip's bottom row like a small
+histogram) rather than a single reverse-video character — a screen already
+full of colored footprint cells/VP bars makes a single tiny marker easy to
+miss entirely. The strip's space is only reserved while [D] is on — toggle
+it off and the price ladder gets those rows back. Together with the
+per-bar table's green/red POC row (Point of Control shifting up/down
+bar-to-bar) and Δ row (net delta shifting positive/negative), this puts
+all three entry signals — POC shift, delta shift, and BTD — on the one
+footprint chart.
+
 Price scale is $1.00 (--tick) increments by default — but if any SINGLE bar
 currently on screen has its own traded (high-low) range too tall to show at
 that resolution, the grid automatically widens (adjacent $1 levels
@@ -157,24 +200,39 @@ never the window size (an auto-fit-the-whole-window version was tried and
 reverted: it left most of the screen blank whenever the traded range was
 smaller than the terminal).
 
-Vertical centering follows what's actually on screen, not a fixed target —
-always the MIDPOINT of the traded range across every currently visible bar
-(live edge included), not just the rightmost one and not the tick-by-tick
-last trade price. Centering on the raw last price flickered (it updates on
-every single print, shifting the whole window every frame even within an
-already-established range) and, like centering on only the rightmost bar,
-skewed the window toward wherever that one reference point sits, leaving
-other visible bars at a different price trailing off-center and clipped
-instead of evenly fit in frame. Midpoint-of-visible-levels only moves when
-a bar's range genuinely extends to a new high/low, so panning through
-history doesn't also require manually readjusting [↑/↓] every time just to
-keep everything in view. The price scale/resolution itself never changes
-because of this, only where the window is centered. [↑/↓]/[PgUp/PgDn] override this with a
-manual pan (any press disables auto-centering until re-enabled). [Home]/[L]
-re-enables it AND returns to the live edge; [C] re-enables it WITHOUT
-moving your horizontal position — useful if you're deliberately scrolled
-back through history and just want vertical auto-centering back on for
-wherever you currently are, without being yanked back to live.
+Vertical centering follows what's actually on screen, not a fixed target,
+and behaves differently at the live edge than scrolled back into history:
+
+At the live edge (hscroll_bars == 0), it's a strict "rubber band" follow:
+the window stays EXACTLY where it is, frame after frame — new candles
+starting, the live bar's own range growing, bars rolling in/out of the
+visible columns, none of it moves the window on its own. The ONLY thing
+that ever moves it is the live price itself falling outside the window,
+and then only by the exact amount needed to bring it back to whichever
+edge it crossed — no more (a full recenter for any other reason would
+shift the window without the live price actually requiring it — flickery,
+unpredictable), no less (a partial nudge would still clip it). Once
+shifted, it stays at that new position the same way, until live crosses
+out of frame again.
+
+Scrolled back into history, there's no live price to chase, so it centers
+on the MIDPOINT of the traded range across every currently visible bar
+instead, staying put unless that range genuinely changes (a bar with a new
+high/low scrolls into view) — same "don't move without a reason" principle,
+just anchored to the visible data instead of the live price. Centering on
+the raw last price (an earlier version) flickered (it updates on every
+single print, shifting the whole window every frame even within an
+already-established range) and skewed the window toward wherever that one
+reference point sits, leaving other visible bars trailing off-center and
+clipped instead of evenly fit in frame.
+
+The price scale/resolution itself never changes because of any of this,
+only where the window is positioned. [↑/↓]/[PgUp/PgDn] override this with
+a manual pan (any press disables auto-centering until re-enabled).
+[Home]/[L] re-enables it AND returns to the live edge; [C] re-enables it
+WITHOUT moving your horizontal position — useful if you're deliberately
+scrolled back through history and just want vertical auto-centering back
+on for wherever you currently are, without being yanked back to live.
 
 Loads real trade history from the PREVIOUS day's 00:00 CT (midnight) on
 startup — always a full day back, regardless of what time it currently is.
@@ -189,13 +247,31 @@ quickly, not a hard cutoff on how far back you can go: scrolling ([←/→]/
 the background and prepends it — keep scrolling left and it keeps loading,
 same lazy-load-on-demand convention cvd.py uses.
 
+Every WS feed's connection status (live/error/reconnecting/crashed) is
+persisted to a per-day feed-health log (footprint_feedhealth_<SYMBOL>_
+<date>.jsonl, one line per ACTUAL transition — not per message, which would
+flood it) whenever it genuinely changes, plus a 5-minute heartbeat of how
+many trades were ingested (combined across whatever feeds are active) —
+state.<exchange>_status only ever lived in memory before this, so an oddly
+long bar (a 250-tick bar taking 90 minutes to fill, say) couldn't be told
+apart from a real feed drop after the fact; now it can, by checking whether
+a disconnect was logged for that window or the trade rate just genuinely
+dipped. Each WS reconnect loop's run_forever() call is also wrapped in a
+try/except — websocket-client routes most socket/protocol errors to its own
+on_error/on_close callbacks, but isn't guaranteed to catch every exception
+a callback (or the library itself) might raise, and an escaped one would
+otherwise silently kill that feed's daemon thread for the rest of the
+session with zero visible sign anything was wrong, permanently dropping
+that exchange from the aggregate.
+
 Navigation: [←/→] pan time 1 bar, [[/]] pan time 10 bars, [↑/↓] pan price,
 [PgUp/PgDn] pan price (bigger step), [Home]/[L]/Esc return to live, [C]
 re-center vertically without leaving your current scroll position, [Z]/[X]
 move a crosshair one candle left/right, [V] toggle Volume Profile mode,
-[S] change symbol (crypto or equity), [I] change bar interval, [T] change
-price increment, [M] change imbalance ratio, [B] change Big Trades size,
-[P] screenshot, [Q] quit.
+[D] toggle Big Trade Detector, [K] change BTD lookback bars, [G] change
+BTD sigma sensitivity, [S] change symbol (crypto or equity), [I] change
+bar interval, [T] change price increment, [M] change imbalance ratio,
+[B] change Big Trades size, [P] screenshot, [Q] quit.
 
 [Z]/[X] crosshair: selects a single candle (bar) and shows its OHLC + net
 delta in the status bar, updating one bar at a time as you press [Z] (left,
@@ -469,6 +545,66 @@ if "--big-trade-size" in args:
     BIG_TRADE_SIZE = parsed_big
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
 
+def parse_btd_lookback(raw):
+    """Decode a --btd-lookback/[K]-prompt string into an integer bar count
+    >= 2, or None if invalid — shared by the CLI flag and the in-app [K]
+    prompt. Lookback is a bar COUNT (a slice length), so it must be typed
+    as a whole number — no decimal rounding (that was a mistake; sigma is
+    the parameter meant to take free-form float input, not this one)."""
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val >= 2 else None
+
+BTD_LOOKBACK = 10   # [K] Big Trade Detector: number of prior bars used to
+                    # establish the "normal" buy/sell volume baseline for
+                    # the z-score anomaly check (matches charthacker.py's
+                    # BTD default)
+if "--btd-lookback" in args:
+    i = args.index("--btd-lookback")
+    try:
+        raw_lookback = args[i + 1]
+    except IndexError:
+        print("--btd-lookback requires a value"); sys.exit(1)
+    parsed_lookback = parse_btd_lookback(raw_lookback)
+    if parsed_lookback is None:
+        print("--btd-lookback requires an integer >= 2"); sys.exit(1)
+    BTD_LOOKBACK = parsed_lookback
+    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+
+def parse_btd_sigma(raw):
+    """Decode a --btd-sigma/[G]-prompt string into a positive float, or
+    None if invalid — shared by the CLI flag and the in-app [G] prompt.
+    Unlike lookback (a bar count, must be a whole number), sigma is a
+    sensitivity threshold and takes free-form decimal input (e.g. "2.5")."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+BTD_SIGMA = 3.0   # [G] Big Trade Detector: sensitivity — a bar's buy or
+                  # sell volume must exceed the lookback window's mean by
+                  # at least this many standard deviations to fire a
+                  # signal at all (T1); T2/T3 are progressively higher
+                  # (matches charthacker.py's BTD default)
+if "--btd-sigma" in args:
+    i = args.index("--btd-sigma")
+    try:
+        raw_sigma = args[i + 1]
+    except IndexError:
+        print("--btd-sigma requires a value"); sys.exit(1)
+    parsed_sigma = parse_btd_sigma(raw_sigma)
+    if parsed_sigma is None:
+        print("--btd-sigma requires a positive number"); sys.exit(1)
+    BTD_SIGMA = parsed_sigma
+    args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
+
+BTD_MODE = True   # [D] Big Trade Detector: toggles the buy/sell volume
+                  # anomaly markers on/off — pure display toggle, same
+                  # instant-apply convention as [V]/[M]/[B]
+
 VP_MODE = False   # [V] Volume Profile: replaces each bar's "<bid> x <ask>"
                   # cells with a gradient-shaded horizontal bar per price
                   # level (length ~ that level's share of the bar's volume)
@@ -515,6 +651,11 @@ VIEW_DATE       = LOAD_DATE or TODAY_STR
 HISTORICAL_MODE = LOAD_DATE is not None and LOAD_DATE != TODAY_STR
 
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+FOOTPRINT_DATA_DIR = os.path.join(LOG_DIR, "data", "footprint")   # every
+    # footprint.py-produced file (bar logs + feed-health logs) lives under
+    # here, in a data/footprint/YYYY/MM/DD/ tree — one day-folder per
+    # calendar day, keeping the repo root itself from accumulating dozens
+    # of flat footprint_*.jsonl files the way it used to
 
 PHEMEX_SYMBOLS       = {"ETH": "ETHUSDT", "BTC": "BTCUSDT"}
 KRAKEN_WS_PAIRS      = {"ETH": "ETH/USD", "BTC": "BTC/USD"}
@@ -530,13 +671,32 @@ ALPACA_WS_URL   = "wss://stream.data.alpaca.markets/v2/iex"
 ALPACA_REST_URL = "https://data.alpaca.markets/v2"
 
 # ── PERSISTENCE ──────────────────────────────────────────────────────────────
+def day_dir(date_str):
+    """Parse a 'MM_DD_YYYY' date_str (footprint.py's date-string convention
+    throughout — TODAY_STR/LOAD_DATE/VIEW_DATE are all this exact format in
+    real use, enforced by --date's own startup validation) into its
+    data/footprint/YYYY/MM/DD folder, creating it if needed. Anything that
+    doesn't actually parse that way falls back to using date_str as a
+    single opaque folder name, rather than raising — only ever hit by a
+    test fixture's sentinel value (e.g. "TEST_DAY") used to isolate test
+    log files from real dated ones."""
+    parts = date_str.split("_")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        mm, dd, yyyy = parts
+        d = os.path.join(FOOTPRINT_DATA_DIR, yyyy, mm, dd)
+    else:
+        d = os.path.join(FOOTPRINT_DATA_DIR, date_str)
+    os.makedirs(d, exist_ok=True)
+    return d
+
 def log_path(date_str):
     # TICK is in the filename for the same reason INTERVAL_LABEL is: a
     # bar's "levels" dict is bucketed at a specific $ granularity, so
     # switching tick in-app (see switch_tick) must never append
-    # differently-bucketed bars into the same file.
+    # differently-bucketed bars into the same file. The date itself is NOT
+    # in the filename — it's already the day_dir() folder this lives in.
     tick_str = f"{TICK:g}"
-    return os.path.join(LOG_DIR, f"footprint_{SYMBOL}_{INTERVAL_LABEL}_{tick_str}_{date_str}.jsonl")
+    return os.path.join(day_dir(date_str), f"footprint_{SYMBOL}_{INTERVAL_LABEL}_{tick_str}.jsonl")
 
 def _serialize_bar(bar):
     return {
@@ -586,6 +746,56 @@ def load_log(date_str):
         else:
             deduped.append(b)
     return deduped
+
+# ── FEED HEALTH LOG ──────────────────────────────────────────────────────────
+# state.<exchange>_status (kraken_status/phemex_status/coinbase_status/
+# alpaca_status) only ever lived in memory — after a session ends there's no
+# way to tell whether a gap in the bar data (e.g. an oddly long tick/volume
+# bar) was a real market lull or a feed silently dropping out. This persists
+# every ACTUAL status transition (not every message — on_message reassigns
+# "live" on every single trade, which would flood this) plus a regular
+# trades-ingested heartbeat, so a future gap can be diagnosed from the log
+# instead of guessed at after the fact.
+def feed_log_path(date_str):
+    return os.path.join(day_dir(date_str), f"footprint_feedhealth_{SYMBOL}.jsonl")
+
+def log_feed_event(exchange, event, detail=""):
+    try:
+        with open(feed_log_path(TODAY_STR), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), "exchange": exchange, "event": event, "detail": detail}) + "\n")
+    except Exception:
+        pass   # diagnostic logging must never be able to take down a feed thread
+
+def set_feed_status(attr_name, exchange, new_status):
+    """Sets state.<attr_name> and logs the transition to disk, but ONLY when
+    the status actually CHANGED — call this everywhere a WS handler would
+    otherwise have done a bare `state.kraken_status = ...` assignment.
+    Caller must already hold state.lock (same requirement the bare
+    assignments this replaces always had)."""
+    old = getattr(state, attr_name)
+    if old != new_status:
+        log_feed_event(exchange, "status_change", f"{old} -> {new_status}")
+    setattr(state, attr_name, new_status)
+
+FEED_HEARTBEAT_SEC = 300   # 5 min — how often the combined trade-ingestion
+                           # rate gets written to the feed-health log, so a
+                           # future gap can be checked against a real
+                           # baseline ("was the rate near zero the whole
+                           # time, or did it just dip") instead of guessed at
+
+def feed_heartbeat_loop(session):
+    """Background watchdog: every FEED_HEARTBEAT_SEC, logs how many trades
+    were ingested (combined, across whichever feeds are active) since the
+    last check. Runs unconditionally (not just when something looks wrong)
+    so there's always a real baseline to compare an anomaly against."""
+    while state.session == session:
+        time.sleep(FEED_HEARTBEAT_SEC)
+        if state.session != session:
+            break
+        with state.lock:
+            n = state.trades_since_heartbeat
+            state.trades_since_heartbeat = 0
+        log_feed_event("combined", "heartbeat", f"{n} trades in last {FEED_HEARTBEAT_SEC}s")
 
 # ── HISTORICAL BACKFILL (Kraken + Coinbase REST — Phemex has no history API) ─
 def fetch_kraken_trades_range(pair, since_ts, until_ts, progress=None, deadline=None):
@@ -1207,6 +1417,19 @@ def set_big_trade_size(new_size):
     global BIG_TRADE_SIZE
     BIG_TRADE_SIZE = new_size
 
+def set_btd_lookback(new_lookback):
+    """Change the Big Trade Detector's lookback window ([K]) live — same
+    no-rebuild-needed reasoning as set_imbalance_ratio: draw() reads
+    BTD_LOOKBACK fresh from already-accumulated bar data every frame."""
+    global BTD_LOOKBACK
+    BTD_LOOKBACK = new_lookback
+
+def set_btd_sigma(new_sigma):
+    """Change the Big Trade Detector's sensitivity ([G]) live — same
+    no-rebuild-needed reasoning as set_imbalance_ratio."""
+    global BTD_SIGMA
+    BTD_SIGMA = new_sigma
+
 # ── SHARED STATE ─────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
@@ -1219,6 +1442,10 @@ class State:
         self.kraken_status = "connecting…"
         self.coinbase_status = "connecting…"
         self.alpaca_status = "connecting…"   # only used for equity/ETF symbols
+        self.trades_since_heartbeat = 0   # feed-health log: combined trade
+                                           # count since the last periodic
+                                           # heartbeat write — see
+                                           # feed_heartbeat_loop()
         self.last_price = None
         self.session = 0
         self.backfill_boundary_ts = None   # everything <= this is Kraken+Coinbase only (no Phemex)
@@ -1327,6 +1554,7 @@ def ingest_trade(ts, price, qty, is_buy):
     live["delta"] = live["buy_vol"] - live["sell_vol"]
     live["n_trades"] += 1
     state.last_price = price
+    state.trades_since_heartbeat += 1
 
     if BAR_MODE == "volume" and (live["buy_vol"] + live["sell_vol"]) >= BAR_THRESHOLD:
         _close_live()
@@ -1351,6 +1579,7 @@ def start_feeds(session):
         threading.Thread(target=ws_coinbase, args=(session,), daemon=True).start()
     else:
         threading.Thread(target=ws_alpaca, args=(session,), daemon=True).start()
+    threading.Thread(target=feed_heartbeat_loop, args=(session,), daemon=True).start()
 
 def ws_kraken(session):
     pair = KRAKEN_WS_PAIRS[SYMBOL]
@@ -1362,7 +1591,7 @@ def ws_kraken(session):
         ws.send(json.dumps({"method": "subscribe", "params": {"channel": "trade", "symbol": [pair]}}))
         with state.lock:
             if stale(): return
-            state.kraken_status = "live"
+            set_feed_status("kraken_status", "Kraken", "live")
 
     def on_message(ws, message):
         if stale(): return
@@ -1384,30 +1613,44 @@ def ws_kraken(session):
             with state.lock:
                 if stale(): return
                 ingest_trade(ts, price, qty, is_buy)
-                state.kraken_status = "live"
+                set_feed_status("kraken_status", "Kraken", "live")
 
     def on_error(ws, err):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.kraken_status = f"err: {str(err)[:30]}"
+            set_feed_status("kraken_status", "Kraken", f"err: {str(err)[:30]}")
 
     def on_close(ws, code, msg):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.kraken_status = "reconnecting…"
+            set_feed_status("kraken_status", "Kraken", "reconnecting…")
 
     backoff = 1
     while not stale():
         ws_app = websocket.WebSocketApp(KRAKEN_WS_URL, on_open=on_open, on_message=on_message,
                                          on_error=on_error, on_close=on_close)
-        ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        try:
+            ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            # run_forever() routes most socket/protocol errors to
+            # on_error/on_close internally, but isn't guaranteed to catch
+            # EVERY exception a callback or the library itself might raise
+            # — without this, an escaped exception would silently kill this
+            # daemon thread for the rest of the session, permanently
+            # dropping Kraken from the aggregate with no visible sign
+            # anything is wrong. Logged so a future occurrence is
+            # diagnosable instead of invisible.
+            if not stale():
+                with state.lock:
+                    if not stale():
+                        set_feed_status("kraken_status", "Kraken", f"crashed: {str(e)[:30]}")
         if stale():
             break
         with state.lock:
             if stale(): break
-            state.kraken_status = f"reconnecting… ({backoff}s)"
+            set_feed_status("kraken_status", "Kraken", f"reconnecting… ({backoff}s)")
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
@@ -1421,7 +1664,7 @@ def ws_phemex(session):
         ws.send(json.dumps({"id": 1, "method": "trade_p.subscribe", "params": [symbol]}))
         with state.lock:
             if stale(): return
-            state.phemex_status = "live"
+            set_feed_status("phemex_status", "Phemex", "live")
 
     def on_message(ws, message):
         if stale(): return
@@ -1451,19 +1694,19 @@ def ws_phemex(session):
             with state.lock:
                 if stale(): return
                 ingest_trade(ts, price, qty, is_buy)
-                state.phemex_status = "live"
+                set_feed_status("phemex_status", "Phemex", "live")
 
     def on_error(ws, err):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.phemex_status = f"err: {str(err)[:30]}"
+            set_feed_status("phemex_status", "Phemex", f"err: {str(err)[:30]}")
 
     def on_close(ws, code, msg):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.phemex_status = "reconnecting…"
+            set_feed_status("phemex_status", "Phemex", "reconnecting…")
 
     _ping_ws = [None]
     _ping_stop = threading.Event()
@@ -1486,12 +1729,21 @@ def ws_phemex(session):
         ws_app = websocket.WebSocketApp(PHEMEX_WS_URL, on_open=on_open, on_message=on_message,
                                          on_error=on_error, on_close=on_close)
         _ping_ws[0] = ws_app
-        ws_app.run_forever(ping_interval=25, ping_timeout=10)
+        try:
+            ws_app.run_forever(ping_interval=25, ping_timeout=10)
+        except Exception as e:
+            # see ws_kraken's identical try/except for why this exists —
+            # without it, an escaped exception silently kills this daemon
+            # thread for the rest of the session with no visible sign.
+            if not stale():
+                with state.lock:
+                    if not stale():
+                        set_feed_status("phemex_status", "Phemex", f"crashed: {str(e)[:30]}")
         if stale():
             break
         with state.lock:
             if stale(): break
-            state.phemex_status = f"reconnecting… ({backoff}s)"
+            set_feed_status("phemex_status", "Phemex", f"reconnecting… ({backoff}s)")
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
         _ping_stop.set()
@@ -1508,7 +1760,7 @@ def ws_coinbase(session):
                              "channels": [{"name": "matches", "product_ids": [product_id]}]}))
         with state.lock:
             if stale(): return
-            state.coinbase_status = "live"
+            set_feed_status("coinbase_status", "Coinbase", "live")
 
     def on_message(ws, message):
         if stale(): return
@@ -1520,7 +1772,7 @@ def ws_coinbase(session):
         if mtype == "error":
             with state.lock:
                 if stale(): return
-                state.coinbase_status = f"err: {str(msg.get('message', ''))[:30]}"
+                set_feed_status("coinbase_status", "Coinbase", f"err: {str(msg.get('message', ''))[:30]}")
             return
         if mtype != "match":
             return
@@ -1534,30 +1786,39 @@ def ws_coinbase(session):
         with state.lock:
             if stale(): return
             ingest_trade(ts, price, qty, is_buy)
-            state.coinbase_status = "live"
+            set_feed_status("coinbase_status", "Coinbase", "live")
 
     def on_error(ws, err):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.coinbase_status = f"err: {str(err)[:30]}"
+            set_feed_status("coinbase_status", "Coinbase", f"err: {str(err)[:30]}")
 
     def on_close(ws, code, msg):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.coinbase_status = "reconnecting…"
+            set_feed_status("coinbase_status", "Coinbase", "reconnecting…")
 
     backoff = 1
     while not stale():
         ws_app = websocket.WebSocketApp(COINBASE_WS_URL, on_open=on_open, on_message=on_message,
                                          on_error=on_error, on_close=on_close)
-        ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        try:
+            ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            # see ws_kraken's identical try/except for why this exists —
+            # without it, an escaped exception silently kills this daemon
+            # thread for the rest of the session with no visible sign.
+            if not stale():
+                with state.lock:
+                    if not stale():
+                        set_feed_status("coinbase_status", "Coinbase", f"crashed: {str(e)[:30]}")
         if stale():
             break
         with state.lock:
             if stale(): break
-            state.coinbase_status = f"reconnecting… ({backoff}s)"
+            set_feed_status("coinbase_status", "Coinbase", f"reconnecting… ({backoff}s)")
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
@@ -1591,11 +1852,11 @@ def ws_alpaca(session):
                 ws.send(json.dumps({"action": "subscribe", "trades": [SYMBOL], "quotes": [SYMBOL]}))
                 with state.lock:
                     if stale(): return
-                    state.alpaca_status = "live"
+                    set_feed_status("alpaca_status", "Alpaca", "live")
             elif mtype == "error":
                 with state.lock:
                     if stale(): return
-                    state.alpaca_status = f"err: {str(msg.get('msg', ''))[:30]}"
+                    set_feed_status("alpaca_status", "Alpaca", f"err: {str(msg.get('msg', ''))[:30]}")
             elif mtype == "q":
                 latest["bid"] = msg.get("bp")
                 latest["ask"] = msg.get("ap")
@@ -1612,7 +1873,7 @@ def ws_alpaca(session):
                 with state.lock:
                     if stale(): return
                     ingest_trade(ts, price, qty, is_buy)
-                    state.alpaca_status = "live"
+                    set_feed_status("alpaca_status", "Alpaca", "live")
 
     last_err = {"text": ""}
 
@@ -1622,13 +1883,13 @@ def ws_alpaca(session):
         last_err["text"] = text
         with state.lock:
             if stale(): return
-            state.alpaca_status = f"err: {text}"
+            set_feed_status("alpaca_status", "Alpaca", f"err: {text}")
 
     def on_close(ws, code, msg):
         if stale(): return
         with state.lock:
             if stale(): return
-            state.alpaca_status = "reconnecting…"
+            set_feed_status("alpaca_status", "Alpaca", "reconnecting…")
 
     backoff = 1
     while not stale():
@@ -1637,7 +1898,17 @@ def ws_alpaca(session):
             on_error=on_error, on_close=on_close,
         )
         state.alpaca_ws_app = ws_app
-        ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        try:
+            ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            # see ws_kraken's identical try/except for why this exists —
+            # without it, an escaped exception silently kills this daemon
+            # thread for the rest of the session with no visible sign.
+            last_err["text"] = str(e)[:30]
+            if not stale():
+                with state.lock:
+                    if not stale():
+                        set_feed_status("alpaca_status", "Alpaca", f"crashed: {str(e)[:30]}")
         state.alpaca_ws_app = None
         if stale():
             break
@@ -1649,7 +1920,7 @@ def ws_alpaca(session):
             backoff = max(backoff, 15)
         with state.lock:
             if stale(): break
-            state.alpaca_status = f"reconnecting… ({backoff}s)"
+            set_feed_status("alpaca_status", "Alpaca", f"reconnecting… ({backoff}s)")
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
@@ -1789,7 +2060,7 @@ def compute_value_area(levels, poc_g, target_frac=VALUE_AREA_FRACTION):
     return lo, hi
 
 # ── COLOUR PAIRS ─────────────────────────────────────────────────────────────
-P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_BLUE = range(1, 9)
+P_DEFAULT, P_DIM, P_CYAN, P_YELLOW, P_GREEN, P_RED, P_STATUS, P_BLUE, P_MAGENTA = range(1, 10)
 
 def init_colors():
     curses.start_color()
@@ -1797,12 +2068,13 @@ def init_colors():
     BG = -1
     curses.init_pair(P_DEFAULT, curses.COLOR_WHITE,  BG)
     curses.init_pair(P_DIM,     curses.COLOR_WHITE,  BG)
-    curses.init_pair(P_CYAN,    curses.COLOR_CYAN,   BG)   # [B] Big Trades filter
+    curses.init_pair(P_CYAN,    curses.COLOR_CYAN,   BG)   # [B] Big Trades filter, BTD buys
     curses.init_pair(P_YELLOW,  curses.COLOR_YELLOW, BG)
     curses.init_pair(P_GREEN,   curses.COLOR_GREEN,  BG)
     curses.init_pair(P_RED,     curses.COLOR_RED,    BG)
     curses.init_pair(P_STATUS,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
     curses.init_pair(P_BLUE,    curses.COLOR_BLUE,   BG)   # [V] Volume Profile value area
+    curses.init_pair(P_MAGENTA, curses.COLOR_MAGENTA, BG)  # [D] BTD sells
 
 def cp(pair, bold=False, dim=False):
     a = curses.color_pair(pair)
@@ -1914,6 +2186,31 @@ def fmt_bar_progress(live, now=None):
     accumulated = live["buy_vol"] + live["sell_vol"]
     return f"{fmt_lvl_qty(accumulated)} / {BAR_THRESHOLD:g}"
 
+def compute_btd_tier(cur_val, window_vals, sigma):
+    """[D] Big Trade Detector: z-score anomaly check — how far `cur_val`
+    (a bar's buy_vol or sell_vol) sits above the mean of `window_vals`
+    (the same side's volume over the lookback window), in standard
+    deviations. Returns 0 (no signal) or a tier 1/2/3 (progressively more
+    standard deviations above the mean, same sigma/sigma+1.5/sigma+3.0
+    breakpoints charthacker.py's BTD uses). Ported from charthacker.py's
+    BTD, but fed real trade-classified buy/sell volume (bar["buy_vol"]/
+    bar["sell_vol"]) instead of an OHLC-shape approximation — footprint
+    bars already carry genuine aggressor-side volume per bar, so there's
+    no approximation to make."""
+    n = len(window_vals)
+    if n < 2:
+        return 0
+    mean = sum(window_vals) / n
+    variance = sum((x - mean) ** 2 for x in window_vals) / (n - 1)
+    sd = variance ** 0.5
+    if cur_val > mean + sd * (sigma + 3.0):
+        return 3
+    if cur_val > mean + sd * (sigma + 1.5):
+        return 2
+    if cur_val > mean + sd * sigma:
+        return 1
+    return 0
+
 # ── DRAW ──────────────────────────────────────────────────────────────────
 CELL_TXT_W = 15   # "1,234.5 x 1,234.5"-worst-case text width
 COL_W = 1 + CELL_TXT_W + 1   # marker gutter + text + trailing gap
@@ -1923,6 +2220,10 @@ AXIS_W = 10       # left-side price-axis gutter width — a module constant
                   # clamping/edge-trigger without duplicating a magic number
 VSTEP = 5         # ticks per Up/Down press
 VSTEP_BIG = 25    # ticks per PgUp/PgDn press
+BTD_STRIP_ROWS = 3   # [D] Big Trade Detector: height of the fixed signal
+                     # strip reserved at the bottom of the price ladder
+                     # (must match the tallest tier's row count — see
+                     # _btd_mark() inside draw())
 POC_MARKER = "◆"
 OPEN_MARKER = "○"    # hollow circle — this bar's open price row
 CLOSE_MARKER = "●"   # filled circle — this bar's close price row
@@ -1930,25 +2231,21 @@ LIVE_LINE_CH = "─"   # live-price line, drawn only through empty cells
 CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair, drawn down the selected
                           # bar's left gutter only (never through cell text)
 VP_BLOCK_FULL = "█"
-VP_BLOCK_EIGHTHS = " ▏▎▍▌▋▊▉"   # index 0 (none) .. 7 (7/8) — index 8 would
-                                # be VP_BLOCK_FULL itself, one whole char
+VP_GHOST_CH = "|"   # placeholder for a within-range VP row whose volume
+                    # rounds to zero blocks (a real gap, or just too thin
+                    # to earn a whole block) -- keeps the profile's edge
+                    # reading as continuous instead of a blank hole
 TABLE_BORDER_CH = "─"   # divider row between the chart and the Δ/VAH/VAL/POC table
 
 def vp_bar_str(frac, max_width):
     """[V] Volume Profile: render `frac` (0..1, a level's volume relative
     to the bar's own busiest level) as a left-aligned horizontal bar up to
-    max_width characters, using whole blocks plus one eighth-block
-    character for sub-character precision — same "smooth bar in a
-    monospace cell" trick sparkline/progress-bar libraries use, so even a
-    narrow difference in volume between two adjacent rows is visible
-    rather than rounding to the same whole-character width."""
+    max_width characters, using whole blocks only (rounded to the nearest
+    whole character — no partial eighth-block tip), so the bar's right
+    edge is always a clean, solid stop rather than a stray partial glyph."""
     frac = max(0.0, min(1.0, frac))
-    eighths_total = round(frac * max_width * 8)
-    full, rem = divmod(eighths_total, 8)
-    bar = VP_BLOCK_FULL * full
-    if rem:
-        bar += VP_BLOCK_EIGHTHS[rem]
-    return bar
+    full = round(frac * max_width)
+    return VP_BLOCK_FULL * full
 
 def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshair_bar_idx=None):
     """Renders one frame. Returns the number of bar-columns actually drawn.
@@ -1982,9 +2279,18 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         live_bar = state.live
 
     top_reserved = 1
-    bottom_reserved = 7   # divider row, net-delta + VAH + VAL + POC rows, time axis, status bar
+    bottom_reserved = 11   # divider row, O/H/L/C + net-delta + VAH + VAL + POC rows, time axis, status bar
     axis_w = AXIS_W
-    plot_h = h - top_reserved - bottom_reserved
+    # [D] Big Trade Detector: a fixed strip reserved at the BOTTOM of the
+    # price ladder, directly above the table divider — BTD signals draw
+    # here at a constant screen position instead of floating near each
+    # bar's own (constantly-changing) low/high, so they're always in the
+    # same predictable place to scan across, and never compete with real
+    # footprint cell data for the same rows (those never map into this
+    # strip — see plot_h below). Only reserved while BTD_MODE is on, so
+    # turning it off gives that vertical space back to the price ladder.
+    btd_strip_h = BTD_STRIP_ROWS if BTD_MODE else 0
+    plot_h = h - top_reserved - bottom_reserved - btd_strip_h
     plot_w = max(1, w - axis_w)
 
     if not all_bars or plot_h <= 0:
@@ -2043,75 +2349,59 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
 
     if vfollow_price:
         all_visible_lvls = [lvl for bar in visible for lvl in bar["levels"]]
-        if _last_center_lvl is not None and _center_fits(_last_center_lvl, all_visible_lvls):
-            # Keep the EXISTING center exactly as-is — this is the
-            # default, common-case path. Recomputing "the ideal center"
-            # fresh every frame from the combined min/max of all visible
-            # bars sounds harmless ("only moves when the data genuinely
-            # changes"), but for an actively-trading live bar its own
-            # OWN range keeps growing with every single trade tick, and a
-            # fast tick-bar interval rolls bars in/out of the visible
-            # window constantly too — both make the "ideal center"
-            # shift on nearly every frame even though the current window
-            # still shows everything just fine, which reads as the chart
-            # continuously bouncing up/down (the actual bug reported).
-            # Only recompute when the CURRENT window would actually fail
-            # to show something.
-            center_lvl = _last_center_lvl
-        elif all_visible_lvls:
-            # Always center on the MIDPOINT of the traded range across ALL
-            # currently visible bars — including at the live edge. Two real
-            # bugs came from special-casing the live edge to center on
-            # last_price directly: (1) last_price updates on EVERY trade
-            # tick, so the whole window shifted up/down on every single
+
+        if hscroll_bars == 0:
+            # LIVE MODE — a strict "rubber band" follow: the window stays
+            # EXACTLY where it is, frame after frame, no matter what —
+            # new candles starting, the live bar's own range growing,
+            # bars rolling in/out of the visible N columns, none of it
+            # moves the window on its own. The ONLY thing that ever moves
+            # it is the live price itself falling outside the window, and
+            # then by EXACTLY the amount needed to bring it back to
+            # whichever edge it crossed (the bar's current low if it went
+            # below, high if it went above) — no more (a full recenter,
+            # or recomputing "the ideal center" for any other reason,
+            # would shift the window for no reason the user asked for —
+            # the flip-flopping this replaces), no less (a partial nudge
+            # would still clip it). Once shifted, it stays at that new
+            # position too, exactly the same way, until live crosses out
+            # of frame again. Only an explicit reset — [Home]/[L]/[C], a
+            # symbol/interval/tick switch — re-establishes a fresh
+            # baseline (see curses_main's _last_center_lvl = None sites).
+            if _last_center_lvl is None:
+                if all_visible_lvls:
+                    center_lvl = (max(all_visible_lvls) + min(all_visible_lvls)) // 2
+                else:
+                    center_lvl = round((last_price or visible[-1]["c"]) / TICK)
+            else:
+                center_lvl = _last_center_lvl
+
+            if last_price is not None:
+                g_center = center_lvl // group_size
+                top, bot = g_center + half, g_center + half - plot_h + 1
+                live_g = round(last_price / TICK) // group_size
+                if live_g > top:
+                    center_lvl += (live_g - top) * group_size
+                elif live_g < bot:
+                    center_lvl -= (bot - live_g) * group_size
+        else:
+            # SCROLLED BACK into history — no live price to chase here.
+            # Keep the window stable unless it would no longer show the
+            # visible bars' own traded range (e.g. a bar with a new
+            # high/low scrolled into view). Two real bugs came from
+            # special-casing the live edge to center on last_price
+            # directly instead of this: (1) last_price updates on EVERY
+            # trade tick, so the whole window shifted on every single
             # print even within an already-established range — visible
             # flicker; (2) it skewed the window toward wherever the live
-            # price happens to sit, leaving OTHER visible bars (often at a
-            # meaningfully different price — normal for volume bars, or
-            # just an active session) cramped off-center instead of evenly
-            # fit in frame, the same skew problem already fixed for the
-            # scrolled-back case.
-            center_lvl = (max(all_visible_lvls) + min(all_visible_lvls)) // 2
-        else:
-            center_lvl = round((last_price or visible[-1]["c"]) / TICK)
-        # The freshly recomputed center above might STILL not show the
-        # live price. AT THE LIVE EDGE specifically (hscroll_bars == 0 —
-        # NOT just vfollow_price, which stays True even scrolled back into
-        # history, deliberately centering on whatever old bars are visible
-        # rather than chasing a live price that isn't even in view there —
-        # see the regression test for that), the live price must always
-        # be on screen. How far to correct depends on how badly it
-        # misses:
-        #   - a NEAR miss (the required span is only slightly taller than
-        #     plot_h, e.g. off by a row or two — ordinary price drift
-        #     across a few columns) gets a MINIMAL nudge, just enough to
-        #     bring live into view, preserving as much of the other
-        #     visible bars as possible — a full recenter here would
-        #     reintroduce the "skewed toward live, other bars cramped"
-        #     bug this whole even-weighting design exists to avoid.
-        #   - a LARGE miss (more than half the window's height short —
-        #     e.g. resuming from a log whose visible bars span MULTIPLE
-        #     CALENDAR DAYS at a meaningfully different price, common for
-        #     a thin equity tick-bar interval where sparse overnight/
-        #     pre-market volume means few bars close) means the other
-        #     visible bars won't be usefully shown together with live
-        #     either way, so fully recenter on live instead of leaving it
-        #     squeezed against one edge with most of the window empty
-        #     (the original bug report this fallback exists for).
-        if hscroll_bars == 0 and last_price is not None:
-            g_center = center_lvl // group_size
-            top, bot = g_center + half, g_center + half - plot_h + 1
-            live_g = round(last_price / TICK) // group_size
-            if live_g > top:
-                shift = live_g - top
-            elif live_g < bot:
-                shift = bot - live_g
+            # price happens to sit, leaving OTHER visible bars cramped
+            # off-center instead of evenly fit in frame.
+            if _last_center_lvl is not None and _center_fits(_last_center_lvl, all_visible_lvls):
+                center_lvl = _last_center_lvl
+            elif all_visible_lvls:
+                center_lvl = (max(all_visible_lvls) + min(all_visible_lvls)) // 2
             else:
-                shift = 0
-            if shift > half:
-                center_lvl = round(last_price / TICK)
-            elif shift > 0:
-                center_lvl += shift * group_size if live_g > top else -shift * group_size
+                center_lvl = round((last_price or visible[-1]["c"]) / TICK)
     else:
         center_lvl = vscroll_center
     _last_center_lvl = center_lvl
@@ -2141,6 +2431,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     header = (f" FOOTPRINT — {SYMBOL}  bar:{INTERVAL_LABEL} [I]  tick:${fmt_price(TICK)} [T]  "
               f"imb:{IMBALANCE_RATIO:g}x [M]  stack:{STACK_COUNT}+  big:${fmt_price(BIG_TRADE_SIZE)}+ [B]"
               f"  vp:{'on' if VP_MODE else 'off'} [V]"
+              f"  btd:{'on' if BTD_MODE else 'off'} [D]  lb:{BTD_LOOKBACK} [K]  sig:{BTD_SIGMA:g} [G]"
               f"{f'  grid:${fmt_price(TICK * group_size)}' if group_size > 1 else ''}"
               f"{f'  |  {bar_progress}' if bar_progress else ''}  ")
     safe_add(win, 0, 0, header.ljust(w), cp(P_STATUS))
@@ -2161,6 +2452,34 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     if live_row_y is not None:
         live_label = f"▶{fmt_price(last_price)}"
         safe_add(win, live_row_y, 0, live_label.rjust(axis_w - 1), cp(P_YELLOW, bold=True) | curses.A_REVERSE)
+
+    # [D] Big Trade Detector: only worth evaluating once there's a full
+    # lookback window of prior bars PLUS at least one bar after it to
+    # actually check for a signal
+    btd_active = BTD_MODE and len(all_bars) >= BTD_LOOKBACK + 1
+    btd_strip_bottom = top_reserved + plot_h + btd_strip_h - 1   # last row
+                        # of the strip -- directly above the table divider
+
+    def _btd_mark(cx, tier, color_pair):
+        """Draws one BTD signal marker in the FIXED strip at the bottom of
+        the price ladder (btd_strip_h rows, reserved above regardless of
+        where this bar's own price action happens to sit) — buy and sell
+        signals both land in the exact same screen rows every time,
+        distinguished only by color, so they're always in one predictable
+        place to scan across rather than floating near each bar's own
+        (constantly changing) low/high. Grows UPWARD from the strip's
+        bottom row as tier increases, like a small histogram bar — tier 1
+        is just the bottom row, tier 3 fills the whole strip. Deliberately
+        BIG (several rows tall and several characters wide even at tier
+        1) — a single reverse-video character cell reads as an
+        easy-to-miss speck on a screen already full of colored footprint
+        cells/VP bars; a block this size can't be overlooked."""
+        n_rows = tier
+        n_cols = 3 + 2 * tier   # tier1=5, tier2=7, tier3=9
+        for k in range(n_rows):
+            row_y = btd_strip_bottom - k
+            for dx in range(n_cols):
+                safe_add(win, row_y, cx + dx, "#", cp(color_pair, bold=True) | curses.A_REVERSE)
 
     # footprint cells
     bar_stats = []   # per-bar (poc_price, vah_price, val_price) for the
@@ -2235,8 +2554,13 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
                         color = cp(P_CYAN if closeness <= 0.5 else P_BLUE) | poc_attr
                     else:
                         color = cp(P_DIM, dim=True) | poc_attr
-                    if bar_str:
-                        safe_add(win, row_y, cx + 1, bar_str, color)
+                    if not bar_str:
+                        # zero (or near-zero, rounds-to-zero-blocks) volume
+                        # within the bar's own traded range -- a thin sliver
+                        # instead of leaving a blank hole, colored the same
+                        # as a real bar at this row would be
+                        bar_str = VP_GHOST_CH
+                    safe_add(win, row_y, cx + 1, bar_str, color)
                     if is_poc:
                         safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
             else:
@@ -2309,6 +2633,25 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         if live_row_y is not None and not has_live_cell:
             safe_add(win, live_row_y, cx, LIVE_LINE_CH * (COL_W - 1), cp(P_YELLOW, dim=True))
 
+        # [D] Big Trade Detector — a real trade-classified buy/sell volume
+        # anomaly check (see compute_btd_tier), drawn into the fixed strip
+        # at the bottom of the price ladder (never collides with real cell
+        # data, since that strip is reserved space the footprint grid
+        # never draws into). Needs a FULL lookback window of bars strictly
+        # BEFORE this one (never a partial window, and never including
+        # this bar or any bar after it). If both sides fire on the same
+        # bar (rare), sell is drawn second and wins any pixel overlap.
+        if btd_active:
+            abs_i = start + i
+            if abs_i >= BTD_LOOKBACK:
+                window = all_bars[abs_i - BTD_LOOKBACK:abs_i]
+                buy_tier = compute_btd_tier(bar["buy_vol"], [b["buy_vol"] for b in window], BTD_SIGMA)
+                if buy_tier:
+                    _btd_mark(cx, buy_tier, P_CYAN)
+                sell_tier = compute_btd_tier(bar["sell_vol"], [b["sell_vol"] for b in window], BTD_SIGMA)
+                if sell_tier:
+                    _btd_mark(cx, sell_tier, P_MAGENTA)
+
         # [Z]/[X] crosshair vertical line: runs down the visual CENTER of
         # the selected bar's own column (not the left gutter — that's
         # already POC/open/close markers' spot) so it reads as centered on
@@ -2339,31 +2682,54 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
 
     # divider row — a solid horizontal rule spanning the full window
     # width, separating the candle/footprint area above from the small
-    # Δ/VAH/VAL/POC table below (drawn next).
+    # O/H/L/C/Δ/VAH/VAL/POC table below (drawn next).
     border_row = h - bottom_reserved
     safe_add(win, border_row, 0, TABLE_BORDER_CH * w, cp(P_DIM))
 
-    # small per-bar table — Net Delta, then Value Area High/Low, then
-    # POC — one row each, directly under each bar's own cells, above the
-    # time axis. Row-labeled in the left gutter (same column the price
-    # axis uses). VAH/VAL/POC are the same numbers already driving VP
-    # mode's shading and the POC diamond marker (compute_value_area()/
-    # compute_poc()), just broken out as plain per-bar price values
-    # regardless of chart mode — "—" for a bar with no real trades. The
-    # crosshair's column ([Z]/[X]) gets reverse-video on every row of
-    # this table, alongside its time-axis label below and the gutter line
-    # drawn above — all of it makes the selected column unambiguous;
-    # OHLC for the selected bar is shown in the status bar.
-    delta_row = border_row + 1
-    vah_row = delta_row + 1
-    val_row = delta_row + 2
-    poc_row = delta_row + 3
+    # small per-bar table — Open/High/Low/Close, then Net Delta, then
+    # Value Area High/Low, then POC — one row each, directly under each
+    # bar's own cells, above the time axis. Row-labeled in the left
+    # gutter (same column the price axis uses), same O/H/L/C/Δ order the
+    # crosshair's status-bar readout already uses. O/C are colored to
+    # match their own gutter markers (○/●) — O plain cyan, C green/red
+    # bold by direction; H/L are neutral, same dim styling as VAH/VAL.
+    # VAH/VAL/POC are the same numbers already driving VP mode's shading
+    # and the POC diamond marker (compute_value_area()/compute_poc()),
+    # just broken out as plain per-bar price values regardless of chart
+    # mode — "—" for a bar with no real trades. The crosshair's column
+    # ([Z]/[X]) gets reverse-video on every row of this table, alongside
+    # its time-axis label below and the gutter line drawn above — all of
+    # it makes the selected column unambiguous.
+    o_row = border_row + 1
+    h_row = o_row + 1
+    l_row = o_row + 2
+    c_row = o_row + 3
+    delta_row = o_row + 4
+    vah_row = o_row + 5
+    val_row = o_row + 6
+    poc_row = o_row + 7
+    safe_add(win, o_row, 0, "O".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, h_row, 0, "H".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, l_row, 0, "L".rjust(axis_w - 1), cp(P_DIM))
+    safe_add(win, c_row, 0, "C".rjust(axis_w - 1), cp(P_DIM))
     safe_add(win, delta_row, 0, "Δ".rjust(axis_w - 1), cp(P_DIM))
     safe_add(win, vah_row, 0, "VAH".rjust(axis_w - 1), cp(P_DIM))
     safe_add(win, val_row, 0, "VAL".rjust(axis_w - 1), cp(P_DIM))
     safe_add(win, poc_row, 0, "POC".rjust(axis_w - 1), cp(P_DIM))
     for i, bar in enumerate(visible):
         rev = curses.A_REVERSE if i == crosshair_i else 0
+
+        # bold, vivid colors throughout so O/H/L/C stand out from the more
+        # muted VAH/VAL rows below — O cyan (matching the ○ marker), H
+        # green / L red (the "top"/"bottom" of the bar's range, same
+        # up/down convention C's direction-coloring already uses), C
+        # green/red by direction (matching the ● marker).
+        safe_add(win, o_row, col_x[i], fmt_price(bar["o"]).center(COL_W - 1), cp(P_CYAN, bold=True) | rev)
+        safe_add(win, h_row, col_x[i], fmt_price(bar["h"]).center(COL_W - 1), cp(P_GREEN, bold=True) | rev)
+        safe_add(win, l_row, col_x[i], fmt_price(bar["l"]).center(COL_W - 1), cp(P_RED, bold=True) | rev)
+        close_color = cp(P_GREEN, bold=True) if bar["c"] >= bar["o"] else cp(P_RED, bold=True)
+        safe_add(win, c_row, col_x[i], fmt_price(bar["c"]).center(COL_W - 1), close_color | rev)
+
         delta = bar["delta"]
         if delta > 0:
             delta_color = cp(P_GREEN, bold=True)
@@ -2376,7 +2742,18 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
         poc_price, vah_price, val_price = bar_stats[i]
         safe_add(win, vah_row, col_x[i], fmt_price(vah_price).center(COL_W - 1), cp(P_DIM) | rev)
         safe_add(win, val_row, col_x[i], fmt_price(val_price).center(COL_W - 1), cp(P_DIM) | rev)
-        safe_add(win, poc_row, col_x[i], fmt_price(poc_price).center(COL_W - 1), cp(P_YELLOW, bold=True) | rev)
+        # green/red vs. the immediately PREVIOUS bar's own POC (rising vs.
+        # falling value area over time), same up/down convention Δ and C
+        # already use — not a fixed color, and not comparable for the
+        # first visible bar or a bar with no real trades on either side
+        prev_poc_price = bar_stats[i - 1][0] if i > 0 else None
+        if poc_price is not None and prev_poc_price is not None and poc_price > prev_poc_price:
+            poc_color = cp(P_GREEN, bold=True)
+        elif poc_price is not None and prev_poc_price is not None and poc_price < prev_poc_price:
+            poc_color = cp(P_RED, bold=True)
+        else:
+            poc_color = cp(P_DEFAULT, bold=True)
+        safe_add(win, poc_row, col_x[i], fmt_price(poc_price).center(COL_W - 1), poc_color | rev)
 
     # time axis
     axis_row = poc_row + 1
@@ -2447,6 +2824,12 @@ def _prompt_imbalance(stdscr):
 def _prompt_big_trade(stdscr):
     return _prompt_text(stdscr, "Big Trades size (e.g. 100): ")
 
+def _prompt_btd_lookback(stdscr):
+    return _prompt_text(stdscr, "BTD lookback bars (e.g. 10): ")
+
+def _prompt_btd_sigma(stdscr):
+    return _prompt_text(stdscr, "BTD sigma sensitivity (e.g. 3.0): ")
+
 def _prompt_symbol(stdscr):
     raw = _prompt_text(stdscr, "Symbol — crypto (ETH, BTC) or equity/ETF ticker: ")
     return raw.strip().upper() if raw else None
@@ -2470,7 +2853,7 @@ def _crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est, historical_m
 
 # ── MAIN LOOPS ────────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global SYMBOL, IS_CRYPTO, VP_MODE, _last_center_lvl
+    global SYMBOL, IS_CRYPTO, VP_MODE, BTD_MODE, _last_center_lvl
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -2588,6 +2971,10 @@ def curses_main(stdscr):
             # (same instant-apply convention as [M]/[B]): draw() just
             # reads VP_MODE fresh every frame.
             VP_MODE = not VP_MODE
+        elif key in (ord('d'), ord('D')):
+            # Big Trade Detector toggle — same pure display, no-rebuild
+            # convention as [V].
+            BTD_MODE = not BTD_MODE
         elif key in (ord('p'), ord('P')):
             fn = take_screenshot(stdscr)
             screenshot_msg = f"Screenshot: {os.path.basename(fn)}"
@@ -2653,6 +3040,26 @@ def curses_main(stdscr):
                     set_big_trade_size(new_size)
                     status_line = f"Big Trades size set to {new_size:g}"
                 init_shown_at = time.time()
+        elif key in (ord('k'), ord('K')):
+            raw_lookback = _prompt_btd_lookback(stdscr)
+            if raw_lookback is not None:
+                new_lookback = parse_btd_lookback(raw_lookback)
+                if new_lookback is None:
+                    status_line = f"Invalid BTD lookback '{raw_lookback}' — enter an integer >= 2"
+                else:
+                    set_btd_lookback(new_lookback)
+                    status_line = f"BTD lookback set to {new_lookback} bars"
+                init_shown_at = time.time()
+        elif key in (ord('g'), ord('G')):
+            raw_sigma = _prompt_btd_sigma(stdscr)
+            if raw_sigma is not None:
+                new_sigma = parse_btd_sigma(raw_sigma)
+                if new_sigma is None:
+                    status_line = f"Invalid BTD sigma '{raw_sigma}' — enter a positive number"
+                else:
+                    set_btd_sigma(new_sigma)
+                    status_line = f"BTD sigma set to {new_sigma:g}"
+                init_shown_at = time.time()
         elif key in (ord('s'), ord('S')) and not HISTORICAL_MODE:
             new_symbol = _prompt_symbol(stdscr)
             if new_symbol is not None:
@@ -2680,6 +3087,7 @@ def curses_main(stdscr):
                         state.kraken_status = "connecting…"
                         state.coinbase_status = "connecting…"
                         state.alpaca_status = "connecting…"
+                        state.trades_since_heartbeat = 0
                     SYMBOL, IS_CRYPTO = new_symbol, new_is_crypto
                     # Deliberately does NOT reset INTERVAL_LABEL/BAR_MODE/TICK
                     # (keeps whatever bar shape/price increment was already

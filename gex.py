@@ -63,9 +63,11 @@ Data:
             instead (falls back to CBOE's price if that fetch fails), so the
             header and price marker don't read ~15m stale.
 
-Every refresh is appended to a per-day log (gex_<SYMBOL>_MM_DD_YYYY.jsonl, next
-to this script) so history survives restarts. Launching on a day that already
-has a log resumes it; `--date` opens a past day for pure playback/browsing.
+Every refresh is appended to a per-day log
+(logs/YYYY/MM/DD/gex_<SYMBOL>_MM_DD_YYYY.jsonl, filed by that day's date under
+this script's folder) so history survives restarts. Launching on a day that
+already has a log resumes it; `--date` opens a past day for pure
+playback/browsing.
 
 IMPORTANT: neither Deribit nor CBOE expose *historical* per-strike gamma/OI —
 only a live snapshot. There is no API to backfill history out of thin air on a
@@ -127,10 +129,11 @@ symbol from the start. [G]/[N] (which view, and whether it's net) carry over
 across a switch; everything else resets.
 
 [P] saves a plain-text dump of exactly what's on screen right now to
-screenshots/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt, next to this script — works the
-same in every mode (interval map, GEX by strike, separate or net), since it
-just captures whatever's currently drawn. Same convention chart.py's [P]shot
-already uses elsewhere in this repo.
+screenshots/YYYY/MM/DD/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt, filed by today's date
+under this script's folder — works the same in every mode (interval map, GEX
+by strike, separate or net), since it just captures whatever's currently
+drawn. Same convention chart.py's [P]shot already uses elsewhere in this repo
+(just nested under the year/month/day scheme here).
 """
 
 import sys
@@ -447,12 +450,22 @@ def fetch_snapshot():
         return fetch_eth(SYMBOL, ALL_EXP)
     return fetch_equity(SYMBOL, ALL_EXP)
 
-# ── PERSISTENCE — one JSON-lines file per symbol/day, next to this script ────
+# ── PERSISTENCE — one JSON-lines file per symbol/day, filed under logs/YYYY/MM/DD/ ──
 # JSONL (not wide CSV) because each column is a variable-size {strike: gex}
 # dict — this maps directly onto the in-memory column format with no reshaping.
+def _date_folder(*roots, date_str):
+    """date_str: 'MM_DD_YYYY'. Builds (and ensures) roots.../YYYY/MM/DD/, so every
+    caller — logs, diagnostics, screenshots — files things under the same year/
+    month/day scheme without duplicating the split-and-makedirs logic three times."""
+    mm, dd, yyyy = date_str.split("_")
+    folder = os.path.join(LOG_DIR, *roots, yyyy, mm, dd)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
 def log_path(date_str):
     suffix = "_allexp" if ALL_EXP else ""
-    return os.path.join(LOG_DIR, f"gex_{SYMBOL}{suffix}_{date_str}.jsonl")
+    folder = _date_folder("logs", date_str=date_str)
+    return os.path.join(folder, f"gex_{SYMBOL}{suffix}_{date_str}.jsonl")
 
 def append_log(col):
     """Append one column to today's log. Returns (ok, err_str_or_None)."""
@@ -471,7 +484,8 @@ def append_log(col):
 
 def diag_log_path(date_str):
     suffix = "_allexp" if ALL_EXP else ""
-    return os.path.join(LOG_DIR, f"gex_diag_{SYMBOL}{suffix}_{date_str}.jsonl")
+    folder = _date_folder("logs", date_str=date_str)
+    return os.path.join(folder, f"gex_diag_{SYMBOL}{suffix}_{date_str}.jsonl")
 
 def append_diag(prev_col, prev_level, new_col, new_level):
     """Log a raw-flip jump exceeding DIAG_THRESHOLD: full before/after OI+gamma per
@@ -772,17 +786,18 @@ def safe_add(win, y, x, s, attr=0):
                 row[xi] = ch
 
 def take_screenshot():
-    """Dump the current frame to screenshots/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt — same
-    plain-text convention chart.py's [P]shot already uses in this repo. Reads back
+    """Dump the current frame to screenshots/YYYY/MM/DD/gex_<SYMBOL>_YYYYMMDD_HHMMSS.txt
+    — same plain-text convention chart.py's [P]shot already uses in this repo (just
+    filed under the same year/month/day scheme as the data logs). Reads back
     _screen_mirror (a plain-Python copy of every string safe_add has written this frame)
     rather than curses' own buffer (win.instr()/win.inch()): this file's dot/line
     characters (●, ─, │, etc.) are multi-byte, and whether curses' internal storage
     round-trips them losslessly depends on the underlying build — chart.py sidesteps the
     same uncertainty the same way, with its own DoubleBuffer. Works identically for every
     chart mode, since it just dumps whatever's already been drawn — no per-mode logic."""
-    folder = os.path.join(LOG_DIR, "screenshots")
-    os.makedirs(folder, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.now()
+    folder = _date_folder("screenshots", date_str=now.strftime("%m_%d_%Y"))
+    ts = now.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(folder, f"gex_{SYMBOL}_{ts}.txt")
     lines = ["".join(row).rstrip() for row in _screen_mirror]
     with open(path, "w", encoding="utf-8") as f:

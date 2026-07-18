@@ -10,7 +10,8 @@ be checked by hand across multiple other tools in this repo.
                          opt_dashboard.py's exact KILL_ZONES/exclusion logic)
   2. Volatility       — ETH's Deribit 30d IV index (DVOL), plus the Layer 1
                          position sizing / Layer 2 cap it maps to (fixed
-                         lookup table), and QQQ's CBOE iv30
+                         lookup table), and QQQ's volatility source, VXN
+                         (Cboe Nasdaq-100 Volatility Index, via Yahoo)
   3. PCVR             — put/call volume ratio of the nearest-expiry chain for
                          TLT (08:45-15:00 CT) or BTC (all other times) — this
                          single ratio is the shared ">1.00"/"<1.00" regime
@@ -68,15 +69,24 @@ Usage:
                       so the dashboard shows real-time price movement between
                       full refreshes instead of a price frozen at the last one.
 
+Backtest log: every 60s (SNAPSHOT_INTERVAL, independent of --interval), a
+full plain-data snapshot of everything currently shown (session, DVOL/VXN,
+PCVR, every HPL value+status for both instruments, Targets, Final Status —
+same values as the display, just ANSI-stripped and typed) is appended to
+  status_logs/YYYY/MM/DD/status_MM_DD_YYYY.jsonl
+one JSON object per line, folders created on demand. See
+compute_dashboard_snapshot/append_snapshot/snapshot_log_path.
+
 Data sources (all free, snapshot/REST — no websockets):
   ETH price/DVOL/chain  — Deribit REST
   ETH session candles   — Phemex kline/list, full current session in one call
   ETH previous close    — current session's own open (crypto trades 24/7, so
                            "previous close" == this session's open — same
                            value as charthacker.py's "EOpen" line)
-  QQQ price/chain/iv30  — CBOE delayed-quotes (~15m delay) + Yahoo (live spot)
+  QQQ price/chain       — CBOE delayed-quotes (~15m delay) + Yahoo (live spot)
+  QQQ volatility        — VXN via Yahoo (^VXN), not CBOE's iv30
   QQQ session candles   — Yahoo 1m/5d, includePrePost=true
-  QQQ previous close    — close of the 16:00 CT candle the prior day (a real
+  QQQ previous close    — close of the 15:59 CT candle the prior day (a real
                            market close, genuinely different from today's open)
   TLT/BTC PCVR chain    — CBOE (TLT) / Deribit (BTC), same nearest-expiry
                            pattern as chain.py/gex.py in this repo
@@ -383,6 +393,17 @@ def fetch_yahoo_meta(symbol):
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     return (float(price) if price else None,
             float(prev_close) if prev_close else None)
+
+def fetch_vxn():
+    """VXN (Cboe Nasdaq-100 Volatility Index) via the same Yahoo chart meta
+    block as fetch_yahoo_meta — QQQ's volatility source (replaces CBOE's
+    iv30 from the options chain). VXN is already quoted as an annualized %,
+    same shape as DVOL/iv30, so it drops straight into compute_er()."""
+    try:
+        price, _prev = fetch_yahoo_meta("^VXN")
+        return price
+    except Exception:
+        return None
 
 PHEMEX_TICKER_URL = "https://api.phemex.com/md/v3/ticker/24hr"
 
@@ -1124,6 +1145,139 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
 
     return rows
 
+# ── Backtest snapshot (plain data, no ANSI — for the minute-interval log) ────
+def compute_dashboard_snapshot(data):
+    """Plain-data (JSON-serializable) snapshot of everything the dashboard
+    currently shows. Mirrors render()'s own computation (same evaluate_hpls/
+    compute_bt_st/gamma_cluster_targets_directional calls, same rule
+    thresholds) but returns raw values instead of colored display strings,
+    for the minute-interval backtest log."""
+    snap = {"ts": datetime.now().isoformat()}
+
+    sess_name, excl_reason = data.get("session", (None, None))
+    in_session = sess_name is not None and excl_reason is None
+    snap["session"] = {"name": sess_name, "excl_reason": excl_reason, "in_session": in_session}
+
+    dvol = data.get("dvol")
+    l1, l2 = dvol_layers(dvol)
+    snap["dvol"] = dvol
+    snap["layer1"] = l1
+    snap["layer2"] = l2
+    snap["vxn"] = data.get("qqq_iv")
+
+    pcvr = data.get("pcvr")
+    snap["pcvr"] = pcvr
+    pcvr_gt1 = bool(pcvr and pcvr["ratio"] > 1.00)
+    pcvr_extreme = bool(pcvr) and (pcvr["ratio"] <= 0.98 or pcvr["ratio"] >= 1.02)
+
+    instruments = {}
+    for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
+        ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
+        ("QQQ", "qqq_price", "qqq_chain", "qqq_candles", "qqq_prev_close", "qqq_iv", 0.25, 0.35, 0.35, False),
+    ):
+        chain = data.get(chain_key)
+        candles = data.get(candles_key) or []
+        price = data.get(price_key)
+        prev_close = data.get(prev_key)
+        iv = data.get(iv_key)
+        inst_snap = {"price": price, "available": bool(chain and price is not None)}
+        if not inst_snap["available"]:
+            instruments[inst_name] = inst_snap
+            continue
+
+        export = read_charthacker_export(inst_name)
+        gex_export = read_gex_export(inst_name)
+        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
+                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export)
+        closed = inst_name == "QQQ" and qqq_market_closed()
+        inst_snap["market_closed"] = closed
+
+        hpl = {}
+        for label_, level_str, ok in rows:
+            hpl[label_] = {
+                "value": _ANSI_RE.sub("", level_str),
+                "status": "closed" if closed else ("active" if ok else "inactive"),
+            }
+        inst_snap["hpl"] = hpl
+        any_active = (not closed) and any(ok for _l, _v, ok in rows)
+        inst_snap["any_active"] = any_active
+
+        ratio = pcvr["ratio"] if pcvr else None
+        targets = []
+        if ratio is not None and not closed:
+            if ratio < 0.98:
+                bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                if bt is not None:
+                    targets.append({"type": "BT", "level": bt, "tier": None})
+                above, _below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
+                targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in above]
+            elif ratio > 1.02:
+                _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                if st is not None:
+                    targets.append({"type": "ST", "level": st, "tier": None})
+                _above, below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
+                targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in below]
+        inst_snap["targets"] = targets
+        has_targets = bool(targets)
+
+        ready = in_session and pcvr_extreme and any_active and has_targets
+        inst_snap["final_status"] = "EXECUTE WHEN READY" if ready else "HOLD"
+
+        instruments[inst_name] = inst_snap
+
+    snap["eth"] = instruments.get("ETH")
+    snap["qqq"] = instruments.get("QQQ")
+    return snap
+
+# ── Backtest log: year/month/day folder structure ─────────────────────────────
+SNAPSHOT_DIR_BASE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "status_logs")
+SNAPSHOT_INTERVAL  = 60   # seconds — independent of --interval and the live-price poller
+
+def snapshot_log_path(dt):
+    """status_logs/YYYY/MM/DD/status_MM_DD_YYYY.jsonl — creates the
+    year/month/day folders on demand. One JSONL file per day (not one file
+    per snapshot — matches this repo's existing gex.py/cvd.py/footprint.py
+    per-day-log convention) so a day's worth of minute snapshots (~1440
+    rows) stays a single, appendable file instead of thousands of tiny ones."""
+    year_dir  = os.path.join(SNAPSHOT_DIR_BASE, f"{dt.year:04d}")
+    month_dir = os.path.join(year_dir, f"{dt.month:02d}")
+    day_dir   = os.path.join(month_dir, f"{dt.day:02d}")
+    os.makedirs(day_dir, exist_ok=True)
+    return os.path.join(day_dir, f"status_{dt.strftime('%m_%d_%Y')}.jsonl")
+
+def append_snapshot(snap):
+    try:
+        path = snapshot_log_path(datetime.now())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(snap) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# inst/display_data shared between main()'s fetch loop and the snapshot
+# logger thread, so the logger doesn't have to run its own independent
+# fetch cycle (which would double the network load) — it just reads
+# whatever the main loop most recently built (data + live-overlaid prices).
+_latest_data_lock = threading.Lock()
+_latest_display_data = None
+
+def snapshot_logger_loop():
+    """Background: every SNAPSHOT_INTERVAL seconds, write a full backtest
+    snapshot of the current dashboard state to today's dated log file."""
+    while not _quit_evt.is_set():
+        with _latest_data_lock:
+            display_data = _latest_display_data
+        if display_data:
+            try:
+                snap = compute_dashboard_snapshot(display_data)
+                append_snapshot(snap)
+            except Exception:
+                pass
+        for _ in range(int(SNAPSHOT_INTERVAL / 0.5)):
+            if _quit_evt.is_set():
+                break
+            time.sleep(0.5)
+
 # ── Full refresh cycle ────────────────────────────────────────────────────────
 def run_cycle():
     result = {"errors": {}}
@@ -1144,6 +1298,7 @@ def run_cycle():
             "qqq_chain": ex.submit(fetch_cboe_chain, "QQQ"),
             "qqq_candles": ex.submit(fetch_yahoo_candles, "QQQ", "5d", "1m"),
             "qqq_meta": ex.submit(fetch_yahoo_meta, "QQQ"),
+            "vxn": ex.submit(fetch_vxn),
         }
         for key, fut in futs.items():
             try:
@@ -1200,9 +1355,9 @@ def render(data, remaining=None):
         p(f"     {LIGHT_BLANK}  {DIM}DVOL (ETH) unavailable{RST}")
     qqq_iv = data.get("qqq_iv")
     if qqq_iv is not None:
-        p(f"     {LIGHT_BLANK}  {DIM}{'IV (QQQ)':<12}{RST}{CYN}{BLD}{qqq_iv:>6.2f}{RST}")
+        p(f"     {LIGHT_BLANK}  {DIM}{'VXN (QQQ)':<12}{RST}{CYN}{BLD}{qqq_iv:>6.2f}{RST}")
     else:
-        p(f"     {LIGHT_BLANK}  {DIM}IV (QQQ) unavailable{RST}")
+        p(f"     {LIGHT_BLANK}  {DIM}VXN (QQQ) unavailable{RST}")
     p()
 
     # 3. PCVR — no light row (just the text): green when ratio <= 0.98, red
@@ -1402,7 +1557,7 @@ def assemble(raw):
     out["qqq_price"] = (qqq_meta[0] if qqq_meta and qqq_meta[0] else (qqq_chain["spot"] if qqq_chain else None))
     _prev_open_ts, curr_open_ts = session_open_ts()
     out["qqq_prev_close"] = session_prev_eod_close(raw.get("qqq_candles") or [], curr_open_ts)
-    out["qqq_iv"] = qqq_chain["iv30"] if qqq_chain else None
+    out["qqq_iv"] = raw.get("vxn")   # VXN, not CBOE's iv30 — see fetch_vxn
     return out
 
 # ── Live price poller ──────────────────────────────────────────────────────
@@ -1477,10 +1632,12 @@ def _keyboard_thread():
         pass
 
 def main():
+    global _latest_display_data
     hide_cursor()
     kb = threading.Thread(target=_keyboard_thread, daemon=True)
     kb.start()
     threading.Thread(target=live_price_loop, daemon=True).start()
+    threading.Thread(target=snapshot_logger_loop, daemon=True).start()
     try:
         while not _quit_evt.is_set():
             raw = run_cycle()
@@ -1506,6 +1663,8 @@ def main():
                     if live.get("QQQ") is not None:
                         display_data["qqq_price"] = live["QQQ"]
                     check_bt_st_cross_alert(display_data, data.get("pcvr"))
+                    with _latest_data_lock:
+                        _latest_display_data = display_data
                     render(display_data, remaining=remaining)
                     last_shown = shown
                 time.sleep(0.2)

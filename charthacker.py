@@ -20,7 +20,7 @@ import sys
 import time
 import threading
 import collections
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── auto-install deps ──────────────────────────────────────────────────────────
@@ -441,6 +441,7 @@ class ChartState:
         self.econ_impact_filter = {1, 2, 3}  # show * ** *** (all by default)
         self.econ_date_range  = "today"  # yesterday/today/tomorrow/week
         self.econ_scroll      = 0        # scroll offset in event list
+        self.econ_loop_active = False    # guards against duplicate auto-refresh loops
         # Live trade lines drawn on chart
         # Each dict: {side, entry, sl, tp, size_phemex, size_xl, status}
         self.trade_lines    = []    # active/pending trade levels to draw
@@ -1417,12 +1418,49 @@ def _fetch_cboe_iv(symbol: str) -> float | None:
         pass
     return cached[0] if cached else None
 
+VXN_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVXN"
+_vxn_cache: dict = {}   # single-entry cache: (value, fetched_at)
+_VXN_TTL = 300
+
+def _fetch_vxn() -> float | None:
+    """
+    Cboe NASDAQ-100 Volatility Index (VXN) — the direct QQQ/NDX analog to
+    Deribit's DVOL for crypto: a single published annualised-IV number
+    (VIX-style, calculated the same way VIX is for the S&P 500) rather than
+    something computed per-strike from an options chain — the cleaner
+    parallel to DVOL for QQQ's Expected Range specifically, vs. falling
+    back to CBOE's per-symbol ATM iv30 the way other equities do.
+    Sourced from Yahoo Finance (ticker ^VXN) via the same v8 chart endpoint
+    already used for equity candle data elsewhere in this file — verified
+    working directly (returns real ~25-27% readings), and there's no
+    simpler VXN-specific endpoint already in use here to prefer instead.
+    """
+    now    = time.time()
+    cached = _vxn_cache.get("VXN")
+    if cached and now - cached[1] < _VXN_TTL:
+        return cached[0]
+    try:
+        r = requests.get(VXN_URL, headers={"User-Agent": "Mozilla/5.0"},
+                         params={"interval": "1d", "range": "5d"}, timeout=12)
+        result = r.json().get("chart", {}).get("result", [])
+        if result:
+            val = (result[0].get("meta") or {}).get("regularMarketPrice")
+            if val:
+                val = float(val)
+                _vxn_cache["VXN"] = (val, now)
+                return val
+    except Exception:
+        pass
+    return cached[0] if cached else None
+
 def iv_monitor_loop():
     """Background: keeps state.er_iv fresh for the active asset so draw()
     (the render thread) never blocks on a network call. Deribit DVOL for
-    ETH/BTC, CBOE iv30 for everything else — state.er_iv only gets written
-    on a successful fetch, so a symbol with no options chain just leaves it
-    at 0 and the Expected Range block falls back to ER_MANUAL_IV.
+    ETH/BTC, VXN (Cboe NASDAQ-100 Volatility Index) for QQQ specifically —
+    the direct QQQ/NDX analog to DVOL, same conceptual role — CBOE per-
+    symbol iv30 for everything else. state.er_iv only gets written on a
+    successful fetch, so a symbol with no data source just leaves it at 0
+    and the Expected Range block falls back to ER_MANUAL_IV.
 
     Also periodically refreshes state.dvol_history (crypto only, every 5min
     — DVOL doesn't move fast enough to need the live-value's 20s cadence)
@@ -1461,6 +1499,11 @@ def iv_monitor_loop():
                     # real attempt for a full 5 minutes even though usable
                     # candle data might show up 1 loop iteration (20s) later.
                     _last_hist_refresh = now
+        elif asset == "QQQ":
+            iv = _fetch_vxn()
+            if iv:
+                with state.lock:
+                    state.er_iv = iv
         else:
             iv = _fetch_cboe_iv(asset)
             if iv:
@@ -1468,17 +1511,25 @@ def iv_monitor_loop():
                     state.er_iv = iv
         time.sleep(20)
 
-def compute_er(open_price: float, iv: float) -> dict | None:
+def compute_er(open_price: float, iv: float, trading_days_per_year: float = 365) -> dict | None:
     """
     Expected Range levels from a session open, given annualised IV (%).
-      daily_move = IV / sqrt(365) / 100
+      daily_move = IV / sqrt(trading_days_per_year) / 100
       level±N%   = open ± open * daily_move * N   for N in 20/40/60/80/100/150
     Returns {"pct": one-day move %, "upper": {N: price}, "lower": {N: price}}.
+
+    trading_days_per_year is the annualization constant — 365 for crypto
+    (trades every calendar day), 252 for equities (US trading-day count).
+    Using 365 on an equity understates the expected daily move by ~17%
+    (√365≈19.1 vs √252≈15.87), which then throws off every downstream
+    threshold built on it (the 40-80% zone, the ±100% bound, the ±150%
+    hard stop) — caller MUST pass 252 for non-crypto symbols.
     """
     if not open_price or not iv or iv <= 0:
         return None
-    daily_move = iv / math.sqrt(365) / 100.0
-    pct        = math.floor(iv / math.sqrt(365) * 100) / 100
+    _sqrt_days = math.sqrt(trading_days_per_year)
+    daily_move = iv / _sqrt_days / 100.0
+    pct        = math.floor(iv / _sqrt_days * 100) / 100
     dist       = open_price * daily_move
     return {
         "pct":   pct,
@@ -1514,37 +1565,24 @@ def _status_export_session_open_ts() -> float:
     return today_open.timestamp()
 
 def _status_export_prev_eod_close(asset: str, curr_open_ts: float):
-    """Close at 16:00 CT the day before curr_open_ts (curr_open_ts - 3h) —
-    matches status.py's own "Previous EOD Close" definition exactly.
-    A dedicated fetch, NOT the Global-mode fetch_global_asset_phemex/yahoo
-    helpers above — those only pull a short trailing window (good enough for
-    a macro overview, but not guaranteed to reach back to yesterday's 16:00
-    CT), so this queries an explicit historical window around target_ts
-    instead (Phemex's /kline/list range endpoint for crypto, Yahoo's 5-day
-    chart range for everything else)."""
-    target_ts = curr_open_ts - 3 * 3600
+    """Equities only (status.py's QQQ rule: close of the 15:59 CT candle the
+    prior day — the LAST candle of the regular trading day, right before
+    16:00 CT — a real market close, genuinely different from today's open).
+    Crypto has no real market close (trades 24/7) — status.py derives its
+    "previous close" straight from the exported session_open field instead
+    (== this session's own open == charthacker.py's "EOpen" line), so this
+    function isn't called for crypto assets at all; see status_export_loop."""
     try:
-        if is_crypto_symbol(asset):
-            path_  = "/exchange/public/md/v2/kline/list"
-            query_ = (f"symbol={PHEMEX_SYMBOLS[asset]}&resolution=60"
-                      f"&from={int(target_ts) - 3600}&to={int(target_ts) + 60}&limit=100")
-            r = requests.get(f"{PHEMEX_REST_URL}{path_}?{query_}",
-                              headers=_phemex_headers(path_, query_), timeout=12)
-            data = r.json()
-            if data.get("code") != 0:
-                return None
-            rows = data.get("data", {}).get("rows", [])   # oldest-first
-            return float(rows[-1][5]) if rows else None
-        else:
-            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{asset}",
-                              headers={"User-Agent": "Mozilla/5.0"},
-                              params={"interval": "1m", "range": "5d", "includePrePost": "true"},
-                              timeout=12)
-            res = r.json()["chart"]["result"][0]
-            ts_list = res.get("timestamp") or []
-            closes  = res["indicators"]["quote"][0]["close"]
-            before  = [(t, c) for t, c in zip(ts_list, closes) if t <= target_ts and c is not None]
-            return float(before[-1][1]) if before else None
+        target_ts = curr_open_ts - 3 * 3600 - 60   # 15:59 CT, not 16:00 CT
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{asset}",
+                          headers={"User-Agent": "Mozilla/5.0"},
+                          params={"interval": "1m", "range": "5d", "includePrePost": "true"},
+                          timeout=12)
+        res = r.json()["chart"]["result"][0]
+        ts_list = res.get("timestamp") or []
+        closes  = res["indicators"]["quote"][0]["close"]
+        before  = [(t, c) for t, c in zip(ts_list, closes) if t <= target_ts and c is not None]
+        return float(before[-1][1]) if before else None
     except Exception:
         return None
 
@@ -1569,7 +1607,10 @@ def status_export_loop():
 
             key = (asset, curr_open_ts)
             if _cached_key != key:
-                _cached_prev_close = _status_export_prev_eod_close(asset, curr_open_ts)
+                # Crypto has no real "previous close" fetch to do — status.py
+                # uses session_open (== EOpen) for that instead. Only
+                # equities need this separate 16:00 CT lookup.
+                _cached_prev_close = None if is_crypto_symbol(asset) else _status_export_prev_eod_close(asset, curr_open_ts)
                 _cached_key = key
 
             if session_open is not None and levels:
@@ -1672,6 +1713,33 @@ def session_bounds():
         prev_end   = curr_start
 
     return prev_start, prev_end, curr_start
+
+
+def equity_session_open_ts(now: datetime = None) -> int:
+    """
+    Most recent US equity regular-session open (08:30 CT = 9:30 AM ET)
+    on/before `now`, skipping weekends. Used ONLY by the Expected Range
+    block for non-crypto symbols — VWAP/VP/Sessions elsewhere in the app
+    stay on session_bounds()'s 19:00 CT anchor unchanged.
+
+    Unlike crypto's continuous trading, equities gap overnight and over the
+    weekend — a meaningful chunk of a trading day's realized move can
+    happen in the pre-market gap alone, outside the hours ER's rules
+    (the 40-80% zone, the ±100% bound, the ±150% hard stop) are meant to
+    bound. Anchoring to the regular session open instead of midnight/19:00
+    CT means ER tracks live intraday behavior specifically, with no
+    meaningless pre-market gap baked into the "session so far" candles.
+
+    No holiday calendar — matches the level of sophistication used
+    elsewhere in this file (session_bounds() doesn't have one either).
+    """
+    now    = now or datetime.now()
+    anchor = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    if now < anchor:
+        anchor -= timedelta(days=1)
+    while anchor.weekday() >= 5:   # Sat=5, Sun=6 — step back to Friday
+        anchor -= timedelta(days=1)
+    return int(anchor.timestamp())
 
 
 # ── Global mode data fetching ─────────────────────────────────────────────────
@@ -2778,18 +2846,33 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
 
     # ── EXPECTED RANGE (IV-implied daily move) — current session only ───────
     # ±20/40/60/80% soft levels (dim dashed), ±100% bound (bold), ±150% hard
-    # stop (bold magenta), anchored to the session open. er_iv is real,
-    # live IV for whatever's on screen (Deribit DVOL for crypto, CBOE iv30
-    # otherwise, refreshed by iv_monitor_loop) — ER_MANUAL_IV is only a
-    # last-resort fallback for symbols with no listed options chain on CBOE.
+    # stop (bold magenta), anchored to the session open. er_iv is real, live
+    # IV for whatever's on screen (Deribit DVOL for crypto, VXN for QQQ
+    # specifically, CBOE iv30 for other equities — refreshed by
+    # iv_monitor_loop) — ER_MANUAL_IV is only a last-resort fallback.
+    #
+    # Crypto trades every calendar day (annualise by √365) and never gaps,
+    # so 19:00 CT session_bounds() is a fine anchor. Equities only trade
+    # ~252 days/year (using √365 there would understate the expected move
+    # by ~17%, mis-scaling every threshold built on it) AND gap overnight/
+    # weekend — a real chunk of a trading day's move can happen in the
+    # pre-market gap alone, outside what ER's rules are meant to bound — so
+    # equities anchor to the REGULAR SESSION open (08:30 CT) instead via
+    # equity_session_open_ts(), not session_bounds()'s 19:00 CT.
     if show_er and visible and chart_h > 0 and cur_resolution() <= 3600:
-        _er_pstart, _er_pend, _er_cstart = session_bounds()
+        _er_is_crypto = is_crypto_symbol(asset)
+        if _er_is_crypto:
+            _er_cstart = session_bounds()[2]
+            _er_days   = 365
+        else:
+            _er_cstart = equity_session_open_ts()
+            _er_days   = 252
         _er_iv = er_iv if er_iv > 0 else ER_MANUAL_IV
         _er_sess_candles = [c for c in all_candles if c.ts >= _er_cstart]
 
         if _er_sess_candles and _er_iv and _er_iv > 0:
             _er_open = _er_sess_candles[0].o
-            _er = compute_er(_er_open, _er_iv)
+            _er = compute_er(_er_open, _er_iv, trading_days_per_year=_er_days)
 
             _er_col_start = chart_r
             _er_start_c   = chart_r - n_vis
@@ -5608,171 +5691,178 @@ def alert_monitor():
 
 
 # ── Economic calendar fetcher ─────────────────────────────────────────────────
+# Switched from scraping Investing.com to Forex Factory's public calendar feed
+# (2026-07-17) — Investing.com started hard-403ing every request at the
+# Cloudflare WAF level, including a plain homepage GET with full browser
+# headers, no JS-challenge page returned at all. That's a site-side block,
+# not fixable by UA/header tweaks (re-verified still 403 later the same day),
+# so the whole scraper was swapped for nfs.faireconomy.media's
+# ff_calendar_thisweek.json — a free, no-auth, plain JSON feed (verified
+# live: 200 OK, real event data) that many trading tools already rely on for
+# exactly this. Only "thisweek" is actually hosted there (lastweek/nextweek/
+# thismonth all 404'd when probed) — spans Sun-Sat of the current week, so
+# "yesterday" on a Sunday or "tomorrow" on a Saturday can come back empty
+# (falls through to the existing "No events" UI state, same as any other
+# empty-fetch case). No "actual" field in this feed at all (only
+# title/country/date/impact/forecast/previous) — a real gap vs. Investing.
+# com's post-release actuals, but draw_econ_cal_overlay() never rendered
+# "actual" in the first place, so nothing visible regresses.
+#
+# Hardened against Forex Factory's own per-IP rate limiter (same day,
+# follow-up): the feed serves the WHOLE week in one payload, so every
+# date_range view (today/yesterday/tomorrow/week) now filters ONE shared
+# cached fetch in-memory (_fetch_ff_raw(), 90s TTL) instead of each range
+# hitting the network separately — cycling through all 4 range keys costs
+# at most one live request, not four. A global 20s minimum gap between any
+# two live requests (_FF_MIN_GAP) is kept as a second layer of defense for
+# whatever races the TTL alone doesn't catch (e.g. the load_econ_calendar
+# auto-loop's 60s cycle landing right as the cache expires), guarded by a
+# lock so concurrent callers can't both slip through at once. On any
+# failure (429, timeout, bad JSON) this now falls back to the last
+# successfully cached payload instead of returning an empty list — a
+# transient rate-limit hit degrades to slightly-stale data, not a blank
+# "No events" screen that looks like the feature broke.
+_IMPACT_MAP   = {"low": 1, "medium": 2, "high": 3, "holiday": 1}
+_ff_raw_cache = None          # (raw_events, fetched_at) — shared across all date_range views
+_FF_CACHE_TTL = 90            # seconds — serve from cache with zero network calls inside this window
+_FF_MIN_GAP   = 20            # seconds — floor between any two live requests, even across cache expiry
+_ff_last_request_ts = 0.0
+_ff_fetch_lock = threading.Lock()
+
+
+def _fetch_ff_raw():
+    """Fetch+cache the full weekly JSON once; fetch_econ_calendar() filters
+    this same cached payload for every date_range instead of re-fetching
+    per range. Falls back to the last good cache on any failure."""
+    global _ff_raw_cache, _ff_last_request_ts
+    now = time.time()
+    if _ff_raw_cache and now - _ff_raw_cache[1] < _FF_CACHE_TTL:
+        return _ff_raw_cache[0]
+    with _ff_fetch_lock:
+        now = time.time()
+        if _ff_raw_cache and now - _ff_raw_cache[1] < _FF_CACHE_TTL:
+            return _ff_raw_cache[0]
+        if now - _ff_last_request_ts < _FF_MIN_GAP:
+            return _ff_raw_cache[0] if _ff_raw_cache else None
+        _ff_last_request_ts = now
+        try:
+            r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if r.status_code != 200:
+                return _ff_raw_cache[0] if _ff_raw_cache else None
+            raw = r.json() or []
+            _ff_raw_cache = (raw, now)
+            return raw
+        except Exception:
+            return _ff_raw_cache[0] if _ff_raw_cache else None
+
+
 def fetch_econ_calendar(date_range="today"):
     """
-    Fetch US economic events by scraping Investing.com's economic calendar page.
-    Parses the datatable-v2 HTML table which contains actual/forecast/previous
-    as plain text in <td> cells. Times returned are in ET; convert to CT (-1h).
+    Fetch US (USD) economic events from Forex Factory's public calendar feed.
     date_range: yesterday/today/tomorrow/week
     """
-    from html.parser import HTMLParser
-    import re as _re, calendar as _cal
-
-    today   = datetime.now()
     import datetime as _dt2
+
+    today = datetime.now()
     if date_range == "yesterday":
-        _target = today - _dt2.timedelta(days=1)
+        target_start = target_end = today - _dt2.timedelta(days=1)
     elif date_range == "tomorrow":
-        _target = today + _dt2.timedelta(days=1)
+        target_start = target_end = today + _dt2.timedelta(days=1)
+    elif date_range == "week":
+        # Sun-Sat containing today, NOT "today forward 6 days" — the feed
+        # itself is scoped to that same Sun-Sat window (its earliest date is
+        # always a Sunday), so a forward-only filter silently threw away
+        # every already-elapsed day of the current week even though that
+        # data was already sitting in the fetched payload. today.weekday()
+        # is Mon=0..Sun=6; (weekday()+1)%7 remaps it to Sun=0..Sat=6 so we
+        # can subtract back to that Sunday.
+        _wd = (today.weekday() + 1) % 7
+        target_start = today - _dt2.timedelta(days=_wd)
+        target_end   = target_start + _dt2.timedelta(days=6)
     else:
-        _target = today
+        target_start = target_end = today
 
-    # Investing.com page URL with date param
-    date_fmt = _target.strftime("%Y-%m-%d")
-    url = f"https://www.investing.com/economic-calendar/"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "Chrome/124.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
-    }
-
-    # Use the AJAX endpoint which is more reliable
-    payload = (
-        f"country%5B%5D=5"
-        f"&dateFrom={date_fmt}"
-        f"&dateTo={date_fmt}"
-        f"&timeZone=8"       # New York time (ET)
-        f"&timeFilter=timeOnly"
-        f"&currentTab={'today' if date_range in ('today','') else date_range.replace('week','thisWeek')}"
-        f"&limit_from=0"
-    )
-    if date_range == "week":
-        _wend = (_target + _dt2.timedelta(days=6)).strftime("%Y-%m-%d")
-        payload = payload.replace(f"dateTo={date_fmt}", f"dateTo={_wend}")
-        payload = payload.replace("currentTab=week", "currentTab=thisWeek")
-
-    ajax_headers = dict(headers)
-    ajax_headers.update({
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json, text/javascript, */*",
-    })
-
-    try:
-        r    = requests.post(
-            "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData",
-            data=payload, headers=ajax_headers, timeout=15)
-        data = r.json()
-        html = data.get("data", "")
-        if not html:
-            return []
-
-        events = []
-
-        class _P(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self._ev    = None
-                self._field = None
-                self._depth = 0
-
-            def handle_starttag(self, tag, attrs):
-                d = dict(attrs)
-                cls = d.get("class", "")
-                row_id = d.get("id", "")
-
-                # New event row: id like "123-456789-US-7"
-                if tag == "tr" and "js-event-item" in cls:
-                    self._ev = {
-                        "time": d.get("data-event-datetime", ""),
-                        "name": "", "impact": 1,
-                        "actual": "", "forecast": "", "previous": "", "ts": 0,
-                    }
-                    self._field = None
-                    return
-
-                if self._ev is None:
-                    return
-
-                # Impact from bull icon
-                imgkey = d.get("data-img_key", "")
-                if imgkey.startswith("bull"):
-                    try: self._ev["impact"] = int(imgkey[-1])
-                    except: pass
-
-                if tag == "td":
-                    cls_l = cls.lower()
-                    # Map td class to field
-                    if   "js-time"  in cls_l or "first" in cls_l: self._field = "time_td"
-                    elif "event"    in cls_l:                      self._field = "event"
-                    elif "actual"   in cls_l:                      self._field = "actual"
-                    elif "fore"     in cls_l:                      self._field = "forecast"
-                    elif "prev"     in cls_l:                      self._field = "previous"
-                    # Also detect by position using data-* attrs
-                    for attr, fld in [("data-actual","actual"),
-                                      ("data-forecast","forecast"),
-                                      ("data-previous","previous")]:
-                        v = d.get(attr,"").strip().strip("\xa0")
-                        if v and v != "&nbsp;":
-                            self._ev[fld] = v
-                    else:
-                        if self._field is None: self._field = None
-
-                if tag == "a" and self._field == "event":
-                    self._field = "event_a"
-
-            def handle_data(self, data):
-                data = data.strip().strip("\xa0")
-                if not data or self._ev is None:
-                    return
-                if   self._field == "event_a"  and not self._ev["name"]:     self._ev["name"]     = data
-                elif self._field == "event"     and not self._ev["name"]:     self._ev["name"]     = data
-                elif self._field == "time_td"   and not self._ev["time"] and _re.match(r"\d{1,2}:\d{2}", data):
-                    self._ev["time"] = data
-                elif self._field == "actual"    and not self._ev["actual"]:   self._ev["actual"]   = data
-                elif self._field == "forecast"  and not self._ev["forecast"]: self._ev["forecast"] = data
-                elif self._field == "previous"  and not self._ev["previous"]: self._ev["previous"] = data
-
-            def handle_endtag(self, tag):
-                if self._ev is None: return
-                if tag == "a" and self._field == "event_a": self._field = "event"
-                if tag == "tr" and self._ev.get("name"):
-                    events.append(dict(self._ev))
-                    self._ev = None
-
-        _P().feed(html)
-
-        # Convert times: data-event-datetime is UTC from server (timeZone=8 = ET)
-        # ET = UTC-4 (EDT in April). CT = ET - 1h.
-        CT_OFFSET = 14400  # Investing.com timeZone=8 returns data; +14400 aligns to CT
-        for ev in events:
-            raw    = ev.get("time", "")
-            m_full = _re.search(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})", raw)
-            m_hm   = _re.search(r"(\d{1,2}):(\d{2})", raw)
-            if m_full:
-                yr,mo,dy = int(m_full.group(1)),int(m_full.group(2)),int(m_full.group(3))
-                h,mn,sc  = int(m_full.group(4)),int(m_full.group(5)),int(m_full.group(6))
-                et_ts    = _cal.timegm((yr,mo,dy,h,mn,sc,0,0,0))
-                ct_ts    = et_ts + CT_OFFSET
-                ev["ts"] = ct_ts
-                ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
-            elif m_hm:
-                h, mn  = int(m_hm.group(1)), int(m_hm.group(2))
-                et_ts  = datetime(_target.year,_target.month,_target.day,h,mn,0).timestamp()
-                ct_ts  = et_ts + CT_OFFSET
-                ev["ts"]   = ct_ts
-                ev["time"] = datetime.fromtimestamp(ct_ts).strftime("%H:%M")
-
-        return sorted([e for e in events if e.get("name")],
-                      key=lambda x: x.get("ts", 0))
-
-    except Exception as _exc:
+    raw_events = _fetch_ff_raw()
+    if not raw_events:
         return []
 
+    events = []
+    for ev in raw_events:
+        if ev.get("country") != "USD":
+            continue
+        try:
+            dt = datetime.fromisoformat(ev.get("date", ""))  # tz-aware (ET, DST-correct)
+        except Exception:
+            continue
+        if not (target_start.date() <= dt.date() <= target_end.date()):
+            continue
+        ts = dt.timestamp()
+        events.append({
+            "time":     datetime.fromtimestamp(ts).strftime("%H:%M"),
+            "name":     ev.get("title", ""),
+            "impact":   _IMPACT_MAP.get((ev.get("impact") or "").strip().lower(), 1),
+            "actual":   ev.get("actual", ""),
+            "forecast": ev.get("forecast", ""),
+            "previous": ev.get("previous", ""),
+            "ts":       ts,
+        })
+
+    return sorted(events, key=lambda x: x["ts"])
+
 def load_econ_calendar():
-    """Background: fetch calendar and keep it refreshed every 60s while open."""
+    """Background: fetch calendar and keep it refreshed every 60s while open.
+
+    Only one of these loops may run at a time (state.econ_loop_active guards
+    it) — every date-range-change / manual-refresh key used to start a brand
+    new copy of this function via its own thread, and since the loop below
+    never exits until the calendar closes, a quick sequence of Y/T/W/N/R
+    presses left several of these 60s-loops running concurrently. Each did
+    its own immediate fetch on start, so a few keypresses within a couple
+    seconds fired that many near-simultaneous requests at Forex Factory's
+    feed — enough to trip ITS OWN rate limiter (verified: as few as 4-5
+    rapid requests triggers a 429 that persists for minutes), after which
+    every subsequent fetch — refresh included — silently came back empty.
+    Range-change/refresh keys now call _econ_refresh_once() instead, which
+    does a single fetch and returns; this loop (started once, on [K] open)
+    is the only thing that owns repeated polling.
+    """
+    with state.lock:
+        if state.econ_loop_active:
+            return
+        state.econ_loop_active = True
+        state.econ_loading = True
+        _dr = state.econ_date_range
+    try:
+        events = fetch_econ_calendar(date_range=_dr)
+        with state.lock:
+            state.econ_events  = events
+            state.econ_loading = False
+        # Auto-refresh loop: re-fetch every 60s while calendar is open
+        while True:
+            for _ in range(60):
+                time.sleep(1)
+                with state.lock:
+                    if not state.show_econ_cal:
+                        return
+            with state.lock:
+                if not state.show_econ_cal:
+                    return
+            with state.lock:
+                _dr2 = state.econ_date_range
+            fresh = fetch_econ_calendar(date_range=_dr2)
+            with state.lock:
+                state.econ_events = fresh
+    finally:
+        with state.lock:
+            state.econ_loop_active = False
+
+
+def _econ_refresh_once():
+    """One-shot fetch for date-range-change / manual-refresh keys (Y/T/W/N/R).
+    Does NOT start a new 60s auto-loop — load_econ_calendar (started once on
+    [K] open) already owns that and picks up the new date range on its next
+    cycle; this just gives the keypress instant feedback."""
     with state.lock:
         state.econ_loading = True
         _dr = state.econ_date_range
@@ -5780,21 +5870,6 @@ def load_econ_calendar():
     with state.lock:
         state.econ_events  = events
         state.econ_loading = False
-    # Auto-refresh loop: re-fetch every 60s while calendar is open
-    while True:
-        for _ in range(60):
-            time.sleep(1)
-            with state.lock:
-                if not state.show_econ_cal:
-                    return
-        with state.lock:
-            if not state.show_econ_cal:
-                return
-        with state.lock:
-            _dr2 = state.econ_date_range
-        fresh = fetch_econ_calendar(date_range=_dr2)
-        with state.lock:
-            state.econ_events = fresh
 
 
 # ── main loop ────────────────────────────────────────────────────────────────
@@ -6170,7 +6245,7 @@ def main(stdscr):
                     with state.lock:
                         state.econ_date_range = "week"
                         state.econ_scroll = 0
-                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                    threading.Thread(target=_econ_refresh_once, daemon=True).start()
                 else:
                     with state.lock:
                         state.show_vwap = not state.show_vwap
@@ -6182,7 +6257,7 @@ def main(stdscr):
                     with state.lock:
                         state.econ_date_range = "today"
                         state.econ_scroll = 0
-                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                    threading.Thread(target=_econ_refresh_once, daemon=True).start()
                 else:
                     with state.lock:
                         state.show_btd = not state.show_btd
@@ -6311,7 +6386,7 @@ def main(stdscr):
                     with state.lock:
                         state.econ_date_range = "tomorrow"
                         state.econ_scroll = 0
-                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                    threading.Thread(target=_econ_refresh_once, daemon=True).start()
                 elif _al_open:
                     new_alt = alert_create_dialog(stdscr, rows, cols)
                     if new_alt:
@@ -6383,7 +6458,7 @@ def main(stdscr):
                     with state.lock:
                         state.econ_date_range = "yesterday"
                         state.econ_scroll = 0
-                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                    threading.Thread(target=_econ_refresh_once, daemon=True).start()
 
             elif key in (ord("m"), ord("M")):
                 with state.lock:
@@ -6402,7 +6477,7 @@ def main(stdscr):
                 if _in_global:
                     start_global(_g_sess)
                 elif _in_econ:
-                    threading.Thread(target=load_econ_calendar, daemon=True).start()
+                    threading.Thread(target=_econ_refresh_once, daemon=True).start()
                 else:
                     # Plain chart view — [R] is otherwise unused here, so
                     # repurpose it as a manual "force full redraw" escape

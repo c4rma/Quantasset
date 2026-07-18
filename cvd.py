@@ -48,7 +48,7 @@ Data (real trade prints, not just OHLC volume) — depends on the symbol:
                            the standard approach real CVD tools use when
                            trades aren't natively side-tagged.
 
-Every closed bar is appended to a per-day log (cvd_<SYMBOL>_<bar>_MM_DD_YYYY.jsonl,
+Every closed bar is appended to a per-day log (cvd_data/YYYY/MM/DD/cvd_<SYMBOL>_<bar>.jsonl,
 next to this script) so history survives restarts — launching on a day that
 already has a log resumes it (CVD continues from the last logged value
 instead of restarting at zero).
@@ -105,10 +105,10 @@ Usage:
     --headless           no UI — just ingest+log trades forever (e.g. Task
                         Scheduler), so a real history is on disk once you
                         open the full UI later. ALSO writes a separate,
-                        always-1m OHLC(spot)+CVD CSV (cvd_1m_<SYMBOL>_
-                        MM_DD_YYYY.csv, one row per minute, regardless of
-                        --interval) — a new file starts automatically at
-                        00:00 CT, matching gex.py's daily log rotation.
+                        always-1m OHLC(spot)+CVD CSV (cvd_data/YYYY/MM/DD/
+                        cvd_1m_<SYMBOL>.csv, one row per minute, regardless of
+                        --interval) — a new file/folder starts automatically
+                        at 00:00 CT, matching gex.py's daily log rotation.
 
 There is only ONE bar timeline (not a separate one for Goto/history) — the
 same buffer the live WS feeds populate. Scrolling back past whatever's
@@ -363,6 +363,20 @@ VIEW_DATE       = LOAD_DATE or TODAY_STR
 HISTORICAL_MODE = LOAD_DATE is not None and LOAD_DATE != TODAY_STR
 
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(LOG_DIR, "cvd_data")   # every persisted output (bar log,
+                                                 # headless CSV, screenshots) lives
+                                                 # under here, organized by date —
+                                                 # see _date_dir()
+
+def _date_dir(date_str):
+    """MM_DD_YYYY -> DATA_ROOT/YYYY/MM/DD, creating it if needed. All of
+    cvd.py's persisted output (bar log, headless CSV, screenshots) is
+    organized this way so a day's files are always found in one place
+    instead of scattered flat in the script directory."""
+    mm, dd, yyyy = date_str.split("_")
+    path = os.path.join(DATA_ROOT, yyyy, mm, dd)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 # Pan step tiers — same convention as quantasset_chart.py: plain arrow = 1,
 # [ / ] = 10, { / } = 50 (negative = pan left/older, positive = pan right/newer).
@@ -374,7 +388,7 @@ PAN_KEYS = {
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────────
 def log_path(date_str):
-    return os.path.join(LOG_DIR, f"cvd_{SYMBOL}_{INTERVAL_LABEL}_{date_str}.jsonl")
+    return os.path.join(_date_dir(date_str), f"cvd_{SYMBOL}_{INTERVAL_LABEL}.jsonl")
 
 def append_log(bar):
     try:
@@ -1016,7 +1030,7 @@ class CsvState:
 csv_state = CsvState()
 
 def csv_path(date_str):
-    return os.path.join(LOG_DIR, f"cvd_1m_{SYMBOL}_{date_str}.csv")
+    return os.path.join(_date_dir(date_str), f"cvd_1m_{SYMBOL}.csv")
 
 def _new_csv_bar(ts, price, cvd_open):
     return {"ts": ts, "o": price, "h": price, "l": price, "c": price,
@@ -1642,17 +1656,20 @@ def safe_add(win, y, x, s, attr=0):
         pass
 
 def take_screenshot(win=None):
-    """Dump the last-rendered frame to screenshots/cvd_<SYMBOL>_<ts>.txt
-    (same convention as charthacker.py's [P] key). Reads from the
-    _shadow_buf tracked alongside every real draw call (see _shadow_put) —
-    NOT from curses' win.instr(), which corrupts the multi-byte candle
-    glyphs on readback. win is only used as a last-resort size fallback
-    if no frame has been drawn yet (shouldn't happen in practice: draw()
-    always runs at least once before the first key is read)."""
-    folder = os.path.join(os.path.dirname(__file__), "screenshots")
+    """Dump the last-rendered frame to
+    cvd_data/YYYY/MM/DD/screenshots/cvd_<SYMBOL>_<HHMMSS>.txt (dated by the
+    real moment the screenshot is taken, not whatever historical date might
+    be on screen in --date playback — same convention as charthacker.py's
+    [P] key otherwise). Reads from the _shadow_buf tracked alongside every
+    real draw call (see _shadow_put) — NOT from curses' win.instr(), which
+    corrupts the multi-byte candle glyphs on readback. win is only used as
+    a last-resort size fallback if no frame has been drawn yet (shouldn't
+    happen in practice: draw() always runs at least once before the first
+    key is read)."""
+    now = datetime.now()
+    folder = os.path.join(_date_dir(now.strftime("%m_%d_%Y")), "screenshots")
     os.makedirs(folder, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fn = os.path.join(folder, f"cvd_{SYMBOL}_{ts}.txt")
+    fn = os.path.join(folder, f"cvd_{SYMBOL}_{now.strftime('%H%M%S')}.txt")
     if _shadow_buf is not None:
         buf = _shadow_buf
     elif win is not None:
@@ -2243,7 +2260,7 @@ def curses_main(stdscr):
             zoom_group = zoom_step(zoom_group, 1)
         elif key in (ord('p'), ord('P')):
             fn = take_screenshot(stdscr)
-            screenshot_msg = f"Screenshot: {os.path.basename(fn)}"
+            screenshot_msg = f"Screenshot: {os.path.relpath(fn, LOG_DIR)}"
             screenshot_until = time.time() + 5
         elif key in (ord('s'), ord('S')) and not HISTORICAL_MODE:
             new_symbol = _prompt_symbol(stdscr)

@@ -13,23 +13,33 @@ be checked by hand across multiple other tools in this repo.
                          lookup table), and QQQ's volatility source, VXN
                          (Cboe Nasdaq-100 Volatility Index, via Yahoo)
   3. PCVR             — put/call volume ratio of the nearest-expiry chain for
-                         TLT (08:45-15:00 CT) or BTC (all other times) — this
-                         single ratio is the shared ">1.00"/"<1.00" regime
-                         signal every conditional HPL rule below reads.
+                         TLT (Mon-Fri 08:45-15:00 CT only) or BTC (all other
+                         times/days) — this single ratio is the shared regime
+                         signal every conditional HPL/Targets rule reads.
+                         BT/ST's own branch selection still uses the >1.00/
+                         <1.00 split; VAH/VAL/POC/±2sd (below) and Targets
+                         use a stricter <0.98/>1.02 split — different
+                         thresholds for different rules, both intentional.
   4. HPLs             — High-Probability Levels, evaluated separately for ETH
-                         (Deribit + Phemex) and QQQ (CBOE + Yahoo), 15 rules
+                         (Deribit + Phemex) and QQQ (CBOE + Yahoo), 14 rules
                          each, grouped for display into Volume (VAH, VAL,
                          POC, +2/2.5sd, -2/2.5sd, 0.5sd band, VWAP), Expected
                          Range (40-80% band, 100%, 150%), Options (BT, ST,
-                         GEX Flip, Medium/Large Gamma Clusters — shows the 2
-                         clusters closest to live price, not every qualifying
-                         strike), and Miscellaneous (Previous EOD Close).
-                         QQQ's rows show CLOSED (not ACTIVE/INACTIVE) from
-                         15:00 CT to 08:44 CT the next morning.
-  5. Targets          — BT + every Large gamma cluster above price when
-                         PCVR < 0.98, or ST + every Large gamma cluster below
-                         price when PCVR > 1.02, in green. QQQ only during its
-                         own 08:45-15:00 CT hours; ETH always.
+                         Medium/Large Gamma Clusters — shows the 2 clusters
+                         closest to live price, not every qualifying strike),
+                         and Miscellaneous (Previous EOD Close). VAH/VAL/POC/
+                         ±2sd have no proximity tolerance — once price has
+                         actually crossed (PCVR<0.98: VAL/-2sd at price<=
+                         level, POC at/near POC; PCVR>1.02: the VAH/+2sd
+                         mirror), it counts regardless of how far past;
+                         every other row still needs price within tolerance.
+                         QQQ's rows show CLOSED (not ACTIVE/INACTIVE) outside
+                         Mon-Fri 08:45-15:00 CT (including all day weekends).
+  5. Targets          — BT + GEX Flip + every Medium/Large gamma cluster
+                         above price when PCVR < 0.98, or ST + GEX Flip +
+                         every Medium/Large gamma cluster below price when
+                         PCVR > 1.02. QQQ only during its own Mon-Fri
+                         08:45-15:00 CT hours; ETH always.
 
 Every rule renders ACTIVE (green) when its condition is met right now,
 INACTIVE (red) otherwise. A centered "EXECUTE WHEN READY" (green) / "HOLD"
@@ -285,9 +295,13 @@ def get_session_status():
     return None, excl_reason
 
 def in_tlt_window():
+    """TLT trades weekdays only — Mon-Fri 08:45-15:00 CT. Outside that
+    window (including all day Sat/Sun, when TLT isn't trading at all
+    regardless of clock time), PCVR falls back to BTC."""
     n = now_ct()
     t_mins = n.hour * 60 + n.minute
-    return TLT_WINDOW_START <= t_mins < TLT_WINDOW_END
+    is_weekday = n.weekday() < 5   # Mon=0 ... Sun=6
+    return is_weekday and TLT_WINDOW_START <= t_mins < TLT_WINDOW_END
 
 def session_open_ts():
     """Unix ts of the current session's 19:00 CT open (same anchor charthacker.py
@@ -936,7 +950,7 @@ def read_gex_export(asset, max_age_sec=GEX_STATUS_EXPORT_MAX_AGE):
 HPL_CATEGORIES = (
     ("Volume", ("VAH", "VAL", "POC", "+2sd/2.5sd", "-2sd/2.5sd", "0.5sd band", "VWAP")),
     ("Expected Range", ("ER 40-80% band", "ER 100%", "ER 150%")),
-    ("Options", ("BT", "ST", "GEX Flip", "Med/Large Gamma Clusters")),
+    ("Options", ("BT", "ST", "Med/Large Gamma Clusters")),
     ("Miscellaneous", ("Prev EOD Close",)),
 )
 
@@ -985,16 +999,19 @@ QQQ_OPEN_CT_MIN  = 8 * 60 + 45   # 08:45 CT — regular market open
 QQQ_CLOSE_CT_MIN = 15 * 60       # 15:00 CT — regular market close
 
 def qqq_market_closed():
-    """True from 15:00 CT through 08:29 CT the next day — QQQ's HPLs render
-    as CLOSED/inactive outside regular hours rather than showing numbers
-    computed against a market that isn't actively trading."""
+    """True from 15:00 CT through 08:44 CT the next day, and all day on
+    Sat/Sun (QQQ doesn't trade weekends regardless of clock time) — QQQ's
+    HPLs render as CLOSED/inactive outside regular hours rather than
+    showing numbers computed against a market that isn't actively trading."""
     n = now_ct()
+    if n.weekday() >= 5:   # Sat=5, Sun=6
+        return True
     minutes = n.hour * 60 + n.minute
     return not (QQQ_OPEN_CT_MIN <= minutes < QQQ_CLOSE_CT_MIN)
 
 # ── HPL evaluation for one instrument (ETH or QQQ) ────────────────────────────
 def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamma_tol, pcvr_gt1, is_crypto,
-                   export=None, gamma_yellow_tol=None, gex_export=None):
+                   export=None, gamma_yellow_tol=None, gex_export=None, ratio=None):
     """Returns list of (label, level_str, is_green) rows, in the fixed order.
     If `export` is given (a fresh status_<ASSET>.json written by a live
     charthacker.py instance), VAH/VAL/POC/VWAP/SD bands/session-open/prev-close
@@ -1025,6 +1042,30 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
             return YLW
         else:
             return RED
+
+    # Every HPL row appends one of these — same 3-tier coloring already used
+    # for GEX Flip/gamma clusters/Targets, recomputed fresh every call (so it
+    # updates in step with the live price, same as those).
+    def dist_tag(level):
+        if level is None:
+            return ""
+        dist = abs(price - level)
+        return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
+
+    def nearest_dist_tag(*levels):
+        valid = [l for l in levels if l is not None]
+        if not valid:
+            return ""
+        dist = min(abs(price - l) for l in valid)
+        return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
+
+    def band_dist_tag(lo, hi):
+        """0 (green) when price is inside the band, else distance to the
+        nearer edge."""
+        if lo is None or hi is None:
+            return ""
+        dist = 0.0 if lo <= price <= hi else min(abs(price - lo), abs(price - hi))
+        return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
 
     if export:
         vah, val, poc = export.get("vah"), export.get("val"), export.get("poc")
@@ -1067,20 +1108,30 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     elif export and export.get("prev_eod_close") is not None:
         prev_close = export["prev_eod_close"]
 
-    rows.append(("VAH", f"${vah:,.2f}" if vah is not None else "n/a",
-                 vah is not None and price > vah and near(vah) and pcvr_gt1))
-    rows.append(("VAL", f"${val:,.2f}" if val is not None else "n/a",
-                 val is not None and price < val and near(val) and not pcvr_gt1))
-    rows.append(("POC", f"${poc:,.2f}" if poc is not None else "n/a", near(poc)))
+    # VAH/VAL/POC/±2sd active rules: PCVR < 0.98 -> VAL active at price<=VAL,
+    # POC active at/near POC, -2sd active at price<=-2sd. PCVR > 1.02 -> the
+    # mirror (VAH/POC/+2sd). No tolerance gate on VAH/VAL/±2sd here (unlike
+    # every other row) — once price has actually crossed, it counts,
+    # regardless of how far past. POC keeps its proximity check (near) since
+    # "at POC" isn't a meaningful exact-equality test, but is now gated to
+    # the same PCVR<0.98/PCVR>1.02 zones rather than "any scenario".
+    pcvr_lt_098 = ratio is not None and ratio < 0.98
+    pcvr_gt_102 = ratio is not None and ratio > 1.02
+    rows.append(("VAH", f"${vah:,.2f}{dist_tag(vah)}" if vah is not None else "n/a",
+                 vah is not None and pcvr_gt_102 and price >= vah))
+    rows.append(("VAL", f"${val:,.2f}{dist_tag(val)}" if val is not None else "n/a",
+                 val is not None and pcvr_lt_098 and price <= val))
+    rows.append(("POC", f"${poc:,.2f}{dist_tag(poc)}" if poc is not None else "n/a",
+                 near(poc) and (pcvr_lt_098 or pcvr_gt_102)))
 
     if vwap is not None and sd_p2 is not None:
-        rows.append(("+2sd/2.5sd", f"${sd_p2:,.2f} / ${sd_p25:,.2f}",
-                     price >= sd_p2 and near(sd_p2) and pcvr_gt1))
-        rows.append(("-2sd/2.5sd", f"${sd_m2:,.2f} / ${sd_m25:,.2f}",
-                     price <= sd_m2 and near(sd_m2) and not pcvr_gt1))
-        rows.append(("0.5sd band", f"${sd_m05:,.2f} - ${sd_p05:,.2f}",
+        rows.append(("+2sd/2.5sd", f"${sd_p2:,.2f} / ${sd_p25:,.2f}{dist_tag(sd_p2)}",
+                     pcvr_gt_102 and price >= sd_p2))
+        rows.append(("-2sd/2.5sd", f"${sd_m2:,.2f} / ${sd_m25:,.2f}{dist_tag(sd_m2)}",
+                     pcvr_lt_098 and price <= sd_m2))
+        rows.append(("0.5sd band", f"${sd_m05:,.2f} - ${sd_p05:,.2f}{band_dist_tag(sd_m05, sd_p05)}",
                      sd_m05 <= price <= sd_p05))
-        rows.append(("VWAP", f"${vwap:,.2f}", near(vwap)))
+        rows.append(("VWAP", f"${vwap:,.2f}{dist_tag(vwap)}", near(vwap)))
     else:
         rows.append(("+2sd/2.5sd", "n/a", False))
         rows.append(("-2sd/2.5sd", "n/a", False))
@@ -1092,9 +1143,14 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         u40, u80, u100, u150 = er["upper"][40], er["upper"][80], er["upper"][100], er["upper"][150]
         l40, l80, l100, l150 = er["lower"][40], er["lower"][80], er["lower"][100], er["lower"][150]
         in_band = (u40 <= price <= u80) or (l80 <= price <= l40)
-        rows.append(("ER 40-80% band", f"${u40:,.2f}-${u80:,.2f} / ${l80:,.2f}-${l40:,.2f}", in_band))
-        rows.append(("ER 100%", f"${u100:,.2f} / ${l100:,.2f}", near(u100) or near(l100)))
-        rows.append(("ER 150%", f"${u150:,.2f} / ${l150:,.2f}", near(u150) or near(l150)))
+        er_band_dist = min(
+            0.0 if u40 <= price <= u80 else min(abs(price - u40), abs(price - u80)),
+            0.0 if l80 <= price <= l40 else min(abs(price - l40), abs(price - l80)),
+        )
+        er_band_tag = f" ({dist_color(er_band_dist)}{BLD}${er_band_dist:,.2f} away{RST})"
+        rows.append(("ER 40-80% band", f"${u40:,.2f}-${u80:,.2f} / ${l80:,.2f}-${l40:,.2f}{er_band_tag}", in_band))
+        rows.append(("ER 100%", f"${u100:,.2f} / ${l100:,.2f}{nearest_dist_tag(u100, l100)}", near(u100) or near(l100)))
+        rows.append(("ER 150%", f"${u150:,.2f} / ${l150:,.2f}{nearest_dist_tag(u150, l150)}", near(u150) or near(l150)))
     else:
         rows.append(("ER 40-80% band", "n/a", False))
         rows.append(("ER 100%", "n/a", False))
@@ -1104,23 +1160,14 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     bt_green = active == "BT" and bt is not None and price >= bt and near(bt)
     st_green = active == "ST" and st is not None and price <= st and near(st)
     # BT/ST values are always colored green/red respectively (buy/sell
-    # territory), independent of the row's own light/condition.
-    rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}" if bt is not None else "n/a", bt_green))
-    rows.append(("ST", f"{RED}{BLD}${st:,.2f}{RST}" if st is not None else "n/a", st_green))
+    # territory), independent of the row's own light/condition — the
+    # distance tag still uses the shared 3-tier scheme like every other row.
+    rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}{dist_tag(bt)}" if bt is not None else "n/a", bt_green))
+    rows.append(("ST", f"{RED}{BLD}${st:,.2f}{RST}{dist_tag(st)}" if st is not None else "n/a", st_green))
 
-    rows.append(("Prev EOD Close", f"${prev_close:,.2f}" if prev_close is not None else "n/a", near(prev_close)))
+    rows.append(("Prev EOD Close", f"${prev_close:,.2f}{dist_tag(prev_close)}" if prev_close is not None else "n/a",
+                 near(prev_close)))
 
-    if gex_export and gex_export.get("gex_flip") is not None:
-        gex_flip = gex_export["gex_flip"]
-    else:
-        gex_flip = compute_gex_flip(chain, is_crypto)
-    if gex_flip is not None:
-        gflip_dist = abs(price - gex_flip)
-        gflip_col = dist_color(gflip_dist)
-        gex_flip_str = f"${gex_flip:,.2f} ({gflip_col}{BLD}${gflip_dist:,.2f} away{RST})"
-    else:
-        gex_flip_str = "n/a"
-    rows.append(("GEX Flip", gex_flip_str, near(gex_flip)))
 
     # Row's own light follows the ORIGINAL rule (unchanged): green if ANY of
     # the shown clusters is within gamma_tol. The per-cluster DISTANCE TEXT
@@ -1188,7 +1235,8 @@ def compute_dashboard_snapshot(data):
         export = read_charthacker_export(inst_name)
         gex_export = read_gex_export(inst_name)
         rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
-                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export)
+                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                              ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and qqq_market_closed()
         inst_snap["market_closed"] = closed
 
@@ -1409,7 +1457,8 @@ def render(data, remaining=None):
             continue
         p(f"        {LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
         rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
-                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export)
+                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                              ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and qqq_market_closed()
         rows_by_label = {label_: (level_str, ok) for label_, level_str, ok in rows}
         any_active = (not closed) and any(ok for _l, _v, ok in rows)
@@ -1469,17 +1518,25 @@ def render(data, remaining=None):
             else:
                 col = DIM
             return f"{col}{BLD}{direction}, ${dist:,.2f} away{RST}"
+        if gex_export and gex_export.get("gex_flip") is not None:
+            gex_flip = gex_export["gex_flip"]
+        else:
+            gex_flip = compute_gex_flip(chain, is_crypto)
         targets = []
         if ratio < 0.98:
             bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if bt is not None:
                 targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})")
+            if gex_flip is not None:
+                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
             above, _below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
             targets += [f"Cluster ({t[0]}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in above]
         elif ratio > 1.02:
             _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if st is not None:
                 targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})")
+            if gex_flip is not None:
+                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
             _above, below = gamma_cluster_targets_directional(chain, is_crypto, gex_export, price)
             targets += [f"Cluster ({t[0]}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in below]
         has_targets[inst_name] = bool(targets)

@@ -605,7 +605,7 @@ if "--btd-sigma" in args:
     BTD_SIGMA = parsed_sigma
     args = [a for j, a in enumerate(args) if j not in (i, i + 1)]
 
-BTD_MODE = True   # [D] Big Trade Detector: toggles the buy/sell volume
+BTD_MODE = False  # [D] Big Trade Detector: toggles the buy/sell volume
                   # anomaly markers on/off — pure display toggle, same
                   # instant-apply convention as [V]/[M]/[B]
 
@@ -2768,7 +2768,17 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             delta_shift = " (-)"
         else:
             delta_shift = ""
-        safe_add(win, delta_row, col_x[i], (fmt_delta(delta) + delta_shift).center(COL_W - 1), delta_color | rev)
+        delta_text = fmt_delta(delta)
+        full_text = delta_text + delta_shift
+        centered = full_text.center(COL_W - 1)
+        safe_add(win, delta_row, col_x[i], centered, delta_color | rev)
+        if delta_shift:
+            # marker color is fixed (green=+/red=-) regardless of delta_color,
+            # so it always reads as "rose"/"fell" even when delta_color is
+            # P_DEFAULT (delta == 0) or the opposite sign of the shift
+            shift_color = cp(P_GREEN, bold=True) if delta_shift.strip() == "(+)" else cp(P_RED, bold=True)
+            shift_col = col_x[i] + centered.find(full_text) + len(delta_text)
+            safe_add(win, delta_row, shift_col, delta_shift, shift_color | rev)
 
         poc_price, vah_price, val_price = bar_stats[i]
         safe_add(win, vah_row, col_x[i], fmt_price(vah_price).center(COL_W - 1), cp(P_DIM) | rev)

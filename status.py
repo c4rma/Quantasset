@@ -551,16 +551,22 @@ def fetch_pcvr():
 BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}   # same convention as gex.py's BAND_PCT
 
 def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
-    """Scan ASCENDING FROM THE BOTTOM of a spot-centered band (±20% crypto,
-    ±12% equity — same band gex.py already uses around ATM) for the first
-    3-consecutive-strike run where one side's volume dominates. The band
-    restriction matters because a raw options chain lists strikes far beyond
-    any reasonable trading range (CBOE especially — QQQ's chain runs into
-    strikes 30%+ from spot); those deep-OTM strikes have thin, noisy volume
-    that can spuriously satisfy "3 in a row" long before reaching the real,
-    liquid run near the money. Scanning the whole unrestricted chain from its
-    edge picks up that noise; the band keeps the scan confined to strikes that
-    are actually tradeable/relevant.
+    """Scan OUTWARD FROM SPOT (not from the edge of a spot-centered band) for
+    the first 3-consecutive-strike run where one side's volume dominates,
+    taking the strike CLOSEST TO SPOT within that window as the anchor.
+
+    Earlier version scanned ascending from the bottom of a ±20%/±12% band,
+    taking the run's own lowest strike as the anchor — this broke on real
+    data: deep strikes have near-zero volume on one side (e.g. call_vol=0),
+    which trivially "satisfies" 3-in-a-row long before the scan ever reaches
+    the real, liquid run near the money, producing an anchor $150+ from spot
+    (confirmed live: ETH strikes 1600/1700/1725 all had call_vol=0, forming
+    a false match, while the real liquid run sat at 1800/1825/1850 —
+    immediately below spot). Searching outward from spot and taking the
+    near-spot edge of the first qualifying window fixes this: it finds the
+    same {1800,1825,1850} window but anchors ST at 1850 (the strike closest
+    to spot within it), giving BT=1875 — confirmed correct against a live,
+    hand-checked chain.
     Returns (bt, st, active) where `active` is "BT" or "ST" — whichever one
     this PCVR regime actually scores (see module docstring)."""
     band_pct = BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
@@ -592,24 +598,27 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
                 return False
         return True
 
+    atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+
     if pcvr_gt1:
-        # ST = first strike (ascending from the bottom of the band) of the
-        # first run where put_vol > call_vol at 3 in a row; BT = the very
-        # next strike above ST.
-        for i in range(n - 2):
-            if window_ok(i, want_put=True):
-                st = sorted_strikes[i]
-                bt = sorted_strikes[i + 1] if i + 1 < n else None
+        # ST: put-dominant run, searching DOWNWARD from the strike nearest
+        # spot. Window ending at index j is strikes[j-2..j]; ST = the TOP of
+        # the first (closest-to-spot) qualifying window, BT = next strike up.
+        for j in range(min(atm_idx, n - 1), 1, -1):
+            if window_ok(j - 2, want_put=True):
+                st = sorted_strikes[j]
+                bt = sorted_strikes[j + 1] if j + 1 < n else None
                 return bt, st, "BT"
         return None, None, "BT"
     else:
-        # BT = first strike (ascending from the bottom of the band) of the
-        # first run where call_vol > put_vol at 3 in a row; ST = the strike
-        # just below BT.
-        for i in range(n - 2):
-            if window_ok(i, want_put=False):
-                bt = sorted_strikes[i]
-                st = sorted_strikes[i - 1] if i - 1 >= 0 else None
+        # BT: call-dominant run, searching UPWARD from the strike nearest
+        # spot. Window starting at index j is strikes[j..j+2]; BT = the
+        # BOTTOM of the first (closest-to-spot) qualifying window, ST = next
+        # strike down.
+        for j in range(max(atm_idx, 0), n - 2):
+            if window_ok(j, want_put=False):
+                bt = sorted_strikes[j]
+                st = sorted_strikes[j - 1] if j - 1 >= 0 else None
                 return bt, st, "ST"
         return None, None, "ST"
 

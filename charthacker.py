@@ -342,6 +342,10 @@ C_VWAP_SD2  = 18   # 2σ / 2.5σ bands
 C_ER_UP     = 43   # upper levels — green
 C_ER_DOWN   = 44   # lower levels — red
 C_ER_STOP   = 45   # ±150% hard-stop lines — magenta
+# BT/ST/GEX Flip (options-chain-derived levels, same source/math as status.py)
+C_BT        = 46   # Buy Territory — green (matches status.py's BT coloring)
+C_ST        = 47   # Sell Territory — red (matches status.py's ST coloring)
+C_GEX_FLIP  = 48   # GEX Flip (zero gamma) — blue, kept distinct from BT/ST/ER
 # The ER 40%-80% fill/level lines share the "█" glyph with real candle
 # bodies, so any OTHER overlay that wants to draw over "background" cells
 # but never over a real candle needs to distinguish the two by color pair,
@@ -417,6 +421,23 @@ class ChartState:
                                      # lets the OHLC header show accurate
                                      # historical DVOL for a cursor-selected
                                      # candle instead of always today's live IV
+        self.show_bt_st_gex = True   # BT/ST/GEX Flip overlay toggle ([;])
+        self.opt_chain        = None # nearest-expiry chain for the active asset
+                                      # (Deribit for ETH/BTC, CBOE for equities),
+                                      # kept fresh by bt_st_gex_loop — {"strikes":
+                                      # {...}, "spot": last_price_at_fetch, plus
+                                      # "expiry_ts"(crypto)/"expiry_label"(equity)}
+        self.opt_chain_is_crypto = False
+        self.opt_chain_asset  = ""   # which asset opt_chain belongs to — draw()
+                                      # only trusts it when this == state.asset,
+                                      # so a stale chain never shows after a
+                                      # symbol switch outpaces the next refresh
+        self.gex_flip         = None # GEX Flip (zero gamma) level, Black-Scholes
+                                      # swept — expensive, so computed once per
+                                      # bt_st_gex_loop cycle, not every draw() frame
+        self.pcvr_ratio        = None # shared BT/ST regime signal (TLT put/call
+                                      # 08:45-15:00 CT, BTC otherwise) — same
+                                      # source status.py's PCVR uses
         self.interval_secs = 60      # display-candle width in seconds — set
                                       # via [I] (interval_dialog); see
                                       # cur_resolution()/base_fetch_resolution()
@@ -1066,6 +1087,11 @@ def start_feed(asset: str, feed: str = "", interval_secs: int = -1):
                                     # pan could be nonsensical at a new scale
         state.er_iv          = 0.0 # stale IV from a different asset would be wrong
         state.dvol_history    = {} # ditto for the historical DVOL series
+        state.opt_chain        = None  # ditto for BT/ST/GEX Flip's chain —
+        state.opt_chain_asset  = ""    # opt_chain_asset=="" also fails the
+        state.gex_flip         = None  # draw()-side "asset matches" guard
+        state.pcvr_ratio       = None  # immediately, not just after the next
+                                        # bt_st_gex_loop cycle catches up
 
     candles = fetch_candles(asset, my_feed)
 
@@ -1305,6 +1331,9 @@ def init_colors(scheme: str = "bw"):
     curses.init_pair(C_ER_UP,     curses.COLOR_GREEN,   -1)
     curses.init_pair(C_ER_DOWN,   curses.COLOR_RED,     -1)
     curses.init_pair(C_ER_STOP,   curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_BT,        curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_ST,        curses.COLOR_RED,     -1)
+    curses.init_pair(C_GEX_FLIP,  curses.COLOR_BLUE,    -1)
 
 # ── formatting ────────────────────────────────────────────────────────────────
 def price_fmt(p: float, asset: str = "") -> str:
@@ -1452,6 +1481,384 @@ def _fetch_vxn() -> float | None:
     except Exception:
         pass
     return cached[0] if cached else None
+
+# ── BT / ST / GEX Flip (options-chain-derived levels) ────────────────────────
+# Ported from status.py (2026-07-17) — same formulas, same thresholds, so
+# whatever the chart plots here always matches what status.py's own
+# dashboard would show for the same instrument at the same moment. The one
+# deliberate difference: status.py does its own separate live-price fetch
+# for the chain's "spot" (Deribit index price / a Yahoo meta call); here the
+# caller (bt_st_gex_loop) passes state.last_price instead — this app already
+# streams a live, sub-second price for the active asset via WebSocket, so
+# reusing it is both simpler and more current than another round-trip fetch.
+BT_ST_GEX_REFRESH_SEC = 30   # matches status.py's own default --interval —
+                              # an options chain and its GEX Flip don't move
+                              # fast enough to need a tighter cadence
+MARKET_OPEN_FORCE_CT_MIN = 8 * 60 + 46   # 08:46 CT — regular equity open
+                              # (08:45 CT / 9:30 ET) plus a 1-minute buffer
+                              # for CBOE's own delayed-quotes feed to start
+                              # reflecting real intraday data. bt_st_gex_loop
+                              # force-refreshes an equity's chain right at
+                              # this boundary instead of waiting on its
+                              # normal 30s cadence to eventually catch it.
+BT_ST_BAND_PCT  = {"crypto": 0.20, "equity": 0.12}   # same as status.py/gex.py
+GEX_MULT_CRYPTO = 1
+GEX_MULT_EQUITY = 100
+BS_SWEEP_PCT    = 0.20
+BS_SWEEP_POINTS = 61
+
+DERIBIT_BASE = "https://www.deribit.com/api/v2"
+
+def _deribit_api(path, **params):
+    r = requests.get(DERIBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def fetch_deribit_option_chain(currency: str) -> dict:
+    """Nearest-expiry option chain for ETH/BTC. Returns {"strikes":
+    {strike: {"call": ticker, "put": ticker}}, "expiry_ts": ms} — same shape
+    status.py's fetch_deribit_chain builds, minus its own separate spot
+    fetch (bt_st_gex_loop supplies live spot from state.last_price instead,
+    stamped onto the dict as chain["spot"] after this returns)."""
+    instruments = _deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+    target_exp = min((e for e in by_exp if e > now_ms), default=None)
+    if not target_exp:
+        raise RuntimeError(f"No active {currency} expiry found")
+    chain_ins = by_exp[target_exp]
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
+        ticker_futs = {ex.submit(_deribit_api, "/public/ticker", instrument_name=ins["instrument_name"]): ins
+                       for ins in chain_ins}
+        tickers = {}
+        for fut, ins in ticker_futs.items():
+            try:
+                tickers[ins["instrument_name"]] = fut.result()
+            except Exception:
+                pass
+
+    strikes = {}
+    for ins in chain_ins:
+        t = tickers.get(ins["instrument_name"])
+        if not t:
+            continue
+        strikes.setdefault(ins["strike"], {})[ins["option_type"]] = t
+
+    return {"strikes": strikes, "expiry_ts": target_exp}
+
+def fetch_cboe_option_chain(symbol: str) -> dict:
+    """Nearest-expiry option chain for an equity/ETF ticker. Returns
+    {"strikes": {strike: {"call": opt, "put": opt}}, "expiry_label": "YYMMDD"}
+    — same nearest-expiry selection as status.py's fetch_cboe_chain, minus
+    its own separate spot fetch. Reuses CBOE_IV_URL (already defined above
+    for _fetch_cboe_iv) since it's the exact same delayed-quotes endpoint,
+    just reading the full chain here instead of only iv30."""
+    r = requests.get(CBOE_IV_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in data.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp_flag = name[-9]
+        exp = name[-15:-9]
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
+        by_exp.setdefault(exp, []).append((cp_flag, strike, o))
+    if not by_exp:
+        raise RuntimeError(f"empty chain for {symbol}")
+
+    if today in by_exp:
+        target_exp = today
+    else:
+        future = sorted(e for e in by_exp if e >= today)
+        target_exp = future[0] if future else min(by_exp)
+
+    strikes = {}
+    for cp_flag, strike, o in by_exp[target_exp]:
+        otype = "call" if cp_flag == "C" else "put"
+        strikes.setdefault(strike, {})[otype] = o
+
+    return {"strikes": strikes, "expiry_label": target_exp}
+
+# ── PCVR (shared BT/ST regime signal: TLT 08:45-15:00 CT, BTC otherwise) ─────
+# Verbatim thresholds/logic from status.py — a DIFFERENT sum than the
+# nearest-expiry chains above (PCVR sums put/call VOLUME across the ENTIRE
+# chain, every expiry), matching opt_dashboard.py's established number.
+TLT_WINDOW_START = 8 * 60 + 45   # 08:45 CT
+TLT_WINDOW_END   = 15 * 60       # 15:00 CT
+_CT_OFFSET_BT    = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
+
+def _now_ct():
+    return datetime.now(timezone.utc) + _CT_OFFSET_BT
+
+def _in_tlt_window():
+    n = _now_ct()
+    t_mins = n.hour * 60 + n.minute
+    is_weekday = n.weekday() < 5   # Mon=0 ... Sun=6
+    return is_weekday and TLT_WINDOW_START <= t_mins < TLT_WINDOW_END
+
+def _fetch_deribit_pcvr(currency):
+    r = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency",
+                     params={"currency": currency, "kind": "option"}, timeout=12)
+    r.raise_for_status()
+    instruments = r.json().get("result") or []
+    put_vol = call_vol = 0.0
+    for inst in instruments:
+        name = inst.get("instrument_name", "")
+        volume = float(inst.get("volume") or 0)
+        if volume == 0:
+            continue
+        suffix = name.split("-")[-1]
+        if suffix == "P":
+            put_vol += volume
+        elif suffix == "C":
+            call_vol += volume
+    return put_vol, call_vol
+
+def _fetch_cboe_pcvr(symbol):
+    r = requests.get(CBOE_IV_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    options = (r.json().get("data") or {}).get("options") or []
+    put_vol = call_vol = 0.0
+    for o in options:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp = name[-9]
+        try:
+            vol = float(o.get("volume") or 0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if cp == "P":
+            put_vol += vol
+        elif cp == "C":
+            call_vol += vol
+    return put_vol, call_vol
+
+def fetch_pcvr() -> dict:
+    """{"underlying": "TLT"|"BTC", "ratio": put/call}. Same TLT/BTC regime
+    split as status.py — the single ratio compute_bt_st's pcvr_gt1 arg
+    reads, independent of whichever asset is actually on screen."""
+    if _in_tlt_window():
+        put_vol, call_vol = _fetch_cboe_pcvr("TLT")
+        underlying = "TLT"
+    else:
+        put_vol, call_vol = _fetch_deribit_pcvr("BTC")
+        underlying = "BTC"
+    ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
+    return {"underlying": underlying, "ratio": ratio}
+
+# ── BT / ST — verbatim port of status.py's compute_bt_st ─────────────────────
+def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
+    """Scan outward from spot for the first 3-consecutive-strike run where
+    one side's volume dominates, anchoring at the strike closest to spot
+    within that window. Identical logic/thresholds to status.py's
+    compute_bt_st — see that module's docstring for the full rationale (deep
+    OTM strikes with near-zero volume on one side can trivially satisfy a
+    naive ascending scan long before the real, liquid run near the money).
+    Returns (bt, st, active) where `active` is "BT" or "ST" — whichever one
+    this PCVR regime actually scores."""
+    band_pct = BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
+    lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
+    sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
+    n = len(sorted_strikes)
+    if n < 3:
+        return None, None, ("BT" if pcvr_gt1 else "ST")
+
+    def vols(k):
+        legs = strikes.get(k, {})
+        call = legs.get("call"); put = legs.get("put")
+        if is_crypto:
+            cv = float((call.get("stats") or {}).get("volume") or 0) if call else 0.0
+            pv = float((put.get("stats") or {}).get("volume") or 0) if put else 0.0
+        else:
+            cv = float(call.get("volume") or 0) if call else 0.0
+            pv = float(put.get("volume") or 0) if put else 0.0
+        return cv, pv
+
+    def window_ok(i, want_put):
+        for k in (sorted_strikes[i], sorted_strikes[i + 1], sorted_strikes[i + 2]):
+            cv, pv = vols(k)
+            if want_put and not (pv > cv):
+                return False
+            if not want_put and not (cv > pv):
+                return False
+        return True
+
+    atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+
+    if pcvr_gt1:
+        # ST: put-dominant run, searching DOWNWARD from the strike nearest
+        # spot. Window ending at index j is strikes[j-2..j]; ST = the TOP of
+        # the first (closest-to-spot) qualifying window, BT = next strike up.
+        for j in range(min(atm_idx, n - 1), 1, -1):
+            if window_ok(j - 2, want_put=True):
+                st = sorted_strikes[j]
+                bt = sorted_strikes[j + 1] if j + 1 < n else None
+                return bt, st, "BT"
+        return None, None, "BT"
+    else:
+        # BT: call-dominant run, searching UPWARD from the strike nearest
+        # spot. Window starting at index j is strikes[j..j+2]; BT = the
+        # BOTTOM of the first (closest-to-spot) qualifying window, ST = next
+        # strike down.
+        for j in range(max(atm_idx, 0), n - 2):
+            if window_ok(j, want_put=False):
+                bt = sorted_strikes[j]
+                st = sorted_strikes[j - 1] if j - 1 >= 0 else None
+                return bt, st, "ST"
+        return None, None, "ST"
+
+# ── GEX Flip (Zero Gamma) — verbatim port of status.py's BS sweep ────────────
+def _bs_gamma(S, K, T, sigma):
+    """Black-Scholes gamma (identical formula for calls and puts). r=0 — a
+    standard simplification for short-dated options."""
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    return math.exp(-0.5 * d1 * d1) / (math.sqrt(2 * math.pi) * S * sigma * math.sqrt(T))
+
+def _build_bs_gex_curve(contracts, spot, mult, n_points=BS_SWEEP_POINTS, sweep_pct=BS_SWEEP_PCT):
+    """contracts: [(strike, "call"|"put", oi, iv_decimal, T_years), ...].
+    Returns [(hyp_spot, total_net_gex), ...] swept across ±sweep_pct of spot."""
+    lo, hi = spot * (1 - sweep_pct), spot * (1 + sweep_pct)
+    step = (hi - lo) / (n_points - 1) if n_points > 1 else 0.0
+    curve = []
+    for i in range(n_points):
+        S = lo + step * i
+        total = 0.0
+        for strike, otype, oi, iv, T in contracts:
+            gamma = _bs_gamma(S, strike, T, iv)
+            gex = gamma * oi * mult * S * S * 0.01
+            total += -gex if otype == "put" else gex
+        curve.append((S, total))
+    return curve
+
+def _find_nearest_zero_crossing(points, ref):
+    """points: [(x, y), ...] sorted ascending by x. Returns the interpolated
+    x of the y-crossing nearest `ref`, or None if y never crosses zero."""
+    if len(points) < 2:
+        return None
+    crossings = []
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        if y0 == 0:
+            crossings.append(x0)
+        elif (y0 < 0) != (y1 < 0):
+            crossings.append(x0 + (x1 - x0) * (-y0 / (y1 - y0)))
+    if not crossings:
+        return None
+    return min(crossings, key=lambda x: abs(x - ref))
+
+def _cboe_time_to_expiry_years(exp_str):
+    """exp_str: 'YYMMDD'. Time to expiry in years, treating expiry as market
+    close (15:00 local) on that date."""
+    exp_date = datetime.strptime(exp_str, "%y%m%d").date()
+    close_dt = datetime(exp_date.year, exp_date.month, exp_date.day, 15, 0, 0)
+    seconds = (close_dt - datetime.now()).total_seconds()
+    return max(seconds, 60.0) / 86400.0 / 365.0
+
+def compute_gex_flip(chain, is_crypto, spot):
+    """GEX Flip (Zero Gamma) level for an already-fetched chain, or None if
+    the Black-Scholes-repriced curve never crosses zero within ±20% of spot.
+    Same sweep as status.py/gex.py, already validated there against a live
+    Barchart figure (QQQ flip landed within ~$12)."""
+    mult = GEX_MULT_CRYPTO if is_crypto else GEX_MULT_EQUITY
+    now_ms = int(time.time() * 1000)
+    contracts = []
+    for strike, legs in chain["strikes"].items():
+        for otype, opt in legs.items():
+            if is_crypto:
+                oi = opt.get("open_interest") or 0.0
+                iv_pct = opt.get("mark_iv") or 0.0
+                iv = iv_pct / 100.0
+                T = max(chain["expiry_ts"] - now_ms, 60_000) / 1000.0 / 86400.0 / 365.0
+            else:
+                oi = opt.get("open_interest") or 0.0
+                iv = opt.get("iv") or 0.0
+                T = _cboe_time_to_expiry_years(chain["expiry_label"])
+            if oi > 0 and iv > 0:
+                contracts.append((strike, otype, oi, iv, T))
+    if not contracts:
+        return None
+    curve = _build_bs_gex_curve(contracts, spot, mult)
+    return _find_nearest_zero_crossing(curve, spot)
+
+def bt_st_gex_loop():
+    """Background: keeps state.opt_chain / state.gex_flip / state.pcvr_ratio
+    fresh for the active asset, using the fetch+compute functions above
+    (verbatim ports of status.py's own chain fetch, compute_bt_st, and
+    compute_gex_flip). Runs every BT_ST_GEX_REFRESH_SEC (30s) — an options
+    chain and its GEX Flip don't move fast enough to need a tighter cadence,
+    and the GEX Flip sweep itself (Black-Scholes re-pricing over dozens of
+    contracts x 61 points) is too expensive to redo every draw() frame. BT/ST
+    themselves are NOT cached here — draw() recomputes them fresh every
+    frame from the cached chain + the LIVE current price, same as status.py's
+    own render() does every render call, since that recompute is cheap (just
+    a scan over already-fetched strikes, no network/BS math involved).
+
+    Equity market-open force-refresh: for any non-crypto asset, the sleep
+    between cycles is broken into 5s ticks so this loop can react within
+    seconds of MARKET_OPEN_FORCE_CT_MIN (08:46 CT) rather than depend on
+    wherever the normal 30s cadence happens to land — CBOE's chain is
+    genuinely different data before vs. after the open (thin/stale
+    pre-market quotes vs. real intraday oi/iv), so BT/ST/GEX Flip should
+    refresh right at that boundary, not just "eventually, within 30s, by
+    coincidence." Fires once per calendar day (_forced_open_date tracks
+    the date it last fired), then reverts to the normal cadence."""
+    _forced_open_date = None
+    while True:
+        with state.lock:
+            asset = state.asset
+            price = state.last_price
+        is_crypto = is_crypto_symbol(asset)
+        if price:
+            try:
+                if is_crypto:
+                    chain = fetch_deribit_option_chain(asset)
+                else:
+                    chain = fetch_cboe_option_chain(asset)
+                chain["spot"] = price
+                gex_flip = compute_gex_flip(chain, is_crypto, price)
+                with state.lock:
+                    if state.asset == asset:   # still the same asset — see
+                                                # opt_chain_asset's docstring
+                        state.opt_chain           = chain
+                        state.opt_chain_is_crypto = is_crypto
+                        state.opt_chain_asset     = asset
+                        state.gex_flip            = gex_flip
+            except Exception:
+                pass   # leave previous values in place — a transient fetch
+                       # failure shouldn't blank out an already-good overlay
+        try:
+            pcvr = fetch_pcvr()
+            with state.lock:
+                state.pcvr_ratio = pcvr["ratio"]
+        except Exception:
+            pass
+
+        for _ in range(max(1, BT_ST_GEX_REFRESH_SEC // 5)):
+            time.sleep(5)
+            if not is_crypto:
+                _n_ct   = _now_ct()
+                _mins   = _n_ct.hour * 60 + _n_ct.minute
+                _today  = _n_ct.date()
+                if _mins >= MARKET_OPEN_FORCE_CT_MIN and _forced_open_date != _today:
+                    _forced_open_date = _today
+                    break   # skip the rest of this sleep — refetch now
 
 def iv_monitor_loop():
     """Background: keeps state.er_iv fresh for the active asset so draw()
@@ -2199,6 +2606,12 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         show_hline_list   = state.show_hline_list
         hline_sel         = state.hline_sel
         global_mode       = state.global_mode
+        show_bt_st_gex    = state.show_bt_st_gex
+        opt_chain         = state.opt_chain
+        opt_chain_is_crypto = state.opt_chain_is_crypto
+        opt_chain_asset   = state.opt_chain_asset
+        gex_flip          = state.gex_flip
+        pcvr_ratio        = state.pcvr_ratio
 
     all_candles = candles_snap + ([live] if live else [])
 
@@ -3437,6 +3850,21 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     if hlines:
         draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines)
 
+    # ── BT / ST / GEX FLIP ────────────────────────────────────────────
+    # BT/ST/GEX Flip use status.py's exact math (compute_bt_st/
+    # compute_gex_flip above are verbatim ports). The chain + GEX Flip
+    # (expensive Black-Scholes sweep) are only refreshed every 30s by
+    # bt_st_gex_loop; BT/ST themselves are cheap and recomputed fresh right
+    # here every frame against the live current price, same as status.py's
+    # own render() does on every render call. opt_chain_asset == asset
+    # guards against showing a stale chain from a just-abandoned symbol
+    # during the up-to-30s window before the background loop catches up.
+    if show_bt_st_gex and opt_chain and opt_chain_asset == asset and last_price:
+        _btg_pcvr_gt1 = bool(pcvr_ratio is not None and pcvr_ratio > 1.00)
+        _btg_bt, _btg_st, _btg_active = compute_bt_st(
+            opt_chain["strikes"], opt_chain_is_crypto, _btg_pcvr_gt1, last_price)
+        draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, _btg_bt, _btg_st, gex_flip)
+
     # ── POSITION TOOLS ───────────────────────────────────────────────
     if pos_tools:
         draw_pos_tools(db, chart_top, chart_bot, chart_r, p2r,
@@ -4629,6 +5057,34 @@ def draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines):
                 C_VWAP, curses.A_BOLD | curses.A_REVERSE)
 
 
+def draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, bt, st, gex_flip):
+    """Draw BT (green)/ST (red)/GEX Flip (blue) as full-width dashed lines —
+    same visual language as draw_hlines(). Values come from compute_bt_st()/
+    compute_gex_flip() above, which are verbatim ports of status.py's own
+    math, so these are exactly the levels status.py's dashboard would show
+    for the same instrument right now."""
+    PRICE_W = 12   # must match draw_hlines()/main draw() layout constant
+
+    def _line(price, pair, label):
+        if price is None:
+            return
+        row = chart_top + p2r(price)
+        if not (chart_top <= row < chart_bot):
+            return
+        for col in range(chart_r):
+            _cell = db.buf[row][col]
+            if _cell[0] in (" ", ".", ":") or (_cell[0] == "█" and _cell[1] in ER_FILL_PAIRS):
+                db.put(row, col, "-", pair, curses.A_BOLD)
+        lbl_text = f"{label} {price:.2f}"
+        db.put(row, chart_r, "+", pair, curses.A_BOLD)
+        db.puts(row, chart_r + 1, f"{lbl_text:<{PRICE_W}}"[:PRICE_W],
+                pair, curses.A_BOLD | curses.A_REVERSE)
+
+    _line(bt, C_BT, "BT")
+    _line(st, C_ST, "ST")
+    _line(gex_flip, C_GEX_FLIP, "GEX")
+
+
 def draw_hline_list_overlay(db, rows, cols, hlines, sel):
     """Non-blocking drawing list overlay."""
     box_w = min(cols - 4, 60)
@@ -5424,6 +5880,7 @@ HELP_SECTIONS = [
         ("[B]",        "Toggle Expected Range overlay (IV-implied daily move)"),
         ("[T]",        "Toggle Big Trade Detector  (volume anomaly circles)"),
         ("[S]",        "Toggle Sessions indicator  (NDO/Morn/Excl/Lunch/PWR/EOD/EEOD)"),
+        ("[;]",        "Toggle BT/ST/GEX Flip overlay  (options-chain levels, status.py math)"),
     ]),
     ("INDICATORS", [
         ("VWAP",         "Volume Weighted Avg Price  (session-anchored 19:00 CT)"),
@@ -5438,6 +5895,10 @@ HELP_SECTIONS = [
         ("ER ±150%",     "Expected Range hard-stop levels  (magenta, bold)"),
         ("",             "  Crypto IV = live Deribit DVOL. Stocks/other = live CBOE iv30."),
         ("S",            "Period separator  (19:00 CT session open)"),
+        ("BT",           "Buy Territory  (green) — nearest-expiry chain, status.py math"),
+        ("ST",           "Sell Territory  (red) — nearest-expiry chain, status.py math"),
+        ("GEX",          "GEX Flip / Zero Gamma  (blue) — Black-Scholes sweep, status.py math"),
+        ("",             "  Chain refreshed every 30s; BT/ST/GEX recompute vs live price."),
     ]),
     ("DRAWINGS", [
         ("[`]",        "Toggle Drawings list (backtick key)"),
@@ -5691,75 +6152,85 @@ def alert_monitor():
 
 
 # ── Economic calendar fetcher ─────────────────────────────────────────────────
-# Switched from scraping Investing.com to Forex Factory's public calendar feed
-# (2026-07-17) — Investing.com started hard-403ing every request at the
-# Cloudflare WAF level, including a plain homepage GET with full browser
-# headers, no JS-challenge page returned at all. That's a site-side block,
-# not fixable by UA/header tweaks (re-verified still 403 later the same day),
-# so the whole scraper was swapped for nfs.faireconomy.media's
-# ff_calendar_thisweek.json — a free, no-auth, plain JSON feed (verified
-# live: 200 OK, real event data) that many trading tools already rely on for
-# exactly this. Only "thisweek" is actually hosted there (lastweek/nextweek/
-# thismonth all 404'd when probed) — spans Sun-Sat of the current week, so
-# "yesterday" on a Sunday or "tomorrow" on a Saturday can come back empty
-# (falls through to the existing "No events" UI state, same as any other
-# empty-fetch case). No "actual" field in this feed at all (only
-# title/country/date/impact/forecast/previous) — a real gap vs. Investing.
-# com's post-release actuals, but draw_econ_cal_overlay() never rendered
-# "actual" in the first place, so nothing visible regresses.
+# History (2026-07-17, all same day): started on Investing.com's HTML scrape,
+# switched to Forex Factory's public ff_calendar_thisweek.json after
+# Investing.com started hard-403ing every request at the Cloudflare WAF level
+# (re-verified 3 separate times since, always the identical 403/3-byte body —
+# a standing block, not a rate limit or a one-off). Forex Factory worked but
+# turned out to be BOTH rate-limit-fragile (a handful of rapid requests could
+# 429 it for minutes — this is what the thread-leak bug and the shared-cache
+# hardening further down this file's history were fighting) AND structurally
+# thin — a live check found it only had ~10 US events for a given week,
+# versus Investing.com's usual 40+.
 #
-# Hardened against Forex Factory's own per-IP rate limiter (same day,
-# follow-up): the feed serves the WHOLE week in one payload, so every
-# date_range view (today/yesterday/tomorrow/week) now filters ONE shared
-# cached fetch in-memory (_fetch_ff_raw(), 90s TTL) instead of each range
-# hitting the network separately — cycling through all 4 range keys costs
-# at most one live request, not four. A global 20s minimum gap between any
-# two live requests (_FF_MIN_GAP) is kept as a second layer of defense for
-# whatever races the TTL alone doesn't catch (e.g. the load_econ_calendar
-# auto-loop's 60s cycle landing right as the cache expires), guarded by a
-# lock so concurrent callers can't both slip through at once. On any
-# failure (429, timeout, bad JSON) this now falls back to the last
-# successfully cached payload instead of returning an empty list — a
-# transient rate-limit hit degrades to slightly-stale data, not a blank
-# "No events" screen that looks like the feature broke.
-_IMPACT_MAP   = {"low": 1, "medium": 2, "high": 3, "holiday": 1}
-_ff_raw_cache = None          # (raw_events, fetched_at) — shared across all date_range views
-_FF_CACHE_TTL = 90            # seconds — serve from cache with zero network calls inside this window
-_FF_MIN_GAP   = 20            # seconds — floor between any two live requests, even across cache expiry
-_ff_last_request_ts = 0.0
-_ff_fetch_lock = threading.Lock()
+# Switched again, this time to TradingView's economic-calendar backing API
+# (economic-calendar.tradingview.com/events) — the same endpoint
+# tradingview.com's own calendar widget calls. Verified directly: no
+# Cloudflare block, no rate-limit hit across 6 rapid back-to-back requests
+# (unlike Forex Factory), and richer data than EITHER prior source — 171 US
+# events over a 15-day test window vs. Forex Factory's low double digits, AND
+# it has real "actual" (post-release) values Forex Factory's feed lacked
+# entirely (draw_econ_cal_overlay() doesn't render "actual" today, but this
+# closes that gap if it ever does). `importance` is -1/0/1 (Low/Medium/High)
+# instead of a string label — mapped straight to this app's existing 1/2/3
+# tiers. `date` is ISO8601 UTC with a trailing "Z", which datetime.fromisoformat
+# only accepts natively on Python 3.11+; swapped for "+00:00" here so this
+# works on older interpreters too (this box runs 3.10).
+#
+# Same caching/cooldown/stale-fallback architecture kept from the Forex
+# Factory version (renamed tv_* instead of ff_*) even though TradingView
+# hasn't shown rate-limiting in testing — cheap insurance, and it means every
+# date_range view (today/yesterday/tomorrow/week) still shares ONE fetch
+# instead of hitting the network per range.
+TV_CAL_URL   = "https://economic-calendar.tradingview.com/events"
+TV_HEADERS   = {"User-Agent": "Mozilla/5.0",
+               "Origin": "https://www.tradingview.com",
+               "Referer": "https://www.tradingview.com/"}
+_IMPACT_MAP_TV = {-1: 1, 0: 2, 1: 3}   # Low/Medium/High -> this app's 1/2/3 tiers
+_tv_raw_cache = None          # (raw_events, fetched_at) — shared across all date_range views
+_TV_CACHE_TTL = 90            # seconds — serve from cache with zero network calls inside this window
+_TV_MIN_GAP   = 20            # seconds — floor between any two live requests, even across cache expiry
+_tv_last_request_ts = 0.0
+_tv_fetch_lock = threading.Lock()
 
 
-def _fetch_ff_raw():
-    """Fetch+cache the full weekly JSON once; fetch_econ_calendar() filters
-    this same cached payload for every date_range instead of re-fetching
-    per range. Falls back to the last good cache on any failure."""
-    global _ff_raw_cache, _ff_last_request_ts
+def _fetch_tv_raw():
+    """Fetch+cache a wide [-3d, +10d] window once; fetch_econ_calendar()
+    filters this same cached payload for every date_range instead of
+    re-fetching per range. Falls back to the last good cache on any
+    failure (mirrors the Forex Factory version's hardening, kept as cheap
+    insurance even though TradingView hasn't shown rate-limiting here)."""
+    global _tv_raw_cache, _tv_last_request_ts
     now = time.time()
-    if _ff_raw_cache and now - _ff_raw_cache[1] < _FF_CACHE_TTL:
-        return _ff_raw_cache[0]
-    with _ff_fetch_lock:
+    if _tv_raw_cache and now - _tv_raw_cache[1] < _TV_CACHE_TTL:
+        return _tv_raw_cache[0]
+    with _tv_fetch_lock:
         now = time.time()
-        if _ff_raw_cache and now - _ff_raw_cache[1] < _FF_CACHE_TTL:
-            return _ff_raw_cache[0]
-        if now - _ff_last_request_ts < _FF_MIN_GAP:
-            return _ff_raw_cache[0] if _ff_raw_cache else None
-        _ff_last_request_ts = now
+        if _tv_raw_cache and now - _tv_raw_cache[1] < _TV_CACHE_TTL:
+            return _tv_raw_cache[0]
+        if now - _tv_last_request_ts < _TV_MIN_GAP:
+            return _tv_raw_cache[0] if _tv_raw_cache else None
+        _tv_last_request_ts = now
         try:
-            r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            nowu = datetime.utcnow()
+            params = {
+                "from": (nowu - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "to":   (nowu + timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "countries": "US",
+            }
+            r = requests.get(TV_CAL_URL, headers=TV_HEADERS, params=params, timeout=15)
             if r.status_code != 200:
-                return _ff_raw_cache[0] if _ff_raw_cache else None
-            raw = r.json() or []
-            _ff_raw_cache = (raw, now)
+                return _tv_raw_cache[0] if _tv_raw_cache else None
+            raw = r.json().get("result") or []
+            _tv_raw_cache = (raw, now)
             return raw
         except Exception:
-            return _ff_raw_cache[0] if _ff_raw_cache else None
+            return _tv_raw_cache[0] if _tv_raw_cache else None
 
 
 def fetch_econ_calendar(date_range="today"):
     """
-    Fetch US (USD) economic events from Forex Factory's public calendar feed.
+    Fetch US economic events from TradingView's economic-calendar API.
     date_range: yesterday/today/tomorrow/week
     """
     import datetime as _dt2
@@ -5770,29 +6241,28 @@ def fetch_econ_calendar(date_range="today"):
     elif date_range == "tomorrow":
         target_start = target_end = today + _dt2.timedelta(days=1)
     elif date_range == "week":
-        # Sun-Sat containing today, NOT "today forward 6 days" — the feed
-        # itself is scoped to that same Sun-Sat window (its earliest date is
-        # always a Sunday), so a forward-only filter silently threw away
-        # every already-elapsed day of the current week even though that
-        # data was already sitting in the fetched payload. today.weekday()
-        # is Mon=0..Sun=6; (weekday()+1)%7 remaps it to Sun=0..Sat=6 so we
-        # can subtract back to that Sunday.
+        # Sun-Sat containing today, NOT "today forward 6 days" — a
+        # forward-only filter would silently throw away every already-
+        # elapsed day of the current week. today.weekday() is Mon=0..Sun=6;
+        # (weekday()+1)%7 remaps it to Sun=0..Sat=6 so we can subtract back
+        # to that Sunday.
         _wd = (today.weekday() + 1) % 7
         target_start = today - _dt2.timedelta(days=_wd)
         target_end   = target_start + _dt2.timedelta(days=6)
     else:
         target_start = target_end = today
 
-    raw_events = _fetch_ff_raw()
+    raw_events = _fetch_tv_raw()
     if not raw_events:
         return []
 
     events = []
     for ev in raw_events:
-        if ev.get("country") != "USD":
+        if ev.get("country") != "US":
             continue
+        raw_date = (ev.get("date") or "").replace("Z", "+00:00")
         try:
-            dt = datetime.fromisoformat(ev.get("date", ""))  # tz-aware (ET, DST-correct)
+            dt = datetime.fromisoformat(raw_date)   # tz-aware UTC
         except Exception:
             continue
         if not (target_start.date() <= dt.date() <= target_end.date()):
@@ -5801,10 +6271,10 @@ def fetch_econ_calendar(date_range="today"):
         events.append({
             "time":     datetime.fromtimestamp(ts).strftime("%H:%M"),
             "name":     ev.get("title", ""),
-            "impact":   _IMPACT_MAP.get((ev.get("impact") or "").strip().lower(), 1),
-            "actual":   ev.get("actual", ""),
-            "forecast": ev.get("forecast", ""),
-            "previous": ev.get("previous", ""),
+            "impact":   _IMPACT_MAP_TV.get(ev.get("importance"), 1),
+            "actual":   "" if ev.get("actual") is None else str(ev.get("actual")),
+            "forecast": "" if ev.get("forecast") is None else str(ev.get("forecast")),
+            "previous": "" if ev.get("previous") is None else str(ev.get("previous")),
             "ts":       ts,
         })
 
@@ -6136,6 +6606,7 @@ def main(stdscr):
     threading.Thread(target=alert_monitor, daemon=True).start()
     threading.Thread(target=_bg_ticker_loop, daemon=True).start()
     threading.Thread(target=iv_monitor_loop, daemon=True).start()
+    threading.Thread(target=bt_st_gex_loop, daemon=True).start()
     threading.Thread(target=status_export_loop, daemon=True).start()
     threading.Thread(target=check_open_position_on_startup, daemon=True).start()
     # Start trade monitor immediately — auto-plots any existing positions/orders
@@ -6237,6 +6708,12 @@ def main(stdscr):
             elif key in (ord("b"), ord("B")):
                 with state.lock:
                     state.show_er = not state.show_er
+                db.prev = None
+            elif key == ord(";"):
+                # Toggle BT/ST/GEX Flip overlay — freed up when the
+                # liquidation heatmap (its previous owner) was removed.
+                with state.lock:
+                    state.show_bt_st_gex = not state.show_bt_st_gex
                 db.prev = None
             elif key in (ord("w"), ord("W")):
                 with state.lock:

@@ -17,9 +17,11 @@ be checked by hand across multiple other tools in this repo.
                          times/days) — this single ratio is the shared regime
                          signal every conditional HPL/Targets rule reads.
                          BT/ST's own branch selection still uses the >1.00/
-                         <1.00 split; VAH/VAL/POC/±2sd (below) and Targets
-                         use a stricter <0.98/>1.02 split — different
-                         thresholds for different rules, both intentional.
+                         <1.00 split; VAH/VAL/POC/±2sd use a stricter
+                         <0.98/>1.02 split; ER rows use an inclusive
+                         <=0.98/>=1.02 split — three different thresholds for
+                         different rules, all given explicitly, not the same
+                         by coincidence.
   4. HPLs             — High-Probability Levels, evaluated separately for ETH
                          (Deribit + Phemex) and QQQ (CBOE + Yahoo), 14 rules
                          each, grouped for display into Volume (VAH, VAL,
@@ -31,8 +33,11 @@ be checked by hand across multiple other tools in this repo.
                          ±2sd have no proximity tolerance — once price has
                          actually crossed (PCVR<0.98: VAL/-2sd at price<=
                          level, POC at/near POC; PCVR>1.02: the VAH/+2sd
-                         mirror), it counts regardless of how far past;
-                         every other row still needs price within tolerance.
+                         mirror), it counts regardless of how far past. ER
+                         rows are also PCVR-direction-gated: PCVR>=1.02 ->
+                         only the upper band/level can be active; PCVR<=0.98
+                         -> only the lower one. Every other row still needs
+                         price within tolerance, PCVR-ungated.
                          QQQ's rows show CLOSED (not ACTIVE/INACTIVE) outside
                          Mon-Fri 08:45-15:00 CT (including all day weekends).
   5. Targets          — BT + GEX Flip + every Medium/Large gamma cluster
@@ -550,30 +555,42 @@ def fetch_pcvr():
 # ── BT / ST ────────────────────────────────────────────────────────────────
 BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}   # same convention as gex.py's BAND_PCT
 
-def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
-    """Scan OUTWARD FROM SPOT (not from the edge of a spot-centered band) for
-    the first 3-consecutive-strike run where one side's volume dominates,
-    taking the strike CLOSEST TO SPOT within that window as the anchor.
+BT_ST_MAX_STRIKES_FROM_ATM = 10   # how far the scan is allowed to travel from
+                                  # spot before giving up — see compute_bt_st
 
-    Earlier version scanned ascending from the bottom of a ±20%/±12% band,
-    taking the run's own lowest strike as the anchor — this broke on real
-    data: deep strikes have near-zero volume on one side (e.g. call_vol=0),
-    which trivially "satisfies" 3-in-a-row long before the scan ever reaches
-    the real, liquid run near the money, producing an anchor $150+ from spot
-    (confirmed live: ETH strikes 1600/1700/1725 all had call_vol=0, forming
-    a false match, while the real liquid run sat at 1800/1825/1850 —
-    immediately below spot). Searching outward from spot and taking the
-    near-spot edge of the first qualifying window fixes this: it finds the
-    same {1800,1825,1850} window but anchors ST at 1850 (the strike closest
-    to spot within it), giving BT=1875 — confirmed correct against a live,
-    hand-checked chain.
+BT_ST_RUN_LEN = {"crypto": 3, "equity": 5}   # consecutive strikes required for
+                    # a side's volume to count as "consistently" dominant (not
+                    # just a 1-2 strike blip that flips between refresh
+                    # cycles) — crypto chains list far fewer strikes than
+                    # equity chains, so a 5-run is often unreachable there
+
+def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
+    """Scan outward from the strike nearest spot (both directions) for the
+    first consecutive-strike run (length set by BT_ST_RUN_LEN, per asset
+    class) where one side's volume dominates, capped at
+    BT_ST_MAX_STRIKES_FROM_ATM strikes away — if nothing qualifies within
+    that radius, returns None/None.
+
+    Per the exact spec: when PCVR<=0.98, BT is the FIRST strike (scanning
+    outward from spot) where call volume is consistently greater than put
+    volume — i.e. the edge of the qualifying run nearest to spot, not the
+    far edge — and ST is simply one strike below BT. When PCVR>=1.02, ST is
+    the first strike (same outward scan) where put volume is consistently
+    greater, and BT is one strike above ST. Only one side is ever searched
+    directly; the other is always just the adjacent strike.
+
+    Candidate windows are ranked by distance from spot (in strike-index
+    terms) and evaluated closest-first, so the result is always the
+    nearest-to-spot qualifying run within the capped radius.
+
     Returns (bt, st, active) where `active` is "BT" or "ST" — whichever one
     this PCVR regime actually scores (see module docstring)."""
     band_pct = BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
+    run_len = BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
     lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
     sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
     n = len(sorted_strikes)
-    if n < 3:
+    if n < run_len:
         return None, None, ("BT" if pcvr_gt1 else "ST")
 
     def vols(k):
@@ -587,11 +604,11 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
             pv = float(put.get("volume") or 0) if put else 0.0
         return cv, pv
 
-    def window_ok(i, want_put):
-        """True if strikes[i..i+2] all have put_vol>call_vol (want_put) or
-        call_vol>put_vol (not want_put)."""
-        for k in (sorted_strikes[i], sorted_strikes[i + 1], sorted_strikes[i + 2]):
-            cv, pv = vols(k)
+    def run_ok(start, want_put):
+        """True if strikes[start..start+run_len-1] all have put_vol>call_vol
+        (want_put) or call_vol>put_vol (not want_put)."""
+        for idx in range(start, start + run_len):
+            cv, pv = vols(sorted_strikes[idx])
             if want_put and not (pv > cv):
                 return False
             if not want_put and not (cv > pv):
@@ -599,28 +616,39 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
         return True
 
     atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+    max_start = n - run_len
+    if max_start < 0:
+        return None, None, ("BT" if pcvr_gt1 else "ST")
 
-    if pcvr_gt1:
-        # ST: put-dominant run, searching DOWNWARD from the strike nearest
-        # spot. Window ending at index j is strikes[j-2..j]; ST = the TOP of
-        # the first (closest-to-spot) qualifying window, BT = next strike up.
-        for j in range(min(atm_idx, n - 1), 1, -1):
-            if window_ok(j - 2, want_put=True):
-                st = sorted_strikes[j]
-                bt = sorted_strikes[j + 1] if j + 1 < n else None
+    lo_start = max(0, atm_idx - BT_ST_MAX_STRIKES_FROM_ATM)
+    hi_start = min(max_start, atm_idx + BT_ST_MAX_STRIKES_FROM_ATM)
+
+    candidates = []
+    for s in range(lo_start, hi_start + 1):
+        top = s + run_len - 1
+        if top <= atm_idx:
+            near_idx, dist = top, atm_idx - top          # window below spot
+        elif s >= atm_idx:
+            near_idx, dist = s, s - atm_idx               # window above spot
+        else:
+            near_idx, dist = atm_idx, 0                   # window straddles spot
+        candidates.append((dist, s, near_idx))
+    candidates.sort(key=lambda c: c[0])
+
+    want_put = bool(pcvr_gt1)   # PCVR>=1.02 -> searching for ST (puts dominant)
+    for _dist, s, near_idx in candidates:
+        if run_ok(s, want_put):
+            anchor = sorted_strikes[near_idx]
+            if want_put:
+                st = anchor
+                bt = sorted_strikes[near_idx + 1] if near_idx + 1 < n else None
                 return bt, st, "BT"
-        return None, None, "BT"
-    else:
-        # BT: call-dominant run, searching UPWARD from the strike nearest
-        # spot. Window starting at index j is strikes[j..j+2]; BT = the
-        # BOTTOM of the first (closest-to-spot) qualifying window, ST = next
-        # strike down.
-        for j in range(max(atm_idx, 0), n - 2):
-            if window_ok(j, want_put=False):
-                bt = sorted_strikes[j]
-                st = sorted_strikes[j - 1] if j - 1 >= 0 else None
+            else:
+                bt = anchor
+                st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
                 return bt, st, "ST"
-        return None, None, "ST"
+
+    return None, None, ("BT" if pcvr_gt1 else "ST")
 
 # ── Gamma clusters (Medium/Large tier, reusing gex.py's magnitude_char tiers) ─
 MULT_CRYPTO = 1
@@ -1147,19 +1175,29 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         rows.append(("0.5sd band", "n/a", False))
         rows.append(("VWAP", "n/a", False))
 
+    # ER rows are PCVR-direction-gated: PCVR>=1.02 -> only the UPPER side can
+    # be active; PCVR<=0.98 -> only the LOWER side. Inclusive thresholds
+    # (>=,<=) here, unlike VAH/VAL/POC/±2sd's strict (<,>) gate above — both
+    # given explicitly, not the same threshold by coincidence.
     er = compute_er(session_open, iv)
     if er:
         u40, u80, u100, u150 = er["upper"][40], er["upper"][80], er["upper"][100], er["upper"][150]
         l40, l80, l100, l150 = er["lower"][40], er["lower"][80], er["lower"][100], er["lower"][150]
-        in_band = (u40 <= price <= u80) or (l80 <= price <= l40)
+        pcvr_ge_102 = ratio is not None and ratio >= 1.02
+        pcvr_le_098 = ratio is not None and ratio <= 0.98
+        in_upper_band = u40 <= price <= u80
+        in_lower_band = l80 <= price <= l40
+        band_active = (pcvr_ge_102 and in_upper_band) or (pcvr_le_098 and in_lower_band)
         er_band_dist = min(
-            0.0 if u40 <= price <= u80 else min(abs(price - u40), abs(price - u80)),
-            0.0 if l80 <= price <= l40 else min(abs(price - l40), abs(price - l80)),
+            0.0 if in_upper_band else min(abs(price - u40), abs(price - u80)),
+            0.0 if in_lower_band else min(abs(price - l40), abs(price - l80)),
         )
         er_band_tag = f" ({dist_color(er_band_dist)}{BLD}${er_band_dist:,.2f} away{RST})"
-        rows.append(("ER 40-80% band", f"${u40:,.2f}-${u80:,.2f} / ${l80:,.2f}-${l40:,.2f}{er_band_tag}", in_band))
-        rows.append(("ER 100%", f"${u100:,.2f} / ${l100:,.2f}{nearest_dist_tag(u100, l100)}", near(u100) or near(l100)))
-        rows.append(("ER 150%", f"${u150:,.2f} / ${l150:,.2f}{nearest_dist_tag(u150, l150)}", near(u150) or near(l150)))
+        rows.append(("ER 40-80% band", f"${u40:,.2f}-${u80:,.2f} / ${l80:,.2f}-${l40:,.2f}{er_band_tag}", band_active))
+        rows.append(("ER 100%", f"${u100:,.2f} / ${l100:,.2f}{nearest_dist_tag(u100, l100)}",
+                     (pcvr_ge_102 and near(u100)) or (pcvr_le_098 and near(l100))))
+        rows.append(("ER 150%", f"${u150:,.2f} / ${l150:,.2f}{nearest_dist_tag(u150, l150)}",
+                     (pcvr_ge_102 and near(u150)) or (pcvr_le_098 and near(l150))))
     else:
         rows.append(("ER 40-80% band", "n/a", False))
         rows.append(("ER 100%", "n/a", False))

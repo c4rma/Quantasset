@@ -1078,7 +1078,15 @@ def start_feed(asset: str, feed: str = "", interval_secs: int = -1):
         state.session      += 1
         my_session          = state.session
         state.status        = "Loading..."
-        state.error         = ""
+        # Don't clobber load_chart_state()'s "Chart restored: N pos-tool(s)..."
+        # confirmation — start_feed() runs in its own thread spawned right
+        # after load_chart_state() at startup, so this line was racing (and
+        # almost always winning against) that message, clearing it within a
+        # frame or two of it ever appearing. The user had no reliable way to
+        # tell restored pos_tools/hlines/alerts actually loaded, which read
+        # as "it's gone" even when the data itself was fine.
+        if not state.error.startswith("Chart restored:"):
+            state.error     = ""
         state.candles.clear()
         state.live          = None
         state.last_price    = 0.0
@@ -1502,6 +1510,16 @@ MARKET_OPEN_FORCE_CT_MIN = 8 * 60 + 46   # 08:46 CT — regular equity open
                               # this boundary instead of waiting on its
                               # normal 30s cadence to eventually catch it.
 BT_ST_BAND_PCT  = {"crypto": 0.20, "equity": 0.12}   # same as status.py/gex.py
+BT_ST_MAX_STRIKES_FROM_ATM = 10   # how far the scan is allowed to travel
+                                   # from spot before giving up — see
+                                   # compute_bt_st's docstring; same as
+                                   # status.py's constant of the same name
+BT_ST_RUN_LEN = {"crypto": 3, "equity": 5}   # consecutive strikes required
+                    # for a side's volume to count as "consistently"
+                    # dominant (not just a 1-2 strike blip that flips
+                    # between refresh cycles) — crypto chains list far
+                    # fewer strikes than equity chains, so a 5-run is often
+                    # unreachable there; same as status.py's constant
 GEX_MULT_CRYPTO = 1
 GEX_MULT_EQUITY = 100
 BS_SWEEP_PCT    = 0.20
@@ -1662,19 +1680,33 @@ def fetch_pcvr() -> dict:
 
 # ── BT / ST — verbatim port of status.py's compute_bt_st ─────────────────────
 def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
-    """Scan outward from spot for the first 3-consecutive-strike run where
-    one side's volume dominates, anchoring at the strike closest to spot
-    within that window. Identical logic/thresholds to status.py's
-    compute_bt_st — see that module's docstring for the full rationale (deep
-    OTM strikes with near-zero volume on one side can trivially satisfy a
-    naive ascending scan long before the real, liquid run near the money).
-    Returns (bt, st, active) where `active` is "BT" or "ST" — whichever one
-    this PCVR regime actually scores."""
+    """Scan outward from the strike nearest spot (both directions) for the
+    first consecutive-strike run (length set by BT_ST_RUN_LEN, per asset
+    class) where one side's volume dominates, capped at
+    BT_ST_MAX_STRIKES_FROM_ATM strikes away — if nothing qualifies within
+    that radius, returns None/None.
+
+    Per the exact spec: when PCVR<=0.98, BT is the FIRST strike (scanning
+    outward from spot) where call volume is consistently greater than put
+    volume — i.e. the edge of the qualifying run nearest to spot, not the
+    far edge — and ST is simply one strike below BT. When PCVR>=1.02, ST is
+    the first strike (same outward scan) where put volume is consistently
+    greater, and BT is one strike above ST. Only one side is ever searched
+    directly; the other is always just the adjacent strike.
+
+    Candidate windows are ranked by distance from spot (in strike-index
+    terms) and evaluated closest-first, so the result is always the
+    nearest-to-spot qualifying run within the capped radius.
+
+    Identical logic/thresholds to status.py's compute_bt_st — keep these two
+    in sync any time one changes. Returns (bt, st, active) where `active` is
+    "BT" or "ST" — whichever one this PCVR regime actually scores."""
     band_pct = BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
+    run_len = BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
     lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
     sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
     n = len(sorted_strikes)
-    if n < 3:
+    if n < run_len:
         return None, None, ("BT" if pcvr_gt1 else "ST")
 
     def vols(k):
@@ -1688,9 +1720,11 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
             pv = float(put.get("volume") or 0) if put else 0.0
         return cv, pv
 
-    def window_ok(i, want_put):
-        for k in (sorted_strikes[i], sorted_strikes[i + 1], sorted_strikes[i + 2]):
-            cv, pv = vols(k)
+    def run_ok(start, want_put):
+        """True if strikes[start..start+run_len-1] all have put_vol>call_vol
+        (want_put) or call_vol>put_vol (not want_put)."""
+        for idx in range(start, start + run_len):
+            cv, pv = vols(sorted_strikes[idx])
             if want_put and not (pv > cv):
                 return False
             if not want_put and not (cv > pv):
@@ -1698,28 +1732,39 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
         return True
 
     atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+    max_start = n - run_len
+    if max_start < 0:
+        return None, None, ("BT" if pcvr_gt1 else "ST")
 
-    if pcvr_gt1:
-        # ST: put-dominant run, searching DOWNWARD from the strike nearest
-        # spot. Window ending at index j is strikes[j-2..j]; ST = the TOP of
-        # the first (closest-to-spot) qualifying window, BT = next strike up.
-        for j in range(min(atm_idx, n - 1), 1, -1):
-            if window_ok(j - 2, want_put=True):
-                st = sorted_strikes[j]
-                bt = sorted_strikes[j + 1] if j + 1 < n else None
+    lo_start = max(0, atm_idx - BT_ST_MAX_STRIKES_FROM_ATM)
+    hi_start = min(max_start, atm_idx + BT_ST_MAX_STRIKES_FROM_ATM)
+
+    candidates = []
+    for s in range(lo_start, hi_start + 1):
+        top = s + run_len - 1
+        if top <= atm_idx:
+            near_idx, dist = top, atm_idx - top          # window below spot
+        elif s >= atm_idx:
+            near_idx, dist = s, s - atm_idx               # window above spot
+        else:
+            near_idx, dist = atm_idx, 0                   # window straddles spot
+        candidates.append((dist, s, near_idx))
+    candidates.sort(key=lambda c: c[0])
+
+    want_put = bool(pcvr_gt1)   # PCVR>=1.02 -> searching for ST (puts dominant)
+    for _dist, s, near_idx in candidates:
+        if run_ok(s, want_put):
+            anchor = sorted_strikes[near_idx]
+            if want_put:
+                st = anchor
+                bt = sorted_strikes[near_idx + 1] if near_idx + 1 < n else None
                 return bt, st, "BT"
-        return None, None, "BT"
-    else:
-        # BT: call-dominant run, searching UPWARD from the strike nearest
-        # spot. Window starting at index j is strikes[j..j+2]; BT = the
-        # BOTTOM of the first (closest-to-spot) qualifying window, ST = next
-        # strike down.
-        for j in range(max(atm_idx, 0), n - 2):
-            if window_ok(j, want_put=False):
-                bt = sorted_strikes[j]
-                st = sorted_strikes[j - 1] if j - 1 >= 0 else None
+            else:
+                bt = anchor
+                st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
                 return bt, st, "ST"
-        return None, None, "ST"
+
+    return None, None, ("BT" if pcvr_gt1 else "ST")
 
 # ── GEX Flip (Zero Gamma) — verbatim port of status.py's BS sweep ────────────
 def _bs_gamma(S, K, T, sigma):

@@ -136,25 +136,36 @@ What it shows, per price level per bar:
   plain when there's no previous bar to compare against.
   All eight read "—" for a bar with no real trades.
 
-[V] toggles Volume Profile mode — pure display toggle, same instant-apply,
-no-rebuild convention as [M]/[B]. Replaces every bar's "<bid> x <ask>" cells
-with a single gradient-shaded horizontal bar per price row, length
-proportional to that level's combined bid+ask volume relative to the bar's
-own busiest level (see vp_bar_str() — uses eighth-block Unicode characters
-for sub-character precision, not just whole blocks). Colour marks the
-Value Area: the classic Volume Profile algorithm (compute_value_area) —
-starting at the POC, greedily expand toward whichever adjacent level (above
-or below) has more volume, until VALUE_AREA_FRACTION (70%, the standard
+[V] cycles the profile display: off -> Volume Profile -> Delta Profile ->
+off — pure display toggle, same instant-apply, no-rebuild convention as
+[M]/[B]. Both modes replace every bar's "<bid> x <ask>" cells with a single
+horizontal bar per price row instead (see vp_bar_str()); POC/open/close
+markers still show in the same left gutter, same precedence, as in the
+normal footprint view in either mode, and both leave imbalance/Big Trades
+highlighting off (a profile bar shows one aggregated number per level, not
+a bid/ask split).
+
+Volume Profile: bar length proportional to that level's combined bid+ask
+volume relative to the bar's own busiest level. Colour marks the Value
+Area: the classic Volume Profile algorithm (compute_value_area) — starting
+at the POC, greedily expand toward whichever adjacent level (above or
+below) has more volume, until VALUE_AREA_FRACTION (70%, the standard
 default) of the bar's total volume is enclosed — shaded from cyan
 (lightest, at the Value Area's outer edge) to blue (darkest, at the POC) —
 two distinct colors rather than one color with a bold/dim attribute trick,
 since A_BOLD and A_DIM are each inconsistently supported across terminals
 (see the comment at this gradient's implementation); the remaining ~30%
-outer tails are dim gray. POC/open/close markers still show in the same
-left gutter, same precedence, as in the normal footprint view — VP mode
-only changes how the price-level cells themselves render, nothing
-else (imbalance/Big Trades highlighting doesn't apply here, since a profile
-bar shows combined volume, not a bid/ask split).
+outer tails are dim gray.
+
+Delta Profile: bar length proportional to that level's own
+|buy_vol - sell_vol| relative to the bar's own largest per-level |delta|.
+Colour is fixed by that level's own delta sign — green for net buying, red
+for net selling at that price, same convention as the Δ row and normal
+"<bid> x <ask>" cells — so a bar with a net-negative overall Δ can still
+show green rows at the specific levels where buyers actually won. The POC
+marker stays the volume POC in this mode too (not a delta-based one), to
+stay consistent with the VAH/VAL/POC table below, which is always
+volume-based.
 
 [D] toggles the Big Trade Detector (BTD, --btd-lookback default 10 bars,
 [K] to change live without restarting — a whole number of bars, since
@@ -609,13 +620,20 @@ BTD_MODE = False  # [D] Big Trade Detector: toggles the buy/sell volume
                   # anomaly markers on/off — pure display toggle, same
                   # instant-apply convention as [V]/[M]/[B]
 
-VP_MODE = False   # [V] Volume Profile: replaces each bar's "<bid> x <ask>"
-                  # cells with a gradient-shaded horizontal bar per price
-                  # level (length ~ that level's share of the bar's volume)
-                  # instead — see compute_value_area() and draw()'s VP_MODE
-                  # branch. Purely a display toggle, no rebuild needed
-                  # (same instant-apply convention as IMBALANCE_RATIO/
-                  # BIG_TRADE_SIZE — draw() just reads it fresh every frame).
+PROFILE_MODE = "off"   # [V] cycles off -> volume -> delta -> off. Replaces
+                  # each bar's "<bid> x <ask>" cells with a horizontal bar
+                  # per price level instead — see compute_value_area() and
+                  # draw()'s PROFILE_MODE branches. "volume": length ~ that
+                  # level's share of the bar's total volume, shaded by
+                  # Value Area (cyan/blue) vs. outer tail (dim gray).
+                  # "delta": length ~ that level's share of the bar's own
+                  # largest per-level |buy_vol - sell_vol|, colored green
+                  # (net buying) or red (net selling) at that level — same
+                  # color convention as the Δ row and "<bid> x <ask>" cells,
+                  # just applied per price level instead of per bar. Purely
+                  # a display toggle, no rebuild needed (same instant-apply
+                  # convention as IMBALANCE_RATIO/BIG_TRADE_SIZE — draw()
+                  # just reads it fresh every frame).
 
 LOAD_DATE = None
 if "--date" in args:
@@ -2450,7 +2468,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
     bar_progress = fmt_bar_progress(live_bar)
     header = (f" FOOTPRINT — {SYMBOL}  bar:{INTERVAL_LABEL} [I]  tick:${fmt_price(TICK)} [T]  "
               f"imb:{IMBALANCE_RATIO:g}x [M]  stack:{STACK_COUNT}+  big:${fmt_price(BIG_TRADE_SIZE)}+ [B]"
-              f"  vp:{'on' if VP_MODE else 'off'} [V]"
+              f"  profile:{PROFILE_MODE} [V]"
               f"  btd:{'on' if BTD_MODE else 'off'} [D]  lb:{BTD_LOOKBACK} [K]  sig:{BTD_SIGMA:g} [G]"
               f"{f'  grid:${fmt_price(TICK * group_size)}' if group_size > 1 else ''}"
               f"{f'  |  {bar_progress}' if bar_progress else ''}  ")
@@ -2515,7 +2533,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             glevels = group_levels(levels, group_size)
             poc_g = compute_poc(glevels)
             # Value Area (VAH/VAL) — computed for every bar regardless of
-            # VP_MODE, since the table below always shows it, not just
+            # PROFILE_MODE, since the table below always shows it, not just
             # the Volume Profile view.
             va_low, va_high = compute_value_area(glevels, poc_g)
             has_live_cell = live_group in glevels
@@ -2532,7 +2550,7 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
             for g in range(min(glevels), max(glevels) + 1):
                 display_levels.setdefault(g, [0.0, 0.0])
 
-            if VP_MODE:
+            if PROFILE_MODE == "volume":
                 # [V] Volume Profile: one gradient-shaded horizontal bar
                 # per price row instead of "<bid> x <ask>" text — length ~
                 # that level's share of the bar's OWN busiest level's
@@ -2579,6 +2597,45 @@ def draw(win, status_line, vscroll_center, vfollow_price, hscroll_bars, crosshai
                         # within the bar's own traded range -- a thin sliver
                         # instead of leaving a blank hole, colored the same
                         # as a real bar at this row would be
+                        bar_str = VP_GHOST_CH
+                    safe_add(win, row_y, cx + 1, bar_str, color)
+                    if is_poc:
+                        safe_add(win, row_y, cx, POC_MARKER, cp(P_YELLOW, bold=True))
+            elif PROFILE_MODE == "delta":
+                # [V] Delta Profile: one horizontal bar per price row, length
+                # ~ that level's share of the bar's OWN largest per-level
+                # |buy_vol - sell_vol| (real levels only, gap-filled 0-volume
+                # rows just render empty). Color is fixed by that level's own
+                # delta sign — green for net buying, red for net selling —
+                # same convention as the Δ row and normal "<bid> x <ask>"
+                # cells, just resolved per price level instead of per bar
+                # (so a bar with a net-negative overall Δ can still show
+                # green rows at the levels where buyers actually won).
+                # POC/open/close markers below are unchanged — same gutter,
+                # same precedence, and still the volume POC (not a
+                # delta-based one) to stay consistent with the VAH/VAL/POC
+                # table, which is always volume-based.
+                max_abs_delta = max((abs(c[1] - c[0]) for c in glevels.values()), default=0.0)
+                for g, cell in display_levels.items():
+                    r_i = group_to_row.get(g)
+                    if r_i is None:
+                        continue
+                    row_y = top_reserved + r_i
+                    lvl_delta = cell[1] - cell[0]
+                    frac = (abs(lvl_delta) / max_abs_delta) if max_abs_delta > 0 else 0.0
+                    bar_str = vp_bar_str(frac, CELL_TXT_W)
+                    is_poc = (g == poc_g)
+                    poc_attr = curses.A_UNDERLINE if is_poc else 0
+                    if lvl_delta > 0:
+                        color = cp(P_GREEN, bold=True) | poc_attr
+                    elif lvl_delta < 0:
+                        color = cp(P_RED, bold=True) | poc_attr
+                    else:
+                        color = cp(P_DEFAULT) | poc_attr
+                    if not bar_str:
+                        # zero (or near-zero, rounds-to-zero-blocks) |delta|
+                        # within the bar's own traded range -- a thin sliver
+                        # instead of leaving a blank hole
                         bar_str = VP_GHOST_CH
                     safe_add(win, row_y, cx + 1, bar_str, color)
                     if is_poc:
@@ -2894,7 +2951,7 @@ def _crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est, historical_m
 
 # ── MAIN LOOPS ────────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global SYMBOL, IS_CRYPTO, VP_MODE, BTD_MODE, _last_center_lvl
+    global SYMBOL, IS_CRYPTO, PROFILE_MODE, BTD_MODE, _last_center_lvl
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -3008,10 +3065,11 @@ def curses_main(stdscr):
             vfollow_price = True
             _last_center_lvl = None
         elif key in (ord('v'), ord('V')):
-            # Volume Profile toggle — pure display mode, no rebuild needed
-            # (same instant-apply convention as [M]/[B]): draw() just
-            # reads VP_MODE fresh every frame.
-            VP_MODE = not VP_MODE
+            # Cycles the profile display: off -> volume -> delta -> off.
+            # Pure display mode, no rebuild needed (same instant-apply
+            # convention as [M]/[B]): draw() just reads PROFILE_MODE fresh
+            # every frame.
+            PROFILE_MODE = {"off": "volume", "volume": "delta", "delta": "off"}[PROFILE_MODE]
         elif key in (ord('d'), ord('D')):
             # Big Trade Detector toggle — same pure display, no-rebuild
             # convention as [V].

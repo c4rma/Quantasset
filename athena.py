@@ -2382,6 +2382,28 @@ class DoubleBuffer:
         self.prev = [row[:] for row in self.buf]
         self.buf  = [[EMPTY_CELL] * self.cols for _ in range(self.rows)]
 
+def take_screenshot(db):
+    """[C] — plain-text dump of exactly what's currently on screen, same
+    convention as footprint.py's own [P] screenshot (folder + filename
+    style, txt not an image — curses has no pixel buffer to capture).
+    Simpler here than footprint.py's version: footprint.py writes straight
+    to curses via safe_add() and needs a SEPARATE shadow buffer just to
+    reconstruct what was drawn; Athena's own DoubleBuffer.prev already IS
+    that reconstruction (the last fully-flushed frame's cell grid), so
+    this just reads it directly — no extra tracking needed. Read `prev`,
+    not `buf`: by the time a keypress is handled, flush() has already
+    copied buf->prev and wiped buf for the next frame, so buf itself is
+    always blank at this point in the loop."""
+    folder = os.path.join(SCRIPT_DIR, "screenshots")
+    os.makedirs(folder, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = os.path.join(folder, f"athena_{ts}.txt")
+    rows = db.prev if db.prev is not None else db.buf
+    lines = ["".join(cell[0] for cell in row).rstrip() for row in rows]
+    with open(fn, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return fn
+
 # Color pairs — same P_* naming/semantics as footprint.py's own
 # init_colors(), pre-registered once at startup and never redefined at
 # runtime (charthacker.py's memory log flags redefining a pair as the root
@@ -3226,14 +3248,22 @@ def draw_dashboard(db, snap, cols):
         # TP legs — one fixed row (blank if none), both legs on the same
         # line, each showing which target (BT/ST/GEX Flip/Cluster) it's
         # tied to, per explicit user request to see "the HPL they are
-        # associated with".
+        # associated with", plus how far the live price currently is from
+        # each level (a second explicit user request — fetched fresh here
+        # via inst.get("live_price") rather than reusing the `live` local
+        # from the position/pending line above, since that branch may not
+        # have run this cycle — e.g. PENDING_FILL has no "position" key —
+        # and would leave it undefined).
         tp_legs = (inst.get("position") or {}).get("tp_legs") or []
         if tp_legs:
+            live_for_tp = inst.get("live_price")
             parts = []
             for i, leg in enumerate(tp_legs[:2], start=1):
                 gex_tag = f"{DIM}(GEX){RST}" if leg.get("tracks_gex_flip") else ""
+                dist_tag = f"{DIM}[{fmt_num(abs(live_for_tp - leg['level']))} away]{RST} " \
+                           if live_for_tp is not None else ""
                 parts.append(f"{DIM}TP{i} ({leg.get('type', '?')}){RST} "
-                             f"{fmt_num(leg['qty'], 2)} @ {fmt_num(leg['level'])} {gex_tag}")
+                             f"{fmt_num(leg['qty'], 2)} @ {fmt_num(leg['level'])} {dist_tag}{gex_tag}")
             db.puts_ansi(y, 0, "       " + "    ".join(parts))
         y += 2   # blank row separates this instrument block from the next one
 
@@ -3508,7 +3538,7 @@ def curses_main(stdscr):
             tab_hint = f" [Tab]:{chart_focus}" if both_panes else ""
             footer = (f"{ts}  [Q]uit [A]:{'OFF' if not ATHENA_ENABLED else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{tab_hint} [Home]live"
-                      f" [P]ct:{PCT:g}% [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og"
+                      f" [P]ct:{PCT:g}% [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture"
                       + ("  [R]eset" if DRY_RUN else "")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
@@ -3585,6 +3615,10 @@ def curses_main(stdscr):
         elif key in (ord("l"), ord("L")):
             activity_log_open = True
             activity_log_scroll = 0
+        elif key in (ord("c"), ord("C")):
+            fn = take_screenshot(db)
+            console_log(f"{CYN}Screenshot saved: {os.path.basename(fn)}{RST}")
+            log_event("SYSTEM", "screenshot", {"file": fn})
         elif key in (ord("h"), ord("H")):
             dashboard_hidden = not dashboard_hidden
         elif key in (ord("n"), ord("N")):

@@ -435,6 +435,11 @@ class ChartState:
         self.gex_flip         = None # GEX Flip (zero gamma) level, Black-Scholes
                                       # swept — expensive, so computed once per
                                       # bt_st_gex_loop cycle, not every draw() frame
+        self.gex_flip_updated_at = 0.0  # time.time() of the last SUCCESSFUL
+                                      # gex_flip compute — draw() flags the
+                                      # overlay stale if this falls too far
+                                      # behind instead of silently trusting
+                                      # a possibly-frozen number forever
         self.pcvr_ratio        = None # shared BT/ST regime signal (TLT put/call
                                       # 08:45-15:00 CT, BTC otherwise) — same
                                       # source status.py's PCVR uses
@@ -1098,8 +1103,8 @@ def start_feed(asset: str, feed: str = "", interval_secs: int = -1):
         state.opt_chain        = None  # ditto for BT/ST/GEX Flip's chain —
         state.opt_chain_asset  = ""    # opt_chain_asset=="" also fails the
         state.gex_flip         = None  # draw()-side "asset matches" guard
-        state.pcvr_ratio       = None  # immediately, not just after the next
-                                        # bt_st_gex_loop cycle catches up
+        state.gex_flip_updated_at = 0.0  # immediately, not just after the next
+        state.pcvr_ratio       = None  # bt_st_gex_loop cycle catches up
 
     candles = fetch_candles(asset, my_feed)
 
@@ -1499,9 +1504,17 @@ def _fetch_vxn() -> float | None:
 # caller (bt_st_gex_loop) passes state.last_price instead — this app already
 # streams a live, sub-second price for the active asset via WebSocket, so
 # reusing it is both simpler and more current than another round-trip fetch.
-BT_ST_GEX_REFRESH_SEC = 30   # matches status.py's own default --interval —
-                              # an options chain and its GEX Flip don't move
-                              # fast enough to need a tighter cadence
+BT_ST_GEX_REFRESH_SEC = 15   # tightened from 30s (2026-07-22) — user compared
+                              # against status.py/gex.py and saw charthacker.py
+                              # visibly behind (fresh test calls confirmed the
+                              # chain fetch (~0.6-1.2s) + GEX Flip's BS sweep
+                              # (<0.1s) leave comfortable headroom well under
+                              # even this tighter cadence, so there's no real
+                              # cost to refreshing twice as often
+GEX_FLIP_STALE_AFTER_SEC = BT_ST_GEX_REFRESH_SEC * 3   # if no successful
+                              # update lands within 3 missed cycles, flag the
+                              # displayed GEX Flip as stale instead of quietly
+                              # showing a frozen number as if it were current
 MARKET_OPEN_FORCE_CT_MIN = 8 * 60 + 46   # 08:46 CT — regular equity open
                               # (08:45 CT / 9:30 ET) plus a 1-minute buffer
                               # for CBOE's own delayed-quotes feed to start
@@ -1885,6 +1898,7 @@ def bt_st_gex_loop():
                         state.opt_chain_is_crypto = is_crypto
                         state.opt_chain_asset     = asset
                         state.gex_flip            = gex_flip
+                        state.gex_flip_updated_at = time.time()
             except Exception:
                 pass   # leave previous values in place — a transient fetch
                        # failure shouldn't blank out an already-good overlay
@@ -2656,6 +2670,7 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
         opt_chain_is_crypto = state.opt_chain_is_crypto
         opt_chain_asset   = state.opt_chain_asset
         gex_flip          = state.gex_flip
+        gex_flip_updated_at = state.gex_flip_updated_at
         pcvr_ratio        = state.pcvr_ratio
 
     all_candles = candles_snap + ([live] if live else [])
@@ -3898,17 +3913,22 @@ def draw(win, db: DoubleBuffer, rows: int, cols: int):
     # ── BT / ST / GEX FLIP ────────────────────────────────────────────
     # BT/ST/GEX Flip use status.py's exact math (compute_bt_st/
     # compute_gex_flip above are verbatim ports). The chain + GEX Flip
-    # (expensive Black-Scholes sweep) are only refreshed every 30s by
-    # bt_st_gex_loop; BT/ST themselves are cheap and recomputed fresh right
-    # here every frame against the live current price, same as status.py's
-    # own render() does on every render call. opt_chain_asset == asset
-    # guards against showing a stale chain from a just-abandoned symbol
-    # during the up-to-30s window before the background loop catches up.
+    # (expensive Black-Scholes sweep) are only refreshed every
+    # BT_ST_GEX_REFRESH_SEC by bt_st_gex_loop; BT/ST themselves are cheap
+    # and recomputed fresh right here every frame against the live current
+    # price, same as status.py's own render() does on every render call.
+    # opt_chain_asset == asset guards against showing a stale chain from a
+    # just-abandoned symbol during the window before the background loop
+    # catches up. gex_flip_updated_at feeds a staleness check — if the loop
+    # ever silently stops updating (network hang, etc.) the label flags it
+    # instead of quietly showing an old number as if it were current.
     if show_bt_st_gex and opt_chain and opt_chain_asset == asset and last_price:
         _btg_pcvr_gt1 = bool(pcvr_ratio is not None and pcvr_ratio > 1.00)
         _btg_bt, _btg_st, _btg_active = compute_bt_st(
             opt_chain["strikes"], opt_chain_is_crypto, _btg_pcvr_gt1, last_price)
-        draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, _btg_bt, _btg_st, gex_flip)
+        _btg_gex_stale = (time.time() - gex_flip_updated_at) > GEX_FLIP_STALE_AFTER_SEC
+        draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r,
+                       _btg_bt, _btg_st, gex_flip, _btg_gex_stale)
 
     # ── POSITION TOOLS ───────────────────────────────────────────────
     if pos_tools:
@@ -5102,15 +5122,21 @@ def draw_hlines(db, chart_top, chart_bot, chart_r, p2r, hlines):
                 C_VWAP, curses.A_BOLD | curses.A_REVERSE)
 
 
-def draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, bt, st, gex_flip):
+def draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, bt, st, gex_flip, gex_stale=False):
     """Draw BT (green)/ST (red)/GEX Flip (blue) as full-width dashed lines —
     same visual language as draw_hlines(). Values come from compute_bt_st()/
     compute_gex_flip() above, which are verbatim ports of status.py's own
     math, so these are exactly the levels status.py's dashboard would show
-    for the same instrument right now."""
-    PRICE_W = 12   # must match draw_hlines()/main draw() layout constant
+    for the same instrument right now. gex_stale flags GEX Flip specifically
+    (BT/ST recompute every frame so they can't go stale the same way) when
+    bt_st_gex_loop hasn't landed a successful update within
+    GEX_FLIP_STALE_AFTER_SEC — dims the line and appends "(stale)" to the
+    label so an old, frozen number is never mistaken for a current one."""
+    PRICE_W = 18   # wide enough for " GEX 1234.56 (stale)"; must stay >=
+                   # draw_hlines()' own 12 since both share the right-axis
+                   # column layout — only widened here, not shrunk elsewhere
 
-    def _line(price, pair, label):
+    def _line(price, pair, label, attrs=curses.A_BOLD):
         if price is None:
             return
         row = chart_top + p2r(price)
@@ -5119,15 +5145,17 @@ def draw_bt_st_gex(db, chart_top, chart_bot, chart_r, p2r, bt, st, gex_flip):
         for col in range(chart_r):
             _cell = db.buf[row][col]
             if _cell[0] in (" ", ".", ":") or (_cell[0] == "█" and _cell[1] in ER_FILL_PAIRS):
-                db.put(row, col, "-", pair, curses.A_BOLD)
+                db.put(row, col, "-", pair, attrs)
         lbl_text = f"{label} {price:.2f}"
-        db.put(row, chart_r, "+", pair, curses.A_BOLD)
+        db.put(row, chart_r, "+", pair, attrs)
         db.puts(row, chart_r + 1, f"{lbl_text:<{PRICE_W}}"[:PRICE_W],
-                pair, curses.A_BOLD | curses.A_REVERSE)
+                pair, attrs | curses.A_REVERSE)
 
     _line(bt, C_BT, "BT")
     _line(st, C_ST, "ST")
-    _line(gex_flip, C_GEX_FLIP, "GEX")
+    _gex_label = "GEX (stale)" if gex_stale else "GEX"
+    _gex_attrs = curses.A_DIM if gex_stale else curses.A_BOLD
+    _line(gex_flip, C_GEX_FLIP, _gex_label, _gex_attrs)
 
 
 def draw_hline_list_overlay(db, rows, cols, hlines, sel):

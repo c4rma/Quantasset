@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# deribit_dashboard.py — Real-time Deribit + CBOE Put/Call Volume Monitor
+# opt_dashboard.py — Options Flow Dashboard: Real-time Deribit + CBOE Monitor
 #
 # Usage:
-#   python deribit_dashboard.py
-#   python deribit_dashboard.py --interval 60
+#   python opt_dashboard.py
+#   python opt_dashboard.py --interval 60
+#   python opt_dashboard.py --mute                 (start with alert.wav muted)
+#   python opt_dashboard.py --data-dir D:\opt_logs  (custom data root)
+#   python opt_dashboard.py --no-csv                (screenshots only, no CSV)
 #
 # Equities (TLT/GLD/QQQ) put/call volume comes from CBOE's free delayed-quote
 # feed (exchange-sourced, ~15 min delay). Needs only httpx — no extra package.
+#
+# CSV logs and [S] screenshots are both filed under:
+#   data/opt_dashboard/YYYY/MM/DD/
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import csv
 import json
+import math
 import os
+import re
 import sys
 import time
 import argparse
@@ -46,30 +54,53 @@ CURRENCIES     = ['ETH', 'BTC']
 PHEMEX_TICKER  = 'https://api.phemex.com/md/v3/ticker/24hr?symbol=ETHUSDT'
 CT_OFFSET      = timedelta(hours=-5)   # CT = UTC-5 (CDT); use -6 for CST
 
-# ── Equities options config (CBOE delayed quotes — exchange source, ~15m delay) ─
+# ── Equities options config (CBOE primary, Nasdaq automatic fallback) ─────────
 # Webull's free API was inconsistent and its volumes didn't match IBKR. CBOE's
 # delayed-quote feed returns the full consolidated chain and tracks IBKR's
 # put/call direction (e.g. GLD/TLT correctly read < 1.00). Needs only httpx.
-EQUITY_SYMBOLS = ['TLT', 'GLD', 'QQQ']
-CBOE_URL       = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
+#
+# CBOE has intermittently hard-blocked this endpoint (Cloudflare bot management)
+# — when that happens ALL data (P/C volume, Exp Move) automatically fails over to
+# Nasdaq's public option-chain API. Nasdaq has no IV field at all, so while on the
+# fallback, "IV" is computed ourselves via Black-Scholes from the ATM straddle at
+# the expiry nearest 30 calendar days out, and is marked with '≈' since it's an
+# approximation, not CBOE's native iv30 index. A background task probes CBOE every
+# few seconds while on the fallback and switches back automatically once it recovers.
+EQUITY_SYMBOLS   = ['TLT', 'GLD', 'QQQ']
+CBOE_URL         = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
+NASDAQ_URL       = 'https://api.nasdaq.com/api/quote/{}/option-chain'
+NASDAQ_HEADERS   = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
+    'Accept':     'application/json',
+    'Referer':    'https://www.nasdaq.com/market-activity/etf/qqq/option-chain',
+}
+RISK_FREE_RATE          = 0.045   # approx annualized risk-free rate, for the fallback IV solver
+CBOE_HEALTHCHECK_SYMBOL = 'TLT'   # lightweight probe symbol used to test CBOE recovery
+CBOE_HEALTHCHECK_SECS   = 5       # how often to re-probe CBOE while on the Nasdaq fallback
 # Exp Move = ATM straddle of the 0DTE (or nearest) expiry × this factor.
 # 1.0 = raw straddle (≈ market-implied expected absolute move to expiry);
 # set 0.85 for the common 1-SD "expected move" convention.
 EXP_MOVE_FACTOR = 1.0
+
+# ── Equities data-source state (module-level so the health task can flip it) ──
+eq_source = 'cboe'   # 'cboe' (default/primary) or 'nasdaq' (automatic fallback)
 
 # Auto-refresh once per weekday when the clock reaches this CT time (market open
 # data settles). Mirrors a manual restart so the new session's PCVR/IV/DVOL show
 # up without intervention.
 MARKET_OPEN_REFRESH = (8, 45)   # (hour, minute) in CT
 
-# ── CSV logging — one wide row appended after every refresh ────────────────────
-# A separate file per CT day, named opt_data_MM_DD_YYYY.csv. On startup the
-# current day's file is resumed if it exists (else created); when the CT clock
-# crosses 00:00 the next refresh rolls over to a fresh file automatically.
-_csv_dir      = None          # log directory; None disables logging (set in main)
-_csv_cur_path = None          # path of the file currently being written
-_csv_rows     = 0             # rows written this session to the current file
-_csv_err      = None          # last write error (shown on the status line)
+# ── Data filing system — data/opt_dashboard/YYYY/MM/DD/ ───────────────────────
+# CSV logs and screenshots both live under this same per-day folder, mirroring
+# the data/footprint/YYYY/MM/DD convention already used elsewhere in this repo.
+# One CSV file per CT day (opt_data_MM_DD_YYYY.csv); resumed on startup if it
+# exists, and rolled over to a fresh file/folder automatically at 00:00 CT.
+_data_root    = None           # <script dir>/data/opt_dashboard by default (set in main)
+_csv_enabled  = True           # False disables CSV writes only (--no-csv); screenshots unaffected
+_csv_cur_path = None           # path of the file currently being written
+_csv_rows     = 0              # rows written this session to the current file
+_csv_err      = None           # last write error (shown on the status line)
 
 # ── Shared equities state (prefetched in background, promoted at cycle boundary) ─
 eq_results = {}            # symbol -> (put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte)
@@ -82,9 +113,11 @@ _refresh_evt    = threading.Event()
 _screenshot_evt = threading.Event()
 _last_open_refresh = None   # date of the most recent market-open auto-refresh
 
-# ── Screenshot state ([S] key saves a PNG of the console window) ───────────────
-_shot_dir    = None         # resolved in main() -> <script dir>/screenshots
+# ── Screenshot state ([S] key saves a PNG into today's dated data folder) ─────
 _shot_status = None         # last screenshot result (shown on the Shot line)
+
+# ── Mute state ([M] toggles alert.wav playback) ────────────────────────────────
+_muted = False
 
 # ── Kill zones (CT, minutes since midnight) ───────────────────────────────────
 KILL_ZONES = [
@@ -198,7 +231,10 @@ def _get_sentiment(ratio):
     else:                return 'NEUTRAL'
 
 def _play_alert():
-    """Play sentiment.wav non-blocking from the same folder as this script."""
+    """Play sentiment.wav non-blocking from the same folder as this script.
+    No-ops entirely when muted ([M] key or --mute at launch)."""
+    if _muted:
+        return
     wav = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sentiment.wav')
     if not os.path.exists(wav):
         return
@@ -298,26 +334,225 @@ async def _cboe_symbol_volume(client, symbol):
     return put_vol, call_vol, iv30, exp_move, em_is_0dte
 
 
+# ── Nasdaq fallback (used only when CBOE is unreachable) ──────────────────────
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_price(S, K, T, r, sigma, is_call):
+    """European Black-Scholes price. Good enough for a best-effort IV fallback —
+    not meant to reproduce CBOE/IBKR's own (likely American-style) methodology."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, (S - K) if is_call else (K - S))
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _implied_vol(price, S, K, T, r, is_call, lo=0.001, hi=5.0, tol=1e-4, max_iter=60):
+    """Bisection IV solver (no derivatives needed — robust near-expiry too)."""
+    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0.0
+    intrinsic = max(0.0, (S - K) if is_call else (K - S))
+    if price < intrinsic - 1e-6:
+        return 0.0
+    plo, phi = _bs_price(S, K, T, r, lo, is_call), _bs_price(S, K, T, r, hi, is_call)
+    if not (plo <= price <= phi):
+        return 0.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        pm  = _bs_price(S, K, T, r, mid, is_call)
+        if abs(pm - price) < tol:
+            return mid
+        if pm < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+_NASDAQ_PRICE_RE = re.compile(r'\$([\d,]+\.?\d*)')
+
+def _nasdaq_mid(row, side):
+    """Bid/ask mid for one side ('c' or 'p') of a Nasdaq option-chain row."""
+    try:
+        bid = float(row.get(f'{side}_Bid') or 0)
+        ask = float(row.get(f'{side}_Ask') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+
+
+async def _nasdaq_symbol_volume(client, symbol):
+    """
+    Return (put_vol, call_vol, iv_approx, exp_move, em_is_0dte) for one symbol via
+    Nasdaq's public option-chain API — used only when CBOE is unreachable.
+
+    One request (limit=10000, fromdate=all&todate=all) returns the ENTIRE chain,
+    same as CBOE. Rows are grouped under 'expirygroup' header rows (full date,
+    e.g. "July 23, 2026"); contract rows between headers belong to the most
+    recent header, which is the only reliable source of the expiry's year.
+
+    Nasdaq has no implied-volatility field at all, so iv_approx is computed
+    ourselves via Black-Scholes from the ATM straddle at the expiry nearest
+    30 calendar days out — an approximation of CBOE's native iv30, not the
+    real thing (see EQUITY_SYMBOLS comment above).
+    """
+    params = {'assetclass': 'etf', 'limit': '10000', 'fromdate': 'all', 'todate': 'all'}
+    r = await client.get(NASDAQ_URL.format(symbol), params=params, headers=NASDAQ_HEADERS)
+    r.raise_for_status()
+    data = r.json().get('data') or {}
+    rows = (data.get('table') or {}).get('rows') or []
+    if not rows:
+        raise RuntimeError('empty chain')
+
+    m = _NASDAQ_PRICE_RE.search(data.get('lastTrade') or '')
+    price = float(m.group(1).replace(',', '')) if m else 0.0
+
+    today   = datetime.now().date()
+    put_vol = call_vol = 0.0
+    by_exp  = {}   # date -> {strike: {'C': mid, 'P': mid}}
+    def _vol(v):
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return 0.0
+
+    current_group = None
+    for row in rows:
+        grp = row.get('expirygroup')
+        if grp:
+            try:
+                current_group = datetime.strptime(grp, '%B %d, %Y').date()
+            except ValueError:
+                current_group = None
+            continue   # header row, no contract data
+        if current_group is None:
+            continue
+        try:
+            strike = float(row.get('strike'))
+        except (TypeError, ValueError):
+            continue
+
+        put_vol  += _vol(row.get('p_Volume'))
+        call_vol += _vol(row.get('c_Volume'))
+
+        legs = by_exp.setdefault(current_group, {}).setdefault(strike, {})
+        cmid, pmid = _nasdaq_mid(row, 'c'), _nasdaq_mid(row, 'p')
+        if cmid > 0: legs['C'] = cmid
+        if pmid > 0: legs['P'] = pmid
+
+    if not by_exp:
+        raise RuntimeError('no parsable expiries')
+
+    # Expected move: ATM straddle of the 0DTE expiry, else nearest future expiry
+    em_is_0dte = today in by_exp
+    target_em  = today if em_is_0dte else min((e for e in by_exp if e >= today), default=None)
+    exp_move = 0.0
+    if target_em and price > 0:
+        strikes = by_exp[target_em]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 and lg.get('P', 0) > 0]
+        if atm:
+            k = min(atm, key=lambda s: abs(s - price))
+            exp_move = (strikes[k]['C'] + strikes[k]['P']) * EXP_MOVE_FACTOR
+
+    # IV approximation: ATM straddle at the expiry nearest 30 calendar days out
+    iv_approx = 0.0
+    target_30 = min(by_exp, key=lambda e: abs((e - today).days - 30), default=None)
+    if target_30 and price > 0:
+        strikes = by_exp[target_30]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 or lg.get('P', 0) > 0]
+        if atm:
+            k    = min(atm, key=lambda s: abs(s - price))
+            T    = max((target_30 - today).days, 1) / 365.0
+            legs = strikes[k]
+            ivs = []
+            if legs.get('C', 0) > 0:
+                ivs.append(_implied_vol(legs['C'], price, k, T, RISK_FREE_RATE, True))
+            if legs.get('P', 0) > 0:
+                ivs.append(_implied_vol(legs['P'], price, k, T, RISK_FREE_RATE, False))
+            ivs = [v for v in ivs if v > 0]
+            if ivs:
+                iv_approx = (sum(ivs) / len(ivs)) * 100.0
+
+    return put_vol, call_vol, iv_approx, exp_move, em_is_0dte
+
+
+async def _cboe_is_healthy(client):
+    """Lightweight probe: does CBOE currently serve real data for one symbol?"""
+    try:
+        r = await client.get(CBOE_URL.format(CBOE_HEALTHCHECK_SYMBOL), timeout=8)
+        if r.status_code != 200:
+            return False
+        options = (r.json().get('data') or {}).get('options') or []
+        return bool(options)
+    except Exception:
+        return False
+
+
+async def cboe_health_monitor():
+    """
+    Background task (runs for the whole session): while the dashboard is on the
+    Nasdaq fallback, re-probes CBOE every CBOE_HEALTHCHECK_SECS seconds and
+    switches back the moment it's healthy again. Idles quietly while CBOE is
+    already the active source.
+    """
+    global eq_source
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            if eq_source == 'nasdaq':
+                if await _cboe_is_healthy(client):
+                    eq_source = 'cboe'
+            await asyncio.sleep(CBOE_HEALTHCHECK_SECS)
+
+
+async def _fetch_all_equities(client, fetch_fn, iv_is_approx):
+    """Run fetch_fn concurrently for every symbol; return (results, errors) with
+    the 7-element tuple shape eq_results expects."""
+    results, errors = {}, {}
+
+    async def _one(symbol):
+        try:
+            put_vol, call_vol, iv, exp_move, em_is_0dte = await fetch_fn(client, symbol)
+            ratio = put_vol / call_vol if call_vol > 0 else 0.0
+            results[symbol] = (put_vol, call_vol, ratio, iv, exp_move, em_is_0dte, iv_is_approx)
+        except Exception as e:
+            errors[symbol] = str(e).replace('\n', ' ')[:36]
+
+    await asyncio.gather(*(_one(s) for s in EQUITY_SYMBOLS))
+    return results, errors
+
+
 async def refresh_equities():
     """
-    Fetch all equity symbols concurrently from CBOE and return a completed
-    snapshot: (results, errors, status). Does NOT touch the displayed globals —
-    the caller promotes the snapshot at the crypto cycle boundary so equities
-    update in lockstep with the counter. ~9s total for all three.
+    Fetch all equity symbols concurrently, preferring CBOE and failing over to
+    Nasdaq (all-or-nothing, same cycle) if CBOE errors on any symbol — matching
+    the module-level `eq_source` flag that cboe_health_monitor() flips back once
+    CBOE recovers. Returns a completed snapshot: (results, errors, status).
+    Does NOT touch the displayed globals — the caller promotes the snapshot at
+    the crypto cycle boundary so equities update in lockstep with the counter.
     """
-    results, errors = {}, {}
+    global eq_source
+    results, errors, source_used = {}, {}, eq_source
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            async def _one(symbol):
-                try:
-                    put_vol, call_vol, iv30, exp_move, em_is_0dte = await _cboe_symbol_volume(client, symbol)
-                    ratio = put_vol / call_vol if call_vol > 0 else 0.0
-                    results[symbol] = (put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte)
-                except Exception as e:
-                    errors[symbol] = str(e).replace('\n', ' ')[:36]
+            if eq_source == 'cboe':
+                results, errors = await _fetch_all_equities(client, _cboe_symbol_volume, False)
+                if errors:
+                    # CBOE failed for at least one symbol — treat it as down for
+                    # ALL symbols this cycle rather than mixing sources, and let
+                    # the background health monitor probe for recovery.
+                    eq_source   = 'nasdaq'
+                    source_used = 'nasdaq'
+                    results, errors = await _fetch_all_equities(client, _nasdaq_symbol_volume, True)
+            else:
+                source_used = 'nasdaq'
+                results, errors = await _fetch_all_equities(client, _nasdaq_symbol_volume, True)
 
-            await asyncio.gather(*(_one(s) for s in EQUITY_SYMBOLS))
-        status = f'OK ({len(results)}/{len(EQUITY_SYMBOLS)})'
+        tag    = 'CBOE' if source_used == 'cboe' else 'Nasdaq (fallback)'
+        status = f'OK ({len(results)}/{len(EQUITY_SYMBOLS)}) via {tag}'
 
     except asyncio.CancelledError:
         raise
@@ -336,14 +571,23 @@ def _csv_columns():
                  f'{ccy}_pc_ratio', f'{ccy}_dvol', f'{ccy}_sentiment']
     for sym in EQUITY_SYMBOLS:
         cols += [f'{sym}_put_vol', f'{sym}_call_vol', f'{sym}_total_vol',
-                 f'{sym}_pc_ratio', f'{sym}_iv30', f'{sym}_exp_move',
+                 f'{sym}_pc_ratio', f'{sym}_iv30', f'{sym}_iv_source', f'{sym}_exp_move',
                  f'{sym}_exp_move_0dte', f'{sym}_sentiment']
     return cols
 
 
+def _dated_dir(ct_dt):
+    """data/opt_dashboard/YYYY/MM/DD — one folder per CT day, holding that day's
+    CSV log and any screenshots taken. Mirrors this project's existing
+    data/footprint/YYYY/MM/DD convention used by the other tools."""
+    d = os.path.join(_data_root, ct_dt.strftime('%Y'), ct_dt.strftime('%m'), ct_dt.strftime('%d'))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _daily_csv_path(ct_dt):
-    """Path of the CSV for a given CT datetime: opt_data_MM_DD_YYYY.csv."""
-    return os.path.join(_csv_dir, f"opt_data_{ct_dt.strftime('%m_%d_%Y')}.csv")
+    """Path of the CSV for a given CT datetime: .../YYYY/MM/DD/opt_data_MM_DD_YYYY.csv."""
+    return os.path.join(_dated_dir(ct_dt), f"opt_data_{ct_dt.strftime('%m_%d_%Y')}.csv")
 
 
 def append_csv(fetch_time, results, dvol, eth_price):
@@ -380,12 +624,13 @@ def append_csv(fetch_time, results, dvol, eth_price):
 
     for sym in EQUITY_SYMBOLS:
         if sym in eq_results:
-            pv, cv, ratio, iv30, em, z = eq_results[sym]
+            pv, cv, ratio, iv30, em, z, iv_approx = eq_results[sym]
             row[f'{sym}_put_vol']      = f'{pv:.0f}'
             row[f'{sym}_call_vol']     = f'{cv:.0f}'
             row[f'{sym}_total_vol']    = f'{pv + cv:.0f}'
             row[f'{sym}_pc_ratio']     = f'{ratio:.4f}'
             row[f'{sym}_iv30']         = f'{iv30:.2f}'
+            row[f'{sym}_iv_source']    = 'Nasdaq(approx)' if iv_approx else 'CBOE'
             row[f'{sym}_exp_move']     = f'{em:.2f}'
             row[f'{sym}_exp_move_0dte'] = 'True' if z else 'False'
             row[f'{sym}_sentiment']    = _get_sentiment(ratio)
@@ -408,7 +653,7 @@ def _resume_csv_row_count():
     """On startup, seed the row counter from today's existing file (if any) so
     the status line reflects rows already logged rather than just this session."""
     global _csv_cur_path, _csv_rows
-    if _csv_dir is None:
+    if _data_root is None or not _csv_enabled:
         return
     ct = datetime.now(timezone.utc) + CT_OFFSET
     path = _daily_csv_path(ct)
@@ -469,8 +714,8 @@ def draw_static():
         mark(f'{ccy}_pct');       p(f"    {DIM}     {'':35}{RST}")
         p()
 
-    # ── Equities (CBOE) — compact table ──────────────────────────────────────
-    p(f"  {BLD}{YLW}{'─'*4} EQUITIES (CBOE) {'─'*(WIDTH-18)}{RST}")
+    # ── Equities (CBOE, auto-fallback to Nasdaq) — compact table ─────────────
+    p(f"  {BLD}{YLW}{'─'*4} EQUITIES (CBOE/Nasdaq) {'─'*(WIDTH-25)}{RST}")
     mark('eq_status'); p(f"    {'Status':<8}")
     p(f"    {BLD}{'Symbol':<7}{'Put Vol':>11}{'Call Vol':>11}{'P/C':>7}{'IV':>8}{'Exp Move':>10}  Sentiment{RST}")
     for sym in EQUITY_SYMBOLS:
@@ -479,12 +724,18 @@ def draw_static():
 
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     p(f"  {DIM}Equities P/C = total volume  |  IV = 30-day (matches IBKR){RST}")
+    p(f"  {DIM}IV≈ = Nasdaq-fallback estimate (CBOE unreachable, real IV unavailable){RST}")
     p(f"  {DIM}Exp Move = ±ATM straddle to expiry (0DTE, *=nearest)  |  ~15m delay{RST}")
     p(f"  {DIM}P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH{RST}")
     p(f"{BLD}{CYN}{'─'*WIDTH}{RST}")
     mark('csv');  p(f"    {'CSV':<8}")
     mark('shot'); p(f"    {'Shot':<8}")
-    mark('exit'); p(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}{BLD}[S]{RST}{DIM}creenshot{RST}")
+    mark('mute'); p(f"    {'Sound':<8}")
+    mark('exit')
+    p(
+        f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}"
+        f"{BLD}[S]{RST}{DIM}creenshot   {RST}{BLD}[M]{RST}{DIM}ute{RST}"
+    )
 
     sys.stdout.flush()
 
@@ -585,10 +836,12 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         erase_line()
         sys.stdout.write(f"    {DIM}     {put_pct*100:>5.1f}%{' '*(bar_width-1)}{call_pct*100:>5.1f}%{RST}")
 
-    # ── Equities (CBOE) ───────────────────────────────────────────────────────
+    # ── Equities (CBOE, auto-fallback to Nasdaq) ─────────────────────────────
     move(ROWS['eq_status'])
     erase_line()
-    if eq_status.startswith('OK'):
+    if 'Nasdaq' in eq_status:
+        st_col = YLW           # technically OK, but running on the degraded fallback
+    elif eq_status.startswith('OK'):
         st_col = GRN
     elif eq_status.startswith('err'):
         st_col = RED
@@ -607,7 +860,7 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
             sys.stdout.write(f"    {sym:<8} {DIM}waiting…{RST}")
             continue
 
-        put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte = eq_results[sym]
+        put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte, iv_is_approx = eq_results[sym]
         rc = ratio_colour(ratio)
         if ratio >= 1.02:
             eq_sent = f"{RED}{BLD}BEARISH{RST}"
@@ -615,7 +868,8 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
             eq_sent = f"{GRN}{BLD}BULLISH{RST}"
         else:
             eq_sent = f"{YLW}{BLD}NEUTRAL{RST}"
-        iv_str = f"{iv30:.1f}%" if iv30 else "n/a"
+        # '≈' marks a Black-Scholes IV approximation (Nasdaq fallback has no real IV)
+        iv_str = (f"{iv30:.1f}%" + ("≈" if iv_is_approx else "")) if iv30 else "n/a"
         # '*' marks expected move taken from the nearest expiry (no 0DTE today)
         em_str = (f"±{exp_move:.2f}" + ("" if em_is_0dte else "*")) if exp_move else "n/a"
 
@@ -636,12 +890,13 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
     if 'csv' in ROWS:
         move(ROWS['csv'])
         erase_line()
-        if _csv_dir is None:
-            sys.stdout.write(f"    {'CSV':<8} {DIM}disabled{RST}")
+        if not _csv_enabled:
+            sys.stdout.write(f"    {'CSV':<8} {DIM}disabled (--no-csv){RST}")
         elif _csv_err:
             sys.stdout.write(f"    {'CSV':<8} {RED}error: {_csv_err}{RST}")
         elif _csv_cur_path:
-            sys.stdout.write(f"    {'CSV':<8} {GRN}{_csv_rows}{RST} {DIM}rows → {os.path.basename(_csv_cur_path)}{RST}")
+            rel = os.path.relpath(_csv_cur_path, _data_root)
+            sys.stdout.write(f"    {'CSV':<8} {GRN}{_csv_rows}{RST} {DIM}rows → {rel}{RST}")
         else:
             sys.stdout.write(f"    {'CSV':<8} {DIM}starting…{RST}")
 
@@ -657,17 +912,30 @@ def update_values(results, errors, dvol, fetch_time, remaining, eth_price):
         else:
             sys.stdout.write(f"    {'Shot':<8} {DIM}press [S] to capture{RST}")
 
+    # Mute status
+    if 'mute' in ROWS:
+        move(ROWS['mute'])
+        erase_line()
+        if _muted:
+            sys.stdout.write(f"    {'Sound':<8} {YLW}MUTED{RST}  {DIM}(alert.wav disabled){RST}")
+        else:
+            sys.stdout.write(f"    {'Sound':<8} {GRN}ON{RST}  {DIM}(alert.wav enabled){RST}")
+
     move(ROWS['exit'])
     erase_line()
-    sys.stdout.write(f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}{BLD}[S]{RST}{DIM}creenshot{RST}")
+    sys.stdout.write(
+        f"  {BLD}[Q]{RST}{DIM}uit   {RST}{BLD}[R]{RST}{DIM}efresh   {RST}"
+        f"{BLD}[S]{RST}{DIM}creenshot   {RST}{BLD}[M]{RST}{DIM}ute{RST}"
+    )
 
     sys.stdout.flush()
 
 
-# ── Keyboard input thread ([Q]uit / [R]efresh / [S]creenshot) ─────────────────
+# ── Keyboard input thread ([Q]uit / [R]efresh / [S]creenshot / [M]ute) ────────
 def _input_thread():
     """Daemon thread: read single keypresses and signal the loop via events.
-    Q quits, R forces an immediate refresh, S saves a screenshot. No Enter needed."""
+    Q quits, R forces an immediate refresh, S saves a screenshot, M toggles
+    mute. No Enter needed."""
     try:
         if sys.platform == 'win32':
             import msvcrt
@@ -679,6 +947,8 @@ def _input_thread():
                     _refresh_evt.set()
                 elif ch in ('s', 'S'):
                     _screenshot_evt.set()
+                elif ch in ('m', 'M'):
+                    toggle_mute()
                 elif ch == '\x03':                 # Ctrl+C
                     _quit_evt.set();    break
         else:
@@ -696,24 +966,32 @@ def _input_thread():
                             _refresh_evt.set()
                         elif ch in ('s', 'S'):
                             _screenshot_evt.set()
+                        elif ch in ('m', 'M'):
+                            toggle_mute()
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
         pass
 
 
+def toggle_mute():
+    """Flip the mute flag ([M] key). Alert playback checks this on every call."""
+    global _muted
+    _muted = not _muted
+
+
 def take_screenshot():
-    """Save a PNG of the console window (fallback: full screen) to the shots dir.
-    Sets _shot_status for the on-screen Shot line."""
+    """Save a PNG of the console window (fallback: full screen) into today's
+    dated data folder. Sets _shot_status for the on-screen Shot line."""
     global _shot_status
     if not PIL_AVAILABLE:
         _shot_status = 'Pillow not installed — pip install pillow'
         return
     try:
-        os.makedirs(_shot_dir, exist_ok=True)
-        ct    = datetime.now(timezone.utc) + CT_OFFSET
-        fname = f"opt_dashboard_{ct.strftime('%Y-%m-%d_%H-%M-%S')}.png"
-        path  = os.path.join(_shot_dir, fname)
+        ct      = datetime.now(timezone.utc) + CT_OFFSET
+        shotdir = _dated_dir(ct)   # data/opt_dashboard/YYYY/MM/DD (creates it)
+        fname   = f"opt_dashboard_{ct.strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        path    = os.path.join(shotdir, fname)
 
         # Try to grab just the console window; fall back to the full screen.
         bbox = None
@@ -771,6 +1049,10 @@ async def fetch_all(interval):
     # lockstep with the crypto counter instead of at random times.
     eq_job   = None
     force_eq = False   # set after a manual/market-open refresh to pull fresh data
+
+    # Runs for the whole session: while on the Nasdaq fallback, re-probes CBOE
+    # every few seconds and flips eq_source back automatically once it recovers.
+    health_job = asyncio.ensure_future(cboe_health_monitor())
 
     while True:
         try:
@@ -888,7 +1170,7 @@ async def fetch_all(interval):
                     eth_price = await fetch_eth_price()
 
                     # ── Auto-save this refresh's full snapshot to CSV ──
-                    if _csv_dir is not None:
+                    if _csv_enabled:
                         append_csv(fetch_time, results, dvol, eth_price)
 
                     # ── Countdown — polls keys/market-open ~10x/sec so [R] and
@@ -900,6 +1182,7 @@ async def fetch_all(interval):
                             if _quit_evt.is_set():
                                 if eq_job is not None:
                                     eq_job.cancel()
+                                health_job.cancel()
                                 return
                             if _screenshot_evt.is_set():
                                 _screenshot_evt.clear()
@@ -916,6 +1199,7 @@ async def fetch_all(interval):
         except asyncio.CancelledError:
             if eq_job is not None:
                 eq_job.cancel()
+            health_job.cancel()
             raise
         except Exception as e:
             # Show error and wait with exponential backoff before reconnecting
@@ -929,29 +1213,32 @@ async def fetch_all(interval):
 
 
 def main():
-    global _last_open_refresh, _csv_dir, _shot_dir
+    global _last_open_refresh, _data_root, _csv_enabled, _muted
 
     parser = argparse.ArgumentParser(description='Options Flow Dashboard - Crypto & Equities')
     parser.add_argument('--interval', type=int, default=30,
                         help='Refresh interval in seconds (default: 30)')
-    parser.add_argument('--csv-dir', default=None, metavar='DIR',
-                        help='directory for daily CSV logs (default: next to this script)')
+    parser.add_argument('--data-dir', default=None, metavar='DIR',
+                        help='root for the year/month/day data files '
+                             '(default: <script dir>/data/opt_dashboard)')
     parser.add_argument('--no-csv', action='store_true',
-                        help='disable per-refresh CSV logging')
-    parser.add_argument('--shots-dir', default=None, metavar='DIR',
-                        help='directory for [S] screenshots (default: <script dir>/screenshots)')
+                        help='disable per-refresh CSV logging (screenshots still saved)')
+    parser.add_argument('--mute', action='store_true',
+                        help='start muted — disable alert.wav playback')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Resolve the CSV log directory (logging is on by default). Files are named
-    # opt_data_MM_DD_YYYY.csv, one per CT day. Resume today's file if it exists.
-    if not args.no_csv:
-        _csv_dir = args.csv_dir or script_dir
+    # Resolve the data root: data/opt_dashboard/YYYY/MM/DD/ holds both the CSV
+    # log and any screenshots for that day. Always set (screenshots need it even
+    # if --no-csv disables the log itself); resume today's CSV row count unless
+    # logging is off.
+    _data_root   = args.data_dir or os.path.join(script_dir, 'data', 'opt_dashboard')
+    _csv_enabled = not args.no_csv
+    if _csv_enabled:
         _resume_csv_row_count()
 
-    # Resolve the screenshot directory ([S] key saves PNGs here).
-    _shot_dir = args.shots_dir or os.path.join(script_dir, 'screenshots')
+    _muted = args.mute
 
     # Pre-arm the market-open auto-refresh: if we launch after today's trigger
     # time, mark it done so it only fires when the clock *crosses* 08:45 during
@@ -960,7 +1247,7 @@ def main():
     if (now_ct.hour * 60 + now_ct.minute) >= (MARKET_OPEN_REFRESH[0] * 60 + MARKET_OPEN_REFRESH[1]):
         _last_open_refresh = now_ct.date()
 
-    # Start the keyboard listener ([Q]uit / [R]efresh) as a daemon thread.
+    # Start the keyboard listener ([Q]uit / [R]efresh / [S]creenshot / [M]ute).
     threading.Thread(target=_input_thread, daemon=True).start()
 
     try:

@@ -6428,7 +6428,36 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                     if g == poc_g:
                         db.put(row_y, cx, POC_MARKER, P_YELLOW, curses.A_BOLD)
             else:
-                imbalances = compute_imbalances(glevels)
+                # CRITICAL bug fixed 2026-07-25, user-reported ("ETH
+                # footprint chart should show imbalances of 3.0 or
+                # higher"): this used to run compute_imbalances on
+                # `glevels` (the GROUPED/binned levels), which makes
+                # "one tick below/above" mean "one display GROUP below/
+                # above" — group_size ticks apart, not one real tick.
+                # footprint.py's own call site has this identical shape,
+                # but it rarely bites there since its own full-terminal
+                # chart usually has enough rows to keep group_size at or
+                # near 1; Athena's split-pane view has much less vertical
+                # room, so group_size is routinely much larger — for ETH
+                # specifically (tick=$0.10 against a session range that
+                # can span many dollars) this diluted the diagonal
+                # ask-vs-bid-one-tick-below comparison across a window
+                # many ticks wide, making genuine 3:1+ single-tick
+                # imbalances essentially undetectable. Now computed on
+                # the RAW per-tick `levels` dict (a real imbalance is a
+                # real imbalance regardless of how coarsely the CURRENT
+                # pane happens to be grouping price rows for display),
+                # then each qualifying raw tick is folded up into
+                # whichever display group contains it — a group shows
+                # buy/sell if ANY raw tick inside it qualified. QQQ is
+                # unaffected in practice (its own tick/range combo rarely
+                # forces group_size much past 1), but this fix applies to
+                # both assets uniformly since the underlying bug wasn't
+                # ETH-specific, just far more visible there.
+                raw_imbalances = compute_imbalances(levels)
+                group_imbalance = {}
+                for raw_lvl, direction in raw_imbalances.items():
+                    group_imbalance[raw_lvl // group_size] = direction
                 for g, cell in display_levels.items():
                     r_i = group_to_row.get(g)
                     if r_i is None:
@@ -6436,7 +6465,7 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                     row_y = top + r_i
                     bid, ask = cell[0], cell[1]
                     txt = f"{fmt_lvl_qty(bid)}x{fmt_lvl_qty(ask)}"[:cell_w]
-                    direction = imbalances.get(g)
+                    direction = group_imbalance.get(g)
                     if direction == "sell": pair, attrs = P_RED, curses.A_BOLD
                     elif direction == "buy": pair, attrs = P_GREEN, curses.A_BOLD
                     elif bid >= BIG_TRADE_SIZE or ask >= BIG_TRADE_SIZE: pair, attrs = P_CYAN, curses.A_BOLD
@@ -7656,6 +7685,68 @@ def _go_live(stdscr):
     console_log(f"{RED}{BLD}LIVE ACCOUNT ACTIVE{RST} — {YLW}every asset PAUSED, press [A] to enable trading{RST}")
     log_event("SYSTEM", "switched_to_live", {"assets_paused": list(ASSETS.keys())})
 
+def _go_sim(stdscr, snap):
+    """[G] (the reverse direction) — switch FROM the live Phemex account
+    BACK to --dry-run paper trading, from within the running UI. Added
+    2026-07-25 after the user found `_go_live` was one-way-only (their
+    own original request only ever described GOING live, so no way back
+    was built) and reported "I'm unable to switch back to sim from live."
+
+    Real risk this warns about explicitly, not just "are you sure": any
+    position currently open on the REAL Phemex account is NOT touched by
+    this switch (nothing closes it) — it simply falls out of Athena's own
+    management the instant DRY_RUN flips back to True, since every order
+    call (place_sl/place_tp_leg/cancel_all/market_close/fetch_account)
+    dispatches to SimAccount from that point on instead of the real
+    account. No more SL sync, PCVR-flip-close, or EOD-flatten will happen
+    for that real position until the user switches back to live again or
+    manages it manually. `snap` (the same AppState snapshot the dashboard
+    itself just rendered from) is used to name exactly which asset(s), if
+    any, are in this situation, rather than a generic warning.
+
+    Gated by the same type-to-confirm pop-up _go_live uses (type SIM
+    instead of LIVE) — lighter stakes than going live (a real financial
+    loss isn't possible from this switch itself), but still a real
+    "Athena stops watching your open real position" risk worth a
+    deliberate confirmation, not a single keypress."""
+    global DRY_RUN
+    if DRY_RUN:
+        console_log(f"{YLW}Already on the paper (SIM) account{RST}")
+        return
+
+    open_real = [a for a in ASSETS
+                 if (snap.get("instruments", {}).get(a) or {}).get("state") in ("PENDING_FILL", "IN_POSITION")]
+
+    warning = [
+        "",
+        f"{BLD}SWITCHING BACK TO PAPER (SIM) TRADING{RST}",
+        "",
+        "Athena will start reading/writing the paper account again.",
+    ]
+    if open_real:
+        warning += [
+            "",
+            f"{BLD}WARNING: {', '.join(open_real)} still has an OPEN REAL{RST}",
+            f"{BLD}position/order — it will STOP being managed by Athena{RST}",
+            f"{BLD}(no SL sync, no PCVR-flip-close) once you switch.{RST}",
+        ]
+    warning += [
+        "",
+        "Every asset's trading will start PAUSED again — you must",
+        "manually press [A] to enable each one.",
+        "",
+    ]
+    confirmed = _prompt_confirm_text(stdscr, warning, confirm_word="SIM")
+    if not confirmed:
+        console_log(f"{DIM}Switch back to paper account cancelled{RST}")
+        return
+
+    DRY_RUN = True
+    for a in ASSETS:
+        ATHENA_ENABLED[a] = False
+    console_log(f"{GRN}{BLD}PAPER (SIM) ACCOUNT ACTIVE{RST} — {YLW}every asset PAUSED, press [A] to enable trading{RST}")
+    log_event("SYSTEM", "switched_to_sim", {"assets_paused": list(ASSETS.keys()), "open_real_positions": open_real})
+
 # ── [L] Full Recent Activity log popup ────────────────────────────────────────
 def draw_activity_log_popup(db, rows, cols, event_log, scroll):
     """Centered box overlay showing the FULL in-memory activity buffer
@@ -7993,7 +8084,7 @@ def curses_main(stdscr):
             footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{x_hint}{tab_hint} [Home]live"
                       f" [P]ct:{PCT:g}% [B]:{'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
-                      + ("  [R]eset  [G]o live" if DRY_RUN else "")
+                      + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
@@ -8220,8 +8311,17 @@ def curses_main(stdscr):
                 console_log(f"{YLW}Risk changed: {PCT:g}% -> {new_pct:g}% (via [P]){RST}")
                 log_event("SYSTEM", "pct_changed", {"old": PCT, "new": new_pct})
                 PCT = new_pct
-        elif key in (ord("g"), ord("G")) and DRY_RUN:
-            _go_live(stdscr)
+        elif key in (ord("g"), ord("G")):
+            # [G] toggles both directions (2026-07-25, user-reported: "I'm
+            # unable to switch back to sim from live" — _go_live was
+            # originally one-way-only since the user's first request only
+            # ever described GOING live). _go_sim needs `snap` to warn
+            # about any real position that would fall out of Athena's own
+            # management the instant the switch happens.
+            if DRY_RUN:
+                _go_live(stdscr)
+            else:
+                _go_sim(stdscr, snap)
             db.prev = None   # the warning pop-up wrote straight to stdscr, bypassing
                               # the DoubleBuffer — force a full repaint next frame
         elif key == 9 and both_panes:   # Tab

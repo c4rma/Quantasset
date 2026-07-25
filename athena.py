@@ -18,7 +18,18 @@
 # libraries. It only reads their on-disk output as data:
 #   status_logs/<Y>/<M>/<D>/status_<MM_DD_YYYY>.jsonl   (status.py, ~60s cadence)
 #   status_<ASSET>_gex.json                              (gex.py's live export)
-#   data/footprint/<Y>/<M>/<D>/footprint_<SYM>_90s_*.jsonl (footprint.py)
+#
+# data/footprint/<Y>/<M>/<D>/footprint_<SYM>_90s_*.jsonl — this ONE used to be
+# footprint.py's output too, but as of 2026-07-24 Athena's own LiveTape writes
+# it directly (see LiveTape.ingest/_persist_closed_footprint_bar) in the exact
+# same on-disk shape, so footprint.py no longer needs to run for Athena's
+# Order Flow confirmation to work — it's now Athena's OWN file, just still
+# read back the same way. Running footprint.py alongside Athena is harmless
+# (same format) but no longer necessary. A REST backfill (_run_footprint_
+# backfill, ported from footprint.py's own initialize_today/backfill_trades)
+# runs once per asset at startup, on its own thread before that asset's live
+# feed begins, so there's no meaningful cold-start gap either — same as
+# footprint.py itself, not an approximation of it.
 #
 # All trading is Phemex-only (ETHUSDT / QQQUSDT). No MT5/XLTRADE involvement.
 #
@@ -61,14 +72,24 @@ import os
 import re
 import glob
 import json
+import shutil
 import math
+import bisect
 import time
 import hmac
 import hashlib
 import asyncio
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import requests
+except ModuleNotFoundError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"], stdout=subprocess.DEVNULL)
+    import requests
 
 try:
     import httpx
@@ -111,6 +132,17 @@ def _load_tz(name):
 
 TZ_ET = _load_tz("America/New_York")
 TZ_CT = _load_tz("America/Chicago")
+
+def _in_entry_blackout():
+    """No new entries 19:00-19:30 CT (explicit user request). Only gates
+    the WATCHING->ARMED transition in process_cycle — PENDING_FILL/
+    IN_POSITION handling is completely unaffected, same as ATHENA_ENABLED.
+    If CT can't be resolved (no zoneinfo/tzdata), fail open rather than
+    blocking entries all day over a missing tz database."""
+    if TZ_CT is None:
+        return False
+    now = datetime.now(TZ_CT)
+    return (now.hour, now.minute) >= (19, 0) and (now.hour, now.minute) < (19, 30)
 
 # ── Load .env (same convention as copycat.py/status.py) ──────────────────────
 def load_env():
@@ -170,6 +202,16 @@ KRAKEN_ETH_PAIR = 'ETH/USD'
 COINBASE_WS_URL       = 'wss://ws-feed.exchange.coinbase.com'
 COINBASE_ETH_PRODUCT  = 'ETH-USD'
 
+# REST endpoints for the startup backfill (distinct from the WS URLs above —
+# ported from footprint.py's own REST historical-trades fetchers, see
+# fetch_kraken_trades_range/fetch_coinbase_trades_range/fetch_alpaca_trades_
+# range near LiveTape below). Kraken's REST pair format has no slash, unlike
+# its WS pair (KRAKEN_ETH_PAIR above) — a separate constant, not reused.
+KRAKEN_TRADES_URL     = 'https://api.kraken.com/0/public/Trades'
+KRAKEN_ETH_TRADES_PAIR = 'ETHUSD'
+COINBASE_REST_URL    = 'https://api.exchange.coinbase.com'
+ALPACA_REST_URL      = 'https://data.alpaca.markets/v2'
+
 SCRIPT_DIR          = os.path.dirname(os.path.abspath(__file__))
 STATUS_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "status_logs")
 FOOTPRINT_DATA_DIR  = os.path.join(SCRIPT_DIR, "data", "footprint")
@@ -177,6 +219,7 @@ ATHENA_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "athena_logs")
 SIM_STATE_PATH      = os.path.join(SCRIPT_DIR, "sim_account.json")
 SIM_LOG_DIR_BASE    = os.path.join(SCRIPT_DIR, "sim_logs")
 SIM_DEFAULT_BALANCE = 10000.0
+BLACKJACK_STATE_PATH = os.path.join(SCRIPT_DIR, "blackjack_state.json")
 
 FOOTPRINT_INTERVAL_LABEL = "90s"
 FOOTPRINT_BAR_SECS       = 90   # numeric form of FOOTPRINT_INTERVAL_LABEL, for bucket math
@@ -194,6 +237,51 @@ ASSETS = {
     "QQQ": {"phemex_symbol": "QQQUSDT", "footprint_symbol": "QQQ", "sl": 0.75,  "snap_key": "qqq", "leverage": 10,  "tick": 0.05},
 }
 LEVERAGE_BY_SYMBOL = {cfg["phemex_symbol"]: cfg["leverage"] for cfg in ASSETS.values()}
+ASSET_BY_SYMBOL = {cfg["phemex_symbol"]: name for name, cfg in ASSETS.items()}
+
+# ── "Blackjack" position-sizing mode ([B] toggle) ─────────────────────────────
+# Loss progression 1R,1R,2R,3R,5R (R = balance*PCT/100, the SAME "1 unit of
+# risk" the flat-PCT sizing already uses — Blackjack mode only changes HOW
+# MANY R's are risked per trade, not what "1R" means). A loss advances one
+# step forward through the sequence; a loss already at the max step (5R)
+# wraps back to 1R. A win starts a 2-trade "win progression": the very next
+# trade risks (the R-multiple ONE STEP BACK from wherever the sequence was) +
+# (that win's own dollar profit) — e.g. at 3R with a $100 win, the next trade
+# risks 2R + $100. If THAT trade also wins, two wins in a row, and the whole
+# sequence resets to 1R. If it loses instead, the win progression ends and
+# the loss ladder simply resumes at the level it was frozen at when the win
+# started (3R in the example — losing the win-progression trade is not
+# itself counted as an extra forward step; the next ordinary loss is what
+# advances it further). Full spec confirmed with the user 2026-07-24 via
+# AskUserQuestion — every branch above is a direct quote/paraphrase of their
+# own worked example, not a guess.
+BLACKJACK_STEPS = [1.0, 1.0, 2.0, 3.0, 5.0]
+BLACKJACK_MODE = False
+
+def _default_blackjack_state():
+    return {a: {"loss_step": 0, "in_win_progression": False,
+                "win_step_back": None, "win_profit_dollars": None} for a in ASSETS}
+
+def _load_blackjack_state():
+    try:
+        with open(BLACKJACK_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        state = _default_blackjack_state()
+        for a in ASSETS:
+            if a in data:
+                state[a].update(data[a])
+        return state
+    except Exception:
+        return _default_blackjack_state()
+
+def _save_blackjack_state():
+    try:
+        with open(BLACKJACK_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(BLACKJACK_STATE, f)
+    except Exception:
+        pass
+
+BLACKJACK_STATE = _load_blackjack_state()
 
 # A TP leg targeting GEX Flip never sits exactly at the flip level — $3 on
 # the near side (below for a long, above for a short), applied both at
@@ -224,9 +312,47 @@ if "--pct" in args:
         PCT = max(0.0, float(args[i + 1]))
     except (IndexError, ValueError):
         pass
+
+# ── Footprint startup backfill (--backfill-hours / --backfill-budget-secs) ──
+# Ported from footprint.py's own CLI flags/defaults of the exact same name —
+# see _footprint_session_start_ts/_run_footprint_backfill near LiveTape below.
+def _footprint_session_start_ts(now=None):
+    """The PREVIOUS calendar day's 00:00 — ported verbatim from
+    footprint.py's own _session_start_ts (its docstring calls this '00:00
+    CT' but the actual code just uses naive local system time, not an
+    explicit CT conversion — mirrored exactly as written, not as
+    labeled). Anchoring a full day back, not just today's own midnight,
+    guarantees at least a full day of backfilled context on every
+    startup, same reasoning footprint.py's own docstring gives."""
+    now = now or datetime.now()
+    yesterday = now - timedelta(days=1)
+    return datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0).timestamp()
+
+BACKFILL_HOURS = None
+if "--backfill-hours" in args:
+    i = args.index("--backfill-hours")
+    try:
+        BACKFILL_HOURS = max(0.0, float(args[i + 1]))
+    except (IndexError, ValueError):
+        pass
+if BACKFILL_HOURS is None:
+    BACKFILL_HOURS = max(0.0, (time.time() - _footprint_session_start_ts()) / 3600.0)
+
+INITIAL_FOOTPRINT_BACKFILL_BUDGET_SECS = 30
+if "--backfill-budget-secs" in args:
+    i = args.index("--backfill-budget-secs")
+    try:
+        INITIAL_FOOTPRINT_BACKFILL_BUDGET_SECS = max(1.0, float(args[i + 1]))
+    except (IndexError, ValueError):
+        pass
+
 DRY_RUN = "--dry-run" in args
 NO_SESSION = "--no-session" in args
-ATHENA_ENABLED = True   # [A] master on/off toggle — see process_cycle's own
+ATHENA_ENABLED = {a: True for a in ASSETS}   # [A] per-asset on/off toggle
+                         # (acts on whichever pane is currently [Tab]-
+                         # focused — explicit user request 2026-07-24 to
+                         # control ETH/QQQ independently rather than one
+                         # shared switch) — see process_cycle's own
                          # gating: OFF blocks WATCHING->ARMED->confirm (no
                          # NEW entries), but PENDING_FILL/IN_POSITION
                          # management (SL/TP fills, PCVR-flip-close,
@@ -295,9 +421,25 @@ def console_log(msg):
 def status_log_path(dt=None):
     dt = dt or datetime.now()
     day_dir = os.path.join(STATUS_LOG_DIR_BASE, f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}")
+    os.makedirs(day_dir, exist_ok=True)   # now written by Athena itself
+                                            # (Phase 3), not just read — was
+                                            # a no-op-safe read-only path
+                                            # before, when status.py alone
+                                            # was responsible for creating it
     return os.path.join(day_dir, f"status_{dt.strftime('%m_%d_%Y')}.jsonl")
 
 def read_last_status_snapshot():
+    """Prefers Athena's own in-process status engine (STATUS_SNAPSHOT,
+    populated by _status_snapshot_loop — see Phase 3 of the standalone-
+    merge plan) over the on-disk file — no file round trip needed once
+    that engine is running, same process. Falls back to the file when
+    the in-memory value isn't populated yet (briefly at startup, before
+    the first full refresh + snapshot cycle completes) or an external
+    status.py process is also writing it."""
+    with STATUS_STATE_LOCK:
+        snap = STATUS_SNAPSHOT
+    if snap is not None:
+        return snap
     path = status_log_path()
     try:
         with open(path, encoding="utf-8") as f:
@@ -309,6 +451,19 @@ def read_last_status_snapshot():
         return None
 
 def read_gex_export(asset):
+    """Prefers Athena's own in-process GEX engine (GEX_EXPORT, populated
+    by gex_export_status_snapshot — see _gex_engine_loop, Phase 2 of the
+    standalone-merge plan) over the on-disk file — no file round trip
+    needed once that engine is running, since it's the same process.
+    Falls back to reading the file when the in-memory value isn't
+    populated/fresh yet (e.g. briefly at startup before this asset's
+    first GEX fetch completes) or an external gex.py/status.py process is
+    also writing it — same GEX_EXPORT_MAX_AGE staleness rule either way,
+    so callers never need to know which source actually served them."""
+    with GEX_STATE_LOCK:
+        exp = GEX_EXPORT.get(asset)
+    if exp is not None and time.time() - exp.get("updated_at", 0) <= GEX_EXPORT_MAX_AGE:
+        return exp
     path = os.path.join(SCRIPT_DIR, f"status_{asset}_gex.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -319,34 +474,91 @@ def read_gex_export(asset):
         pass
     return None
 
-def reconstruct_targets(log_targets, gex_export):
-    """[{'type','level'}, ...] in status.py render()'s exact Targets order:
-    BT/ST, then GEX Flip, then every Cluster — status.py's own snapshot log
-    only carries BT/ST + Cluster, so GEX Flip (read separately from the
-    gex.py export) is spliced in as the 2nd element when present.
+def magnitude_tier(net, scale_max):
+    """Ported from status.py's own magnitude_tier (Medium 0.35-0.65
+    fraction of session scale_max, Large >=0.65) — Athena reads gex.py's
+    raw export directly (read_gex_export), not through status.py's
+    periodic snapshot log, so it needs this to classify clusters itself,
+    live, every cycle (see clusters_from_gex_export) instead of only ever
+    seeing whatever cluster set status.py's own snapshot cadence happened
+    to have baked in — that lag was why a cluster which had already
+    crossed into Medium in gex.py's own live export could still be
+    missing from Athena's target list for a cycle or more."""
+    if scale_max <= 0:
+        return None
+    frac = min(1.0, abs(net) / scale_max)
+    if frac < 0.35:
+        return None
+    elif frac < 0.65:
+        return "Medium"
+    else:
+        return "Large"
 
-    Large gamma clusters take precedence over Medium ones (explicit user
-    request 2026-07-23) — status.py's own log orders Cluster entries by
-    STRIKE ascending (see `gamma_cluster_targets_directional`'s `above`/
-    `below` sort), not by tier, so a closer Medium cluster can otherwise
-    land ahead of a farther but more significant Large one. Each Cluster
-    entry carries its own `"tier"` field ("Medium"/"Large" — see
-    status.py's `magnitude_tier()`); a stable sort on tier (Large first)
-    preserves status.py's own relative ordering WITHIN each tier, only
-    promoting Large clusters ahead of Medium ones across tiers."""
+def clusters_from_gex_export(gex_export, price, direction):
+    """[(strike, tier), ...] for every Medium/Large cluster on `direction`
+    ("above" or "below") of `price`, nearest-to-price first. Ported from
+    status.py's all_clusters_from_gex_export/gamma_cluster_targets_
+    directional, reading the same raw gex.py export Athena already pulls
+    for GEX Flip (gex_by_strike + scale_max) — see magnitude_tier."""
+    if not gex_export or price is None:
+        return []
+    scale_max = gex_export.get("scale_max") or 0.0
+    by_strike = gex_export.get("gex_by_strike") or {}
+    out = []
+    for k_str, net in by_strike.items():
+        strike = float(k_str)
+        if direction == "above" and strike <= price:
+            continue
+        if direction == "below" and strike >= price:
+            continue
+        tier = magnitude_tier(float(net), scale_max)
+        if tier:
+            out.append((strike, tier))
+    out.sort(key=lambda kt: abs(kt[0] - price))
+    return out
+
+def reconstruct_targets(log_targets, gex_export, price, regime):
+    """[{'type','level'}, ...]: BT/ST, then every qualifying gamma
+    Cluster (Large before Medium — explicit user request 2026-07-23),
+    then GEX Flip last.
+
+    Clusters are computed LIVE from this cycle's own gex_export via
+    clusters_from_gex_export rather than read back out of status.py's
+    log_targets (status.py's own snapshot log only refreshes every few
+    seconds — computing them here, from the exact same raw export Athena
+    already reads for GEX Flip, means a cluster that just crossed into
+    Medium/Large this cycle is picked up immediately, and Medium ones are
+    never silently dropped just because a couple were missing from
+    whatever status.py had last written). log_targets is still the
+    source for BT/ST (status.py fetches the live options chain for
+    those; Athena doesn't replicate that call).
+
+    GEX Flip is placed LAST, after every cluster (explicit user request
+    2026-07-24, following from 'medium clusters are not ignored' — a real
+    gamma cluster is an actual option-driven wall, GEX Flip a continuously
+    recomputed synthetic level; with only 2 TP legs ever placed
+    (_check_fill takes candidates[0]/[1]), GEX Flip sitting in the fixed
+    2nd slot ahead of every cluster meant a cluster could get entered as
+    the position's own primary target and then STILL never receive a TP
+    leg. GEX Flip is the fallback target now, not the priority one — it
+    already gets refreshed every cycle regardless (_sync_moving_tps), so
+    losing a guaranteed slot doesn't make it any less trackable, just
+    lower priority when a real cluster is also available)."""
     log_targets = log_targets or []
     full = []
-    idx = 0
     if log_targets and log_targets[0].get("type") in ("BT", "ST"):
         full.append({"type": log_targets[0]["type"], "level": float(log_targets[0]["level"])})
-        idx = 1
+
+    if price is not None and regime in ("long", "short"):
+        direction = "above" if regime == "long" else "below"
+        clusters = clusters_from_gex_export(gex_export, price, direction)
+        clusters.sort(key=lambda kt: 0 if kt[1] == "Large" else 1)
+        for strike, _tier in clusters:
+            full.append({"type": "Cluster", "level": strike})
+
     gex_flip = gex_export.get("gex_flip") if gex_export else None
     if gex_flip is not None:
         full.append({"type": "GEX Flip", "level": float(gex_flip)})
-    clusters = [t for t in log_targets[idx:] if t.get("type") == "Cluster"]
-    clusters.sort(key=lambda t: 0 if t.get("tier") == "Large" else 1)
-    for t in clusters:
-        full.append({"type": "Cluster", "level": float(t["level"])})
     return full
 
 def instrument_lights(snapshot, asset):
@@ -393,7 +605,7 @@ def instrument_lights(snapshot, asset):
     lights["Targets"] = bool(log_targets)
 
     gex_export = read_gex_export(asset)
-    targets_full = reconstruct_targets(log_targets, gex_export)
+    targets_full = reconstruct_targets(log_targets, gex_export, price, regime)
     return lights, regime, price, targets_full, False
 
 # ── footprint.py bar log — tail last CLOSED bar ───────────────────────────────
@@ -418,6 +630,47 @@ def footprint_log_glob(asset):
         return None
     matches.sort(key=os.path.getmtime, reverse=True)
     return matches[0]
+
+def _footprint_log_path_for_bar(asset, bar_ts):
+    """Same folder/filename convention footprint.py itself writes
+    (data/footprint/<Y>/<M>/<D>/footprint_<SYM>_<INTERVAL>_<TICK>.jsonl,
+    matching footprint_log_glob's own read pattern above) — but the
+    day-folder is computed from the BAR's own timestamp, not wall-clock-
+    at-call-time, so a bar that closes right at a local-midnight boundary
+    always lands in the correct day's folder. Deliberately NOT
+    footprint.py's own TODAY_STR-frozen-at-launch behavior — see
+    footprint_log_glob's own docstring just above for why that's a bug
+    worth avoiding here, not copying. Local time, same convention every
+    other day-folder helper in this file already uses (sim_log_path/
+    athena_log_path/status_log_path all key off datetime.now())."""
+    dt = datetime.fromtimestamp(bar_ts)
+    day_dir = os.path.join(FOOTPRINT_DATA_DIR, f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}")
+    os.makedirs(day_dir, exist_ok=True)
+    cfg = ASSETS[asset]
+    return os.path.join(day_dir, f"footprint_{cfg['footprint_symbol']}_{FOOTPRINT_INTERVAL_LABEL}_{cfg['tick']}.jsonl")
+
+def _persist_closed_footprint_bar(asset, bar):
+    """Writes ONE closed bar in footprint.py's own persisted shape (see
+    its _serialize_bar: ts/o/h/l/c/buy_vol/sell_vol/delta/tick/levels) so
+    read_last_two_footprint_bars/footprint_log_glob keep working
+    completely unchanged — they just end up reading files Athena itself
+    now writes, not footprint.py. Deliberately excludes the "live" key —
+    that's an Athena-only in-memory marker for the still-forming bar,
+    footprint.py's own on-disk format never had it. Called from
+    LiveTape.ingest() the moment a NEW bucket's first trade arrives,
+    exactly mirroring footprint.py's own close trigger (a bar only closes
+    when the next bucket's first trade lands, not a wall-clock timer —
+    see LiveTape.ingest's own docstring)."""
+    try:
+        path = _footprint_log_path_for_bar(asset, bar["ts"])
+        row = {"ts": bar["ts"], "o": bar["o"], "h": bar["h"], "l": bar["l"], "c": bar["c"],
+               "buy_vol": bar.get("buy_vol", 0.0), "sell_vol": bar.get("sell_vol", 0.0),
+               "delta": bar["delta"], "tick": bar["tick"],
+               "levels": {str(k): list(v) for k, v in bar["levels"].items()}}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
 
 # ── Live trade tape (self-contained — no dependency on footprint.py at all) ──
 # Athena's still-forming bar previously either (a) approximated O/H/L/C from
@@ -451,13 +704,30 @@ class LiveTape:
         DIVERGE from footprint.py's own (organic, sometimes genuinely
         gappy) behavior instead of matching it. Reverted 2026-07-23 after
         the user reported Athena's live O/H/L/C no longer matching
-        footprint.py's own values for the same bar."""
+        footprint.py's own values for the same bar.
+
+        A bucket rollover (the current bar's bucket differs from this
+        trade's) closes and PERSISTS the outgoing bar to the same on-disk
+        format/path footprint.py itself writes to (see
+        _persist_closed_footprint_bar) — this is what lets Athena be its
+        own source for read_last_two_footprint_bars/footprint_log_glob,
+        no footprint.py process required. A trade for an OLDER bucket
+        than the current live bar (a late/out-of-order print) is dropped
+        outright rather than reopening/mutating a bar — footprint.py's
+        own ingest_trade() does the exact same thing (see its
+        `elif bucket_ts < live["ts"]: return`); this matters a lot more
+        now that a rollover persists to disk than it did when a stray
+        late trade could only ever corrupt one in-memory tick harmlessly."""
         bucket_ts = int(ts // FOOTPRINT_BAR_SECS) * FOOTPRINT_BAR_SECS
         with self.lock:
             bar = self.bars[asset]
+            if bar is not None and bucket_ts < bar["ts"]:
+                return
             if bar is None or bar["ts"] != bucket_ts:
+                if bar is not None:
+                    _persist_closed_footprint_bar(asset, bar)
                 bar = {"ts": bucket_ts, "o": price, "h": price, "l": price, "c": price,
-                       "delta": 0.0, "tick": tick, "levels": {}, "live": True}
+                       "delta": 0.0, "buy_vol": 0.0, "sell_vol": 0.0, "tick": tick, "levels": {}, "live": True}
             bar["h"] = max(bar["h"], price)
             bar["l"] = min(bar["l"], price)
             bar["c"] = price
@@ -466,8 +736,10 @@ class LiveTape:
             cell = bar["levels"].setdefault(lvl, [0.0, 0.0])
             if is_buy:
                 cell[1] += qty
+                bar["buy_vol"] += qty
             else:
                 cell[0] += qty
+                bar["sell_vol"] += qty
             bar["delta"] = bar["delta"] + (qty if is_buy else -qty)
             self.bars[asset] = bar
 
@@ -489,6 +761,1839 @@ class LiveTape:
             self.status[asset] = text
 
 LIVE_TAPE = LiveTape()
+
+# ── Footprint startup backfill (mirrors footprint.py's initialize_today) ────
+# Ported from footprint.py's own REST historical-trades fetchers (its own
+# docstrings/reasoning kept verbatim below) so LiveTape.ingest can be REPLAYED
+# with real historical trades at startup, the exact same trick footprint.py's
+# own backfill_trades()/initialize_today() use: replaying trades through the
+# SAME ingest function a live print would go through means the bucket-close/
+# persist-on-rollover logic already built for live trading reconstructs and
+# writes every historical closed bar as a side effect, with zero separate
+# "bar builder" needed. This is what closes the "no REST backfill" gap noted
+# as an accepted tradeoff in Phase 1 of the standalone-merge plan — per
+# explicit user request 2026-07-24 that every ported piece mirror its source
+# script, not just approximate its behavior.
+_coinbase_backfill_session = requests.Session()
+
+def fetch_kraken_trades_range(pair, since_ts, until_ts, deadline=None):
+    """Ported verbatim from footprint.py's fetch_kraken_trades_range —
+    pages forward through Kraken's public Trades endpoint. deadline
+    (time.time() cutoff) stops paging early, returning whatever's
+    gathered so far rather than blocking indefinitely."""
+    since = int(since_ts * 1e9)
+    out = []
+    last_id = None
+    for _ in range(4000):
+        if deadline and time.time() >= deadline:
+            break
+        try:
+            r = requests.get(KRAKEN_TRADES_URL, params={"pair": pair, "since": since}, timeout=15)
+            d = r.json()
+        except Exception:
+            break
+        if d.get("error"):
+            break
+        keys = [k for k in d.get("result", {}) if k != "last"]
+        if not keys:
+            break
+        trades = d["result"][keys[0]]
+        if not trades:
+            break
+        hit_end = False
+        for t in trades:
+            tid = t[6]
+            if last_id is not None and tid <= last_id:
+                continue
+            last_id = tid
+            ts = float(t[2])
+            if ts > until_ts:
+                hit_end = True
+                break
+            out.append((ts, float(t[0]), float(t[1]), t[3] == "b"))
+        if hit_end or trades[-1][2] >= until_ts:
+            break
+        since = int(d["result"]["last"])
+        time.sleep(0.25)
+    return out
+
+def fetch_coinbase_trades_range(product_id, since_ts, until_ts, deadline=None):
+    """Ported verbatim from footprint.py's fetch_coinbase_trades_range —
+    pages backward through Coinbase Exchange's public trades endpoint (no
+    key needed). Coinbase's `side` is the MAKER's side — flipped here so
+    is_buy means "aggressive buy", matching Kraken/Phemex's convention."""
+    out = []
+    after_cursor = None
+    for _ in range(8000):
+        if deadline and time.time() >= deadline:
+            break
+        params = {"limit": 1000}
+        if after_cursor is not None:
+            params["after"] = after_cursor
+        try:
+            r = _coinbase_backfill_session.get(f"{COINBASE_REST_URL}/products/{product_id}/trades",
+                                                params=params, timeout=15)
+            page = r.json()
+        except Exception:
+            break
+        if not isinstance(page, list) or not page:
+            break
+        hit_old_end = False
+        for t in page:
+            try:
+                ts = _parse_rfc3339(t["time"])
+                price = float(t["price"])
+                qty = float(t["size"])
+            except Exception:
+                continue
+            if ts > until_ts:
+                continue
+            if ts < since_ts:
+                hit_old_end = True
+                continue
+            out.append((ts, price, qty, t["side"] == "sell"))
+        after_cursor = r.headers.get("cb-after")
+        if hit_old_end or not after_cursor:
+            break
+        time.sleep(0.2)
+    out.reverse()
+    return out
+
+def _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, deadline=None):
+    """Ported verbatim from footprint.py's _fetch_alpaca_trades_raw —
+    historical trade prints (IEX feed) — (ts, price, size), no side yet."""
+    out = []
+    page_token = None
+    start_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+    end_iso = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+    for _ in range(2000):
+        if deadline and time.time() >= deadline:
+            break
+        params = {"symbols": symbol, "start": start_iso, "end": end_iso, "limit": 10000, "feed": "iex"}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{ALPACA_REST_URL}/stocks/trades", params=params,
+                              headers={"APCA-API-KEY-ID": ALPACA_API_KEY_ID,
+                                       "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY}, timeout=15)
+            d = r.json()
+        except Exception:
+            break
+        page_trades = (d.get("trades") or {}).get(symbol) or []
+        for t in page_trades:
+            out.append((_parse_rfc3339(t["t"]), t["p"], t["s"]))
+        page_token = d.get("next_page_token")
+        if not page_token:
+            break
+        time.sleep(0.2)
+    return out
+
+def fetch_alpaca_trades_range(symbol, since_ts, until_ts, deadline=None):
+    """Ported from footprint.py's fetch_alpaca_trades_range — historical/
+    backfilled bars use TICK-RULE classification only (no quotes fetched
+    here), deliberately, not an oversight: a single liquid symbol can
+    generate hundreds of thousands of NBBO quote updates per hour, and
+    paging through that just to classify a backfill window doesn't scale
+    the way trade counts do. Live bars still get the more accurate
+    quote-rule classification via _alpaca_trade_ws's own continuously-
+    updated running quote, unaffected by this."""
+    raw_trades = _fetch_alpaca_trades_raw(symbol, since_ts, until_ts, deadline=deadline)
+    return classify_trades_quote_rule(raw_trades, [])
+
+def _fetch_footprint_trades_range(asset, since_ts, until_ts, deadline=None):
+    """Dispatch to whichever data source this asset actually uses —
+    ported from footprint.py's fetch_trades_range (its own
+    include_coinbase=False branch, used only by extend_history_backward,
+    is out of scope here — see the standalone-merge plan for why that
+    function isn't being ported). ETH: Kraken+Coinbase concurrently
+    (Phemex has no historical trades API at all, matching footprint.py's
+    own documented limitation), merge-sorted chronologically — NOT a
+    plain concatenation, since LiveTape.ingest drops late/out-of-order
+    prints for an already-closed bucket, so an unsorted replay would
+    silently corrupt bars. QQQ: Alpaca."""
+    if asset == "ETH":
+        results = {}
+        def _fetch_kraken():
+            results["kraken"] = fetch_kraken_trades_range(KRAKEN_ETH_TRADES_PAIR, since_ts, until_ts, deadline=deadline)
+        def _fetch_coinbase():
+            results["coinbase"] = fetch_coinbase_trades_range(COINBASE_ETH_PRODUCT, since_ts, until_ts, deadline=deadline)
+        t1 = threading.Thread(target=_fetch_kraken, daemon=True)
+        t2 = threading.Thread(target=_fetch_coinbase, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        kraken_trades = results.get("kraken", [])
+        coinbase_trades = results.get("coinbase", [])
+        starts = [since_ts]
+        if kraken_trades:
+            starts.append(kraken_trades[0][0])
+        if coinbase_trades:
+            starts.append(coinbase_trades[0][0])
+        effective_since = max(starts)
+        combined = [t for t in (kraken_trades + coinbase_trades) if t[0] >= effective_since]
+        combined.sort(key=lambda t: t[0])
+        return combined
+    return fetch_alpaca_trades_range(ASSETS[asset]["footprint_symbol"], since_ts, until_ts, deadline=deadline)
+
+def _run_footprint_backfill(asset):
+    """Athena's own version of footprint.py's initialize_today(): prefer
+    resuming from today's already-persisted bars (fetch only the GAP
+    since the last one) over a full fresh backfill; only do a full
+    BACKFILL_HOURS-back backfill when there's no usable log yet for
+    today. Trades are replayed through LIVE_TAPE.ingest() itself, in
+    chronological order — the exact same closed-bar persist-on-rollover
+    mechanism a live trade triggers reconstructs and writes every
+    historical closed bar, so no separate bar-building step is needed
+    here (footprint.py's own backfill replays through ingest_trade() for
+    the identical reason).
+
+    Deliberately NOT ported: footprint.py's extend_history_backward()/
+    fill_equity_gap() (scroll-triggered incremental backfill for its own
+    interactive deep-history browsing) — Athena's confirmation logic only
+    ever needs the last two closed bars, it has no analogous "user is
+    scrolling near the loaded edge" trigger to hang an incremental fetch
+    off of. See the standalone-merge plan for this scope boundary."""
+    if asset != "ETH" and not (ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY):
+        # QQQ's backfill has no viable data source without Alpaca creds —
+        # footprint.py itself has no Phemex-backfill fallback either (its
+        # historical-trades gap is Alpaca-only for equities); the
+        # Phemex-WS fallback below is a live-feed-only accommodation,
+        # doesn't extend to backfill.
+        LIVE_TAPE.set_status(asset, "no backfill — Alpaca credentials not set")
+        return
+    cfg = ASSETS[asset]
+    tick = cfg["tick"]
+    deadline = time.time() + INITIAL_FOOTPRINT_BACKFILL_BUDGET_SECS
+    today_path = _footprint_log_path_for_bar(asset, time.time())
+    existing = []
+    if os.path.isfile(today_path):
+        try:
+            with open(today_path, encoding="utf-8") as f:
+                existing = [json.loads(l) for l in f if l.strip()]
+        except Exception:
+            existing = []
+
+    now = time.time()
+    until_ts = now if asset == "ETH" else now - 900   # equities: 15-min REST delay, matches footprint.py
+
+    if existing:
+        since_ts = existing[-1]["ts"]
+        if until_ts <= since_ts:
+            LIVE_TAPE.set_status(asset, "resumed from today's log")
+            return
+        trades = _fetch_footprint_trades_range(asset, since_ts, until_ts, deadline=deadline)
+        for ts, price, qty, is_buy in trades:
+            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+        LIVE_TAPE.set_status(asset, f"resumed, caught up {len(trades)} trades")
+        console_log(f"{asset}: resumed {len(existing)} bars from today's log, caught up {len(trades)} newer trades")
+        return
+
+    if BACKFILL_HOURS <= 0:
+        LIVE_TAPE.set_status(asset, "starting fresh — no backfill")
+        return
+    since_ts = now - BACKFILL_HOURS * 3600.0
+    trades = _fetch_footprint_trades_range(asset, since_ts, until_ts, deadline=deadline)
+    if trades:
+        for ts, price, qty, is_buy in trades:
+            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+        src = "Kraken+Coinbase" if asset == "ETH" else "Alpaca (IEX)"
+        since_str = datetime.fromtimestamp(since_ts).strftime('%H:%M:%S')
+        LIVE_TAPE.set_status(asset, f"backfilled {len(trades)} trades")
+        console_log(f"{asset}: backfilled {len(trades)} {src} trades since {since_str}")
+    else:
+        LIVE_TAPE.set_status(asset, "starting fresh — backfill returned nothing")
+
+def _backfill_then_feeds(asset, feed_starters):
+    """Runs this asset's REST backfill to completion on its OWN dedicated
+    thread — mirrors footprint.py's own sequencing (initialize_today()
+    blocks, THEN start_feeds() begins — see its call site) so live trades
+    for this asset never start being ingested until the backfill has
+    finished catching up, avoiding a race where a live trade for a much
+    newer bucket arrives first and causes the late-trade guard to drop
+    older backfilled trades that hadn't been replayed yet. Deliberately
+    NOT run on the curses main thread the way footprint.py blocks ITS
+    single curses screen during backfill — Athena runs two assets at
+    once and its curses UI must stay responsive regardless, so each
+    asset gets its own thread instead of blocking startup for
+    everything. feed_starters is the list of (target, args) to start as
+    their own additional threads once the backfill completes."""
+    try:
+        _run_footprint_backfill(asset)
+    except Exception as e:
+        console_log(f"{asset}: backfill failed ({e}) — starting live feed anyway")
+    for target, fargs in feed_starters:
+        threading.Thread(target=target, args=fargs, daemon=True).start()
+
+# ── GEX engine (mirrors gex.py — Phase 2 of the standalone-merge plan) ──────
+# Ported from gex.py's own fetch/GEX-math/persistence/export layer
+# (gex.py:139-733, confirmed curses-free) so Athena no longer needs a
+# separate `gex.py` process running per asset. gex.py's SYMBOL/IS_CRYPTO/
+# MULT/BAND_PCT are mutable MODULE GLOBALS reassigned by its own in-app
+# symbol switch — Athena instead runs TWO independent instances of this
+# engine at once (one per asset, in the SAME process), so every function
+# below takes asset/is_crypto/mult/band_pct as explicit parameters instead
+# of reading module globals — that's the one structural adaptation this
+# port needs; the actual fetch/math/persistence logic itself is ported
+# close to verbatim.
+GEX_DERIBIT_BASE_URL = "https://www.deribit.com/api/v2"
+GEX_CBOE_URL         = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+GEX_YAHOO_CHART_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_GEX_YAHOO_HEADERS   = {"User-Agent": "Mozilla/5.0"}
+
+GEX_BS_SWEEP_PCT    = 0.20   # Black-Scholes hypothetical-spot sweep for the
+GEX_BS_SWEEP_POINTS = 61     # GEX Flip — how far/how many points, see build_bs_gex_curve
+
+GEX_REFRESH_SEC    = 60    # matches gex.py's own default --interval
+GEX_SMOOTH_N       = 5     # matches gex.py's own default --smooth-n
+GEX_DIAG_THRESHOLD = 30.0  # matches gex.py's own default --diag-threshold
+GEX_HISTORY_MAXLEN = 1500  # matches gex.py's own HISTORY_MAXLEN (~25h of 1-min columns)
+
+GEX_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "logs")   # SAME "logs/" folder
+                    # name gex.py itself uses (not ATHENA_LOG_DIR_BASE/
+                    # SIM_LOG_DIR_BASE's own naming) — so a real gex.py
+                    # instance run standalone against the same folder later
+                    # shares/continues the exact same history files.
+
+def _gex_deribit_api(path, **params):
+    """Ported verbatim from gex.py's own api()."""
+    r = requests.get(GEX_DERIBIT_BASE_URL + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def _gex_fetch_ticker(name):
+    return name, _gex_deribit_api("/public/ticker", instrument_name=name)
+
+def _gex_countdown(ts_ms):
+    """Ported verbatim from gex.py's own countdown()."""
+    ms = ts_ms - int(time.time() * 1000)
+    if ms <= 0:
+        return "EXPIRED"
+    h, rem = divmod(ms // 1000, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def bs_gamma(S, K, T, sigma):
+    """Ported verbatim from gex.py's own bs_gamma — Black-Scholes gamma
+    (identical formula for calls and puts) at spot S, strike K, time-to-
+    expiry T (years), annualized vol sigma (decimal). r=0, a standard
+    simplification for short-dated options where the rate barely moves d1."""
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    return math.exp(-0.5 * d1 * d1) / (math.sqrt(2 * math.pi) * S * sigma * math.sqrt(T))
+
+def build_bs_gex_curve(contracts, spot, mult, n_points=GEX_BS_SWEEP_POINTS, sweep_pct=GEX_BS_SWEEP_PCT):
+    """Ported verbatim from gex.py's own build_bs_gex_curve — the real
+    Zero Gamma/GEX Flip calc: re-prices every contract's gamma at a sweep
+    of hypothetical spot levels via Black-Scholes and returns the
+    resulting [(hyp_spot, total_net_gex), ...] curve. contracts: [(strike,
+    "call"|"put", oi, iv_decimal, T_years), ...]."""
+    lo, hi = spot * (1 - sweep_pct), spot * (1 + sweep_pct)
+    step = (hi - lo) / (n_points - 1) if n_points > 1 else 0.0
+    curve = []
+    for i in range(n_points):
+        S = lo + step * i
+        total = 0.0
+        for strike, otype, oi, iv, T in contracts:
+            gamma = bs_gamma(S, strike, T, iv)
+            gex = gamma * oi * mult * S * S * 0.01
+            total += -gex if otype == "put" else gex
+        curve.append((S, total))
+    return curve
+
+def _gex_find_nearest_zero_crossing(points, ref):
+    """Ported verbatim from gex.py's own _find_nearest_zero_crossing.
+    points: [(x, y), ...] sorted ascending by x. Returns (x_lo, x_hi,
+    interpolated_x) for the y-crossing nearest ref, or None."""
+    if len(points) < 2:
+        return None
+    crossings = []
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        if y0 == 0:
+            crossings.append((x0, x0, x0))
+        elif (y0 < 0) != (y1 < 0):
+            level = x0 + (x1 - x0) * (-y0 / (y1 - y0))
+            crossings.append((x0, x1, level))
+    if not crossings:
+        return None
+    return min(crossings, key=lambda c: abs(c[2] - ref))
+
+def compute_max_pain(oi_by_type):
+    """Ported verbatim from gex.py's own compute_max_pain — strike where
+    total intrinsic payout to option holders is minimized at expiry."""
+    if not oi_by_type:
+        return None
+    items = list(oi_by_type.items())
+    best_strike, best_payout = None, None
+    for k in oi_by_type:
+        payout = 0.0
+        for s, oi in items:
+            c_oi, p_oi = oi.get("call", 0.0), oi.get("put", 0.0)
+            if k > s:
+                payout += (k - s) * c_oi
+            elif k < s:
+                payout += (s - k) * p_oi
+        if best_payout is None or payout < best_payout:
+            best_payout, best_strike = payout, k
+    return best_strike
+
+def smoothed_max_pain_and_flip(history, end_idx, n):
+    """Ported verbatim from gex.py's own smoothed_max_pain_and_flip —
+    averages Max Pain and the GEX-flip level over the last n raw columns
+    ending at end_idx, to absorb single-snapshot OI/IV artifacts."""
+    window = history[max(0, end_idx - n):end_idx]
+    if not window:
+        return None, None
+    mps, levels = [], []
+    for c in window:
+        mp = compute_max_pain(c.get("oi_by_type"))
+        if mp is not None:
+            mps.append(mp)
+        fl = _gex_find_nearest_zero_crossing(c.get("bs_gex_curve") or [], c["spot"])
+        if fl:
+            levels.append(fl[2])
+    smoothed_mp = sum(mps) / len(mps) if mps else None
+    smoothed_level = sum(levels) / len(levels) if levels else None
+    return smoothed_mp, smoothed_level
+
+def gex_bounding_strikes(sorted_strikes, level):
+    """Ported verbatim from gex.py's own bounding_strikes."""
+    i = bisect.bisect_left(sorted_strikes, level)
+    if i <= 0:
+        return sorted_strikes[0], sorted_strikes[0]
+    if i >= len(sorted_strikes):
+        return sorted_strikes[-1], sorted_strikes[-1]
+    if sorted_strikes[i] == level:
+        return sorted_strikes[i], sorted_strikes[i]
+    return sorted_strikes[i - 1], sorted_strikes[i]
+
+def gex_resolve_marker_row(lo_s, hi_s, row_of):
+    """Ported verbatim from gex.py's own resolve_marker_row."""
+    if lo_s == hi_s:
+        return row_of.get(lo_s)
+    if hi_s in row_of and lo_s in row_of:
+        return row_of[hi_s] + 1
+    return None
+
+def gex_resolve_marker_col(lo_s, hi_s, col_of):
+    """Ported verbatim from gex.py's own resolve_marker_col."""
+    if lo_s == hi_s:
+        return col_of.get(lo_s)
+    if lo_s in col_of and hi_s in col_of:
+        return (col_of[lo_s] + col_of[hi_s]) // 2
+    return None
+
+def gex_ingest_column(col, grid, band_pct):
+    """Ported from gex.py's own ingest_column, parameterized on band_pct
+    instead of a global. Grows `grid` (the strike universe) in place and
+    tags col with its nearest-to-spot strike. Returns (col,
+    local_max_abs_gex) — caller folds local_max into scale_max."""
+    spot = col["spot"]
+    band = spot * band_pct
+    grid.update(s for s in col["gex"] if abs(s - spot) <= band)
+    col["nearest"] = min(grid, key=lambda s: abs(s - spot)) if grid else None
+    local_max = max((abs(v) for v in col["gex"].values()), default=0.0)
+    return col, local_max
+
+def fstrike(strike, is_crypto):
+    """Ported verbatim from gex.py's own fstrike, parameterized on
+    is_crypto instead of a global."""
+    if is_crypto:
+        return f"${strike:,.0f}"
+    return f"${strike:,.2f}"
+
+def fdollars_compact(v):
+    """Ported verbatim from gex.py's own fdollars_compact — compact
+    signed dollar format for totals that can run into the billions."""
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1e9:
+        return f"{sign}${v / 1e9:,.2f}B"
+    if v >= 1e6:
+        return f"{sign}${v / 1e6:,.2f}M"
+    if v >= 1e3:
+        return f"{sign}${v / 1e3:,.2f}K"
+    return f"{sign}${v:,.2f}"
+
+def magnitude_char(net, scale_max, floor_char=" "):
+    """Ported verbatim from gex.py's own magnitude_char — size-tier
+    character for |net| as a fraction of scale_max."""
+    if scale_max <= 0:
+        return floor_char, 0.0
+    frac = min(1.0, abs(net) / scale_max)
+    if frac < 0.04:
+        return floor_char, frac
+    elif frac < 0.15:
+        return ".", frac
+    elif frac < 0.35:
+        return "o", frac
+    elif frac < 0.65:
+        return "O", frac
+    else:
+        return "●", frac
+
+def _gex_fetch_live_price(symbol):
+    """Ported verbatim from gex.py's own fetch_live_price — best-effort
+    near-real-time quote via Yahoo's v8 chart 'meta' block, used only to
+    display/position price for an equity whose options feed (CBOE) is
+    itself ~15m delayed. Returns None on any failure — caller falls back
+    to the options feed's own reference price."""
+    try:
+        r = requests.get(GEX_YAHOO_CHART_URL.format(symbol), headers=_GEX_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
+
+def _gex_cboe_time_to_expiry_years(exp_str):
+    """Ported verbatim from gex.py's own _cboe_time_to_expiry_years.
+    exp_str: 'YYMMDD'. Treats expiry as market close (15:00 local)."""
+    exp_date = datetime.strptime(exp_str, "%y%m%d").date()
+    close_dt = datetime(exp_date.year, exp_date.month, exp_date.day, 15, 0, 0)
+    seconds = (close_dt - datetime.now()).total_seconds()
+    return max(seconds, 60.0) / 86400.0 / 365.0
+
+def fetch_gex_crypto(currency, mult, all_exp=False):
+    """Ported from gex.py's own fetch_eth, parameterized on mult instead
+    of a global MULT (Deribit — real-time gamma+OI read directly off each
+    ticker)."""
+    instruments = _gex_deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+
+    if all_exp:
+        chain_ins = instruments
+        target_exp = None
+    else:
+        target_exp = min((e for e in by_exp if e > now_ms), default=None)
+        if not target_exp:
+            raise RuntimeError("No active expiry found")
+        chain_ins = by_exp[target_exp]
+
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        fut_index = ex.submit(_gex_deribit_api, "/public/get_index_price", index_name=f"{currency.lower()}_usd")
+        ticker_futs = {ex.submit(_gex_fetch_ticker, ins["instrument_name"]): ins for ins in chain_ins}
+        spot = fut_index.result()["index_price"]
+        tickers = {}
+        for fut in as_completed(ticker_futs):
+            try:
+                name, t = fut.result()
+                tickers[name] = t
+            except Exception:
+                pass
+
+    strikes = {}
+    oi_by_type = {}
+    gex_by_type = {}
+    contracts = []
+    for ins in chain_ins:
+        t = tickers.get(ins["instrument_name"])
+        if not t:
+            continue
+        greeks = t.get("greeks") or {}
+        gamma = greeks.get("gamma") or 0.0
+        oi = t.get("open_interest") or 0.0
+        gex = gamma * oi * mult * spot * spot * 0.01
+        otype = ins["option_type"]
+        if otype == "put":
+            gex = -gex
+        strikes[ins["strike"]] = strikes.get(ins["strike"], 0.0) + gex
+        oi_by_type.setdefault(ins["strike"], {"call": 0.0, "put": 0.0})[otype] += oi
+        gex_by_type.setdefault(ins["strike"], {"call": 0.0, "put": 0.0})[otype] += gex
+
+        iv_pct = t.get("mark_iv") or 0.0
+        exp_ms = ins["expiration_timestamp"]
+        T = max(exp_ms - now_ms, 60_000) / 1000.0 / 86400.0 / 365.0
+        if oi > 0 and iv_pct > 0:
+            contracts.append((ins["strike"], otype, oi, iv_pct / 100.0, T))
+
+    bs_gex_curve = build_bs_gex_curve(contracts, spot, mult)
+
+    if target_exp:
+        exp_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d%b%y").upper()
+        ttl = _gex_countdown(target_exp)
+    else:
+        exp_label = f"ALL({len(by_exp)})"
+        ttl = None
+
+    return {"spot": spot, "strikes": strikes, "oi_by_type": oi_by_type, "gex_by_type": gex_by_type,
+            "bs_gex_curve": bs_gex_curve, "expiry_label": exp_label, "ttl": ttl,
+            "fetched_at": datetime.now().strftime("%H:%M:%S")}
+
+def fetch_gex_equity(symbol, mult, all_exp=False):
+    """Ported from gex.py's own fetch_equity, parameterized on mult
+    instead of a global MULT (CBOE delayed-quotes feed, gamma+OI read
+    directly off each contract — no Black-Scholes needed for the raw
+    per-strike GEX, only for the Flip sweep)."""
+    r = requests.get(GEX_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    price = float(data.get("current_price") or 0)
+    if price <= 0:
+        raise RuntimeError("no spot price")
+
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in data.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp_flag = name[-9]
+        exp = name[-15:-9]
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
+        by_exp.setdefault(exp, []).append((cp_flag, strike, o))
+    if not by_exp:
+        raise RuntimeError("empty chain")
+
+    if all_exp:
+        target_exps = sorted(by_exp)
+    elif today in by_exp:
+        target_exps = [today]
+    else:
+        future = [e for e in by_exp if e >= today]
+        target_exps = [min(future)] if future else [min(by_exp)]
+
+    strikes = {}
+    oi_by_type = {}
+    gex_by_type = {}
+    contracts = []
+    for exp in target_exps:
+        T_exp = _gex_cboe_time_to_expiry_years(exp)
+        for cp_flag, strike, o in by_exp[exp]:
+            gamma = float(o.get("gamma") or 0)
+            oi = float(o.get("open_interest") or 0)
+            gex = gamma * oi * mult * price * price * 0.01
+            if cp_flag == "P":
+                gex = -gex
+            strikes[strike] = strikes.get(strike, 0.0) + gex
+            otype = "call" if cp_flag == "C" else "put"
+            oi_by_type.setdefault(strike, {"call": 0.0, "put": 0.0})[otype] += oi
+            gex_by_type.setdefault(strike, {"call": 0.0, "put": 0.0})[otype] += gex
+
+            iv = float(o.get("iv") or 0)
+            if oi > 0 and iv > 0:
+                contracts.append((strike, otype, oi, iv, T_exp))
+
+    bs_gex_curve = build_bs_gex_curve(contracts, price, mult)
+
+    is_0dte = (not all_exp) and target_exps[0] == today
+    exp_label = target_exps[0] if len(target_exps) == 1 else f"ALL({len(target_exps)})"
+
+    live_price = _gex_fetch_live_price(symbol)
+    spot = live_price if live_price else price
+
+    return {"spot": spot, "spot_is_live": live_price is not None, "cboe_ref_price": price,
+            "strikes": strikes, "oi_by_type": oi_by_type, "gex_by_type": gex_by_type,
+            "bs_gex_curve": bs_gex_curve, "expiry_label": exp_label,
+            "ttl": None, "is_0dte": is_0dte, "fetched_at": datetime.now().strftime("%H:%M:%S")}
+
+def fetch_gex_snapshot(asset, is_crypto, mult):
+    """Ported from gex.py's own fetch_snapshot — dispatches to whichever
+    data source this asset actually uses. `asset` doubles as both the
+    Deribit currency ("ETH") and the CBOE ticker ("QQQ") since Athena's
+    own ASSETS keys already match both conventions directly."""
+    if is_crypto:
+        return fetch_gex_crypto(asset, mult)
+    return fetch_gex_equity(asset, mult)
+
+# ── GEX persistence — logs/<Y>/<M>/<D>/gex_<ASSET>_<date>.jsonl ─────────────
+# SAME "logs/" folder gex.py itself writes to (GEX_LOG_DIR_BASE, defined
+# above) — a standalone gex.py instance pointed at this same directory later
+# shares/continues the exact same history, same as footprint.py's log
+# convention from Phase 1.
+def _gex_date_folder(*roots, date_str):
+    """Ported verbatim from gex.py's own _date_folder."""
+    mm, dd, yyyy = date_str.split("_")
+    folder = os.path.join(GEX_LOG_DIR_BASE, *roots, yyyy, mm, dd)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def gex_log_path(asset, date_str):
+    folder = _gex_date_folder(date_str=date_str)
+    return os.path.join(folder, f"gex_{asset}_{date_str}.jsonl")
+
+def gex_append_log(asset, col):
+    """Ported from gex.py's own append_log. Returns (ok, err_str_or_None)."""
+    try:
+        with open(gex_log_path(asset, datetime.now().strftime("%m_%d_%Y")), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": col["ts"].isoformat(), "spot": col["spot"], "gex": col["gex"],
+                "oi_by_type": col.get("oi_by_type") or {},
+                "gex_by_type": col.get("gex_by_type") or {},
+                "bs_gex_curve": col.get("bs_gex_curve") or [],
+                "expiry_label": col.get("expiry_label"), "is_0dte": col.get("is_0dte"),
+            }) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def gex_diag_log_path(asset, date_str):
+    folder = _gex_date_folder(date_str=date_str)
+    return os.path.join(folder, f"gex_diag_{asset}_{date_str}.jsonl")
+
+def gex_append_diag(asset, prev_col, prev_level, new_col, new_level):
+    """Ported from gex.py's own append_diag — logs a raw-flip jump
+    exceeding GEX_DIAG_THRESHOLD with full before/after OI+gamma."""
+    try:
+        with open(gex_diag_log_path(asset, datetime.now().strftime("%m_%d_%Y")), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": new_col["ts"].isoformat(), "prev_ts": prev_col["ts"].isoformat(),
+                "delta": new_level - prev_level,
+                "prev_flip_level": prev_level, "new_flip_level": new_level,
+                "prev_spot": prev_col["spot"], "new_spot": new_col["spot"],
+                "prev_gex": prev_col["gex"], "new_gex": new_col["gex"],
+                "prev_oi_by_type": prev_col.get("oi_by_type"), "new_oi_by_type": new_col.get("oi_by_type"),
+            }) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def gex_check_flip_jump(asset, prev_col, new_col):
+    """Ported from gex.py's own check_flip_jump — compares raw
+    (unsmoothed) flip levels between two consecutive columns; if the jump
+    exceeds GEX_DIAG_THRESHOLD, logs it and returns a short status
+    message, else None."""
+    if GEX_DIAG_THRESHOLD <= 0:
+        return None
+    prev_flip = _gex_find_nearest_zero_crossing(prev_col.get("bs_gex_curve") or [], prev_col["spot"])
+    new_flip = _gex_find_nearest_zero_crossing(new_col.get("bs_gex_curve") or [], new_col["spot"])
+    if not prev_flip or not new_flip:
+        return None
+    delta = new_flip[2] - prev_flip[2]
+    if abs(delta) < GEX_DIAG_THRESHOLD:
+        return None
+    gex_append_diag(asset, prev_col, prev_flip[2], new_col, new_flip[2])
+    sign = "+" if delta > 0 else "-"
+    is_crypto = (asset == "ETH")
+    return f"flip jumped {sign}{fstrike(abs(delta), is_crypto)} @ {new_col['ts'].strftime('%H:%M:%S')} (logged)"
+
+def gex_load_log(asset, date_str):
+    """Ported from gex.py's own load_log — reads a day's log back into
+    column dicts (no 'nearest' yet — gex_ingest_column adds it)."""
+    path = gex_log_path(asset, date_str)
+    cols = []
+    if not os.path.exists(path):
+        return cols
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                cols.append({
+                    "ts": datetime.fromisoformat(d["ts"]), "spot": d["spot"],
+                    "gex": {float(k): v for k, v in d["gex"].items()},
+                    "oi_by_type": {float(k): v for k, v in (d.get("oi_by_type") or {}).items()},
+                    "gex_by_type": {float(k): v for k, v in (d.get("gex_by_type") or {}).items()},
+                    "bs_gex_curve": d.get("bs_gex_curve") or [],
+                    "expiry_label": d.get("expiry_label"), "is_0dte": d.get("is_0dte"),
+                })
+            except Exception:
+                continue
+    return cols
+
+# ── GEX in-process state (replaces the file round-trip a separate gex.py
+# process needed — read_gex_export now prefers this directly; see below) ──
+GEX_HISTORY = {a: deque(maxlen=GEX_HISTORY_MAXLEN) for a in ASSETS}
+GEX_GRID    = {a: set() for a in ASSETS}
+GEX_SCALE_MAX = {a: 0.0 for a in ASSETS}
+GEX_META    = {a: {} for a in ASSETS}
+GEX_EXPORT  = {a: None for a in ASSETS}   # export_status_snapshot's own payload shape, kept in memory
+GEX_STATUS  = {a: "connecting…" for a in ASSETS}   # same convention as LIVE_TAPE.status
+GEX_LOG_ROWS = {a: 0 for a in ASSETS}
+GEX_DIAG_COUNT = {a: 0 for a in ASSETS}
+GEX_STATE_LOCK = threading.Lock()
+
+def _gex_snapshot_state(asset):
+    """A fully independent copy of this asset's GEX state, for the
+    render thread — same convention as LiveTape.snapshot() (the WS/fetch
+    thread keeps mutating the live originals after this returns, so the
+    consumer must never hold a reference into them)."""
+    with GEX_STATE_LOCK:
+        return (list(GEX_HISTORY[asset]), set(GEX_GRID[asset]), GEX_SCALE_MAX[asset], dict(GEX_META[asset]))
+
+def _gex_atm_idx(asset):
+    """Ported from gex.py's own _atm_idx — index of the strike nearest
+    the latest spot, used to seed vert_center_idx the moment the user
+    starts scrolling away from auto-center."""
+    with GEX_STATE_LOCK:
+        grid, history = GEX_GRID[asset], GEX_HISTORY[asset]
+        if not grid or not history:
+            return 0
+        gs = sorted(grid)
+        spot_now = history[-1]["spot"]
+    return min(range(len(gs)), key=lambda i: abs(gs[i] - spot_now))
+
+def _gex_vert_step(asset, delta, vert_follow, vert_center_idx):
+    """Ported from gex.py's own _vert_step — moves vert_center_idx[asset]
+    by delta strikes, seeding it from the currently auto-centered strike
+    the first time (so scrolling starts from wherever you're already
+    looking, not index 0). Shared by the interval map's ↑/↓/[/] (vertical)
+    and the by-strike chart's ←/→/PgUp/PgDn (horizontal) — same "which
+    strike is centered" state either way, just rendered differently.
+    vert_follow/vert_center_idx are the per-asset dicts from curses_main
+    (mutated in place — gex.py's own version closes over plain locals,
+    Athena needs the dict-per-asset indirection instead)."""
+    if vert_follow[asset]:
+        vert_center_idx[asset] = _gex_atm_idx(asset)
+    vert_follow[asset] = False
+    with GEX_STATE_LOCK:
+        grid_len = len(GEX_GRID[asset])
+    vert_center_idx[asset] = max(0, min(max(0, grid_len - 1), vert_center_idx[asset] + delta))
+
+def gex_export_status_snapshot(asset, col, scale_max, flip_level):
+    """Ported from gex.py's own export_status_snapshot — SAME payload
+    shape (`{asset, updated_at, spot, scale_max, gex_by_strike,
+    gex_flip}`), but updates Athena's own in-memory GEX_EXPORT[asset]
+    directly (what read_gex_export now actually reads — no file round
+    trip needed for Athena's own consumption) AND still writes the file,
+    for compat with any external process (status.py, or gex.py itself run
+    standalone) that might also want to read it. Best-effort — a write
+    failure here must never interrupt the fetch loop."""
+    payload = {"asset": asset, "updated_at": time.time(), "spot": col["spot"],
+               "scale_max": scale_max, "gex_by_strike": col.get("gex") or {},
+               "gex_flip": flip_level}
+    with GEX_STATE_LOCK:
+        GEX_EXPORT[asset] = payload
+    try:
+        path = os.path.join(SCRIPT_DIR, f"status_{asset}_gex.json")
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+
+def _gex_load_today(asset):
+    """Ported from gex.py's own _load_into (called at curses_main
+    startup there) — resumes today's already-logged columns into
+    GEX_HISTORY/GEX_GRID/GEX_SCALE_MAX/GEX_META before the live fetch
+    loop starts, same expiry-rollover scale_max reset and scale_at_ingest
+    freezing gex.py's own version does. Best-effort: a corrupt/missing
+    log just leaves state empty, the first live fetch fills it in."""
+    grid = GEX_GRID[asset]
+    history = GEX_HISTORY[asset]
+    is_crypto = (asset == "ETH")
+    band_pct = 0.20 if is_crypto else 0.12
+    grid.clear()
+    history.clear()
+    scale_max = 0.0
+    last_expiry = None
+    for c in gex_load_log(asset, datetime.now().strftime("%m_%d_%Y")):
+        c, local_max = gex_ingest_column(c, grid, band_pct)
+        if last_expiry is not None and c.get("expiry_label") != last_expiry:
+            scale_max = 0.0
+        last_expiry = c.get("expiry_label")
+        scale_max = max(scale_max, local_max)
+        c["scale_at_ingest"] = scale_max
+        history.append(c)
+    GEX_SCALE_MAX[asset] = scale_max
+    if history:
+        last = history[-1]
+        GEX_META[asset] = {"spot": last["spot"], "expiry_label": last.get("expiry_label") or "—",
+                            "is_0dte": last.get("is_0dte"), "fetched_at": last["ts"].strftime("%H:%M:%S")}
+    GEX_LOG_ROWS[asset] = len(history)
+
+def _gex_engine_loop(asset, stop_evt):
+    """Athena's per-asset background GEX engine — runs on its OWN plain
+    thread (not asyncio), mirroring gex.py's own headless_main() loop
+    shape AND execution model almost exactly: gex.py has zero asyncio
+    anywhere in it, and even its live curses mode fetches on a plain
+    thread, never asyncio (see its trigger_fetch/do_fetch) — so a plain
+    thread here is the faithful mirror, not a wrapped asyncio task.
+    fetch -> log -> diag-check -> scale_max update (with expiry-rollover
+    reset, same as gex.py) -> smoothed export, on a GEX_REFRESH_SEC
+    cadence, forever."""
+    is_crypto = (asset == "ETH")
+    mult = 1 if is_crypto else 100
+    band_pct = 0.20 if is_crypto else 0.12
+    _gex_load_today(asset)
+    GEX_STATUS[asset] = "live" if GEX_HISTORY[asset] else "connecting…"
+    prev_col = list(GEX_HISTORY[asset])[-1] if GEX_HISTORY[asset] else None
+    while not stop_evt.is_set():
+        t0 = time.time()
+        ts = datetime.now()
+        try:
+            d = fetch_gex_snapshot(asset, is_crypto, mult)
+            col = {"ts": ts, "spot": d["spot"], "gex": d["strikes"],
+                   "oi_by_type": d.get("oi_by_type") or {},
+                   "gex_by_type": d.get("gex_by_type") or {},
+                   "bs_gex_curve": d.get("bs_gex_curve") or [],
+                   "expiry_label": d.get("expiry_label"),
+                   "is_0dte": d.get("is_0dte", True if is_crypto else False)}
+            with GEX_STATE_LOCK:
+                grid = GEX_GRID[asset]
+                col, local_max = gex_ingest_column(col, grid, band_pct)
+                if prev_col is not None and prev_col.get("expiry_label") != col.get("expiry_label"):
+                    GEX_SCALE_MAX[asset] = 0.0
+                GEX_SCALE_MAX[asset] = max(GEX_SCALE_MAX[asset], local_max)
+                col["scale_at_ingest"] = GEX_SCALE_MAX[asset]
+                GEX_HISTORY[asset].append(col)
+                GEX_META[asset] = {k: v for k, v in d.items() if k != "strikes"}
+                hist_list = list(GEX_HISTORY[asset])
+                scale_max = GEX_SCALE_MAX[asset]
+            ok, err = gex_append_log(asset, col)
+            GEX_LOG_ROWS[asset] = GEX_LOG_ROWS[asset] + 1 if ok else GEX_LOG_ROWS[asset]
+            if prev_col is not None:
+                msg = gex_check_flip_jump(asset, prev_col, col)
+                if msg:
+                    GEX_DIAG_COUNT[asset] += 1
+                    console_log(f"{asset}: GEX {msg}")
+            try:
+                _mp, _flip = smoothed_max_pain_and_flip(hist_list, len(hist_list), GEX_SMOOTH_N)
+            except Exception:
+                _flip = None
+            gex_export_status_snapshot(asset, col, scale_max, _flip)
+            GEX_STATUS[asset] = "live"
+            prev_col = col
+        except Exception as e:
+            GEX_STATUS[asset] = f"error: {e}"[:60]
+        elapsed = time.time() - t0
+        stop_evt.wait(max(1.0, GEX_REFRESH_SEC - elapsed))
+
+STATUS_REFRESH_SEC = 30          # matches status.py's own default --interval
+STATUS_LIVE_PRICE_INTERVAL = 2   # matches status.py's own LIVE_PRICE_INTERVAL
+STATUS_SNAPSHOT_INTERVAL = 3     # matches status.py's own SNAPSHOT_INTERVAL —
+                                  # "feeds athena.py, so the cadence is a
+                                  # functional dependency, not just a
+                                  # backtesting convenience" is now literally
+                                  # Athena itself, same statement as before
+
+STATUS_CT_OFFSET = timedelta(hours=-5)
+
+def _status_now_ct():
+    return datetime.now(timezone.utc) + STATUS_CT_OFFSET
+
+STATUS_KILL_ZONES = [
+    ('NDO',         0,    210,  'CYN'),
+    ('Morning',     510,  630,  'YLW'),
+    ('Lunchtime',   690,  810,  'YLW'),
+    ('Power Hour',  840,  900,  'YLW'),
+    ('EOD',         960,  1080, 'YLW'),
+    ('EEOD',        1110, 1440, 'YLW'),
+]
+STATUS_EXCL_DAYS_09    = {2, 3}
+STATUS_EXCL_START      = 540
+STATUS_EXCL_END        = 600
+STATUS_EXCL_SUN        = 6
+STATUS_EXCL_EEOD_START = 1110
+STATUS_TLT_WINDOW_START = 8 * 60 + 45
+STATUS_TLT_WINDOW_END   = 15 * 60
+STATUS_QQQ_OPEN_CT_MIN  = 8 * 60 + 45
+STATUS_QQQ_CLOSE_CT_MIN = 15 * 60
+
+def status_get_session_status():
+    n = _status_now_ct()
+    t_mins = n.hour * 60 + n.minute
+    dow = n.weekday()
+    excl_reason = None
+    if dow == STATUS_EXCL_SUN:
+        excl_reason = 'Sunday — no trading'
+    elif dow in STATUS_EXCL_DAYS_09 and STATUS_EXCL_START <= t_mins < STATUS_EXCL_END:
+        excl_reason = 'Excluded (09:00-10:00)'
+    elif t_mins >= STATUS_EXCL_EEOD_START:
+        excl_reason = 'EEOD — no trading'
+    for name, start, end, _col in STATUS_KILL_ZONES:
+        if start <= t_mins < end:
+            return name, excl_reason
+    return None, excl_reason
+
+def status_in_tlt_window():
+    n = _status_now_ct()
+    t_mins = n.hour * 60 + n.minute
+    is_weekday = n.weekday() < 5
+    return is_weekday and STATUS_TLT_WINDOW_START <= t_mins < STATUS_TLT_WINDOW_END
+
+def status_session_open_ts():
+    n = datetime.now()
+    today_open = datetime(n.year, n.month, n.day, 19, 0, 0)
+    if n < today_open:
+        curr = today_open - timedelta(days=1)
+    else:
+        curr = today_open
+    prev = curr - timedelta(days=1)
+    return prev.timestamp(), curr.timestamp()
+
+def status_qqq_market_closed():
+    n = _status_now_ct()
+    if n.weekday() >= 5:
+        return True
+    minutes = n.hour * 60 + n.minute
+    return not (STATUS_QQQ_OPEN_CT_MIN <= minutes < STATUS_QQQ_CLOSE_CT_MIN)
+
+STATUS_DVOL_URL = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+
+def fetch_status_dvol(ccy="ETH"):
+    try:
+        now_ms = int(time.time() * 1000)
+        r = requests.get(STATUS_DVOL_URL, params={
+            "currency": ccy, "start_timestamp": now_ms - 7200000,
+            "end_timestamp": now_ms, "resolution": "3600",
+        }, timeout=8)
+        data = (r.json().get("result") or {}).get("data") or []
+        if data:
+            return float(data[-1][4])
+    except Exception:
+        pass
+    return None
+
+def status_dvol_layers(dvol):
+    if dvol is None:
+        return "n/a", "n/a"
+    if dvol <= 60.00:
+        return "Full base unit", "5R cap"
+    elif dvol <= 75.00:
+        return "75% base unit", "3R cap"
+    elif dvol <= 90.00:
+        return "50% base unit", "2R cap"
+    else:
+        return "25% base unit", "1R cap"
+
+STATUS_DERIBIT_BASE = "https://www.deribit.com/api/v2"
+
+def _status_deribit_api(path, **params):
+    r = requests.get(STATUS_DERIBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def fetch_status_deribit_chain(currency):
+    """Ported verbatim from status.py's own fetch_deribit_chain — nearest-
+    expiry option chain: {"spot", "strikes": {strike: {"call": ticker,
+    "put": ticker}}}, ticker being the raw Deribit ticker dict (stats.
+    volume/greeks.gamma/open_interest all present) — distinct from Phase
+    2's fetch_gex_crypto, which returns pre-aggregated net GEX per strike,
+    not raw per-leg tickers; BT/ST here needs the per-leg call/put volume
+    split gex.py's own shape doesn't carry."""
+    instruments = _status_deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+    target_exp = min((e for e in by_exp if e > now_ms), default=None)
+    if not target_exp:
+        raise RuntimeError(f"No active {currency} expiry found")
+    chain_ins = by_exp[target_exp]
+
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        fut_index = ex.submit(_status_deribit_api, "/public/get_index_price", index_name=f"{currency.lower()}_usd")
+        ticker_futs = {ex.submit(_status_deribit_api, "/public/ticker", instrument_name=ins["instrument_name"]): ins
+                       for ins in chain_ins}
+        spot = fut_index.result()["index_price"]
+        tickers = {}
+        for fut, ins in ticker_futs.items():
+            try:
+                tickers[ins["instrument_name"]] = fut.result()
+            except Exception:
+                pass
+
+    strikes = {}
+    for ins in chain_ins:
+        t = tickers.get(ins["instrument_name"])
+        if not t:
+            continue
+        strikes.setdefault(ins["strike"], {})[ins["option_type"]] = t
+
+    return {"spot": spot, "strikes": strikes, "expiry_ts": target_exp}
+
+STATUS_CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+STATUS_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_STATUS_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+def fetch_status_yahoo_meta(symbol):
+    r = requests.get(STATUS_YAHOO_CHART_URL.format(symbol), headers=_STATUS_YAHOO_HEADERS,
+                      params={"interval": "1m", "range": "1d"}, timeout=8)
+    r.raise_for_status()
+    meta = r.json()["chart"]["result"][0]["meta"]
+    price = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    return (float(price) if price else None,
+            float(prev_close) if prev_close else None)
+
+def fetch_status_vxn():
+    try:
+        price, _prev = fetch_status_yahoo_meta("^VXN")
+        return price
+    except Exception:
+        return None
+
+STATUS_PHEMEX_TICKER_URL = "https://api.phemex.com/md/v3/ticker/24hr"
+
+def fetch_status_eth_live_price():
+    try:
+        r = requests.get(STATUS_PHEMEX_TICKER_URL, params={"symbol": "ETHUSDT"}, timeout=6)
+        r.raise_for_status()
+        result = r.json().get("result") or {}
+        price = result.get("lastRp") or result.get("markRp")
+        return float(price) if price is not None else None
+    except Exception:
+        return None
+
+def fetch_status_cboe_chain(symbol):
+    r = requests.get(STATUS_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    ref_price = float(data.get("current_price") or 0)
+    if ref_price <= 0:
+        raise RuntimeError(f"no spot price for {symbol}")
+    try:
+        iv30 = float(data.get("iv30"))
+    except (TypeError, ValueError):
+        iv30 = 0.0
+
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in data.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp_flag = name[-9]
+        exp = name[-15:-9]
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
+        by_exp.setdefault(exp, []).append((cp_flag, strike, o))
+    if not by_exp:
+        raise RuntimeError(f"empty chain for {symbol}")
+
+    if today in by_exp:
+        target_exp = today
+    else:
+        future = sorted(e for e in by_exp if e >= today)
+        target_exp = future[0] if future else min(by_exp)
+
+    strikes = {}
+    for cp_flag, strike, o in by_exp[target_exp]:
+        otype = "call" if cp_flag == "C" else "put"
+        strikes.setdefault(strike, {})[otype] = o
+
+    live_price, _ = (None, None)
+    try:
+        live_price, _ = fetch_status_yahoo_meta(symbol)
+    except Exception:
+        pass
+    spot = live_price if live_price else ref_price
+
+    return {"spot": spot, "cboe_ref_price": ref_price, "iv30": iv30, "strikes": strikes,
+            "expiry_label": target_exp}
+
+STATUS_DERIBIT_BOOK_SUMMARY_URL = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+
+def fetch_status_deribit_pcvr(currency):
+    r = requests.get(STATUS_DERIBIT_BOOK_SUMMARY_URL, params={"currency": currency, "kind": "option"}, timeout=12)
+    r.raise_for_status()
+    instruments = r.json().get("result") or []
+    put_vol = call_vol = 0.0
+    for inst in instruments:
+        name = inst.get("instrument_name", "")
+        volume = float(inst.get("volume") or 0)
+        if volume == 0:
+            continue
+        suffix = name.split("-")[-1]
+        if suffix == "P":
+            put_vol += volume
+        elif suffix == "C":
+            call_vol += volume
+    return put_vol, call_vol
+
+def fetch_status_cboe_pcvr(symbol):
+    r = requests.get(STATUS_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    options = (r.json().get("data") or {}).get("options") or []
+    put_vol = call_vol = 0.0
+    for o in options:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp = name[-9]
+        try:
+            vol = float(o.get("volume") or 0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if cp == "P":
+            put_vol += vol
+        elif cp == "C":
+            call_vol += vol
+    return put_vol, call_vol
+
+def fetch_status_pcvr():
+    if status_in_tlt_window():
+        underlying = "TLT"
+        put_vol, call_vol = fetch_status_cboe_pcvr("TLT")
+    else:
+        underlying = "BTC"
+        put_vol, call_vol = fetch_status_deribit_pcvr("BTC")
+    ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
+    return {"underlying": underlying, "put_vol": put_vol, "call_vol": call_vol, "ratio": ratio}
+
+STATUS_BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}
+STATUS_BT_ST_MAX_STRIKES_FROM_ATM = 10
+STATUS_BT_ST_RUN_LEN = {"crypto": 3, "equity": 5}
+
+def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
+    """Ported verbatim from status.py's own compute_bt_st — see its own
+    docstring there for the full spec. Scans outward from the strike
+    nearest spot for the first consecutive-strike run where one side's
+    option volume dominates; returns (bt, st, active)."""
+    band_pct = STATUS_BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
+    run_len = STATUS_BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
+    lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
+    sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
+    n = len(sorted_strikes)
+    if n < run_len:
+        return None, None, ("BT" if pcvr_gt1 else "ST")
+
+    def vols(k):
+        legs = strikes.get(k, {})
+        call = legs.get("call"); put = legs.get("put")
+        if is_crypto:
+            cv = float((call.get("stats") or {}).get("volume") or 0) if call else 0.0
+            pv = float((put.get("stats") or {}).get("volume") or 0) if put else 0.0
+        else:
+            cv = float(call.get("volume") or 0) if call else 0.0
+            pv = float(put.get("volume") or 0) if put else 0.0
+        return cv, pv
+
+    def run_ok(start, want_put):
+        for idx in range(start, start + run_len):
+            cv, pv = vols(sorted_strikes[idx])
+            if want_put and not (pv > cv):
+                return False
+            if not want_put and not (cv > pv):
+                return False
+        return True
+
+    atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+    max_start = n - run_len
+    if max_start < 0:
+        return None, None, ("BT" if pcvr_gt1 else "ST")
+
+    lo_start = max(0, atm_idx - STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
+    hi_start = min(max_start, atm_idx + STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
+
+    candidates = []
+    for s in range(lo_start, hi_start + 1):
+        top = s + run_len - 1
+        if top <= atm_idx:
+            near_idx, dist = top, atm_idx - top
+        elif s >= atm_idx:
+            near_idx, dist = s, s - atm_idx
+        else:
+            near_idx, dist = atm_idx, 0
+        candidates.append((dist, s, near_idx))
+    candidates.sort(key=lambda c: c[0])
+
+    want_put = bool(pcvr_gt1)
+    for _dist, s, near_idx in candidates:
+        if run_ok(s, want_put):
+            anchor = sorted_strikes[near_idx]
+            if want_put:
+                st = anchor
+                bt = sorted_strikes[near_idx + 1] if near_idx + 1 < n else None
+                return bt, st, "BT"
+            else:
+                bt = anchor
+                st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
+                return bt, st, "ST"
+
+    return None, None, ("BT" if pcvr_gt1 else "ST")
+
+STATUS_PHEMEX_KLINE_LIST_URL = "https://api.phemex.com/exchange/public/md/v2/kline/list"
+
+def fetch_status_phemex_session_candles(symbol="ETHUSDT", resolution=60):
+    """Ported verbatim from status.py's own fetch_phemex_session_candles —
+    oldest-first [(ts,o,h,l,c,v), ...] spanning the current session's
+    19:00 CT open through now."""
+    _prev_open_ts, curr_open_ts = status_session_open_ts()
+    now_ts = int(time.time())
+    minutes = max(1, int((now_ts - curr_open_ts) / resolution) + 5)
+    limit = min(2000, minutes)
+    r = requests.get(STATUS_PHEMEX_KLINE_LIST_URL, params={
+        "symbol": symbol, "resolution": resolution,
+        "from": int(curr_open_ts), "to": now_ts, "limit": limit,
+    }, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != 0:
+        raise RuntimeError(d.get("msg") or "phemex kline error")
+    rows = (d.get("data") or {}).get("rows") or []
+    out = []
+    for row in rows:
+        ts, _interval, o, h, l, c, v = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+        out.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
+    return out
+
+def status_session_prev_eod_close(candles, curr_open_ts):
+    """Ported verbatim from status.py's own session_prev_eod_close —
+    close of the 15:59 CT candle the day before curr_open_ts."""
+    target_ts = curr_open_ts - 3 * 3600 - 60
+    before = [c for c in candles if c[0] <= target_ts]
+    return before[-1][4] if before else None
+
+def fetch_status_yahoo_candles(symbol, rng="5d", interval="1m"):
+    r = requests.get(STATUS_YAHOO_CHART_URL.format(symbol), headers=_STATUS_YAHOO_HEADERS,
+                      params={"interval": interval, "range": rng, "includePrePost": "true"}, timeout=12)
+    r.raise_for_status()
+    res = r.json()["chart"]["result"][0]
+    ts_list = res.get("timestamp") or []
+    q = res["indicators"]["quote"][0]
+    out = []
+    for i, ts in enumerate(ts_list):
+        o, h, l, c, v = q["open"][i], q["high"][i], q["low"][i], q["close"][i], q["volume"][i]
+        if None in (o, h, l, c):
+            continue
+        out.append((int(ts), float(o), float(h), float(l), float(c), float(v or 0)))
+    return out
+
+STATUS_VP_BUCKETS = 200
+
+def status_compute_vp(candles):
+    """Ported verbatim from status.py's own compute_vp (its own docstring
+    notes: "same bucketing as charthacker.py's compute_vp") — REST-based
+    fallback used until Phase 3b's charthacker WS layer is built (and
+    still used as the fallback afterward, exactly mirroring status.py's
+    own dual-path design — see evaluate_hpls)."""
+    if not candles:
+        return None
+    s_lo = min(c[3] for c in candles)
+    s_hi = max(c[2] for c in candles)
+    s_range = s_hi - s_lo
+    if s_range <= 0:
+        return None
+    vp = [0.0] * STATUS_VP_BUCKETS
+
+    def ptb(p):
+        return max(0, min(STATUS_VP_BUCKETS - 1, int((p - s_lo) / s_range * (STATUS_VP_BUCKETS - 1))))
+
+    for _ts, o, h, l, c, v in candles:
+        body_hi, body_lo = max(o, c), min(o, c)
+        wv = v * 0.5
+        bw, bh = ptb(l), ptb(h)
+        sw = max(1, bh - bw + 1)
+        for b in range(bw, bh + 1):
+            vp[b] += wv / sw
+        bv = v * 0.5
+        bl, bb = ptb(body_lo), ptb(body_hi)
+        sb = max(1, bb - bl + 1)
+        if sb > 1:
+            for b in range(bl, bb + 1):
+                vp[b] += bv / sb
+        else:
+            vp[ptb(c)] += bv
+
+    mx = max(vp)
+    tv = sum(vp)
+    pi = vp.index(mx)
+    poc_p = s_lo + (pi / (STATUS_VP_BUCKETS - 1)) * s_range
+
+    tgt = tv * 0.70
+    acc = vp[pi]
+    lo_b = hi_b = pi
+    while acc < tgt:
+        ab = vp[hi_b + 1] if hi_b < STATUS_VP_BUCKETS - 1 else 0.0
+        bb2 = vp[lo_b - 1] if lo_b > 0 else 0.0
+        if ab == 0 and bb2 == 0:
+            break
+        if ab >= bb2:
+            hi_b += 1; acc += ab
+        else:
+            lo_b -= 1; acc += bb2
+
+    vah_p = s_lo + (hi_b / (STATUS_VP_BUCKETS - 1)) * s_range
+    val_p = s_lo + (lo_b / (STATUS_VP_BUCKETS - 1)) * s_range
+    return poc_p, vah_p, val_p
+
+def status_compute_vwap_sd(candles):
+    """Ported verbatim from status.py's own compute_vwap_sd — same
+    cumulative Welford formula as charthacker.py's own."""
+    cum_tpv = cum_vol = cum_dev2 = 0.0
+    vwap = sd = None
+    for _ts, o, h, l, c, v in candles:
+        tp = (h + l + c) / 3.0
+        old_vol = cum_vol
+        cum_tpv += tp * v
+        cum_vol += v
+        if cum_vol > 0:
+            vw = cum_tpv / cum_vol
+            if old_vol > 0:
+                old_vw = (cum_tpv - tp * v) / old_vol
+                cum_dev2 += v * (tp - old_vw) * (tp - vw)
+            var = max(0.0, cum_dev2 / cum_vol)
+            vwap, sd = vw, var ** 0.5
+    return vwap, sd
+
+def status_compute_er(open_price, iv):
+    if not open_price or not iv or iv <= 0:
+        return None
+    daily_move = iv / math.sqrt(365) / 100.0
+    dist = open_price * daily_move
+    return {
+        "upper": {p: open_price + dist * (p / 100.0) for p in (40, 80, 100, 150)},
+        "lower": {p: open_price + dist * (-p / 100.0) for p in (40, 80, 100, 150)},
+    }
+
+STATUS_CHARTHACKER_EXPORT_MAX_AGE = 30
+
+def read_status_charthacker_export(asset, max_age_sec=STATUS_CHARTHACKER_EXPORT_MAX_AGE):
+    """Ported verbatim from status.py's own read_charthacker_export.
+    Always returns None until Phase 3b (charthacker's own WS-fed VAH/
+    VWAP layer) is built — evaluate_hpls's REST-fallback branch is the
+    only reachable path for now, exactly like status.py itself whenever
+    no charthacker.py instance happens to be running."""
+    path = os.path.join(SCRIPT_DIR, f"status_{asset}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - data.get("updated_at", 0) <= max_age_sec:
+            return data
+    except Exception:
+        pass
+    return None
+
+def status_nearest_gex_clusters(gex_export, price, n=2):
+    """Ported from status.py's own clusters_from_gex_export (renamed here
+    to avoid colliding with Athena's OWN clusters_from_gex_export from
+    Phase 2, which has a different signature/purpose — that one returns
+    every qualifying cluster in ONE direction for target-building; this
+    one returns the N clusters closest to price in EITHER direction, for
+    the HPL row's own "2 closest" display text). Reuses Athena's existing
+    magnitude_tier directly against gex_export's own gex_by_strike/
+    scale_max — same math status.py's own all_clusters_from_gex_export
+    used, just inlined rather than a separate helper."""
+    scale_max = gex_export.get("scale_max") or 0.0
+    by_strike = gex_export.get("gex_by_strike") or {}
+    clusters = []
+    for k_str, net in by_strike.items():
+        tier = magnitude_tier(float(net), scale_max)
+        if tier:
+            clusters.append((float(k_str), tier))
+    with_dist = [(k, t, abs(price - k)) for k, t in clusters]
+    with_dist.sort(key=lambda x: x[2])
+    return with_dist[:n]
+
+def status_gamma_cluster_targets_directional(gex_export, price):
+    """Ported from status.py's own gamma_cluster_targets_directional,
+    simplified to ALWAYS use the gex_export path (see this section's
+    module-level comment for why the live options-chain fallback branch
+    isn't reachable/ported here — Phase 2's GEX engine guarantees fresh
+    gex_export always). Thin wrapper around Athena's own EXISTING
+    clusters_from_gex_export (Phase 2), called once per direction. Note:
+    this field is effectively display-only for Athena's own trading
+    logic — reconstruct_targets computes its OWN Cluster targets directly
+    from gex_export (see the "missing medium gamma cluster" fix earlier
+    this session) rather than trusting this snapshot field, so this
+    output's ordering doesn't affect gating/target decisions."""
+    above = clusters_from_gex_export(gex_export, price, "above")
+    below = clusters_from_gex_export(gex_export, price, "below")
+    return above, below
+
+HPL_CATEGORIES = (
+    ("Volume", ("VAH", "VAL", "POC", "+2sd/2.5sd", "-2sd/2.5sd", "0.5sd band", "VWAP")),
+    ("Expected Range", ("ER 40-80% band", "ER 100%", "ER 150%")),
+    ("Options", ("BT", "ST", "Med/Large Gamma Clusters")),
+    ("Miscellaneous", ("Prev EOD Close",)),
+)
+
+def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamma_tol, pcvr_gt1, is_crypto,
+                   export=None, gamma_yellow_tol=None, gex_export=None, ratio=None):
+    """Ported from status.py's own evaluate_hpls. If `export` is given (a
+    fresh status_<ASSET>.json — Phase 3b's not-yet-built charthacker WS
+    layer), VAH/VAL/POC/VWAP/SD bands/session-open/prev-close come from
+    THAT instead of being recomputed from session_candles. gex_export
+    (Athena's OWN Phase 2 GEX engine output, via read_gex_export) is
+    ALWAYS used for Gamma Clusters here — see this section's own
+    module-level comment for why status.py's live-options-chain fallback
+    for clusters isn't reachable/ported. BT/ST/PCVR always come from
+    Athena's own options-chain fetches regardless, same as status.py."""
+    rows = []
+
+    def near(level):
+        return level is not None and abs(price - level) <= tol
+
+    yellow_ceiling = gamma_yellow_tol if gamma_yellow_tol is not None else gamma_tol
+
+    def dist_color(dist):
+        if dist <= tol:
+            return GRN
+        elif dist <= yellow_ceiling:
+            return YLW
+        else:
+            return RED
+
+    def dist_tag(level):
+        if level is None:
+            return ""
+        dist = abs(price - level)
+        return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
+
+    def band_dist_tag(lo, hi):
+        if lo is None or hi is None:
+            return ""
+        dist = 0.0 if lo <= price <= hi else min(abs(price - lo), abs(price - hi))
+        return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
+
+    if export:
+        vah, val, poc = export.get("vah"), export.get("val"), export.get("poc")
+        vwap = export.get("vwap")
+        sd_p05, sd_m05 = export.get("sd_p05"), export.get("sd_m05")
+        sd_p2,  sd_m2  = export.get("sd_p2"),  export.get("sd_m2")
+        sd_p25, sd_m25 = export.get("sd_p25"), export.get("sd_m25")
+        session_open = export.get("session_open")
+        if export.get("iv") is not None:
+            iv = export["iv"]
+    else:
+        vp = status_compute_vp(session_candles)
+        poc = vah = val = None
+        if vp:
+            poc, vah, val = vp
+        vwap, sd = status_compute_vwap_sd(session_candles)
+        if vwap is not None and sd is not None:
+            sd_p05, sd_m05 = vwap + 0.5 * sd, vwap - 0.5 * sd
+            sd_p2,  sd_m2  = vwap + 2.0 * sd, vwap - 2.0 * sd
+            sd_p25, sd_m25 = vwap + 2.5 * sd, vwap - 2.5 * sd
+        else:
+            sd_p05 = sd_m05 = sd_p2 = sd_m2 = sd_p25 = sd_m25 = None
+        _prev_ts, curr_open_ts = status_session_open_ts()
+        open_candidates = [c for c in session_candles if c[0] >= curr_open_ts]
+        session_open = open_candidates[0][1] if open_candidates else (session_candles[0][1] if session_candles else None)
+
+    if is_crypto and session_open is not None:
+        prev_close = session_open
+    elif export and export.get("prev_eod_close") is not None:
+        prev_close = export["prev_eod_close"]
+
+    pcvr_lt_098 = ratio is not None and ratio < 0.98
+    pcvr_gt_102 = ratio is not None and ratio > 1.02
+    rows.append(("VAH", f"${vah:,.2f}{dist_tag(vah)}" if vah is not None else "n/a",
+                 vah is not None and pcvr_gt_102 and price >= vah))
+    rows.append(("VAL", f"${val:,.2f}{dist_tag(val)}" if val is not None else "n/a",
+                 val is not None and pcvr_lt_098 and price <= val))
+    rows.append(("POC", f"${poc:,.2f}{dist_tag(poc)}" if poc is not None else "n/a",
+                 near(poc) and (pcvr_lt_098 or pcvr_gt_102)))
+
+    if vwap is not None and sd_p2 is not None:
+        rows.append(("+2sd/2.5sd", f"${sd_p2:,.2f} / ${sd_p25:,.2f}{dist_tag(sd_p2)}",
+                     pcvr_gt_102 and price >= sd_p2))
+        rows.append(("-2sd/2.5sd", f"${sd_m2:,.2f} / ${sd_m25:,.2f}{dist_tag(sd_m2)}",
+                     pcvr_lt_098 and price <= sd_m2))
+        rows.append(("0.5sd band", f"${sd_m05:,.2f} - ${sd_p05:,.2f}{band_dist_tag(sd_m05, sd_p05)}",
+                     sd_m05 <= price <= sd_p05))
+        rows.append(("VWAP", f"${vwap:,.2f}{dist_tag(vwap)}", near(vwap)))
+    else:
+        rows.append(("+2sd/2.5sd", "n/a", False))
+        rows.append(("-2sd/2.5sd", "n/a", False))
+        rows.append(("0.5sd band", "n/a", False))
+        rows.append(("VWAP", "n/a", False))
+
+    er = status_compute_er(session_open, iv)
+    if er:
+        u40, u80, u100, u150 = er["upper"][40], er["upper"][80], er["upper"][100], er["upper"][150]
+        l40, l80, l100, l150 = er["lower"][40], er["lower"][80], er["lower"][100], er["lower"][150]
+        pcvr_ge_102 = ratio is not None and ratio >= 1.02
+        pcvr_le_098 = ratio is not None and ratio <= 0.98
+        in_upper_band = u40 <= price <= u80
+        in_lower_band = l80 <= price <= l40
+        band_active = (pcvr_ge_102 and in_upper_band) or (pcvr_le_098 and in_lower_band)
+        er_band_dist = min(
+            0.0 if in_upper_band else min(abs(price - u40), abs(price - u80)),
+            0.0 if in_lower_band else min(abs(price - l40), abs(price - l80)),
+        )
+        er_band_tag = f" ({dist_color(er_band_dist)}{BLD}${er_band_dist:,.2f} away{RST})"
+        rows.append(("ER 40-80% band", f"${u40:,.2f}-${u80:,.2f} / ${l80:,.2f}-${l40:,.2f}{er_band_tag}", band_active))
+        def _nearest_dist_tag(*levels):
+            valid = [l for l in levels if l is not None]
+            if not valid:
+                return ""
+            dist = min(abs(price - l) for l in valid)
+            return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
+        rows.append(("ER 100%", f"${u100:,.2f} / ${l100:,.2f}{_nearest_dist_tag(u100, l100)}",
+                     (pcvr_ge_102 and near(u100)) or (pcvr_le_098 and near(l100))))
+        rows.append(("ER 150%", f"${u150:,.2f} / ${l150:,.2f}{_nearest_dist_tag(u150, l150)}",
+                     (pcvr_ge_102 and near(u150)) or (pcvr_le_098 and near(l150))))
+    else:
+        rows.append(("ER 40-80% band", "n/a", False))
+        rows.append(("ER 100%", "n/a", False))
+        rows.append(("ER 150%", "n/a", False))
+
+    bt, st, active = compute_bt_st(chain["strikes"], is_crypto, pcvr_gt1, price)
+    bt_green = active == "BT" and bt is not None and price >= bt
+    st_green = active == "ST" and st is not None and price <= st
+    rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}{dist_tag(bt)}" if bt is not None else "n/a", bt_green))
+    rows.append(("ST", f"{RED}{BLD}${st:,.2f}{RST}{dist_tag(st)}" if st is not None else "n/a", st_green))
+
+    rows.append(("Prev EOD Close", f"${prev_close:,.2f}{dist_tag(prev_close)}" if prev_close is not None else "n/a",
+                 near(prev_close)))
+
+    nearest = status_nearest_gex_clusters(gex_export, price, n=2) if gex_export else []
+    if nearest:
+        hit = any(dist <= gamma_tol for _k, _t, dist in nearest)
+        segs = []
+        for k, t, dist in nearest:
+            dcol = dist_color(dist)
+            segs.append(f"${k:,.2f} ({t[0]}, {dcol}{BLD}${dist:,.2f} away{RST})")
+        cluster_str = ", ".join(segs)
+    else:
+        hit = False
+        cluster_str = "none"
+    rows.append(("Med/Large Gamma Clusters", cluster_str, hit))
+
+    return rows
+
+def hpl_any_active(rows, closed):
+    """Ported verbatim from status.py's own hpl_any_active — True if at
+    least one HPL row is green this cycle, EXCLUDING BT/ST (they're
+    directional profit-take TARGETS, not a 'price is near a key level'
+    condition that should itself gate a new entry)."""
+    if closed:
+        return False
+    return any(ok for label_, _v, ok in rows if label_ not in ("BT", "ST"))
+
+def compute_dashboard_snapshot(data):
+    """Ported from status.py's own compute_dashboard_snapshot — the exact
+    function whose output athena.py has been reading off disk this whole
+    time (status_logs/.../status_MM_DD_YYYY.jsonl). Same shape, same
+    field names, same thresholds — `data` is the SAME plain dict shape
+    status.py's own run_cycle()+assemble() produce (see status_run_cycle/
+    status_assemble below), so this function itself needed NO changes
+    beyond routing gamma-cluster/GEX-Flip work through Athena's own
+    Phase 2 engine (see status_gamma_cluster_targets_directional's own
+    docstring)."""
+    snap = {"ts": datetime.now().isoformat()}
+
+    sess_name, excl_reason = data.get("session", (None, None))
+    in_session = sess_name is not None and excl_reason is None
+    snap["session"] = {"name": sess_name, "excl_reason": excl_reason, "in_session": in_session}
+
+    dvol = data.get("dvol")
+    l1, l2 = status_dvol_layers(dvol)
+    snap["dvol"] = dvol
+    snap["layer1"] = l1
+    snap["layer2"] = l2
+    snap["vxn"] = data.get("qqq_iv")
+
+    pcvr = data.get("pcvr")
+    snap["pcvr"] = pcvr
+    pcvr_gt1 = bool(pcvr and pcvr["ratio"] > 1.00)
+    pcvr_extreme = bool(pcvr) and (pcvr["ratio"] <= 0.98 or pcvr["ratio"] >= 1.02)
+
+    instruments = {}
+    for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
+        ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
+        ("QQQ", "qqq_price", "qqq_chain", "qqq_candles", "qqq_prev_close", "qqq_iv", 0.25, 0.35, 0.35, False),
+    ):
+        chain = data.get(chain_key)
+        candles = data.get(candles_key) or []
+        price = data.get(price_key)
+        prev_close = data.get(prev_key)
+        iv = data.get(iv_key)
+        inst_snap = {"price": price, "available": bool(chain and price is not None)}
+        if not inst_snap["available"]:
+            instruments[inst_name] = inst_snap
+            continue
+
+        export = read_status_charthacker_export(inst_name)
+        gex_export = read_gex_export(inst_name)
+        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
+                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                              ratio=(pcvr["ratio"] if pcvr else None))
+        closed = inst_name == "QQQ" and status_qqq_market_closed()
+        inst_snap["market_closed"] = closed
+
+        hpl = {}
+        for label_, level_str, ok in rows:
+            hpl[label_] = {
+                # _ANSI_RE is Athena's own existing ANSI-tag regex (used by
+                # ansi_segments for curses rendering) — functionally the
+                # same pattern status.py's own _ANSI_RE strips with here,
+                # just written with a capturing group and \033 instead of
+                # \x1b; re.sub() behaves identically either way for a
+                # plain strip-to-empty-string call.
+                "value": _ANSI_RE.sub("", level_str),
+                "status": "closed" if closed else ("active" if ok else "inactive"),
+            }
+        inst_snap["hpl"] = hpl
+        any_active = hpl_any_active(rows, closed)
+        inst_snap["any_active"] = any_active
+
+        ratio = pcvr["ratio"] if pcvr else None
+        targets = []
+        if ratio is not None and not closed:
+            if ratio < 0.98:
+                bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                if bt is not None:
+                    targets.append({"type": "BT", "level": bt, "tier": None})
+                above, _below = status_gamma_cluster_targets_directional(gex_export, price)
+                targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in above]
+            elif ratio > 1.02:
+                _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                if st is not None:
+                    targets.append({"type": "ST", "level": st, "tier": None})
+                _above, below = status_gamma_cluster_targets_directional(gex_export, price)
+                targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in below]
+        inst_snap["targets"] = targets
+        has_targets = bool(targets)
+
+        ready = in_session and pcvr_extreme and any_active and has_targets
+        inst_snap["final_status"] = "EXECUTE WHEN READY" if ready else "HOLD"
+
+        instruments[inst_name] = inst_snap
+
+    snap["eth"] = instruments.get("ETH")
+    snap["qqq"] = instruments.get("QQQ")
+    return snap
+
+def append_status_snapshot(snap):
+    """Ported from status.py's own append_snapshot, using Athena's own
+    EXISTING status_log_path (already used to READ these files — now also
+    the write side, same file/folder convention, no format change)."""
+    try:
+        path = status_log_path(datetime.now())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(snap) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def status_run_cycle():
+    """Ported from status.py's own run_cycle — the FULL data refresh
+    (chains/candles/DVOL/PCVR — the heavy fetches), parallelized the same
+    way status.py's own does."""
+    result = {"errors": {}}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {
+            "dvol": ex.submit(fetch_status_dvol, "ETH"),
+            "pcvr": ex.submit(fetch_status_pcvr),
+            "eth_chain": ex.submit(fetch_status_deribit_chain, "ETH"),
+            "eth_candles": ex.submit(fetch_status_phemex_session_candles, "ETHUSDT", 60),
+            "qqq_chain": ex.submit(fetch_status_cboe_chain, "QQQ"),
+            "qqq_candles": ex.submit(fetch_status_yahoo_candles, "QQQ", "5d", "1m"),
+            "qqq_meta": ex.submit(fetch_status_yahoo_meta, "QQQ"),
+            "vxn": ex.submit(fetch_status_vxn),
+        }
+        for key, fut in futs.items():
+            try:
+                result[key] = fut.result()
+            except Exception as e:
+                result["errors"][key] = str(e)
+                result[key] = None
+    result["session"] = status_get_session_status()
+    return result
+
+def status_assemble(raw):
+    """Ported verbatim from status.py's own assemble."""
+    out = dict(raw)
+    eth_chain = raw.get("eth_chain")
+    out["eth_price"] = eth_chain["spot"] if eth_chain else None
+    out["eth_iv"] = raw.get("dvol")
+    qqq_chain = raw.get("qqq_chain")
+    qqq_meta = raw.get("qqq_meta")
+    out["qqq_price"] = (qqq_meta[0] if qqq_meta and qqq_meta[0] else (qqq_chain["spot"] if qqq_chain else None))
+    _prev_open_ts, curr_open_ts = status_session_open_ts()
+    out["qqq_prev_close"] = status_session_prev_eod_close(raw.get("qqq_candles") or [], curr_open_ts)
+    out["qqq_iv"] = raw.get("vxn")
+    return out
+
+# ── Status engine in-process state (replaces the file round trip a separate
+# status.py process needed — read_last_status_snapshot now prefers this
+# directly, same "no consumer-side changes needed" pattern as Phases 1-2) ──
+STATUS_STATE_LOCK = threading.Lock()
+STATUS_SNAPSHOT = None                          # latest compute_dashboard_snapshot() output
+STATUS_LIVE_PRICES = {"ETH": None, "QQQ": None}
+STATUS_ENGINE_STATE = ["connecting…"]           # mutable single-item box, same
+                                                 # convention _profile_mode_idx uses
+_status_last_full_lock = threading.Lock()
+_status_last_full_data = None
+
+# Deliberately NOT ported: status.py's own check_pcvr_alert/play_alert
+# (plays alert.wav on a PCVR sentiment flip) — a terminal-audio notification
+# for a human watching status.py's OWN screen, not data Athena's trading
+# logic reads or gates on. A genuine scope boundary, not a fidelity cut.
+
+def _status_full_refresh_loop(stop_evt):
+    """The heavy 30s-cadence half of status.py's own main() loop
+    (run_cycle()+assemble()), on its own dedicated thread — a plain
+    thread, not asyncio, matching status.py's own execution model (it
+    has no asyncio anywhere either)."""
+    global _status_last_full_data
+    while not stop_evt.is_set():
+        try:
+            raw = status_run_cycle()
+            data = status_assemble(raw)
+            with _status_last_full_lock:
+                _status_last_full_data = data
+            STATUS_ENGINE_STATE[0] = "live"
+        except Exception as e:
+            STATUS_ENGINE_STATE[0] = f"error: {e}"[:60]
+        stop_evt.wait(STATUS_REFRESH_SEC)
+
+def _status_live_price_loop(stop_evt):
+    """Mirrors status.py's own live_price_loop — independent 2s cadence,
+    tiny/cheap fetches only (Phemex ticker, Yahoo meta), not the heavy
+    chain/candle endpoints, so this stays responsive regardless of how
+    long the full refresh takes."""
+    while not stop_evt.is_set():
+        eth_p = fetch_status_eth_live_price()
+        qqq_p = None
+        try:
+            qqq_p, _prev = fetch_status_yahoo_meta("QQQ")
+        except Exception:
+            pass
+        with STATUS_STATE_LOCK:
+            if eth_p is not None:
+                STATUS_LIVE_PRICES["ETH"] = eth_p
+            if qqq_p is not None:
+                STATUS_LIVE_PRICES["QQQ"] = qqq_p
+        stop_evt.wait(STATUS_LIVE_PRICE_INTERVAL)
+
+def _status_snapshot_loop(stop_evt):
+    """Mirrors status.py's own snapshot_logger_loop — builds+stores a
+    fresh compute_dashboard_snapshot() every STATUS_SNAPSHOT_INTERVAL.
+    ALSO does the "overlay the live price on top of the last full
+    refresh" step itself (status.py's own version does that inline in
+    main()'s 0.2s terminal-redraw tick, since it needs fresh numbers for
+    the screen too — Athena has no redraw tick to piggyback on, so this
+    thread does the overlay directly, at the same net cadence the
+    snapshot content itself is built at — the SNAPSHOT's own values are
+    identical either way, just not also re-rendered to a screen 15x more
+    often for no reason)."""
+    global STATUS_SNAPSHOT
+    while not stop_evt.is_set():
+        with _status_last_full_lock:
+            data = _status_last_full_data
+        if data:
+            with STATUS_STATE_LOCK:
+                live = dict(STATUS_LIVE_PRICES)
+            display_data = dict(data)
+            if live.get("ETH") is not None:
+                display_data["eth_price"] = live["ETH"]
+            if live.get("QQQ") is not None:
+                display_data["qqq_price"] = live["QQQ"]
+            try:
+                snap = compute_dashboard_snapshot(display_data)
+                with STATUS_STATE_LOCK:
+                    STATUS_SNAPSHOT = snap
+                append_status_snapshot(snap)
+            except Exception:
+                pass
+        stop_evt.wait(STATUS_SNAPSHOT_INTERVAL)
 
 def _current_tick(asset):
     """Athena's own live tape ALWAYS groups at a fixed per-asset tick
@@ -600,6 +2705,26 @@ def classify_one_trade(price, bid, ask, prev_price, prev_side):
     if prev_price is not None:
         return price > prev_price if price != prev_price else prev_side
     return True
+
+def classify_trades_quote_rule(raw_trades, quotes):
+    """Ported verbatim from footprint.py — turns (ts, price, size) trades
+    + (ts, bid, ask) quotes into (ts, price, qty, is_buy), the same tuple
+    shape the crypto fetchers produce. See classify_one_trade for the
+    actual rule. quotes=[] (as used by the backfill, which fetches no
+    historical quotes — see fetch_alpaca_trades_range's own docstring)
+    just falls straight through to the tick-rule/assume-buy branches."""
+    out = []
+    qi = 0
+    bid = ask = None
+    prev_price, prev_side = None, True
+    for ts, price, size in raw_trades:
+        while qi < len(quotes) and quotes[qi][0] <= ts:
+            bid, ask = quotes[qi][1], quotes[qi][2]
+            qi += 1
+        is_buy = classify_one_trade(price, bid, ask, prev_price, prev_side)
+        out.append((ts, price, size, is_buy))
+        prev_price, prev_side = price, is_buy
+    return out
 
 def _alpaca_trade_ws(asset, stop_evt):
     """Background thread: real-time IEX trades+quotes for this asset's REAL
@@ -813,7 +2938,11 @@ def read_last_two_footprint_bars(asset):
     that closes right as — or just before — an instrument arms still gets
     evaluated against its own predecessor instead of being silently
     absorbed as an already-seen baseline. cur_bar is None if the log is
-    empty; prev_bar is None if there's only one bar so far."""
+    empty; prev_bar is None if there's only one bar so far — with the
+    startup REST backfill (_run_footprint_backfill, see the module
+    docstring's footprint.py section) this is no longer the normal
+    post-restart state, just the genuine "brand new symbol/day, nothing
+    has traded yet" case."""
     path = footprint_log_glob(asset)
     if not path:
         return None, None
@@ -908,6 +3037,52 @@ def sim_log_event(event, detail):
     except Exception:
         pass
 
+def _archive_sim_logs():
+    """Moves the ENTIRE sim_logs tree aside into a timestamped
+    sim_logs_archive/ folder rather than deleting it — [R]eset is meant to
+    give the Data view (its PnL chart + trade table are both reconstructed
+    from sim_logs, via scan_all_trade_events/scan_all_trades_detailed) a
+    genuinely clean slate; before this, a reset only touched
+    sim_account.json's live balance/positions, leaving the OLD trade
+    history sitting in sim_logs where the Data view would keep showing it
+    forever. History is archived, not destroyed — same "move aside, don't
+    delete" convention already established for this project's own data
+    files. The very next sim_log_event() call (reset() logs one itself,
+    right after this runs) recreates a fresh day-folder under
+    SIM_LOG_DIR_BASE automatically, so nothing further needs to be
+    (re)created here."""
+    if not os.path.isdir(SIM_LOG_DIR_BASE):
+        return
+    try:
+        archive_root = os.path.join(SCRIPT_DIR, "sim_logs_archive")
+        os.makedirs(archive_root, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        shutil.move(SIM_LOG_DIR_BASE, os.path.join(archive_root, f"reset_{ts}"))
+    except Exception:
+        pass
+
+async def live_price_for_symbol(symbol):
+    """LIVE_TAPE's own real-time WS trade price (in-memory, no network
+    round trip) when available, else fetch_last_price's REST poll as a
+    fallback (e.g. right at startup before the WS thread connects). Same
+    LIVE_TAPE-first pattern SimAccount.tick_matching already uses — pulled
+    out into its own helper so every OTHER SimAccount method that needs a
+    current price (to_account_snapshot, market_close, place_entry's market
+    branch) gets the same speed instead of each making its own always-REST
+    fetch_last_price call. That inconsistency was the actual root cause of
+    "flatten takes 10+ seconds": [F]latten alone chains cancel_all ->
+    fetch_account (-> to_account_snapshot, one REST call PER open
+    position) -> market_close (another REST call) -> a THIRD REST call for
+    the athena_logs exit-price note — each with up to a 6s httpx timeout,
+    easily compounding into a double-digit-second wait on anything but a
+    fast/lucky network, when every one of those prices was already sitting
+    in memory via LIVE_TAPE the whole time."""
+    asset = ASSET_BY_SYMBOL.get(symbol)
+    tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
+    if tape_bar is not None:
+        return tape_bar["c"]
+    return await fetch_last_price(symbol)
+
 class SimAccount:
     """Paper-trading ledger used in --dry-run mode, persisted to
     sim_account.json. Exposes place_entry/place_sl/place_tp_leg/cancel_all/
@@ -966,6 +3141,7 @@ class SimAccount:
         self.positions = {}
         self.orders = {}
         self._save()
+        _archive_sim_logs()
         sim_log_event("reset", {"balance": balance})
 
     def _next_id(self, prefix):
@@ -1004,7 +3180,7 @@ class SimAccount:
     async def place_entry(self, symbol, pos_side, order_type, qty_str, price_str):
         qty = float(qty_str)
         if order_type == "market":
-            price = await fetch_last_price(symbol)
+            price = await live_price_for_symbol(symbol)
             if price is None:
                 return {"code": -1, "msg": "sim: no live price available"}
             self._apply_fill(symbol, pos_side, qty, price, "market")
@@ -1037,7 +3213,7 @@ class SimAccount:
         return {"code": 0}
 
     async def market_close(self, symbol, pos_side, qty, reason="flip"):
-        price = await fetch_last_price(symbol)
+        price = await live_price_for_symbol(symbol)
         if price is None:
             return {"code": -1, "msg": "sim: no live price available"}
         self._close(symbol, pos_side, qty, price, reason)
@@ -1045,14 +3221,25 @@ class SimAccount:
         return {"code": 0}
 
     async def tick_matching(self):
-        """Check every resting sim order against the live Phemex price and
-        fill/close whatever now qualifies. Called every time fetch_account()
-        is polled — mirrors how real fills/SL/TP are only ever discovered
-        by polling the real exchange, so the same AthenaInstrument code
-        works for both."""
+        """Check every resting sim order against the live price and
+        fill/close whatever now qualifies. Prefers LIVE_TAPE's own
+        real-time WS trade price (in-memory, no network round trip,
+        updates on every print) over fetch_last_price's REST ticker poll
+        — a REST-only check here meant fills/SL/TP could only ever react
+        to whatever price a poll happened to sample, which on a symbol
+        that briefly touched a level between polls could silently miss
+        the touch entirely and only catch it (at a worse price) on a
+        LATER poll once price had moved further. LIVE_TAPE is cheap
+        enough that this can now be called far more often than once per
+        engine cycle (see engine_loop's fast matching wait) without
+        adding any extra REST load. Falls back to fetch_last_price only
+        for a symbol LIVE_TAPE has no data for yet (e.g. right at
+        startup, before its WS thread connects)."""
         symbols = {o["symbol"] for o in self.orders.values()} | set(self.positions.keys())
         for symbol in symbols:
-            price = await fetch_last_price(symbol)
+            asset = ASSET_BY_SYMBOL.get(symbol)
+            tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
+            price = tape_bar["c"] if tape_bar is not None else await fetch_last_price(symbol)
             if price is None:
                 continue
             for oid, o in list(self.orders.items()):
@@ -1097,7 +3284,7 @@ class SimAccount:
             if pos["qty"] > 0:
                 positions.append({"symbol": symbol, "posSide": pos["pos_side"],
                                    "size": str(pos["qty"]), "avgEntryPriceRp": str(pos["avg_entry"])})
-                price = await fetch_last_price(symbol)
+                price = await live_price_for_symbol(symbol)
                 if price is None:
                     price = pos["avg_entry"]
                 leverage = LEVERAGE_BY_SYMBOL.get(symbol, 1)
@@ -1319,6 +3506,7 @@ class AthenaInstrument:
         self.pending = None     # while PENDING_FILL
         self.position = None    # while IN_POSITION
         self.note = ""
+        self._entry_balance_baseline = None   # DRY_RUN only — see _check_fill/_update_blackjack
 
     async def reconcile_startup(self):
         # CRITICAL: seed the "already evaluated" baseline with whatever bar
@@ -1418,7 +3606,7 @@ class AthenaInstrument:
 
         if self.state == "WATCHING":
             self.lights["Order Flow"] = False
-            if not gate_ok or not ATHENA_ENABLED:
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout():
                 return
             self.state = "ARMED"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching order flow ({regime})"
@@ -1431,13 +3619,14 @@ class AthenaInstrument:
             # against its predecessor (see read_last_two_footprint_bars).
 
         if self.state == "ARMED":
-            if not gate_ok or not ATHENA_ENABLED:
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout():
                 self.state = "WATCHING"
                 self.lights["Order Flow"] = False
-                reason = "Athena paused ([A])" if not ATHENA_ENABLED else "a required condition dropped"
+                reason = ("19:00-19:30 CT entry blackout" if _in_entry_blackout()
+                          else f"{self.asset} paused ([A])" if not ATHENA_ENABLED[self.asset] else "a required condition dropped")
                 console_log(f"{self.asset}: {reason} — back to WATCHING")
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
-                                                     "athena_enabled": ATHENA_ENABLED})
+                                                     "athena_enabled": ATHENA_ENABLED[self.asset]})
                 return
             prev_bar, bar = read_last_two_footprint_bars(self.asset)
             is_fresh_pair = (bar is not None and prev_bar is not None
@@ -1454,6 +3643,51 @@ class AthenaInstrument:
         if self.state == "IN_POSITION":
             await self._manage_position(regime)
             return
+
+    def _trade_net_pnl(self, pnl_approx):
+        """Exact in DRY_RUN (diffs SimAccount.balance against the snapshot
+        taken at fill — see _check_fill), otherwise falls back to the
+        caller's own entry-vs-current-price approximation (real mode's
+        existing, already-documented limitation)."""
+        if DRY_RUN and self._entry_balance_baseline is not None:
+            return get_sim_account().balance - self._entry_balance_baseline
+        return pnl_approx
+
+    def _update_blackjack(self, pnl):
+        """Advances this asset's OWN Blackjack progression (BLACKJACK_STATE
+        is per-asset, independent — explicit user answer 2026-07-24) off
+        one trade's realized net pnl. No I/O of its own — "R" is always
+        computed fresh, from CURRENT balance, at the next entry's sizing
+        time (see _check_confirmation), not frozen at the moment a trade
+        closes. See BLACKJACK_STEPS' own comment for the full spec this
+        implements."""
+        if not BLACKJACK_MODE or pnl is None:
+            return
+        bj = BLACKJACK_STATE[self.asset]
+        if bj["in_win_progression"]:
+            # This was the 2nd trade of a win progression.
+            bj["in_win_progression"] = False
+            bj["win_step_back"] = None
+            bj["win_profit_dollars"] = None
+            if pnl > 0:
+                bj["loss_step"] = 0   # two wins in a row — full reset
+            # else: loss progression simply resumes at the level it was
+            # frozen at when the win progression started — NOT touched here.
+        elif pnl > 0:
+            step_back = max(0, bj["loss_step"] - 1)
+            bj["win_step_back"] = BLACKJACK_STEPS[step_back]
+            bj["win_profit_dollars"] = pnl
+            bj["in_win_progression"] = True
+            # loss_step stays frozen (used to resume from if trade 2 loses)
+        else:
+            bj["loss_step"] = 0 if bj["loss_step"] >= len(BLACKJACK_STEPS) - 1 else bj["loss_step"] + 1
+        _save_blackjack_state()
+        if bj["in_win_progression"]:
+            status_txt = f"win progression started (next risks {bj['win_step_back']:g}R + ${bj['win_profit_dollars']:,.2f})"
+        else:
+            status_txt = f"now at {BLACKJACK_STEPS[bj['loss_step']]:g}R"
+        console_log(f"{self.asset}: {YLW}Blackjack — {status_txt} (trade pnl {fmt_money(pnl)}){RST}")
+        log_event(self.asset, "blackjack_progression_updated", {"pnl": pnl, "state": dict(bj)})
 
     async def _check_confirmation(self, prev_bar, new_bar, regime, live_price_fallback, targets_full):
         confirmed, vah, val = footprint_confirmation(prev_bar, new_bar, regime)
@@ -1507,7 +3741,16 @@ class AthenaInstrument:
         # = ~7.5% of the intended trade_risk, not the full risk budget).
         # Not a price-based notional/price conversion either; this is the
         # sizing rule itself, independent of the asset's current price.
-        raw_qty = (balance * (PCT / 100.0)) / R
+        one_r_dollars = balance * (PCT / 100.0)
+        if BLACKJACK_MODE:
+            bj = BLACKJACK_STATE[self.asset]
+            if bj["in_win_progression"]:
+                trade_risk_dollars = bj["win_step_back"] * one_r_dollars + bj["win_profit_dollars"]
+            else:
+                trade_risk_dollars = BLACKJACK_STEPS[bj["loss_step"]] * one_r_dollars
+        else:
+            trade_risk_dollars = one_r_dollars
+        raw_qty = trade_risk_dollars / R
         qty = floor_to_step(raw_qty, qty_step)
         if qty <= 0:
             console_log(f"{self.asset}: sized qty is 0 (balance ${balance:.2f}, pct {PCT}%) — skipping entry")
@@ -1558,6 +3801,16 @@ class AthenaInstrument:
         qty = abs(float(pos.get("size") or p["qty"]))
         if fill_price <= 0:
             return
+
+        # Snapshot DRY_RUN's own exact running balance right at fill —
+        # diffing sim.balance (not realized_pnl_today, which resets every
+        # day and would corrupt this across a midnight rollover) against
+        # this baseline once the position goes fully flat gives Blackjack
+        # an EXACT trade net pnl in sim mode, vs. real mode's existing
+        # entry-vs-current-price approximation (see _manage_position/
+        # _flatten_now — same documented gap the rest of the app already
+        # accepts for real-mode exit pricing).
+        self._entry_balance_baseline = get_sim_account().balance if DRY_RUN else None
 
         R = self.cfg["sl"]
         sl_price = fill_price - R if p["pos_side"] == "Long" else fill_price + R
@@ -1648,7 +3901,7 @@ class AthenaInstrument:
             # exact, authoritative entry in sim_logs (SimAccount._close),
             # this is just a matching note in athena_logs for one combined
             # blotter view.
-            exit_price = await fetch_last_price(symbol)
+            exit_price = await live_price_for_symbol(symbol)
             entry = self.position.get("fill_price")
             qty = self.position.get("qty")
             pnl_approx = None
@@ -1657,6 +3910,7 @@ class AthenaInstrument:
             log_event(self.asset, "position_closed", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
+            self._update_blackjack(self._trade_net_pnl(pnl_approx))
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -1672,13 +3926,21 @@ class AthenaInstrument:
         # itself is now correct — a known, minor display-only gap.
         self.position["qty"] = abs(float(pos.get("size") or 0))
         if DRY_RUN:
+            # The sim order itself already carries its own "type" (set at
+            # placement — see SimAccount.place_tp_leg/_check_fill/
+            # _sync_moving_tps), so read it straight off the order instead
+            # of round-tripping through the OLD tp_legs list matched by
+            # rounded price — that match silently failed (falling back to
+            # "?") whenever a price didn't line up exactly, e.g. right
+            # after _sync_moving_tps had just moved it. tracks_gex_flip is
+            # always exactly `type == "GEX Flip"` everywhere else it's set
+            # (_check_fill, _sync_moving_tps) — same rule here, not a
+            # separately round-tripped value.
             sim_orders = get_sim_account().orders
-            old_legs = {round(leg["level"], 2): (leg.get("tracks_gex_flip", False), leg.get("type", "?"))
-                        for leg in (self.position.get("tp_legs") or [])}
             self.position["tp_legs"] = [
                 {"level": o["price"], "qty": o["qty"],
-                 "tracks_gex_flip": old_legs.get(round(o["price"], 2), (False, "?"))[0],
-                 "type": old_legs.get(round(o["price"], 2), (False, "?"))[1]}
+                 "tracks_gex_flip": o.get("type") == "GEX Flip",
+                 "type": o.get("type", "?")}
                 for o in sim_orders.values() if o["symbol"] == symbol and o["kind"] == "tp"]
 
         flipped = (pos_side == "Long" and regime == "short") or (pos_side == "Short" and regime == "long")
@@ -1696,77 +3958,111 @@ class AthenaInstrument:
                 console_log(f"{self.asset}: emergency close FAILED — {e}")
                 log_event(self.asset, "pcvr_flip_close_failed", {"error": str(e)})
                 return
-            exit_price = await fetch_last_price(symbol)   # approximate, same caveat as position_closed
+            exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
             if exit_price is not None and entry:
                 pnl_approx = (exit_price - entry) * qty if pos_side == "Long" else (entry - exit_price) * qty
             log_event(self.asset, "pcvr_flip_close", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
+            self._update_blackjack(self._trade_net_pnl(pnl_approx))
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
             return
 
-        await self._sync_gex_flip_tp(symbol, pos_side)
+        await self._sync_moving_tps(symbol, pos_side)
 
-    async def _sync_gex_flip_tp(self, symbol, pos_side):
-        """GEX Flip is recomputed every status.py/gex.py cycle, not fixed at
-        entry — any TP leg tracking it needs its resting order price kept
-        $3 on the near side of whatever GEX Flip currently is, for as long
-        as the position stays open. Full bracket refresh (cancel
-        everything, re-place SL + all TP legs at current prices) rather
-        than a selective single-order amend/cancel — Phemex's real API for
-        editing just one resting order isn't verified/wired up here, and
-        this is simpler and doesn't risk touching the wrong order; SL's own
-        price is unchanged so re-placing it is a harmless no-op. Trade-off,
-        worth knowing: the position briefly has no resting SL between the
-        cancel and re-place calls."""
+    async def _sync_moving_tps(self, symbol, pos_side):
+        """Refreshes any TP leg tracking a MOVING target — GEX Flip (a
+        single level status.py/gex.py recompute every cycle) or a gamma
+        Cluster (explicit user request 2026-07-24: the qualifying Medium/
+        Large cluster set can itself change shape mid-trade as gamma
+        builds/decays — a Large cluster appearing where only a Medium one
+        existed before should retarget that TP leg to it, same
+        Large-over-Medium precedence used when the position was first
+        entered — see reconstruct_targets/clusters_from_gex_export). A TP
+        leg's own `type` field (set at entry — "GEX Flip" or "Cluster",
+        see _check_fill/tp_legs) says which rule applies to it; a leg
+        whose target type never moves (BT/ST) is left untouched here.
+
+        Full bracket refresh (cancel everything, re-place SL + all TP legs
+        at current prices) rather than a selective single-order amend/
+        cancel — Phemex's real API for editing just one resting order
+        isn't verified/wired up here, and this is simpler and doesn't risk
+        touching the wrong order; SL's own price is unchanged so
+        re-placing it is a harmless no-op. Trade-off, worth knowing: the
+        position briefly has no resting SL between the cancel and
+        re-place calls."""
         tp_legs = self.position.get("tp_legs") or []
-        if not any(leg.get("tracks_gex_flip") for leg in tp_legs):
-            return
-        gex_export = read_gex_export(self.asset)
-        gex_flip = gex_export.get("gex_flip") if gex_export else None
-        if gex_flip is None:
-            return
-        new_level = gex_flip - GEX_FLIP_TP_BUFFER if pos_side == "Long" else gex_flip + GEX_FLIP_TP_BUFFER
-        stale = any(leg.get("tracks_gex_flip") and abs(leg["level"] - new_level) > 0.005 for leg in tp_legs)
-        if not stale:
+        if not any(leg.get("tracks_gex_flip") or leg.get("type") == "Cluster" for leg in tp_legs):
             return
 
-        # Same guard as the initial placement (_check_fill) — if GEX Flip
-        # has drifted close enough to the fill price that the buffered
-        # level would land within R of it (or past it), refreshing would
-        # create the exact instant-trigger bug this buffer exists to
-        # avoid. Skip this cycle's refresh (leave the currently-resting
-        # order as-is) and retry once GEX Flip moves back to a safe
-        # distance, rather than ever placing an unsafe level.
         fill_price = self.position.get("fill_price")
         R = self.cfg["sl"]
-        safe = (new_level >= fill_price + R) if pos_side == "Long" else (new_level <= fill_price - R)
-        if fill_price is not None and not safe:
-            console_log(f"{self.asset}: {YLW}GEX Flip too close to fill (${fmt_num(new_level)}) — TP refresh skipped this cycle{RST}")
+
+        def _safe(level):
+            return (level >= fill_price + R) if pos_side == "Long" else (level <= fill_price - R)
+
+        gex_export = read_gex_export(self.asset)
+
+        new_gex_level = None
+        gex_flip = gex_export.get("gex_flip") if gex_export else None
+        if gex_flip is not None:
+            new_gex_level = gex_flip - GEX_FLIP_TP_BUFFER if pos_side == "Long" else gex_flip + GEX_FLIP_TP_BUFFER
+
+        new_cluster_level = None
+        if gex_export:
+            direction = "above" if pos_side == "Long" else "below"
+            clusters = clusters_from_gex_export(gex_export, fill_price, direction)
+            clusters.sort(key=lambda kt: 0 if kt[1] == "Large" else 1)
+            if clusters:
+                new_cluster_level = clusters[0][0]
+
+        new_legs = []
+        changed = False
+        for leg in tp_legs:
+            level = leg["level"]
+            # Same guard as the initial placement (_check_fill) — if the
+            # refreshed target has drifted close enough to the fill price
+            # that it would land within R of it (or past it), skip this
+            # leg's refresh (leave the currently-resting order as-is) and
+            # retry once it moves back to a safe distance, rather than
+            # ever placing an unsafe level.
+            if leg.get("tracks_gex_flip") and new_gex_level is not None:
+                if _safe(new_gex_level):
+                    if abs(level - new_gex_level) > 0.005:
+                        level, changed = new_gex_level, True
+                else:
+                    console_log(f"{self.asset}: {YLW}GEX Flip too close to fill (${fmt_num(new_gex_level)}) — TP refresh skipped this cycle{RST}")
+            elif leg.get("type") == "Cluster" and new_cluster_level is not None:
+                if _safe(new_cluster_level):
+                    if abs(level - new_cluster_level) > 0.005:
+                        level, changed = new_cluster_level, True
+                else:
+                    console_log(f"{self.asset}: {YLW}nearest Cluster too close to fill (${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
+            new_legs.append({"level": level, "qty": leg["qty"],
+                              "tracks_gex_flip": leg.get("tracks_gex_flip", False),
+                              "type": leg.get("type", "?")})
+
+        if not changed:
             return
 
         pd = self.position.get("price_decimals", 2)
         qd = self.position.get("qty_decimals", 2)
-        new_legs = [{"level": (new_level if leg.get("tracks_gex_flip") else leg["level"]),
-                     "qty": leg["qty"], "tracks_gex_flip": leg.get("tracks_gex_flip", False),
-                     "type": leg.get("type", "?")}
-                    for leg in tp_legs]
         try:
             await cancel_all(symbol)
         except Exception as e:
-            console_log(f"{self.asset}: GEX Flip TP refresh — cancel failed ({e})")
+            console_log(f"{self.asset}: TP refresh — cancel failed ({e})")
             return
         sl_price = self.position.get("sl_price")
         if sl_price is not None:
             await place_sl(symbol, pos_side, sl_price, pd)
         for i, leg in enumerate(new_legs, start=1):
-            await place_tp_leg(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i))
+            await place_tp_leg(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
         self.position["tp_legs"] = new_legs
-        console_log(f"{self.asset}: {YLW}GEX Flip moved — TP refreshed to {fmt_num(new_level)}{RST}")
-        log_event(self.asset, "tp_gex_flip_adjusted", {"new_level": new_level, "legs": new_legs})
+        console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
+        log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
 
     async def _flatten_now(self, reason):
         """Force-flat regardless of state/regime — cancels any resting
@@ -1806,13 +4102,14 @@ class AthenaInstrument:
                     console_log(f"{self.asset}: {label} close FAILED — {e}")
                     log_event(self.asset, f"{event_name}_failed", {"error": str(e)})
                     return
-            exit_price = await fetch_last_price(symbol)   # approximate, same caveat as position_closed
+            exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
             if exit_price is not None and entry and qty:
                 pnl_approx = (exit_price - entry) * qty if pos_side == "Long" else (entry - exit_price) * qty
             log_event(self.asset, event_name, {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                 "sim": DRY_RUN})
+            self._update_blackjack(self._trade_net_pnl(pnl_approx))
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
@@ -2666,7 +4963,7 @@ def build_trade_markers(asset, bars, inst_snap, trade_pairs):
     return events
 
 def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mode, trade_events,
-                          hscroll_bars=0, live_price=None, live_bar=None, focused=False):
+                          hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False):
     """One footprint chart pane within rows [y0,y1) / cols [x0,x1) — ported
     rendering from footprint.py's draw(), adapted to (a) write into a
     DoubleBuffer instead of directly to a curses window, (b) a fixed
@@ -2696,7 +4993,16 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # footer string). This makes "which pane does [←/→] scroll" visible
     # right on the pane itself, not just in text you have to go read.
     focus_tag = "  ★ FOCUSED — [Tab] to switch" if focused else ""
-    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag} "
+    # Folded into the header string itself, not a separate overlay drawn
+    # on top after the fact — an earlier version wrote "QQQ closed" as a
+    # standalone db.puts() call at this same row AFTER this header was
+    # already drawn, which just overwrote characters in the middle of the
+    # header text in place (DoubleBuffer.puts replaces cells, it doesn't
+    # blend), producing exactly the garbled "QQQ FQQQ closedSED" text the
+    # user reported. Building it into one single header string avoids any
+    # possibility of two separate draws colliding on the same row.
+    closed_tag = "  [MARKET CLOSED]" if market_closed else ""
+    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
     top = y0 + 1
@@ -3060,6 +5366,462 @@ _flatten_all_evt = threading.Event()   # [F] (armed+confirmed) sets this; engine
                                         # curses thread — same convention as _reset_sim_evt
 _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] key can cycle it in place
 
+GEX_COL_W = 2   # matches gex.py's own COL_W (terminal columns per time interval)
+GEX_ARROW_STEP = 5      # matches gex.py's own ARROW_STEP (time-axis columns per Left/Right)
+GEX_PAGE_STEP = 30      # matches gex.py's own PAGE_STEP (time-axis columns per PgUp/PgDn)
+GEX_VERT_STEP = 1       # matches gex.py's own VERT_STEP (strikes per Up/Down)
+GEX_VERT_PAGE_STEP = 8  # matches gex.py's own VERT_PAGE_STEP (strikes per [/])
+
+def _gex_dot_repr(net, scale_max):
+    """Ported from gex.py's own dot_repr, returning (pair, attrs) split
+    instead of one combined curses attr int (Athena's db.put/db.puts take
+    them as two separate args) — None in place of gex.py's pair=0 for a
+    blank cell, so the caller can skip the db.put() call entirely rather
+    than paint a meaningless pair-0 space."""
+    ch, frac = magnitude_char(net, scale_max)
+    if ch == " ":
+        return " ", None
+    pair = P_GREEN if net > 0 else P_RED
+    return ch, (pair, curses.A_BOLD if frac >= 0.35 else 0)
+
+def _gex_price_marker_repr(net, scale_max):
+    """Ported from gex.py's own price_marker_repr."""
+    ch, frac = magnitude_char(net, scale_max, floor_char="·")
+    return ch, (P_YELLOW, curses.A_BOLD if frac >= 0.35 else 0)
+
+def _gex_draw_pieces(db, row, x0, pieces, max_x):
+    """Draws a sequence of (text, pair, attrs) pieces left-to-right
+    starting at x0 — Athena's equivalent of gex.py's own inline
+    `x = 0; for text, attr in pieces: safe_add(win, row, x, text, attr);
+    x += len(text)` pattern, repeated for the header/legend/info rows in
+    both draw_gex_map and draw_gex_by_strike."""
+    x = x0
+    for text, pair, attrs in pieces:
+        if x >= max_x:
+            break
+        db.puts(row, x, text[:max(0, max_x - x)], pair, attrs)
+        x += len(text)
+    return x
+
+def _gex_build_header(history, meta, live_follow, end_idx, asset, is_crypto, title, log_rows, diag_count):
+    """Ported from gex.py's own build_header, returning (text, pair,
+    attrs) triples instead of (text, attr). Simplified from gex.py's own
+    version in two ways, both deliberate scope boundaries (a different
+    FEATURE than what Athena's GEX mode needs, not an approximation of
+    one it does): no HISTORICAL_MODE/`--date` playback tag (Athena's GEX
+    mode only ever shows live data, it has no standalone day-browsing
+    mode), and no per-write log_err surfacing (GEX_LOG_ROWS already only
+    increments on a successful write — see _gex_engine_loop)."""
+    label = meta.get("expiry_label", "—")
+    ttl = meta.get("ttl")
+    is_0dte = meta.get("is_0dte", True if is_crypto else False)
+    fetched = meta.get("fetched_at", "—")
+
+    if live_follow:
+        mode_piece = ("● LIVE", P_GREEN, curses.A_BOLD)
+        spot = history[-1]["spot"] if history else meta.get("spot", 0.0)
+    else:
+        viewed_ts = history[end_idx - 1]["ts"].strftime("%H:%M:%S") if history else "—"
+        mode_piece = (f"⏸ HISTORY @{viewed_ts}", P_YELLOW, curses.A_BOLD)
+        spot = history[end_idx - 1]["spot"] if history else meta.get("spot", 0.0)
+
+    pieces = [
+        (title, P_CYAN, curses.A_BOLD),
+        ("  │  ", P_DIM, 0),
+        (asset, P_DEFAULT, curses.A_BOLD),
+        ("  ", P_DIM, 0),
+        mode_piece,
+        ("  Spot ", P_DIM, 0),
+        (f"${spot:,.2f}" if spot else "—", P_YELLOW, curses.A_BOLD),
+        ("  Expiry ", P_DIM, 0),
+        (f"{label}{'*' if is_0dte else ''}", P_DEFAULT, 0),
+    ]
+    if ttl and live_follow:
+        pieces += [("  TTL ", P_DIM, 0), (ttl, P_YELLOW, curses.A_BOLD)]
+    if is_crypto:
+        src_tag = "  (live)"
+    elif meta.get("spot_is_live"):
+        src_tag = "  (spot live via Yahoo, GEX ~15m delay via CBOE)"
+    else:
+        src_tag = "  (spot+GEX ~15m delay — live quote fetch failed)"
+    pieces += [("  Updated ", P_DIM, 0), (fetched, P_DEFAULT, 0), (src_tag, P_DIM, 0)]
+    if diag_count:
+        pieces += [(f"  Jumps {diag_count}", P_RED, curses.A_BOLD)]
+    else:
+        pieces += [(f"  Log {log_rows}", P_DIM, 0)]
+    return spot, pieces
+
+def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
+    """Ported from gex.py's own draw() — the time-interval GEX dot map.
+    Y axis = strike, X axis = time (one column per fetch), dot size/color
+    = net GEX at that strike at that moment, scaled against the largest
+    magnitude seen up to that column (frozen at ingestion — see
+    gex_ingest_column/scale_at_ingest, so a later bigger spike never
+    retroactively shrinks/grows an already-drawn dot). ui carries this
+    pane's own scroll state (live_follow/view_end_idx for time-axis
+    panning, vert_follow/vert_center_idx for the strike axis) — same
+    semantics as gex.py's own, ported unchanged."""
+    h, w = y1 - y0, x1 - x0
+    is_crypto = (asset == "ETH")
+    history, grid, scale_max, meta = _gex_snapshot_state(asset)
+
+    live_follow = ui["live_follow"]
+    n_hist = len(history)
+    end_idx = n_hist if live_follow else max(1, min(ui["view_end_idx"], n_hist))
+
+    spot, pieces = _gex_build_header(history, meta, live_follow, end_idx, asset, is_crypto,
+                                      "GEX MAP", GEX_LOG_ROWS[asset], GEX_DIAG_COUNT[asset])
+    _gex_draw_pieces(db, y0, x0, pieces, x1)
+
+    legend = [
+        ("● ", P_GREEN, curses.A_BOLD), ("large  ", P_DIM, 0),
+        ("O ", P_GREEN, 0), ("med  ", P_DIM, 0),
+        ("o ", P_GREEN, 0), ("small  ", P_DIM, 0),
+        (". ", P_GREEN, 0), ("tiny   ", P_DIM, 0),
+        ("green", P_GREEN, curses.A_BOLD), ("=+gamma(pin/support)  ", P_DIM, 0),
+        ("red", P_RED, curses.A_BOLD), ("=-gamma(accelerant)  ", P_DIM, 0),
+        ("●", P_YELLOW, curses.A_BOLD), ("=price(sized)  ", P_DIM, 0),
+        ("cyan", P_CYAN, curses.A_BOLD), ("=GEX flip strikes  ", P_DIM, 0),
+        ("----", P_DEFAULT, curses.A_BOLD), ("=GEX flip level", P_DIM, 0),
+    ]
+    _gex_draw_pieces(db, y0 + 1, x0, legend, x1)
+
+    if not history or not grid:
+        msg = "Waiting for first snapshot…"
+        db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
+        bot = y1 - 1
+        hint = f" q=quit  M=dashboard  [{asset}]  {GEX_STATUS[asset]}"
+        db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
+        return
+
+    axis_w = max(len(fstrike(s, is_crypto)) for s in grid) + 2
+    top = y0 + 3
+    bottom_reserved = 3
+    row_h = 2
+    avail_rows = max(1, (h - 3 - bottom_reserved) // row_h)
+
+    grid_sorted = sorted(grid)
+    if ui["vert_follow"]:
+        center_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    else:
+        center_idx = max(0, min(len(grid_sorted) - 1, ui["vert_center_idx"]))
+    half = avail_rows // 2
+    lo = max(0, center_idx - half)
+    hi = min(len(grid_sorted), lo + avail_rows)
+    lo = max(0, hi - avail_rows)
+    visible = list(reversed(grid_sorted[lo:hi]))
+
+    usable_w = max(0, w - axis_w - 1)
+    n_cols = max(1, usable_w // GEX_COL_W)
+
+    start_idx = max(0, end_idx - n_cols)
+    cols = history[start_idx:end_idx]
+
+    max_pain, flip_level = smoothed_max_pain_and_flip(history, end_idx, GEX_SMOOTH_N)
+    flip = None
+    if flip_level is not None:
+        flip = gex_bounding_strikes(grid_sorted, flip_level) + (flip_level,)
+    flip_strikes = (flip[0], flip[1]) if flip else ()
+
+    row_of = {}
+    for ri, strike in enumerate(visible):
+        row = top + ri * row_h
+        if row >= y1 - bottom_reserved:
+            break
+        row_of[strike] = row
+        is_current = bool(cols) and cols[-1].get("nearest") == strike
+        if is_current:
+            lbl_pair, lbl_attrs = P_YELLOW, curses.A_BOLD
+        elif strike in flip_strikes:
+            lbl_pair, lbl_attrs = P_CYAN, curses.A_BOLD
+        else:
+            lbl_pair, lbl_attrs = P_DIM, 0
+        db.puts(row, x0, fstrike(strike, is_crypto).rjust(axis_w - 1)[:max(0, axis_w - 1)], lbl_pair, lbl_attrs)
+
+        cx = x0 + axis_w
+        for col in cols:
+            if cx >= x1 - 1:
+                break
+            net = col["gex"].get(strike, 0.0)
+            ch, attr = _gex_dot_repr(net, col.get("scale_at_ingest") or scale_max)
+            if attr is not None:
+                pair, attrs = attr
+                db.put(row, cx, ch, pair, attrs)
+            cx += GEX_COL_W
+
+    if flip:
+        flip_row = gex_resolve_marker_row(flip[0], flip[1], row_of)
+        if flip_row is not None and top <= flip_row < y1 - bottom_reserved:
+            cx = x0 + axis_w
+            for _ in cols:
+                if cx >= x1 - 1:
+                    break
+                db.put(flip_row, cx, "-", P_DEFAULT, curses.A_BOLD)
+                cx += GEX_COL_W
+
+    for ci, col in enumerate(cols):
+        cx = x0 + axis_w + ci * GEX_COL_W
+        if cx >= x1 - 1:
+            break
+        spot_c = col["spot"]
+        lo_s, hi_s = gex_bounding_strikes(grid_sorted, spot_c)
+        target_row = gex_resolve_marker_row(lo_s, hi_s, row_of)
+        net_src = lo_s if lo_s == hi_s or abs(spot_c - lo_s) <= abs(spot_c - hi_s) else hi_s
+        if target_row is not None and top <= target_row < y1 - bottom_reserved:
+            ch, attr = _gex_price_marker_repr(col["gex"].get(net_src, 0.0), col.get("scale_at_ingest") or scale_max)
+            pair, attrs = attr
+            db.put(target_row, cx, ch, pair, attrs)
+
+    axis_row = y1 - bottom_reserved
+    label_every_cols = max(1, 8 // GEX_COL_W)
+    cx = x0 + axis_w
+    for ci, col in enumerate(cols):
+        if cx >= x1 - 6:
+            break
+        if ci % label_every_cols == 0 or ci == len(cols) - 1:
+            ts_str = col["ts"].strftime("%H:%M")
+            db.puts(axis_row, cx, ts_str, P_DIM, 0)
+        cx += GEX_COL_W
+
+    mp_str = fstrike(max_pain, is_crypto) if max_pain is not None else "N/A"
+    net_gex = sum(cols[-1]["gex"].values()) if cols else None
+    if net_gex is None:
+        net_gex_str, net_gex_pair = "N/A", P_DIM
+    else:
+        net_gex_str = fdollars_compact(net_gex)
+        net_gex_pair = P_GREEN if net_gex >= 0 else P_RED
+    if flip:
+        lo_f, hi_f, level = flip
+        flip_str = (fstrike(level, is_crypto) if lo_f == hi_f else
+                     f"{fstrike(level, is_crypto)}  (between {fstrike(lo_f, is_crypto)} & {fstrike(hi_f, is_crypto)})")
+    else:
+        flip_str = "N/A"
+    info_pieces = [
+        (" Max Pain ", P_DIM, 0), (mp_str, P_YELLOW, curses.A_BOLD),
+        ("    Net GEX ", P_DIM, 0), (net_gex_str, net_gex_pair, curses.A_BOLD),
+        ("    Zero Gamma/GEX Flip ", P_DIM, 0), (flip_str, P_CYAN, curses.A_BOLD),
+        (f"    (Max Pain/Flip smoothed over last {GEX_SMOOTH_N})", P_DIM, 0),
+    ]
+    _gex_draw_pieces(db, y1 - bottom_reserved + 1, x0, info_pieces, x1)
+
+    bot = y1 - 1
+    other_asset = "QQQ" if asset == "ETH" else "ETH"
+    vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
+    hint = (f" q=quit  M=dashboard  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
+            f"g=by-strike  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
+    db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
+
+def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
+    """Ported from gex.py's own draw_by_strike() — GEX BY STRIKE bar
+    chart (strike on X, GEX $ on Y), matching the Barchart-style "Gamma
+    Exposure by Strike" chart. ui['by_strike_net'] toggles one combined
+    bar per strike (green/red, gex.py's 'n' key) vs two bars (call blue /
+    put — gex.py's own P_ORANGE is just an alias for yellow, "no true
+    orange in base 8-color curses" per its own init_colors comment, so
+    this uses P_YELLOW directly for puts, same color gex.py itself
+    actually renders, not an approximation of it)."""
+    h, w = y1 - y0, x1 - x0
+    is_crypto = (asset == "ETH")
+    history, grid, scale_max, meta = _gex_snapshot_state(asset)
+    net_mode = ui.get("by_strike_net", False)
+    title = "GEX BY STRIKE (NET)" if net_mode else "GEX BY STRIKE"
+
+    spot, pieces = _gex_build_header(history, meta, True, len(history), asset, is_crypto,
+                                      title, GEX_LOG_ROWS[asset], GEX_DIAG_COUNT[asset])
+    _gex_draw_pieces(db, y0, x0, pieces, x1)
+
+    if net_mode:
+        legend = [
+            ("█ ", P_GREEN, curses.A_BOLD), ("net +gamma (call-dominated)  ", P_DIM, 0),
+            ("█ ", P_RED, curses.A_BOLD), ("net -gamma (put-dominated)  ", P_DIM, 0),
+            ("yellow", P_YELLOW, curses.A_BOLD), ("=current price (strike label + line)  ", P_DIM, 0),
+            ("cyan", P_CYAN, curses.A_BOLD), ("=GEX flip strikes  ", P_DIM, 0),
+            ("|", P_DEFAULT, curses.A_BOLD), ("=GEX flip level", P_DIM, 0),
+        ]
+    else:
+        legend = [
+            ("█ ", P_BLUE, curses.A_BOLD), ("call gamma  ", P_DIM, 0),
+            ("█ ", P_YELLOW, curses.A_BOLD), ("put gamma  ", P_DIM, 0),
+            ("yellow", P_YELLOW, curses.A_BOLD), ("=current price (strike label + line)  ", P_DIM, 0),
+            ("cyan", P_CYAN, curses.A_BOLD), ("=GEX flip strikes  ", P_DIM, 0),
+            ("|", P_DEFAULT, curses.A_BOLD), ("=GEX flip level", P_DIM, 0),
+        ]
+    _gex_draw_pieces(db, y0 + 1, x0, legend, x1)
+
+    if not history or not grid:
+        msg = "Waiting for first snapshot…"
+        db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
+        bot = y1 - 1
+        hint = f" q=quit  M=dashboard  [{asset}]  {GEX_STATUS[asset]}"
+        db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
+        return
+
+    ref_col = history[-1]
+    gex_by_type = ref_col.get("gex_by_type") or {}
+    nearest_strike = ref_col.get("nearest")
+
+    top = y0 + 3
+    bottom_reserved = 3
+    grid_sorted = sorted(grid)
+    strike_col_w = 3
+    y_axis_w = 10
+
+    usable_w = max(0, w - y_axis_w - 1)
+    n_strike_cols = max(1, usable_w // strike_col_w)
+
+    if ui["vert_follow"]:
+        center_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    else:
+        center_idx = max(0, min(len(grid_sorted) - 1, ui["vert_center_idx"]))
+    half = n_strike_cols // 2
+    lo = max(0, center_idx - half)
+    hi = min(len(grid_sorted), lo + n_strike_cols)
+    lo = max(0, hi - n_strike_cols)
+    visible_strikes = grid_sorted[lo:hi]
+
+    scale = 0.0
+    if net_mode:
+        for strike in visible_strikes:
+            scale = max(scale, abs(ref_col["gex"].get(strike, 0.0)))
+    else:
+        for strike in visible_strikes:
+            entry = gex_by_type.get(strike, {})
+            scale = max(scale, abs(entry.get("call", 0.0)), abs(entry.get("put", 0.0)))
+
+    avail_v = max(2, h - 3 - bottom_reserved)
+    zero_row = top + avail_v // 2
+    avail_up = zero_row - top
+    avail_down = (y1 - bottom_reserved - 1) - zero_row
+
+    max_pain, flip_level = smoothed_max_pain_and_flip(history, len(history), GEX_SMOOTH_N)
+    flip = None
+    if flip_level is not None:
+        flip = gex_bounding_strikes(grid_sorted, flip_level) + (flip_level,)
+    flip_strikes = (flip[0], flip[1]) if flip else ()
+    net_gex = sum(ref_col["gex"].values())
+
+    col_of = {}
+    for si, strike in enumerate(visible_strikes):
+        cx = x0 + y_axis_w + si * strike_col_w
+        if cx >= x1 - 1:
+            break
+        col_of[strike] = cx
+
+    if flip:
+        flip_col = gex_resolve_marker_col(flip[0], flip[1], col_of)
+        if flip_col is not None:
+            for ry in range(top, y1 - bottom_reserved):
+                db.put(ry, flip_col, "|", P_DEFAULT, curses.A_BOLD)
+
+    price_lo, price_hi = gex_bounding_strikes(grid_sorted, spot)
+    price_col = gex_resolve_marker_col(price_lo, price_hi, col_of)
+    if price_col is not None:
+        for ry in range(top, y1 - bottom_reserved):
+            db.put(ry, price_col, ":", P_YELLOW, curses.A_BOLD)
+
+    for cx in range(x0 + y_axis_w, x1 - 1):
+        db.put(zero_row, cx, "─", P_DIM, 0)
+
+    db.puts(top, x0, fdollars_compact(scale).rjust(y_axis_w - 1)[:max(0, y_axis_w - 1)], P_DIM, 0)
+    db.puts(zero_row, x0, "$0".rjust(y_axis_w - 1)[:max(0, y_axis_w - 1)], P_DIM, 0)
+    db.puts(y1 - bottom_reserved - 1, x0, fdollars_compact(-scale).rjust(y_axis_w - 1)[:max(0, y_axis_w - 1)], P_DIM, 0)
+
+    label_every = max(1, 12 // strike_col_w)
+    for si, strike in enumerate(visible_strikes):
+        cx = col_of.get(strike)
+        if cx is None:
+            break
+        if net_mode:
+            net_val = ref_col["gex"].get(strike, 0.0)
+            rows = round(abs(net_val) / scale * (avail_up if net_val >= 0 else avail_down)) if scale > 0 else 0
+            pair = P_GREEN if net_val >= 0 else P_RED
+            step = -1 if net_val >= 0 else 1
+            for r in range(1, rows + 1):
+                db.put(zero_row + step * r, cx, "█", pair, curses.A_BOLD)
+        else:
+            entry = gex_by_type.get(strike, {})
+            call_val, put_val = entry.get("call", 0.0), entry.get("put", 0.0)
+            call_rows = round(abs(call_val) / scale * avail_up) if scale > 0 else 0
+            put_rows = round(abs(put_val) / scale * avail_down) if scale > 0 else 0
+            for r in range(1, call_rows + 1):
+                db.put(zero_row - r, cx, "█", P_BLUE, curses.A_BOLD)
+            for r in range(1, put_rows + 1):
+                db.put(zero_row + r, cx, "█", P_YELLOW, curses.A_BOLD)
+
+        if si % label_every == 0 or si == len(visible_strikes) - 1:
+            if strike == nearest_strike:
+                lbl_pair, lbl_attrs = P_YELLOW, curses.A_BOLD
+            elif strike in flip_strikes:
+                lbl_pair, lbl_attrs = P_CYAN, curses.A_BOLD
+            else:
+                lbl_pair, lbl_attrs = P_DIM, 0
+            db.puts(y1 - bottom_reserved, max(x0, cx - 1), fstrike(strike, is_crypto), lbl_pair, lbl_attrs)
+
+    mp_str = fstrike(max_pain, is_crypto) if max_pain is not None else "N/A"
+    net_gex_str = fdollars_compact(net_gex)
+    net_gex_pair = P_GREEN if net_gex >= 0 else P_RED
+    if flip:
+        lo_f, hi_f, level = flip
+        flip_str = (fstrike(level, is_crypto) if lo_f == hi_f else
+                     f"{fstrike(level, is_crypto)}  (between {fstrike(lo_f, is_crypto)} & {fstrike(hi_f, is_crypto)})")
+    else:
+        flip_str = "N/A"
+    info_pieces = [
+        (" Max Pain ", P_DIM, 0), (mp_str, P_YELLOW, curses.A_BOLD),
+        ("    Net GEX ", P_DIM, 0), (net_gex_str, net_gex_pair, curses.A_BOLD),
+        ("    Zero Gamma/GEX Flip ", P_DIM, 0), (flip_str, P_CYAN, curses.A_BOLD),
+        (f"    (Max Pain/Flip smoothed over last {GEX_SMOOTH_N})", P_DIM, 0),
+    ]
+    _gex_draw_pieces(db, y1 - bottom_reserved + 1, x0, info_pieces, x1)
+
+    bot = y1 - 1
+    other_asset = "QQQ" if asset == "ETH" else "ETH"
+    vert_tag = "" if ui["vert_follow"] else "[scrolled]"
+    hint = (f" q=quit  M=dashboard  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
+            f"g=interval map  n=net/separate  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
+    db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
+
+FAST_MATCH_STEP = 0.5   # DRY_RUN only — see _fast_match_wait
+
+async def _fast_match_wait(seconds):
+    """Sleeps out the gap between engine_loop cycles, same as a plain
+    asyncio.sleep(seconds) — EXCEPT (a) in DRY_RUN, it also calls
+    SimAccount.tick_matching() every FAST_MATCH_STEP instead of just once
+    at the end, and (b) in EITHER mode, it wakes up early — after at most
+    one FAST_MATCH_STEP — the moment _flatten_all_evt/_reset_sim_evt/
+    _quit_evt gets set, instead of always sleeping out the FULL interval
+    first. That early-wake is what actually fixes "[F]latten takes 10+
+    seconds": engine_loop only ever checks those events once per outer
+    while-loop iteration, right after this sleep returns — with the old
+    plain asyncio.sleep(INTERVAL), confirming [F] mid-sleep meant waiting
+    out however much of the up-to-3s INTERVAL was left before Athena even
+    NOTICED the flatten had been requested, on top of whatever the
+    flatten itself then took.
+
+    tick_matching() itself is now LIVE_TAPE-driven (no REST calls for a
+    symbol with an active WS feed — see tick_matching's own docstring), so
+    the DRY_RUN branch costs nothing extra network-wise; it just means a
+    simulated fill/SL/TP reacts within ~0.5s of the live tape crossing a
+    resting order's price instead of waiting for the next full,
+    REST-heavy INTERVAL cycle (1-3s, but also everything that cycle does
+    ahead of the match check — status/footprint reads, process_cycle for
+    every instrument, etc). Still exclusively the engine/asyncio thread
+    touching SimAccount, same invariant as always — this is just a finer-
+    grained loop on that same thread, not a new one."""
+    sim = get_sim_account() if DRY_RUN else None
+    remaining = seconds
+    while remaining > 0:
+        step = min(FAST_MATCH_STEP, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+        if sim is not None:
+            try:
+                await sim.tick_matching()
+            except Exception:
+                pass
+        if _flatten_all_evt.is_set() or _reset_sim_evt.is_set() or _quit_evt.is_set():
+            return
+
 async def engine_loop():
     if not DRY_RUN and (not PHEMEX_API_KEY or not PHEMEX_API_SECRET):
         console_log(f"{RED}PHEMEX_API_KEY/PHEMEX_API_SECRET not set in .env — real trading needs both{RST}")
@@ -3152,7 +5914,7 @@ async def engine_loop():
 
         qqq_market_closed = bool((snapshot.get("qqq") or {}).get("market_closed")) if snapshot else True
         APP_STATE.publish(instruments, age, acc, live_prices, qqq_market_closed)
-        await asyncio.sleep(INTERVAL)
+        await _fast_match_wait(INTERVAL)
 
     log_event("SYSTEM", "shutdown", {})
 
@@ -3187,8 +5949,10 @@ def _fast_publish_loop(stop_evt):
 # no jitter — see [H] for a full-width toggle when even this isn't enough).
 def draw_dashboard(db, snap, cols):
     y = 0
-    mode_tag = (('  ' + RED + BLD + '[PAUSED — A to resume]' + RST + DIM) if not ATHENA_ENABLED else '') + \
-               ('  [DRY RUN]' if DRY_RUN else '') + ('  [24H MODE]' if NO_SESSION else '')
+    # Per-asset PAUSED state now shown on each instrument's own title line
+    # below (not here) — a single shared tag stopped making sense once [A]
+    # could pause ETH and QQQ independently.
+    mode_tag = ('  [DRY RUN]' if DRY_RUN else '') + ('  [24H MODE]' if NO_SESSION else '')
     now_et = datetime.now(TZ_ET).strftime("%I:%M:%S %p ET") if TZ_ET else "ET n/a"
     now_ct = datetime.now(TZ_CT).strftime("%I:%M:%S %p CT") if TZ_CT else "CT n/a"
     db.puts_ansi(y, 0, f"{BLD}{CYN}ATHENA{RST}{DIM} — {now_et} | {now_ct} | interval {INTERVAL}s | "
@@ -3212,15 +5976,29 @@ def draw_dashboard(db, snap, cols):
         names = gated_light_names()
         segs = "".join((GRN if lights.get(n) else RED) + "█" + RST for n in names)
         count = sum(1 for n in names if lights.get(n))
-        title = f"── {asset} "
+        paused_tag = " [PAUSED]" if not ATHENA_ENABLED[asset] else ""
+        title = f"── {asset}{paused_tag} "
         db.puts(y, 0, (title + "─" * max(2, min(cols, BOX_W) - len(title)))[:cols], P_DIM)
+        if paused_tag:
+            # Overlay just the tag in red/bold — the dash-fill above is
+            # already drawn plain-DIM the full width, so this only needs
+            # to color the few characters the tag itself occupies.
+            tag_x = len(f"── {asset}")
+            db.puts(y, tag_x, paused_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         y += 1
         if inst.get("market_closed"):
             regime_txt, state_txt = "n/a", "CLOSED"
         else:
             regime_txt, state_txt = (inst.get("regime") or "none").upper(), inst.get("state", "?")
         price_txt = f"   {DIM}price {inst['price']:.2f}{RST}" if inst.get("price") is not None else ""
-        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}")
+        bj_txt = ""
+        if BLACKJACK_MODE:
+            bj = BLACKJACK_STATE[asset]
+            if bj["in_win_progression"]:
+                bj_txt = f"   {DIM}BJ: win progression ({fmt_num(bj['win_step_back'], 0)}R + ${bj['win_profit_dollars']:,.2f}){RST}"
+            else:
+                bj_txt = f"   {DIM}BJ: {fmt_num(BLACKJACK_STEPS[bj['loss_step']], 0)}R{RST}"
+        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bj_txt}")
         y += 1
         detail = "  " + "  ".join(
             (GRN if lights.get(n) else RED) + n + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
@@ -3382,7 +6160,7 @@ def draw_activity_log_popup(db, rows, cols, event_log, scroll):
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global PCT, NO_SESSION, ATHENA_ENABLED
+    global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(0)
@@ -3391,6 +6169,7 @@ def curses_main(stdscr):
 
     threading.Thread(target=_run_engine, daemon=True).start()
     for asset in ASSETS:
+        feed_starters = []
         # QQQ's live tape prefers Athena's own dedicated Alpaca account
         # (real QQQ shares, matching footprint.py's own closed-bar source
         # for QQQ) over Phemex's thinner QQQUSDT perp — per explicit user
@@ -3398,21 +6177,40 @@ def curses_main(stdscr):
         # aren't set, so a missing .env entry degrades gracefully instead
         # of leaving QQQ's live chart with no feed at all.
         if asset == "QQQ" and ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
-            threading.Thread(target=_alpaca_trade_ws, args=(asset, _quit_evt), daemon=True).start()
+            feed_starters.append((_alpaca_trade_ws, (asset, _quit_evt)))
         else:
             if asset == "QQQ":
                 console_log(f"{YLW}ALPACA_API_ATHENA_ID/ALPACA_API_SECRET_KEY_ATHENA not set — "
                             f"QQQ live tape falling back to Phemex QQQUSDT{RST}")
-            threading.Thread(target=_phemex_trade_ws, args=(asset, _quit_evt), daemon=True).start()
+            feed_starters.append((_phemex_trade_ws, (asset, _quit_evt)))
         # ETH's live tape aggregates Phemex + Kraken + Coinbase — matching
         # footprint.py's own multi-exchange source for ETH's closed bars
         # exactly, so a live bar isn't blind to a real print that happened
         # to land on Kraken/Coinbase first (see the module-level comment
         # above KRAKEN_WS_URL for the confirmed live discrepancy this fixes).
         if asset == "ETH":
-            threading.Thread(target=_kraken_trade_ws, args=(asset, _quit_evt), daemon=True).start()
-            threading.Thread(target=_coinbase_trade_ws, args=(asset, _quit_evt), daemon=True).start()
+            feed_starters.append((_kraken_trade_ws, (asset, _quit_evt)))
+            feed_starters.append((_coinbase_trade_ws, (asset, _quit_evt)))
+        # Backfill runs to completion on its OWN thread BEFORE this asset's
+        # live feed(s) start — see _backfill_then_feeds's own docstring for
+        # why (mirrors footprint.py's initialize_today()-then-start_feeds()
+        # sequencing without blocking curses startup for both assets).
+        threading.Thread(target=_backfill_then_feeds, args=(asset, feed_starters), daemon=True).start()
+        # GEX engine (Phase 2 of the standalone-merge plan) — one
+        # background thread per asset, independent of the footprint
+        # backfill/feed sequencing above (GEX has its own separate data
+        # source entirely — options chains, not trade prints — so there's
+        # no shared race to avoid the way footprint's late-trade guard
+        # requires backfill-before-live-feed).
+        threading.Thread(target=_gex_engine_loop, args=(asset, _quit_evt), daemon=True).start()
     threading.Thread(target=_fast_publish_loop, args=(_quit_evt,), daemon=True).start()
+    # Status engine (Phase 3 of the standalone-merge plan) — 3 threads,
+    # same cadences/shape as status.py's own main()+live_price_loop+
+    # snapshot_logger_loop (one full-refresh cycle covers BOTH assets at
+    # once, unlike the GEX engine above which is genuinely per-asset).
+    threading.Thread(target=_status_full_refresh_loop, args=(_quit_evt,), daemon=True).start()
+    threading.Thread(target=_status_live_price_loop, args=(_quit_evt,), daemon=True).start()
+    threading.Thread(target=_status_snapshot_loop, args=(_quit_evt,), daemon=True).start()
 
     rows, cols = stdscr.getmaxyx()
     db = DoubleBuffer(rows, cols)
@@ -3423,6 +6221,18 @@ def curses_main(stdscr):
     # bars back from the newest" convention; 0 is always the live tail.
     chart_scroll = {"ETH": 0, "QQQ": 0}
     chart_focus = "ETH"
+    chart_zoom = False   # [Z] — fullscreen whichever pane is [Tab]-focused
+                          # instead of the normal ETH/QQQ side-by-side split
+    gex_mode = False   # [M] — full-screen GEX mode (Phase 2 of the
+                        # standalone-merge plan), replacing the dashboard+
+                        # chart entirely while active, same as data_view
+    gex_by_strike = False   # [G] within gex_mode — dot-map (False) vs
+                             # GEX-by-strike bar chart (True)
+    gex_by_strike_net = False   # [N] within gex_mode's by-strike view
+    gex_live_follow = {"ETH": True, "QQQ": True}      # time-axis auto-follow (dot-map)
+    gex_view_end_idx = {"ETH": 0, "QQQ": 0}           # frozen time-axis index when panned
+    gex_vert_follow = {"ETH": True, "QQQ": True}      # strike-axis auto-center
+    gex_vert_center_idx = {"ETH": 0, "QQQ": 0}        # frozen strike-axis index when scrolled
     dashboard_hidden = False   # [H] — gives the chart the ENTIRE terminal,
                                # same row budget footprint.py's own
                                # full-screen view uses, for when even the
@@ -3477,14 +6287,28 @@ def curses_main(stdscr):
                 trades_cache = {"source": data_source, "ts": now_mono, "trades": trades}
             data_table_info = draw_data_view(db, rows, cols, data_source, data_cache["events"],
                                               data_cache["stats"], trades_cache["trades"], table_scroll)
+        elif gex_mode:
+            # Full screen (0..rows, not 0..footer_row) — draw_gex_map/
+            # draw_gex_by_strike own their entire own status/hint row at
+            # the very last line, same as gex.py's own screen does, so
+            # there's no separate Athena footer drawn underneath (see the
+            # footer dispatch below).
+            gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            gex_ui = {"live_follow": gex_live_follow[gex_asset], "view_end_idx": gex_view_end_idx[gex_asset],
+                      "vert_follow": gex_vert_follow[gex_asset], "vert_center_idx": gex_vert_center_idx[gex_asset],
+                      "by_strike_net": gex_by_strike_net}
+            if gex_by_strike:
+                draw_gex_by_strike(db, gex_asset, 0, rows, 0, cols, gex_ui)
+            else:
+                draw_gex_map(db, gex_asset, 0, rows, 0, cols, gex_ui)
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
                 draw_dashboard(db, snap, cols)
             chart_bottom = footer_row
 
-            both_panes = chart_bottom - chart_top > 10 and not snap["qqq_market_closed"]
-            if chart_bottom - chart_top > 10:
+            both_panes = chart_bottom - chart_top > 10
+            if both_panes:
                 eth_inst = snap["instruments"].get("ETH") or {}
                 qqq_inst = snap["instruments"].get("QQQ") or {}
                 eth_bars = snap["footprint_bars"].get("ETH") or []
@@ -3493,11 +6317,22 @@ def curses_main(stdscr):
                 qqq_live = qqq_inst.get("live_price") if qqq_inst.get("live_price") is not None else qqq_inst.get("price")
                 eth_live_bar = snap["live_bars"].get("ETH")
                 qqq_live_bar = snap["live_bars"].get("QQQ")
-                if snap["qqq_market_closed"]:
-                    draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, cols,
-                                          profile_mode, build_trade_markers("ETH", eth_bars, eth_inst, snap["trade_pairs"]),
-                                          hscroll_bars=chart_scroll["ETH"], live_price=eth_live, live_bar=eth_live_bar)
-                    db.puts(chart_top, max(0, cols - 12), "QQQ closed", P_DIM)
+                if chart_zoom:
+                    # [Z] fullscreen — whichever pane [Tab] currently has
+                    # focused gets the ENTIRE chart width, same panel-
+                    # drawing call as the split view just with x0=0/x1=cols
+                    # instead of a half. [Tab] still works while zoomed, to
+                    # flip which asset fills the screen without leaving
+                    # zoom mode first.
+                    zoom_asset = chart_focus
+                    bars = eth_bars if zoom_asset == "ETH" else qqq_bars
+                    inst = eth_inst if zoom_asset == "ETH" else qqq_inst
+                    live = eth_live if zoom_asset == "ETH" else qqq_live
+                    live_bar = eth_live_bar if zoom_asset == "ETH" else qqq_live_bar
+                    draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
+                                          profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
+                                          hscroll_bars=chart_scroll[zoom_asset], live_price=live, live_bar=live_bar,
+                                          focused=True, market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]))
                 else:
                     mid = cols // 2
                     draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, mid,
@@ -3507,7 +6342,7 @@ def curses_main(stdscr):
                     draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, mid, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
-                                          focused=(chart_focus == "QQQ"))
+                                          focused=(chart_focus == "QQQ"), market_closed=snap["qqq_market_closed"])
 
         if activity_log_open:
             draw_activity_log_popup(db, rows, cols, snap["event_log"], activity_log_scroll)
@@ -3529,16 +6364,22 @@ def curses_main(stdscr):
                 scroll_tag = f"  [{shown}-{shown_end} of {total}, ↑/↓ scroll table]"
             footer = f"{ts}   [D]ashboard   [S]witch source ({data_source}){scroll_tag}   [Q]uit"
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
+        elif gex_mode:
+            pass   # draw_gex_map/draw_gex_by_strike already drew their own
+                   # full status/hint row at the screen's very last line —
+                   # same as gex.py's own screen does — so there's nothing
+                   # left for Athena's own generic footer to add here.
         else:
             # [Tab] hint placed right after the scroll hint it's directly
             # related to (not appended at the very end) — the footer is
             # already long enough on a modest terminal that anything tacked
             # on last just gets silently truncated by the ljust/[:cols]
             # below, which is exactly what was hiding this hint before.
-            tab_hint = f" [Tab]:{chart_focus}" if both_panes else ""
-            footer = (f"{ts}  [Q]uit [A]:{'OFF' if not ATHENA_ENABLED else 'on'} [V]iew:{profile_mode}"
+            tab_hint = f" [Tab]:{chart_focus} [Z]:{'full' if chart_zoom else 'split'}" if both_panes else ""
+            focus_asset = chart_focus if both_panes else "ETH"
+            footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{tab_hint} [Home]live"
-                      f" [P]ct:{PCT:g}% [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture"
+                      f" [P]ct:{PCT:g}% [B]:{'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX"
                       + ("  [R]eset" if DRY_RUN else "")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
@@ -3584,6 +6425,78 @@ def curses_main(stdscr):
                 activity_log_scroll = max(0, activity_log_scroll - 10)
             continue
 
+        if gex_mode:
+            # Ported from gex.py's own curses_main key dispatch. One
+            # deliberate adaptation: gex.py uses Esc (alongside z/Z/End)
+            # to reset pan/scroll to live — Athena instead uses Esc to
+            # LEAVE gex_mode, matching the same cross-mode convention
+            # data_view/activity_log_open already use ([mode-key] or Esc
+            # = back out). z/Z/End alone still does gex.py's own reset.
+            gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key in (ord("m"), ord("M"), 27):
+                gex_mode = False
+            elif key in (ord("g"), ord("G")):
+                gex_by_strike = not gex_by_strike
+            elif key in (ord("n"), ord("N")) and gex_by_strike:
+                gex_by_strike_net = not gex_by_strike_net
+            elif key == 9:   # Tab — switch asset, same convention as the footprint charts
+                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key in (ord("z"), ord("Z"), curses.KEY_END):
+                gex_live_follow[gex_asset] = True
+                gex_vert_follow[gex_asset] = True
+            elif key == curses.KEY_LEFT:
+                if gex_by_strike:
+                    _gex_vert_step(gex_asset, -GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
+                else:
+                    n_hist = len(GEX_HISTORY[gex_asset])
+                    if gex_live_follow[gex_asset]:
+                        gex_view_end_idx[gex_asset] = n_hist
+                    gex_live_follow[gex_asset] = False
+                    gex_view_end_idx[gex_asset] = max(1, gex_view_end_idx[gex_asset] - GEX_ARROW_STEP)
+            elif key == curses.KEY_RIGHT:
+                if gex_by_strike:
+                    _gex_vert_step(gex_asset, GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
+                elif not gex_live_follow[gex_asset]:
+                    n_hist = len(GEX_HISTORY[gex_asset])
+                    gex_view_end_idx[gex_asset] = min(n_hist, gex_view_end_idx[gex_asset] + GEX_ARROW_STEP)
+                    if gex_view_end_idx[gex_asset] >= n_hist:
+                        gex_live_follow[gex_asset] = True
+            elif key == curses.KEY_PPAGE:
+                if gex_by_strike:
+                    _gex_vert_step(gex_asset, -GEX_VERT_PAGE_STEP, gex_vert_follow, gex_vert_center_idx)
+                else:
+                    n_hist = len(GEX_HISTORY[gex_asset])
+                    if gex_live_follow[gex_asset]:
+                        gex_view_end_idx[gex_asset] = n_hist
+                    gex_live_follow[gex_asset] = False
+                    gex_view_end_idx[gex_asset] = max(1, gex_view_end_idx[gex_asset] - GEX_PAGE_STEP)
+            elif key == curses.KEY_NPAGE:
+                if gex_by_strike:
+                    _gex_vert_step(gex_asset, GEX_VERT_PAGE_STEP, gex_vert_follow, gex_vert_center_idx)
+                elif not gex_live_follow[gex_asset]:
+                    n_hist = len(GEX_HISTORY[gex_asset])
+                    gex_view_end_idx[gex_asset] = min(n_hist, gex_view_end_idx[gex_asset] + GEX_PAGE_STEP)
+                    if gex_view_end_idx[gex_asset] >= n_hist:
+                        gex_live_follow[gex_asset] = True
+            elif key == curses.KEY_UP:
+                _gex_vert_step(gex_asset, GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
+            elif key == curses.KEY_DOWN:
+                _gex_vert_step(gex_asset, -GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
+            elif key == ord("["):
+                _gex_vert_step(gex_asset, GEX_VERT_PAGE_STEP, gex_vert_follow, gex_vert_center_idx)
+            elif key == ord("]"):
+                _gex_vert_step(gex_asset, -GEX_VERT_PAGE_STEP, gex_vert_follow, gex_vert_center_idx)
+            elif key == ord("{"):
+                gex_vert_follow[gex_asset] = False
+                with GEX_STATE_LOCK:
+                    gex_vert_center_idx[gex_asset] = max(0, len(GEX_GRID[gex_asset]) - 1)
+            elif key == ord("}"):
+                gex_vert_follow[gex_asset] = False
+                gex_vert_center_idx[gex_asset] = 0
+            continue
+
         if data_view:
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
@@ -3612,6 +6525,12 @@ def curses_main(stdscr):
             flatten_armed = True
         elif key in (ord("d"), ord("D")):
             data_view = True
+            table_scroll = 0   # always reopen scrolled to the newest trades —
+                                # without this, a scroll from a PRIOR visit
+                                # (e.g. to check older trades) silently stayed
+                                # in effect on every later reopen, pinning the
+                                # view below newly-closed trades with no
+                                # visible sign why the table "stopped updating"
         elif key in (ord("l"), ord("L")):
             activity_log_open = True
             activity_log_scroll = 0
@@ -3626,15 +6545,26 @@ def curses_main(stdscr):
             console_log(f"{YLW}Session requirement {'BYPASSED (24H mode)' if NO_SESSION else 'RE-ENABLED'} (via [N]){RST}")
             log_event("SYSTEM", "no_session_toggled", {"no_session": NO_SESSION})
         elif key in (ord("a"), ord("A")):
-            ATHENA_ENABLED = not ATHENA_ENABLED
-            # OFF blocks WATCHING->ARMED->confirm (no NEW entries) —
-            # PENDING_FILL/IN_POSITION management keeps running regardless,
-            # see process_cycle's own gating, so this is a genuine "stop
-            # taking new signals" pause, not "abandon what's already open."
-            console_log((f"{RED}{BLD}Athena PAUSED (via [A]) — no new entries; "
-                          f"open positions still managed normally{RST}") if not ATHENA_ENABLED
-                         else f"{GRN}{BLD}Athena RESUMED (via [A]){RST}")
-            log_event("SYSTEM", "athena_enabled_toggled", {"enabled": ATHENA_ENABLED})
+            # Acts on whichever pane is currently [Tab]-focused — per-asset
+            # toggle (explicit user request 2026-07-24), not one shared
+            # switch, so ETH and QQQ can be paused/resumed independently.
+            focus_asset = chart_focus if both_panes else "ETH"
+            ATHENA_ENABLED[focus_asset] = not ATHENA_ENABLED[focus_asset]
+            # OFF blocks WATCHING->ARMED->confirm (no NEW entries) for THIS
+            # asset only — PENDING_FILL/IN_POSITION management keeps
+            # running regardless, see process_cycle's own gating, so this
+            # is a genuine "stop taking new signals" pause, not "abandon
+            # what's already open."
+            console_log((f"{RED}{BLD}{focus_asset} PAUSED (via [A]) — no new entries; "
+                          f"open positions still managed normally{RST}") if not ATHENA_ENABLED[focus_asset]
+                         else f"{GRN}{BLD}{focus_asset} RESUMED (via [A]){RST}")
+            log_event(focus_asset, "athena_enabled_toggled", {"enabled": ATHENA_ENABLED[focus_asset]})
+        elif key in (ord("b"), ord("B")):
+            BLACKJACK_MODE = not BLACKJACK_MODE
+            console_log((f"{YLW}{BLD}Blackjack sizing ON{RST} — 1R,1R,2R,3R,5R loss progression, "
+                          f"2-trade win progression (via [B]){RST}") if BLACKJACK_MODE
+                         else f"{GRN}{BLD}Blackjack sizing OFF — back to flat {PCT:g}% risk (via [B]){RST}")
+            log_event("SYSTEM", "blackjack_mode_toggled", {"enabled": BLACKJACK_MODE})
         elif key in (ord("p"), ord("P")):
             new_pct = _prompt_number(stdscr, f"New risk %% per trade (current {PCT:g}%, Enter keeps it): ", default=PCT)
             db.prev = None
@@ -3644,6 +6574,12 @@ def curses_main(stdscr):
                 PCT = new_pct
         elif key == 9 and both_panes:   # Tab
             chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+        elif key in (ord("z"), ord("Z")) and both_panes:
+            chart_zoom = not chart_zoom
+            console_log(f"{YLW}Chart {'zoomed to ' + chart_focus if chart_zoom else 'split back to ETH/QQQ'} (via [Z]){RST}")
+        elif key in (ord("m"), ord("M")):
+            gex_mode = True
+            console_log(f"{YLW}GEX mode ({chart_focus if chart_focus in ASSETS else 'ETH'}) — via [M]{RST}")
         elif key == curses.KEY_LEFT:
             asset = chart_focus if both_panes else "ETH"
             max_back = max(0, len(snap["footprint_bars"].get(asset) or []) - 1)

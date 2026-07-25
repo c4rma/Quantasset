@@ -172,6 +172,9 @@ except Exception:
 # none of the many existing call sites needed to change.
 RED = '\033[91m'; GRN = '\033[92m'; YLW = '\033[93m'; CYN = '\033[96m'
 BLD = '\033[1m';  DIM = '\033[2m';  RST = '\033[0m'
+MAG = '\033[95m'   # matches status.py's own MAG exactly — added for Phase 3c's
+                    # Status screen (status.py's Volatility "Layer 2" tag is the
+                    # only place this project needed magenta before now)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PHEMEX_API_KEY    = os.environ.get('PHEMEX_API_KEY', '')
@@ -283,6 +286,77 @@ def _save_blackjack_state():
 
 BLACKJACK_STATE = _load_blackjack_state()
 
+def _reset_blackjack_state():
+    """CRITICAL bug fixed 2026-07-25, user-reported (QQQ still showing
+    'win progression (2R + $39.81)' right after a paper-account reset,
+    when both assets should start fresh at 1R): BLACKJACK_STATE is its
+    own separate global, persisted to blackjack_state.json — neither
+    SimAccount.reset() nor the [R]/--reset-sim flows ever touched it, so
+    a wiped paper ledger still carried forward whatever loss/win
+    progression each asset happened to be at. Called from both reset
+    entry points (in-app [R] and the --reset-sim startup flag) right
+    alongside SimAccount.reset()."""
+    global BLACKJACK_STATE
+    BLACKJACK_STATE = _default_blackjack_state()
+    _save_blackjack_state()
+
+# ── Daily Loss Limit (explicit user request, 2026-07-25) ─────────────────────
+# 5 CONSECUTIVE losses on one asset blocks new entries on THAT asset until
+# either PCVR's regime switches away from whatever it was when the limit was
+# hit, or 19:30 CT passes — whichever comes first. Independent of
+# BLACKJACK_MODE (tracked always, not just when Blackjack sizing is on), and
+# hitting the limit ALSO resets that asset's own Blackjack loss progression
+# back to 1R regardless of whether Blackjack mode is currently enabled — per
+# the user's own explicit spec: "5 losses also means the loss progression
+# automatically resets to 1R." Already-open positions are completely
+# unaffected — this only gates the WATCHING->ARMED transition, same scope as
+# ATHENA_ENABLED/_in_entry_blackout.
+DAILY_LOSS_STATE_PATH = os.path.join(SCRIPT_DIR, "daily_loss_state.json")
+DAILY_LOSS_LIMIT = 5
+
+def _default_daily_loss_state():
+    return {a: {"consecutive_losses": 0, "blocked": False, "blocked_regime": None, "blocked_at": None} for a in ASSETS}
+
+def _load_daily_loss_state():
+    try:
+        with open(DAILY_LOSS_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        state = _default_daily_loss_state()
+        for a in ASSETS:
+            if a in data:
+                state[a].update(data[a])
+        return state
+    except Exception:
+        return _default_daily_loss_state()
+
+def _save_daily_loss_state():
+    try:
+        with open(DAILY_LOSS_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(DAILY_LOSS_STATE, f)
+    except Exception:
+        pass
+
+DAILY_LOSS_STATE = _load_daily_loss_state()
+
+def _reset_daily_loss_state():
+    """Same reasoning as _reset_blackjack_state — a fresh paper account
+    via [R]/--reset-sim should start the daily risk-limit tracking fresh
+    too, not carry forward a block (or a partial loss streak) from
+    whatever the account was doing before the reset."""
+    global DAILY_LOSS_STATE
+    DAILY_LOSS_STATE = _default_daily_loss_state()
+    _save_daily_loss_state()
+
+def _next_1930_ct_after(dt_ct):
+    """The next 19:30 CT instant strictly after dt_ct (a tz-aware CT
+    datetime) — the "19:30 CT comes around" unblock condition. Reuses the
+    real DST-aware TZ_CT zoneinfo already loaded at module import, not a
+    fixed offset."""
+    candidate = dt_ct.replace(hour=19, minute=30, second=0, microsecond=0)
+    if candidate <= dt_ct:
+        candidate += timedelta(days=1)
+    return candidate
+
 # A TP leg targeting GEX Flip never sits exactly at the flip level — $3 on
 # the near side (below for a long, above for a short), applied both at
 # initial placement (_check_fill) and every time GEX Flip itself moves
@@ -348,17 +422,24 @@ if "--backfill-budget-secs" in args:
 
 DRY_RUN = "--dry-run" in args
 NO_SESSION = "--no-session" in args
-ATHENA_ENABLED = {a: True for a in ASSETS}   # [A] per-asset on/off toggle
-                         # (acts on whichever pane is currently [Tab]-
-                         # focused — explicit user request 2026-07-24 to
-                         # control ETH/QQQ independently rather than one
-                         # shared switch) — see process_cycle's own
-                         # gating: OFF blocks WATCHING->ARMED->confirm (no
-                         # NEW entries), but PENDING_FILL/IN_POSITION
-                         # management (SL/TP fills, PCVR-flip-close,
-                         # EOD-flatten) keeps running unconditionally either
-                         # way — pausing must never mean abandoning an
-                         # already-open position's own risk management.
+# [A] per-asset on/off toggle (acts on whichever pane is currently [Tab]-
+# focused — explicit user request 2026-07-24 to control ETH/QQQ
+# independently rather than one shared switch) — see process_cycle's own
+# gating: OFF blocks WATCHING->ARMED->confirm (no NEW entries), but
+# PENDING_FILL/IN_POSITION management (SL/TP fills, PCVR-flip-close,
+# EOD-flatten) keeps running unconditionally either way — pausing must
+# never mean abandoning an already-open position's own risk management.
+#
+# SAFETY REQUIREMENT (explicit user request 2026-07-25): starts False for
+# EVERY asset whenever live (non-DRY_RUN) trading is what Athena is
+# ACTUALLY about to do — whether that's launching `python athena.py`
+# without --dry-run in the first place, or switching to live mid-session
+# from the UI (see _go_live below, which re-applies this same rule at
+# switch time). Athena must never place a single real-money trade until
+# the user has manually reviewed the situation and pressed [A] for each
+# asset they actually want trading — a paper-mode launch is unaffected,
+# still starts enabled as before.
+ATHENA_ENABLED = {a: DRY_RUN for a in ASSETS}
 RESET_SIM = "--reset-sim" in args
 SIM_BALANCE_ARG = SIM_DEFAULT_BALANCE
 if "--sim-balance" in args:
@@ -609,27 +690,39 @@ def instrument_lights(snapshot, asset):
     return lights, regime, price, targets_full, False
 
 # ── footprint.py bar log — tail last CLOSED bar ───────────────────────────────
-def footprint_log_glob(asset):
-    """footprint.py fixes its own day-folder (TODAY_STR) at process start
-    and never recomputes it, so a footprint.py instance that's been running
-    across one or more local midnights keeps writing into a folder that's
-    however many days old — a single long-lived instance can drift multiple
-    days behind actual "today" (confirmed live: a process still running
-    from 07/21 was found writing into that same folder two days later, on
-    07/23 — an earlier version of this function only checked today/
-    yesterday and missed it entirely). Search the WHOLE data/footprint tree
-    recursively rather than guessing how many days back to look, and pick
-    whichever matching file is actually most recently modified — correct
-    for any gap length, and still cheap (this repo's footprint history is a
-    few dozen files at most, and this only runs once per engine cycle, not
-    per redraw)."""
+def footprint_log_paths(asset):
+    """ALL matching footprint bar-log files across every day-folder,
+    oldest-to-newest (the Y/M/D folder structure sorts correctly as plain
+    strings, no mtime needed). Search the WHOLE data/footprint tree
+    recursively rather than guessing how many days back to look — same
+    reasoning footprint_log_glob's own history already established, just
+    keeping every match instead of narrowing to one.
+
+    CRITICAL bug fixed 2026-07-25, user-reported ("the footprint chart
+    resets and I'm unable to see historical data" right at a local
+    day-folder rollover): footprint_log_glob's old "single most-recently-
+    modified file" model meant the instant the first bar of a new local
+    day closed and _persist_closed_footprint_bar started writing a
+    brand-new (near-empty) file, EVERY reader of it — the chart AND
+    read_last_two_footprint_bars' own confirmation-logic comparison —
+    switched over to that one new file and lost access to the entire
+    previous day's bars in a single moment, even though they're still
+    sitting right there on disk in the prior day-folder. Both callers
+    below now walk across as many of these files as needed instead of
+    ever trusting exactly one."""
     pattern = os.path.join(FOOTPRINT_DATA_DIR, "**",
                             f"footprint_{ASSETS[asset]['footprint_symbol']}_{FOOTPRINT_INTERVAL_LABEL}_*.jsonl")
     matches = glob.glob(pattern, recursive=True)
-    if not matches:
-        return None
-    matches.sort(key=os.path.getmtime, reverse=True)
-    return matches[0]
+    matches.sort()
+    return matches
+
+def footprint_log_glob(asset):
+    """The single newest matching file — kept for compat/simple callers;
+    anything that needs bar HISTORY should use footprint_log_paths
+    instead, since a lone file can't represent it correctly across a
+    day-folder rollover (see footprint_log_paths' own docstring)."""
+    paths = footprint_log_paths(asset)
+    return paths[-1] if paths else None
 
 def _footprint_log_path_for_bar(asset, bar_ts):
     """Same folder/filename convention footprint.py itself writes
@@ -2153,11 +2246,17 @@ def status_compute_er(open_price, iv):
 STATUS_CHARTHACKER_EXPORT_MAX_AGE = 30
 
 def read_status_charthacker_export(asset, max_age_sec=STATUS_CHARTHACKER_EXPORT_MAX_AGE):
-    """Ported verbatim from status.py's own read_charthacker_export.
-    Always returns None until Phase 3b (charthacker's own WS-fed VAH/
-    VWAP layer) is built — evaluate_hpls's REST-fallback branch is the
-    only reachable path for now, exactly like status.py itself whenever
-    no charthacker.py instance happens to be running."""
+    """Ported from status.py's own read_charthacker_export, adapted to the
+    same "in-memory first, file fallback" pattern read_gex_export/
+    read_last_status_snapshot already use (Phases 1-3a) — CH_EXPORT[asset]
+    is populated by Athena's own CH engine (see _ch_export_loop below,
+    Phase 3b), the exact thing this function used to always miss before
+    that engine existed. The file read stays as a fallback for compat with
+    any external process, same convention as every prior phase."""
+    with CH_EXPORT_LOCK:
+        data = CH_EXPORT.get(asset)
+    if data and time.time() - data.get("updated_at", 0) <= max_age_sec:
+        return data
     path = os.path.join(SCRIPT_DIR, f"status_{asset}.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -2167,6 +2266,411 @@ def read_status_charthacker_export(asset, max_age_sec=STATUS_CHARTHACKER_EXPORT_
     except Exception:
         pass
     return None
+
+# ── CH engine (Phase 3b of the standalone-merge plan) — charthacker.py's
+# own live-WS-fed VAH/VAL/POC/VWAP/SD-band tracking, ported to supersede
+# the REST-based status_compute_vp/status_compute_vwap_sd fallback above
+# (per the user's explicit preference, confirmed via AskUserQuestion before
+# Phase 1 even started: "I want charthacker's live-WS accuracy"). One
+# background engine per asset, mirroring charthacker.py's own "one instance
+# handles one asset" model — ETH mirrors ws_phemex (charthacker.py:888-
+# 1067), QQQ mirrors ws_yahoo (charthacker.py:685-769, itself just a 5s
+# Yahoo REST poll — charthacker has no true WS for equities either, so this
+# is a faithful mirror of charthacker's own "live" for QQQ, not a downgrade
+# from the ETH path). compute_vp/build_vwap_map are ported near-verbatim
+# from the closures charthacker.py nests inside draw() (charthacker.py:
+# 2958-3020, 3190-3220) — see each function's own docstring for the exact,
+# explicitly-reasoned adaptations made lifting them out of that scope.
+#
+# Deliberately NOT populated in the export here: "iv" and "prev_eod_close".
+# In charthacker.py both are sourced from the SAME upstream endpoints
+# (Deribit DVOL / CBOE IV for er_iv via bt_st_gex_loop; Yahoo's 15:59 CT
+# candle for prev_eod_close) that Athena's OWN status engine (Phase 3a)
+# already fetches independently every cycle and passes into evaluate_hpls
+# directly. Re-fetching either here would be pure duplication of a value
+# that's already fresh via a path Athena already owns — exactly the same
+# reasoning Phase 3a used to skip status.py's redundant gamma-cluster
+# fallback. evaluate_hpls's `export.get("iv")`/`export.get("prev_eod_close")`
+# guards already fall through cleanly to the status-engine-supplied values
+# whenever those keys are absent, so this is a genuine scope boundary, not
+# a silently-broken field.
+class CH_AssetState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.candles = deque(maxlen=1600)   # >24h of 1m bars —
+                                                           # only ever need
+                                                           # this session's
+                                                           # worth (filtered
+                                                           # at read time),
+                                                           # older entries
+                                                           # just age out
+        self.last_price = 0.0
+        self.indicator_levels = {}   # mirrors state.indicator_levels' own
+                                       # persistent-merge semantics — see
+                                       # _ch_export_loop
+
+class CH_Candle:
+    __slots__ = ("ts", "o", "h", "l", "c", "v", "closed")
+    def __init__(self, ts, o, h, l, c, v, closed=False):
+        self.ts, self.o, self.h, self.l, self.c, self.v, self.closed = \
+            int(ts), float(o), float(h), float(l), float(c), float(v), closed
+
+CH_STATE = {"ETH": CH_AssetState(), "QQQ": CH_AssetState()}
+CH_EXPORT_LOCK = threading.Lock()
+CH_EXPORT = {"ETH": None, "QQQ": None}
+CH_EXPORT_INTERVAL = 5   # matches charthacker.py's own STATUS_EXPORT_INTERVAL
+
+def _ch_apply_resampled(ch_state, closed, live):
+    """Simplified from charthacker.py's own _apply_resampled (charthacker.py:
+    230-265): charthacker keeps a separate state.live pointer for the
+    still-forming bar purely so draw() can render it with different visual
+    styling. compute_vp/build_vwap_map never read Candle.closed anywhere in
+    either algorithm, so that distinction carries no information this
+    engine needs — this collapses both into one deque, always overwriting
+    the last entry in place when the ts matches (a forming bar updating)
+    and appending only on a genuinely newer bucket. Still enforces the
+    exact same strict-monotonicity guard charthacker.py's own version does
+    (a real bug it fixed 2026-07-10: a WS reconnect racing a resampler
+    reseed produced non-monotonic candles) — dropping anything that would
+    move backward, regardless of the exact race that produced it.
+
+    charthacker.py's own _Resampler (charthacker.py:149-206) is NOT ported
+    at all: it exists solely to group multiple BASE-resolution candles into
+    a wider DISPLAY resolution for charthacker's own [I]-selectable
+    interval UI. Athena's CH engine has no such UI — it always runs at the
+    fixed 60s resolution both Phemex/Yahoo natively stream — so base
+    resolution == display resolution always, and the resampler is provably
+    a no-op at that ratio (verified by hand before dropping it: its
+    "closed" output for a superseded bucket is always a same-ts, same-OHLCV
+    restatement of what was already the deque's last entry, and its "live"
+    output is always the raw incoming candle itself). Callers below feed
+    raw kline/poll rows straight through this function instead.
+
+    Caller must already hold ch_state.lock."""
+    for c in (closed, live):
+        if c is None:
+            continue
+        if ch_state.candles and ch_state.candles[-1].ts == c.ts:
+            ch_state.candles[-1] = c
+        elif not ch_state.candles or c.ts > ch_state.candles[-1].ts:
+            ch_state.candles.append(c)
+        # else: c.ts older than the last stored candle — stale, drop it
+        # rather than corrupt ordering.
+
+def _ch_compute_vp(candles):
+    """Ported near-verbatim from charthacker.py's own compute_vp closure
+    (charthacker.py:2958-3020), lifted out of draw()'s local scope — the
+    only change is dropping the (row_vol/rendering-only) return values
+    draw() needed for its own bar-chart drawing; the VP_BUCKETS=200
+    bucketing/70%-value-area-expansion math is identical. Returns
+    (poc_price, vah_price, val_price) or None. status_compute_vp (Phase 3a)
+    implements this exact same algorithm too, under a different name — that
+    one is status.py's own REST-based fallback; this is charthacker's
+    live-WS-fed version, a different-fidelity INPUT candle series, not a
+    duplicate computation."""
+    if not candles:
+        return None
+    s_lo = min(c.l for c in candles)
+    s_hi = max(c.h for c in candles)
+    s_range = s_hi - s_lo
+    if s_range <= 0:
+        return None
+    VP_BUCKETS = 200
+    vp = [0.0] * VP_BUCKETS
+
+    def ptb(p):
+        return max(0, min(VP_BUCKETS - 1, int((p - s_lo) / s_range * (VP_BUCKETS - 1))))
+
+    for c in candles:
+        body_hi, body_lo = max(c.o, c.c), min(c.o, c.c)
+        wv = c.v * 0.5
+        bw, bh = ptb(c.l), ptb(c.h)
+        sw = max(1, bh - bw + 1)
+        for b in range(bw, bh + 1):
+            vp[b] += wv / sw
+        bv = c.v * 0.5
+        bl, bb = ptb(body_lo), ptb(body_hi)
+        sb = max(1, bb - bl + 1)
+        if sb > 1:
+            for b in range(bl, bb + 1):
+                vp[b] += bv / sb
+        else:
+            vp[ptb(c.c)] += bv
+
+    mx = max(vp)
+    tv = sum(vp)
+    pi = vp.index(mx)
+    poc_p = s_lo + (pi / (VP_BUCKETS - 1)) * s_range
+
+    tgt = tv * 0.70
+    acc = vp[pi]
+    lo_b = hi_b = pi
+    while acc < tgt:
+        ab = vp[hi_b + 1] if hi_b < VP_BUCKETS - 1 else 0.0
+        bb2 = vp[lo_b - 1] if lo_b > 0 else 0.0
+        if ab == 0 and bb2 == 0:
+            break
+        if ab >= bb2:
+            hi_b += 1; acc += ab
+        else:
+            lo_b -= 1; acc += bb2
+
+    vah_p = s_lo + (hi_b / (VP_BUCKETS - 1)) * s_range
+    val_p = s_lo + (lo_b / (VP_BUCKETS - 1)) * s_range
+    return poc_p, vah_p, val_p
+
+def _ch_build_vwap_map(candles):
+    """Ported from charthacker.py's own build_vwap_map closure
+    (charthacker.py:3190-3220) — same cumulative-typical-price VWAP +
+    Welford-online-variance formula, verbatim. charthacker's own version
+    returns a full {ts: (vwap, sd)} map because it also draws a line across
+    every visible column; status_export_loop itself only ever reads the
+    LAST entry (`_vw_last, _sd_last`) to build the export payload, so this
+    returns that final (vwap, sd) tuple directly instead of the full map —
+    mathematically identical, since the Welford recurrence only depends on
+    iterating candles in order and the last step already holds the
+    cumulative-to-date values. Returns (0.0, 0.0) if candles is empty or
+    carries no volume."""
+    cum_tpv = 0.0
+    cum_vol = 0.0
+    cum_dev2 = 0.0
+    vw, sd = 0.0, 0.0
+    for c in candles:
+        tp = (c.h + c.l + c.c) / 3.0
+        v = c.v
+        old_vol = cum_vol
+        cum_tpv += tp * v
+        cum_vol += v
+        if cum_vol > 0:
+            vw = cum_tpv / cum_vol
+            if old_vol > 0:
+                old_vw = (cum_tpv - tp * v) / old_vol
+                cum_dev2 += v * (tp - old_vw) * (tp - vw)
+            var = max(0.0, cum_dev2 / cum_vol)
+            sd = var ** 0.5
+        else:
+            vw, sd = 0.0, 0.0
+    return vw, sd
+
+def _ch_bootstrap(asset):
+    """One-shot REST seed before the live feed starts — mirrors start_feed()'s
+    own initial `candles = fetch_candles(...)` bootstrap, scoped down to just
+    this session's candles (curr_open_ts to now) rather than charthacker's
+    own REST_LIMIT=500/48h preload, since the CH engine only ever computes
+    VP/VWAP over the current session — charthacker's own deeper scrollback
+    history serves ITS interactive multi-session chart, a genuinely
+    out-of-scope feature Athena's headless engine has no use for. Reuses
+    Phase 3a's own fetch_status_phemex_session_candles/
+    fetch_status_yahoo_candles rather than re-porting fetch_phemex/
+    fetch_yahoo a second time — same REST endpoints, same session window,
+    already-proven-working fetchers."""
+    ch_state = CH_STATE[asset]
+    try:
+        if asset == "ETH":
+            rows = fetch_status_phemex_session_candles(ASSETS["ETH"]["phemex_symbol"], 60)
+        else:
+            rows = fetch_status_yahoo_candles("QQQ", rng="1d", interval="1m")
+            _prev_ts, curr_ts = status_session_open_ts()
+            rows = [r for r in rows if r[0] >= curr_ts]
+        with ch_state.lock:
+            for (ts, o, h, l, c, v) in rows:
+                if ts % 60 != 0:
+                    continue   # drop QQQ's possible trailing unaligned tick
+                ch_state.candles.append(CH_Candle(ts=ts, o=o, h=h, l=l, c=c, v=v, closed=True))
+            if ch_state.candles:
+                ch_state.last_price = ch_state.candles[-1].c
+    except Exception:
+        pass
+
+def _ch_engine_eth(stop_evt):
+    """Port of charthacker.py's ws_phemex (charthacker.py:888-1067) — public
+    kline_p feed, no auth required. See _ch_apply_resampled's docstring for
+    why _Resampler isn't ported: raw kline rows are applied directly."""
+    ch_state = CH_STATE["ETH"]
+    symbol = ASSETS["ETH"]["phemex_symbol"]
+
+    def on_open(ws):
+        ws.send(json.dumps({"id": 1, "method": "kline_p.subscribe", "params": [symbol, 60]}))
+
+    def on_message(ws, message):
+        if stop_evt.is_set():
+            return
+        try:
+            msg = json.loads(message)
+        except Exception:
+            return
+        if msg.get("result") in ({"status": "success"}, "pong"):
+            return
+        klines = msg.get("kline_p")
+        if not klines:
+            return
+        sym = msg.get("symbol", "")
+        if sym and sym != symbol:
+            return
+        msg_type = msg.get("type", "incremental")
+        with ch_state.lock:
+            rows = sorted(klines, key=lambda r: r[0]) if msg_type == "snapshot" else klines
+            for row in rows:
+                c = CH_Candle(ts=row[0], o=row[3], h=row[4], l=row[5], c=row[6], v=row[7],
+                               closed=(msg_type == "snapshot"))
+                _ch_apply_resampled(ch_state, None, c)
+            if ch_state.candles:
+                ch_state.last_price = ch_state.candles[-1].c
+
+    def on_error(ws, err):
+        pass
+
+    def on_close(ws, code, msg):
+        pass
+
+    _ping_ws = [None]
+
+    def _heartbeat():
+        while not stop_evt.wait(timeout=20):
+            ws = _ping_ws[0]
+            if ws:
+                try:
+                    ws.send(json.dumps({"id": 0, "method": "server.ping", "params": []}))
+                except Exception:
+                    pass
+
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
+    backoff = 1
+    while not stop_evt.is_set():
+        ws_app = websocket.WebSocketApp(PHEMEX_WS_URL, on_open=on_open, on_message=on_message,
+                                         on_error=on_error, on_close=on_close)
+        _ping_ws[0] = ws_app
+        try:
+            ws_app.run_forever(ping_interval=25, ping_timeout=10)
+        except Exception:
+            pass
+        if stop_evt.is_set():
+            break
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+def _ch_engine_qqq(stop_evt):
+    """Port of charthacker.py's ws_yahoo (charthacker.py:685-769) — QQQ has
+    no true WS anywhere in charthacker.py either; a 5s Yahoo REST poll IS
+    charthacker's own idea of "live" for equities, so this is a faithful
+    mirror, not a downgrade from the ETH path. Yahoo never populates the
+    still-forming bar with real OHLCV — it appends a trailing real-time
+    quote tick (o=h=l=c=last price, v=0) instead, snapped onto its base-bar
+    boundary and aggregated the same way ws_yahoo does."""
+    ch_state = CH_STATE["QQQ"]
+    POLL_SECS = 5
+    BAR_SECS = 60
+    with ch_state.lock:
+        last_aligned_ts = ch_state.candles[-1].ts if ch_state.candles else 0
+
+    while not stop_evt.is_set():
+        try:
+            fresh = fetch_status_yahoo_candles("QQQ", rng="1d", interval="1m")
+        except Exception:
+            fresh = []
+
+        if fresh:
+            tick = None
+            if fresh[-1][0] % BAR_SECS != 0:
+                tick = fresh.pop()
+
+            with ch_state.lock:
+                for (ts, o, h, l, c, v) in fresh:
+                    if ts <= last_aligned_ts:
+                        continue
+                    _ch_apply_resampled(ch_state, None, CH_Candle(ts=ts, o=o, h=h, l=l, c=c, v=v, closed=True))
+                if fresh:
+                    last_aligned_ts = max(last_aligned_ts, fresh[-1][0])
+                if tick is not None:
+                    t_ts, _to, _th, _tl, t_c, _tv = tick
+                    bucket = t_ts - (t_ts % BAR_SECS)
+                    if bucket > last_aligned_ts:
+                        _ch_apply_resampled(ch_state, None,
+                                             CH_Candle(ts=bucket, o=t_c, h=t_c, l=t_c, c=t_c, v=0, closed=False))
+                        ch_state.last_price = t_c
+                elif ch_state.candles:
+                    ch_state.last_price = ch_state.candles[-1].c
+
+        for _ in range(POLL_SECS):
+            if stop_evt.is_set():
+                return
+            time.sleep(1)
+
+def _ch_engine_thread_eth(stop_evt):
+    _ch_bootstrap("ETH")
+    _ch_engine_eth(stop_evt)
+
+def _ch_engine_thread_qqq(stop_evt):
+    _ch_bootstrap("QQQ")
+    _ch_engine_qqq(stop_evt)
+
+def _ch_export_loop(stop_evt):
+    """Port of charthacker.py's status_export_loop (charthacker.py:2055-
+    2104) — every CH_EXPORT_INTERVAL, computes this session's VP/VWAP from
+    each asset's own CH_STATE candles and writes status_<ASSET>.json, same
+    "in-memory first, file also written for compat" pattern as every prior
+    phase. Runs both assets from one thread (charthacker.py itself only
+    ever has ONE active `state.asset` per process — this loop is the one
+    genuinely Athena-specific structural adaptation: iterating both assets'
+    already-independent CH_STATE here, rather than needing a second
+    charthacker.py instance per its own doc comment)."""
+    while not stop_evt.is_set():
+        for asset in ("ETH", "QQQ"):
+            try:
+                ch_state = CH_STATE[asset]
+                with ch_state.lock:
+                    candles_snap = list(ch_state.candles)
+                    spot = ch_state.last_price
+
+                _prev_ts, curr_open_ts = status_session_open_ts()
+                session_candles = [c for c in candles_snap if c.ts >= curr_open_ts]
+                session_open = session_candles[0].o if session_candles else None
+
+                _ind = {}
+                vp_result = _ch_compute_vp(session_candles)
+                if vp_result:
+                    poc_p, vah_p, val_p = vp_result
+                    _ind.update({"vah": vah_p, "val": val_p, "poc": poc_p})
+                if session_candles:
+                    vw, sd = _ch_build_vwap_map(session_candles)
+                    if vw > 0:
+                        _ind.update({
+                            "vwap": vw,
+                            "sd_p05": vw + 0.5 * sd, "sd_m05": vw - 0.5 * sd,
+                            "sd_p2":  vw + 2.0 * sd, "sd_m2":  vw - 2.0 * sd,
+                            "sd_p25": vw + 2.5 * sd, "sd_m25": vw - 2.5 * sd,
+                        })
+                if _ind:
+                    with ch_state.lock:
+                        ch_state.indicator_levels.update(_ind)
+
+                with ch_state.lock:
+                    levels = dict(ch_state.indicator_levels)
+
+                if session_open is None or not levels:
+                    continue
+
+                payload = {
+                    "asset": asset,
+                    "updated_at": time.time(),
+                    "spot": spot,
+                    "session_open": session_open,
+                    **levels,
+                }
+                with CH_EXPORT_LOCK:
+                    CH_EXPORT[asset] = payload
+                path = os.path.join(SCRIPT_DIR, f"status_{asset}.json")
+                tmp_path = f"{path}.{os.getpid()}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, path)   # atomic on both POSIX and Windows
+            except Exception:
+                pass
+        for _ in range(CH_EXPORT_INTERVAL):
+            if stop_evt.is_set():
+                return
+            time.sleep(1)
 
 def status_nearest_gex_clusters(gex_export, price, n=2):
     """Ported from status.py's own clusters_from_gex_export (renamed here
@@ -2204,6 +2708,23 @@ def status_gamma_cluster_targets_directional(gex_export, price):
     above = clusters_from_gex_export(gex_export, price, "above")
     below = clusters_from_gex_export(gex_export, price, "below")
     return above, below
+
+STATUS_LIGHT_W = 10   # ported verbatim from status.py's own LIGHT_W —
+                        # visible width of status_light(): "* " + 8-char word
+
+def status_light(ok):
+    """Ported verbatim from status.py's own light()."""
+    word = "ACTIVE  " if ok else "INACTIVE"
+    col = GRN if ok else RED
+    return f"{col}{BLD}●{RST} {col}{BLD}{word}{RST}"
+
+def status_light_closed():
+    """Ported verbatim from status.py's own light_closed() — distinct from
+    status_light(False)/INACTIVE: means the market itself is closed, not
+    that the rule failed its condition."""
+    return f"{DIM}●{RST} {DIM}{BLD}CLOSED  {RST}"
+
+STATUS_LIGHT_BLANK = " " * STATUS_LIGHT_W
 
 HPL_CATEGORIES = (
     ("Volume", ("VAH", "VAL", "POC", "+2sd/2.5sd", "-2sd/2.5sd", "0.5sd band", "VWAP")),
@@ -2460,6 +2981,226 @@ def compute_dashboard_snapshot(data):
     snap["qqq"] = instruments.get("QQQ")
     return snap
 
+_STATUS_SEP_MARKER    = "\0SEP\0"
+_STATUS_TITLE_MARKER  = "\0TITLE\0"
+_STATUS_FOOTER_MARKER = "\0FOOTER\0"
+_STATUS_STATUS_MARKER = "\0STATUS\0"
+STATUS_TITLE_TEXT = "BLACKJACK FRAMEWORK DASHBOARD"
+
+def _status_visible_len(s):
+    return len(_ANSI_RE.sub("", s))
+
+def _status_build_render_lines(display_data):
+    """Ported from status.py's own render() (status.py:1402-1633) — same
+    ANSI-tagged line construction, same 5 sections + Final Status, same
+    two-pass marker/centering technique. Deliberately NOT ported: the
+    actual terminal write (`clr_inplace()`/`sys.stdout.write`) — this
+    returns the finished `lines` list instead, for draw_status_screen to
+    render into a DoubleBuffer via the SAME ansi_segments() helper every
+    other console_log()/log message already uses, so none of this
+    construction logic needed rewriting into (text,pair,attrs) tuples by
+    hand. Also NOT ported: the `remaining`-seconds refresh countdown and
+    the `[Q]uit [R]efresh` footer keys — both are tied to status.py's own
+    poll-and-reprint terminal loop, which Athena's continuously-redrawing
+    curses UI has no equivalent of; the footer here shows Athena's own
+    key hints instead (a reasoned adaptation, not a dropped feature — see
+    draw_status_screen for how scrolling/exiting actually works).
+
+    `display_data` must be the SAME live-price-overlaid dict `_status_
+    snapshot_loop` already builds before calling compute_dashboard_
+    snapshot — i.e. this reads price/chain/candles/iv/prev_close fresh
+    from the raw data, not the already-ANSI-stripped STATUS_SNAPSHOT, so
+    per-row distance coloring (evaluate_hpls's own dist_tag/band_dist_tag)
+    survives into the Status screen exactly as status.py's own render()
+    shows it."""
+    lines = []
+    def p(s=""):
+        lines.append(s)
+
+    p(_STATUS_SEP_MARKER)
+    p(_STATUS_TITLE_MARKER)
+    p(_STATUS_SEP_MARKER)
+
+    sess_name, excl_reason = display_data.get("session", (None, None))
+    in_session = sess_name is not None and excl_reason is None
+    p(f"  {BLD}1. Session{RST}")
+    label = excl_reason or sess_name or "No active session"
+    p(f"     {status_light(in_session)}  {DIM}{label}{RST}")
+    p()
+
+    dvol = display_data.get("dvol")
+    l1, l2 = status_dvol_layers(dvol)
+    p(f"  {BLD}2. Volatility{RST}")
+    if dvol is not None:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}{'DVOL (ETH)':<12}{RST}{CYN}{BLD}{dvol:>6.2f}{RST}   "
+          f"Layer 1: {YLW}{l1}{RST}   Layer 2: {MAG}{l2}{RST}")
+    else:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}DVOL (ETH) unavailable{RST}")
+    qqq_iv = display_data.get("qqq_iv")
+    if qqq_iv is not None:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}{'VXN (QQQ)':<12}{RST}{CYN}{BLD}{qqq_iv:>6.2f}{RST}")
+    else:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}VXN (QQQ) unavailable{RST}")
+    p()
+
+    pcvr = display_data.get("pcvr")
+    p(f"  {BLD}3. PCVR{RST}")
+    if pcvr:
+        ratio = pcvr["ratio"]
+        col = RED if ratio >= 1.02 else (GRN if ratio <= 0.98 else YLW)
+        p(f"     {STATUS_LIGHT_BLANK}  {col}{BLD}{ratio:>6.2f}{RST}   ({pcvr['underlying']})   "
+          f"{DIM}put {pcvr['put_vol']:,.0f} / call {pcvr['call_vol']:,.0f}{RST}")
+    else:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")
+    p()
+
+    pcvr_gt1 = bool(pcvr and pcvr["ratio"] > 1.00)
+
+    p(f"  {BLD}4. High-Probability Levels{RST}")
+    active_status = {}
+    for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
+        ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
+        ("QQQ", "qqq_price", "qqq_chain", "qqq_candles", "qqq_prev_close", "qqq_iv", 0.25, 0.35, 0.35, False),
+    ):
+        chain = display_data.get(chain_key)
+        candles = display_data.get(candles_key) or []
+        price = display_data.get(price_key)
+        prev_close = display_data.get(prev_key)
+        iv = display_data.get(iv_key)
+        export = read_status_charthacker_export(inst_name)
+        gex_export = read_gex_export(inst_name)
+        tags = []
+        if export:
+            tags.append(f"{GRN}VP/VWAP: charthacker.py{RST}{DIM}")
+        if gex_export:
+            tags.append(f"{GRN}clusters/flip: gex.py{RST}{DIM}")
+        src_tag = ", ".join(tags) if tags else "status.py REST snapshot"
+        p(f"     {BLD}{YLW}── {inst_name} {RST}{DIM}({src_tag}){RST}")
+        if not chain or price is None:
+            p(f"        {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")
+            p()
+            active_status[inst_name] = False
+            continue
+        p(f"        {STATUS_LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
+        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
+                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                              ratio=(pcvr["ratio"] if pcvr else None))
+        closed = inst_name == "QQQ" and status_qqq_market_closed()
+        rows_by_label = {label_: (level_str, ok) for label_, level_str, ok in rows}
+        any_active = hpl_any_active(rows, closed)
+        active_status[inst_name] = any_active
+        for cat_i, (cat_name, cat_labels) in enumerate(HPL_CATEGORIES):
+            if cat_i > 0:
+                p()
+            p(f"        {STATUS_LIGHT_BLANK}  {DIM}{BLD}{cat_name}{RST}")
+            for label_ in cat_labels:
+                level_str, ok = rows_by_label.get(label_, ("n/a", False))
+                dot = status_light_closed() if closed else status_light(ok)
+                p(f"        {dot}  {label_:<26}{level_str}")
+        p()
+
+    p(f"  {BLD}5. Targets{RST}")
+    has_targets = {}
+    ratio = pcvr["ratio"] if pcvr else None
+    for inst_name, price_key, chain_key, is_crypto, gated in (
+        ("ETH", "eth_price", "eth_chain", True, False),
+        ("QQQ", "qqq_price", "qqq_chain", False, True),
+    ):
+        chain = display_data.get(chain_key)
+        price = display_data.get(price_key)
+        if gated and status_qqq_market_closed():
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{inst_name:<6}CLOSED{RST}")
+            has_targets[inst_name] = False
+            continue
+        if not chain or price is None or ratio is None:
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{inst_name:<6}unavailable{RST}")
+            has_targets[inst_name] = False
+            continue
+        gex_export = read_gex_export(inst_name)
+
+        def target_rel(level, price=price, ratio=ratio):
+            dist = abs(level - price)
+            if level > price:
+                direction = "above"
+            elif level < price:
+                direction = "below"
+            else:
+                return f"{DIM}at price{RST}"
+            if ratio >= 1.02:
+                col = GRN if direction == "below" else RED
+            elif ratio <= 0.98:
+                col = GRN if direction == "above" else RED
+            else:
+                col = DIM
+            return f"{col}{BLD}{direction}, ${dist:,.2f} away{RST}"
+
+        # Phase 2's own GEX engine guarantees gex_export is always fresh
+        # (same process, not a separate gex.py that might not be running)
+        # — status.py's own live-options-chain compute_gex_flip fallback
+        # for a missing/stale gex_export is therefore unreachable here and
+        # wasn't ported, same documented simplification Phase 3a already
+        # made for the gamma-cluster fallback.
+        gex_flip = gex_export.get("gex_flip") if gex_export else None
+        targets = []
+        if ratio < 0.98:
+            bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            if bt is not None:
+                targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})")
+            if gex_flip is not None:
+                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
+            above, _below = status_gamma_cluster_targets_directional(gex_export, price)
+            targets += [f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in above]
+        elif ratio > 1.02:
+            _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            if st is not None:
+                targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})")
+            if gex_flip is not None:
+                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
+            _above, below = status_gamma_cluster_targets_directional(gex_export, price)
+            targets += [f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in below]
+        has_targets[inst_name] = bool(targets)
+        if targets:
+            for i in range(0, len(targets), 2):
+                chunk = targets[i:i + 2]
+                label = f"{DIM}{inst_name:<6}{RST}" if i == 0 else " " * 6
+                p(f"     {STATUS_LIGHT_BLANK}  {label}{', '.join(chunk)}")
+        else:
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{inst_name:<6}no active targets{RST}")
+    p()
+
+    pcvr_extreme = bool(pcvr) and (pcvr["ratio"] <= 0.98 or pcvr["ratio"] >= 1.02)
+    def final_status_text(inst):
+        ready = in_session and pcvr_extreme and active_status.get(inst, False) and has_targets.get(inst, False)
+        word = f"{GRN}{BLD}EXECUTE WHEN READY{RST}" if ready else f"{RED}{BLD}HOLD{RST}"
+        return f"{BLD}{inst}:{RST} {word}"
+    status_line = f"{final_status_text('ETH')}     {final_status_text('QQQ')}"
+    p(_STATUS_STATUS_MARKER)
+    p()
+
+    p(_STATUS_SEP_MARKER)
+    ts = datetime.now().strftime("%H:%M:%S")
+    footer = f"{DIM}{ts}  updates every ~{STATUS_SNAPSHOT_INTERVAL}s{RST}   {BLD}[Q]{RST}{DIM}uit  {BLD}[S]{RST}{DIM}/Esc back  {BLD}[↑/↓/PgUp/PgDn]{RST}{DIM} scroll{RST}"
+    p(_STATUS_FOOTER_MARKER)
+    errs = display_data.get("errors") or {}
+    if errs:
+        p(f"  {RED}errors: {', '.join(errs.keys())}{RST}")
+    p(_STATUS_SEP_MARKER)
+
+    width = max((_status_visible_len(l) for l in lines
+                 if l not in (_STATUS_SEP_MARKER, _STATUS_TITLE_MARKER, _STATUS_FOOTER_MARKER, _STATUS_STATUS_MARKER)),
+                default=78)
+    def centered(s):
+        return " " * max(0, (width - _status_visible_len(s)) // 2) + s
+    sep = f"{BLD}{CYN}{'─' * width}{RST}"
+    title = f"{BLD}{CYN}{STATUS_TITLE_TEXT.center(width)}{RST}"
+    footer_centered = centered(footer)
+    status_centered = centered(status_line)
+    return [sep if l == _STATUS_SEP_MARKER else
+            title if l == _STATUS_TITLE_MARKER else
+            footer_centered if l == _STATUS_FOOTER_MARKER else
+            status_centered if l == _STATUS_STATUS_MARKER else l
+            for l in lines]
+
 def append_status_snapshot(snap):
     """Ported from status.py's own append_snapshot, using Athena's own
     EXISTING status_log_path (already used to READ these files — now also
@@ -2519,6 +3260,12 @@ STATUS_SNAPSHOT = None                          # latest compute_dashboard_snaps
 STATUS_LIVE_PRICES = {"ETH": None, "QQQ": None}
 STATUS_ENGINE_STATE = ["connecting…"]           # mutable single-item box, same
                                                  # convention _profile_mode_idx uses
+STATUS_RENDER_LINES = []   # latest _status_build_render_lines() output — Phase
+                            # 3c's Status screen reads this directly every draw
+                            # (same "engine computes on its own cadence, UI just
+                            # renders the cache" split GEX mode's own history/
+                            # grid state already uses), rather than recomputing
+                            # evaluate_hpls et al. on every ~100ms curses redraw.
 _status_last_full_lock = threading.Lock()
 _status_last_full_data = None
 
@@ -2574,7 +3321,7 @@ def _status_snapshot_loop(stop_evt):
     snapshot content itself is built at — the SNAPSHOT's own values are
     identical either way, just not also re-rendered to a screen 15x more
     often for no reason)."""
-    global STATUS_SNAPSHOT
+    global STATUS_SNAPSHOT, STATUS_RENDER_LINES
     while not stop_evt.is_set():
         with _status_last_full_lock:
             data = _status_last_full_data
@@ -2591,6 +3338,12 @@ def _status_snapshot_loop(stop_evt):
                 with STATUS_STATE_LOCK:
                     STATUS_SNAPSHOT = snap
                 append_status_snapshot(snap)
+            except Exception:
+                pass
+            try:
+                lines = _status_build_render_lines(display_data)
+                with STATUS_STATE_LOCK:
+                    STATUS_RENDER_LINES = lines
             except Exception:
                 pass
         stop_evt.wait(STATUS_SNAPSHOT_INTERVAL)
@@ -2942,17 +3695,34 @@ def read_last_two_footprint_bars(asset):
     startup REST backfill (_run_footprint_backfill, see the module
     docstring's footprint.py section) this is no longer the normal
     post-restart state, just the genuine "brand new symbol/day, nothing
-    has traded yet" case."""
-    path = footprint_log_glob(asset)
-    if not path:
+    has traded yet" case.
+
+    Spans across day-folders (footprint_log_paths, not a single
+    footprint_log_glob file) — see that function's own 2026-07-25 fix
+    note: right after a local day-folder rollover, the newest file may
+    have only 0-1 bars in it, and without this the OTHER bar this
+    function needs would incorrectly come back None (a real correctness
+    bug for the confirmation check, not just a display gap) instead of
+    the true previous bar sitting in yesterday's file."""
+    paths = footprint_log_paths(asset)
+    collected = []   # newest-first
+    for path in reversed(paths):
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]
+        except Exception:
+            continue
+        for line in reversed(lines):
+            collected.append(line)
+            if len(collected) >= 2:
+                break
+        if len(collected) >= 2:
+            break
+    if not collected:
         return None, None
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = [l for l in f if l.strip()]
-        if not lines:
-            return None, None
-        cur = json.loads(lines[-1])
-        prev = json.loads(lines[-2]) if len(lines) >= 2 else None
+        cur = json.loads(collected[0])
+        prev = json.loads(collected[1]) if len(collected) >= 2 else None
         return prev, cur
     except Exception:
         return None, None
@@ -3348,11 +4118,17 @@ def account_available_balance(acc_data):
     return max(0.0, bal - used)
 
 def account_balance_fields(acc_data):
-    """(balance, available) for the dashboard's ACCOUNT line."""
+    """(balance, available, margin_used) for the dashboard's ACCOUNT line.
+    `used` (totalUsedBalanceRv) is Phemex's own real margin-in-use figure
+    across every open position/resting order for this account — SimAccount.
+    to_account_snapshot() produces the identical field (per-symbol leverage-
+    aware), so this works unchanged for DRY_RUN too. margin_used added
+    2026-07-25 (user request: "include how much margin is actively being
+    used across all positions")."""
     acc = (acc_data or {}).get('data', {}).get('account', {})
     bal = float(acc.get('accountBalanceRv') or 0)
     used = float(acc.get('totalUsedBalanceRv') or 0)
-    return bal, max(0.0, bal - used)
+    return bal, max(0.0, bal - used), used
 
 def account_realized_pnl_today(acc_data, symbols):
     """Real mode only: Phemex already tracks today's realized PnL per
@@ -3374,6 +4150,21 @@ def account_position(acc_data, symbol, pos_side=None):
         if abs(float(p.get('size', 0) or 0)) > 0:
             return p
     return None
+
+def _order_ok(result):
+    """True only for a genuine Phemex success response (`{"code": 0, ...}`
+    — SimAccount's own place_entry/place_sl/place_tp_leg/cancel_all/
+    market_close all return this exact shape too, on purpose, so this one
+    check works identically for both DRY_RUN and real). Added 2026-07-25
+    while hardening the real-money order path for the FIRST time it's
+    ever actually been exercised — place_entry already checked this
+    correctly; place_sl/place_tp_leg/cancel_all/market_close never did,
+    only catching outright exceptions (a network error), which misses the
+    much more common case of Phemex responding 200 OK with an
+    application-level rejection (bad price, insufficient margin, etc.) —
+    that response never raises, so every one of those calls was silently
+    treated as a success regardless of what Phemex actually did with it."""
+    return isinstance(result, dict) and result.get("code") == 0
 
 _contract_spec_cache = {}
 
@@ -3438,17 +4229,125 @@ async def place_sl(symbol, pos_side, sl_price, price_decimals):
     }
     return await phemex_request('PUT', '/g-orders/create', params=params)
 
+# target_type <-> a short code embedded in the TP leg's own clOrdID
+# (athena_tp{suffix}_{code}_{ts}) — added 2026-07-25 alongside
+# fetch_resting_orders/_parse_resting_orders below, so a REAL Phemex
+# order can be reconciled back to "which HPL/target this leg came from"
+# exactly the way DRY_RUN already can via SimAccount's own order dict
+# (which just stores "type" directly, no encoding needed there — Athena
+# owns that whole data structure; a real Phemex order has no such custom
+# field, so the clOrdID itself is the only place to carry this).
+_TP_TYPE_CODES = {"BT": "BT", "ST": "ST", "GEX Flip": "GF", "Cluster": "CL"}
+_TP_TYPE_CODES_REV = {v: k for k, v in _TP_TYPE_CODES.items()}
+
+def _tp_type_code(target_type):
+    return _TP_TYPE_CODES.get(target_type, "UNK")
+
+def _tp_type_from_code(code):
+    return _TP_TYPE_CODES_REV.get(code, "?")
+
 async def place_tp_leg(symbol, pos_side, qty_str, price, price_decimals, suffix, target_type="?"):
     if DRY_RUN:
         return await get_sim_account().place_tp_leg(symbol, pos_side, qty_str, price, suffix, target_type)
     close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     params = {
-        'symbol': symbol, 'clOrdID': f'athena_tp{suffix}_{int(time.time() * 1000)}',
+        'symbol': symbol,
+        'clOrdID': f'athena_tp{suffix}_{_tp_type_code(target_type)}_{int(time.time() * 1000)}',
         'side': close_side, 'posSide': pos_side, 'orderQtyRq': qty_str,
         'ordType': 'Limit', 'priceRp': f'{price:.{price_decimals}f}',
         'reduceOnly': 'true', 'timeInForce': 'GoodTillCancel',
     }
     return await phemex_request('PUT', '/g-orders/create', params=params)
+
+async def fetch_resting_orders(symbol):
+    """Real mode only: Phemex's own /g-orders/activeList, queried TWICE —
+    once plain (regular resting orders — Athena's TP legs, ordType=Limit)
+    and once with orderType='conditional' (trigger orders — Athena's SL,
+    ordType=Stop, only shows up under the conditional filter) — same
+    two-call pattern copycat.py's own already-proven order-listing code
+    uses (cross-checked directly against that file before writing this,
+    same discipline as the rest of this session's real-trading hardening
+    work). Returns the combined raw row list, or None if either call
+    outright failed (network/auth) — an empty list is a genuine "no
+    resting orders" answer, distinct from "couldn't ask"."""
+    try:
+        active = await phemex_request('GET', '/g-orders/activeList',
+                                       params={'symbol': symbol, 'currency': 'USDT'})
+        cond = await phemex_request('GET', '/g-orders/activeList',
+                                     params={'symbol': symbol, 'currency': 'USDT', 'orderType': 'conditional'})
+    except Exception:
+        return None
+    rows = []
+    for resp in (active, cond):
+        if resp and resp.get('code') == 0:
+            rows += (resp.get('data', {}).get('rows', []) or [])
+    return rows
+
+def _parse_resting_orders(rows, pos_side):
+    """Reconstructs (sl_price, tp_legs) for ONE position side from
+    Phemex's own /g-orders/activeList rows, using Athena's OWN clOrdID
+    naming convention (athena_sl_..., athena_tp{suffix}_{code}_...) to
+    classify each order precisely — far more reliable than guessing purely
+    from stopDirection/side the way copycat.py's own parsing has to
+    (it doesn't control clOrdID as tightly). tp_legs come back sorted by
+    suffix (1, 2, ...), matching the SAME order _check_fill's own tp_legs
+    list is always built in.
+
+    posSide filtering: uses the order's own posSide field when Phemex
+    echoes it back (should be, since every Athena order sets it
+    explicitly); falls back to inferring it from stopDirection/side for
+    conditional (SL) orders — copycat.py's own documented fallback,
+    "Phemex doesn't return posSide on conditional orders" in some
+    response shapes — and from side-vs-close_side for plain (TP) orders,
+    which need no stopDirection at all.
+
+    Pure function — no network I/O — same "testable without a real
+    Phemex connection" discipline as _footprint_crosshair_clamp/
+    _order_ok elsewhere in this file."""
+    sl_price = None
+    tp_legs = []
+    close_side = 'Sell' if pos_side == 'Long' else 'Buy'
+    for o in rows or []:
+        cl_id = o.get('clOrdID') or ''
+        if not cl_id.startswith('athena_'):
+            continue   # not one of Athena's own orders (e.g. a manually-placed one)
+
+        o_pos_side = o.get('posSide')
+        if not o_pos_side:
+            stop_dir, side_o = o.get('stopDirection', ''), o.get('side', '')
+            if stop_dir == 'Falling' and side_o == 'Sell':
+                o_pos_side = 'Long'
+            elif stop_dir == 'Rising' and side_o == 'Buy':
+                o_pos_side = 'Long'
+            elif stop_dir == 'Rising' and side_o == 'Sell':
+                o_pos_side = 'Short'
+            elif stop_dir == 'Falling' and side_o == 'Buy':
+                o_pos_side = 'Short'
+            elif not stop_dir and side_o == close_side:
+                o_pos_side = pos_side   # plain Limit TP leg, no stopDirection at all
+        if o_pos_side != pos_side:
+            continue
+
+        if cl_id.startswith('athena_sl_'):
+            spx = o.get('stopPxRp')
+            if spx:
+                sl_price = float(spx)
+        elif cl_id.startswith('athena_tp'):
+            # athena_tp{suffix}_{code}_{ts} -> ['athena', 'tp1', 'GF', '...']
+            parts = cl_id.split('_')
+            suffix = parts[1][2:] if len(parts) > 1 and len(parts[1]) > 2 else '?'
+            code = parts[2] if len(parts) > 2 else 'UNK'
+            price = o.get('priceRp')
+            qty = o.get('leavesQtyRq') or o.get('orderQtyRq')
+            if price and qty:
+                leg_type = _tp_type_from_code(code)
+                tp_legs.append({"level": float(price), "qty": float(qty),
+                                 "type": leg_type, "tracks_gex_flip": leg_type == "GEX Flip",
+                                 "_suffix": suffix})
+    tp_legs.sort(key=lambda leg: leg["_suffix"])
+    for leg in tp_legs:
+        del leg["_suffix"]
+    return sl_price, tp_legs
 
 async def cancel_all(symbol):
     if DRY_RUN:
@@ -3507,6 +4406,66 @@ class AthenaInstrument:
         self.position = None    # while IN_POSITION
         self.note = ""
         self._entry_balance_baseline = None   # DRY_RUN only — see _check_fill/_update_blackjack
+        self._tp_skip_warned = {}   # "gex"/"cluster" -> last-warned near level,
+                                     # see _sync_moving_tps's log-dedup fix
+        self._sl_missing = False   # True whenever a real position is known to
+                                     # have NO resting stop-loss right now (an
+                                     # SL placement failed and every retry so
+                                     # far has too) — see _place_sl_with_retry/
+                                     # _manage_position's own retry-every-cycle
+                                     # safety net, added 2026-07-25 as part of
+                                     # hardening the real-money order path,
+                                     # which had never actually been exercised.
+
+    async def _place_sl_with_retry(self, symbol, pos_side, sl_price, price_decimals, retries=3):
+        """A resting stop-loss is the single most important order this app
+        ever places for a real position — losing it silently is the worst
+        failure mode here, worse than a missed TP or a slightly-late close.
+        Retries with backoff (same 3-attempt/1s-backoff shape copycat.py's
+        own proven phemex_amend_sl already uses for the exact same order —
+        cross-checked directly against that file's real Phemex field names/
+        values while hardening this path). Returns True/False and updates
+        self._sl_missing so _manage_position's own per-cycle safety net
+        (below) keeps retrying for as long as it takes if every attempt
+        here fails, rather than the position ever being silently left
+        unprotected with nothing watching for it."""
+        last_result = None
+        for attempt in range(retries):
+            if attempt > 0:
+                await asyncio.sleep(1.0)
+            try:
+                last_result = await place_sl(symbol, pos_side, sl_price, price_decimals)
+            except Exception as e:
+                last_result = {"code": -1, "msg": str(e)}
+            if _order_ok(last_result):
+                if self._sl_missing:
+                    console_log(f"{self.asset}: {GRN}stop-loss re-established at {fmt_num(sl_price)}{RST}")
+                self._sl_missing = False
+                return True
+        console_log(f"{self.asset}: {RED}{BLD}CRITICAL — stop-loss placement FAILED after {retries} attempts "
+                    f"({last_result}) — position has NO resting stop-loss right now{RST}")
+        log_event(self.asset, "sl_placement_failed", {"sl_price": sl_price, "result": last_result, "sim": DRY_RUN})
+        self._sl_missing = True
+        return False
+
+    async def _place_tp_leg_checked(self, symbol, pos_side, qty_str, level, price_decimals, suffix, target_type):
+        """A failed TP leg isn't the same kind of danger a failed SL is (no
+        resting TP just means no automatic profit-taking, not open-ended
+        risk) — so this logs loudly rather than retrying in a loop, same
+        general "check the actual response, don't just catch exceptions"
+        fix as _place_sl_with_retry, added while hardening the real-money
+        order path for the first time it's ever been exercised."""
+        try:
+            result = await place_tp_leg(symbol, pos_side, qty_str, level, price_decimals, suffix, target_type)
+        except Exception as e:
+            result = {"code": -1, "msg": str(e)}
+        if not _order_ok(result):
+            console_log(f"{self.asset}: {RED}TP{suffix} ({target_type}) placement FAILED @ {fmt_num(level)} "
+                        f"({result}) — that leg is NOT resting{RST}")
+            log_event(self.asset, "tp_placement_failed",
+                       {"suffix": suffix, "level": level, "type": target_type, "result": result, "sim": DRY_RUN})
+            return False
+        return True
 
     async def reconcile_startup(self):
         # CRITICAL: seed the "already evaluated" baseline with whatever bar
@@ -3548,14 +4507,15 @@ class AthenaInstrument:
             # restart silently lost the SL/TP display (dashboard showed
             # "SL n/a") even though the real resting orders were still
             # there protecting the position the whole time. DRY_RUN has
-            # authoritative order data (SimAccount.orders); real mode has
-            # no "list my resting orders" call wired up here, so it stays
-            # an honest gap (sl_price/tp_legs empty) rather than a guess —
-            # same documented limitation as elsewhere.
+            # authoritative order data (SimAccount.orders); real mode now
+            # queries Phemex's own resting orders directly (fetch_resting_
+            # orders/_parse_resting_orders, added 2026-07-25 — the exact
+            # gap flagged, not fixed, in the earlier real-trading hardening
+            # pass) instead of leaving sl_price/tp_legs empty and guessing.
             sl_price, tp_legs = None, []
+            symbol = self.cfg["phemex_symbol"]
             if DRY_RUN:
                 sim_orders = get_sim_account().orders
-                symbol = self.cfg["phemex_symbol"]
                 for o in sim_orders.values():
                     if o["symbol"] != symbol or o.get("posSide") != pos_side:
                         continue
@@ -3571,17 +4531,34 @@ class AthenaInstrument:
                         tp_legs.append({"level": o["price"], "qty": o["qty"],
                                         "tracks_gex_flip": leg_type == "GEX Flip", "type": leg_type})
                 tp_legs.sort(key=lambda leg: leg["level"], reverse=(pos_side == "Short"))
+            else:
+                try:
+                    rows = await fetch_resting_orders(symbol)
+                    if rows is not None:
+                        sl_price, tp_legs = _parse_resting_orders(rows, pos_side)
+                except Exception as e:
+                    console_log(f"{self.asset}: resting-order lookup failed on restart ({e}) — SL/TP display will show n/a")
+
+            # A resurrected position with NO resting SL order found is
+            # EXACTLY what _place_sl_with_retry's own _sl_missing flag
+            # exists for — this makes _manage_position's per-cycle retry
+            # safety net kick in immediately on restart too, not just for
+            # failures that happen while Athena is already running.
+            self._sl_missing = (not DRY_RUN) and sl_price is None
 
             self.position = {"pos_side": pos_side, "qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "tp_legs": tp_legs,
                               "price_decimals": pd, "qty_decimals": qd}
             self.state = "IN_POSITION"
             self.lights["Order Flow"] = True
-            console_log(f"{self.asset}: found existing {pos_side} position ({size}) on restart — resuming IN_POSITION"
-                        + ("" if DRY_RUN else f" {DIM}(SL/TP display unavailable after restart in real mode){RST}"))
+            sl_note = ""
+            if not DRY_RUN:
+                sl_note = f" {DIM}(no resting SL found — will retry placing one){RST}" if self._sl_missing \
+                          else f" {DIM}(SL/TP reconciled from Phemex's own resting orders){RST}"
+            console_log(f"{self.asset}: found existing {pos_side} position ({size}) on restart — resuming IN_POSITION{sl_note}")
             log_event(self.asset, "reconciled_existing_position", {"pos_side": pos_side, "qty": size,
                                                                      "fill_price": fill_price, "sl_price": sl_price,
-                                                                     "tp_legs": tp_legs})
+                                                                     "tp_legs": tp_legs, "sl_missing": self._sl_missing})
 
     async def process_cycle(self, snapshot):
         lights5, regime, price, targets_full, market_closed = instrument_lights(snapshot, self.asset)
@@ -3603,10 +4580,16 @@ class AthenaInstrument:
 
         required = required_status_lights()
         gate_ok = all(lights5[n] for n in required)
+        # Daily Loss Limit (2026-07-25) — same scope as ATHENA_ENABLED/
+        # _in_entry_blackout: only gates WATCHING->ARMED, never touches an
+        # already-open PENDING_FILL/IN_POSITION. Computed once per cycle
+        # (it also performs its own unblock check/side effect — see the
+        # method's own docstring) and reused in both branches below.
+        daily_loss_blocked = self._daily_loss_limit_active(regime)
 
         if self.state == "WATCHING":
             self.lights["Order Flow"] = False
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout():
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked:
                 return
             self.state = "ARMED"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching order flow ({regime})"
@@ -3619,10 +4602,11 @@ class AthenaInstrument:
             # against its predecessor (see read_last_two_footprint_bars).
 
         if self.state == "ARMED":
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout():
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked:
                 self.state = "WATCHING"
                 self.lights["Order Flow"] = False
                 reason = ("19:00-19:30 CT entry blackout" if _in_entry_blackout()
+                          else "Daily Loss Limit active" if daily_loss_blocked
                           else f"{self.asset} paused ([A])" if not ATHENA_ENABLED[self.asset] else "a required condition dropped")
                 console_log(f"{self.asset}: {reason} — back to WATCHING")
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
@@ -3688,6 +4672,72 @@ class AthenaInstrument:
             status_txt = f"now at {BLACKJACK_STEPS[bj['loss_step']]:g}R"
         console_log(f"{self.asset}: {YLW}Blackjack — {status_txt} (trade pnl {fmt_money(pnl)}){RST}")
         log_event(self.asset, "blackjack_progression_updated", {"pnl": pnl, "state": dict(bj)})
+
+    def _update_daily_loss_limit(self, pnl):
+        """Daily Loss Limit tracking (explicit user request, 2026-07-25) —
+        see the DAILY_LOSS_STATE module-level comment for the full spec.
+        Called alongside _update_blackjack from every close site,
+        regardless of BLACKJACK_MODE (this tracks independently of it)."""
+        if pnl is None:
+            return
+        dl = DAILY_LOSS_STATE[self.asset]
+        if pnl > 0:
+            dl["consecutive_losses"] = 0
+        else:
+            dl["consecutive_losses"] += 1
+            if dl["consecutive_losses"] >= DAILY_LOSS_LIMIT:
+                dl["consecutive_losses"] = 0
+                dl["blocked"] = True
+                dl["blocked_regime"] = self.regime
+                dl["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
+                bj = BLACKJACK_STATE[self.asset]
+                bj["loss_step"] = 0
+                bj["in_win_progression"] = False
+                bj["win_step_back"] = None
+                bj["win_profit_dollars"] = None
+                _save_blackjack_state()
+                console_log(f"{self.asset}: {RED}{BLD}Daily Loss Limit hit — {DAILY_LOSS_LIMIT} consecutive losses. "
+                            f"No new entries until PCVR switches or 19:30 CT. Loss progression reset to 1R.{RST}")
+                log_event(self.asset, "daily_loss_limit_hit", {"blocked_regime": dl["blocked_regime"]})
+        _save_daily_loss_state()
+
+    def _clear_daily_loss_block(self, reason):
+        dl = DAILY_LOSS_STATE[self.asset]
+        dl["blocked"] = False
+        dl["blocked_regime"] = None
+        dl["blocked_at"] = None
+        _save_daily_loss_state()
+        console_log(f"{self.asset}: {GRN}Daily Loss Limit cleared ({reason}) — new entries allowed again{RST}")
+        log_event(self.asset, "daily_loss_limit_cleared", {"reason": reason})
+
+    def _daily_loss_limit_active(self, regime):
+        """True if this asset is currently blocked from NEW entries by the
+        Daily Loss Limit. Also performs the unblock check itself (and
+        clears the block as a side effect) — called every cycle from
+        process_cycle's own gate, so there's no separate polling loop
+        needed for the "PCVR switches or 19:30 CT" conditions."""
+        dl = DAILY_LOSS_STATE[self.asset]
+        if not dl["blocked"]:
+            return False
+        # Unblock condition 1: PCVR's regime switched away from whatever
+        # it was when the limit was hit — must be a REAL regime (long/
+        # short), not just "went neutral", same "flipped" concept
+        # _manage_position's own PCVR-flip emergency-close already uses.
+        if regime in ("long", "short") and regime != dl["blocked_regime"]:
+            self._clear_daily_loss_block("PCVR switched")
+            return False
+        # Unblock condition 2: 19:30 CT has passed since the block was set.
+        if TZ_CT and dl["blocked_at"]:
+            try:
+                blocked_at = datetime.fromisoformat(dl["blocked_at"])
+                if blocked_at.tzinfo is None:
+                    blocked_at = blocked_at.replace(tzinfo=TZ_CT)
+                if datetime.now(TZ_CT) >= _next_1930_ct_after(blocked_at):
+                    self._clear_daily_loss_block("19:30 CT reached")
+                    return False
+            except Exception:
+                pass
+        return True
 
     async def _check_confirmation(self, prev_bar, new_bar, regime, live_price_fallback, targets_full):
         confirmed, vah, val = footprint_confirmation(prev_bar, new_bar, regime)
@@ -3815,7 +4865,7 @@ class AthenaInstrument:
         R = self.cfg["sl"]
         sl_price = fill_price - R if p["pos_side"] == "Long" else fill_price + R
         symbol = self.cfg["phemex_symbol"]
-        await place_sl(symbol, p["pos_side"], sl_price, p["price_decimals"])
+        await self._place_sl_with_retry(symbol, p["pos_side"], sl_price, p["price_decimals"])
 
         targets = p["targets"]
         qd = p["qty_decimals"]
@@ -3856,13 +4906,13 @@ class AthenaInstrument:
             tp1_qty = tp1_steps * step
             tp2_qty = tp2_steps * step
             (tp1_level, tp1_t), (tp2_level, tp2_t) = valid[0], valid[1]
-            await place_tp_leg(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
-            await place_tp_leg(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
+            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
             tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"]},
                        {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": tp2_t["type"] == "GEX Flip", "type": tp2_t["type"]}]
         elif valid:
             tp1_level, tp1_t = valid[0]
-            await place_tp_leg(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
             tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"]}]
         else:
             tp_legs = []
@@ -3910,20 +4960,29 @@ class AthenaInstrument:
             log_event(self.asset, "position_closed", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
-            self._update_blackjack(self._trade_net_pnl(pnl_approx))
+            net_pnl = self._trade_net_pnl(pnl_approx)
+            self._update_blackjack(net_pnl)
+            self._update_daily_loss_limit(net_pnl)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
             return
 
+        # Safety net, 2026-07-25: if a PRIOR cycle's SL placement (initial
+        # fill or a TP refresh's re-place) ultimately failed after retries,
+        # this position has been sitting with NO resting stop since then —
+        # keep retrying every cycle for as long as it takes rather than
+        # ever letting that be a one-shot attempt that's forgotten about.
+        if self._sl_missing:
+            sl_price = self.position.get("sl_price")
+            pd = self.position.get("price_decimals", 2)
+            if sl_price is not None:
+                await self._place_sl_with_retry(symbol, pos_side, sl_price, pd, retries=1)
+
         # A partial TP fill reduces the exchange's own position without it
-        # going fully flat — keep the displayed size (and, in --dry-run
-        # where we have authoritative order data, the resting TP legs) in
-        # sync, or the dashboard/open-PnL calc would keep showing the
-        # original full size and both TP legs forever. Real mode has no
-        # "list my resting orders" call wired up here, so its tp_legs
-        # display can go stale after a partial fill even though the size
-        # itself is now correct — a known, minor display-only gap.
+        # going fully flat — keep the displayed size (and the resting TP
+        # legs) in sync, or the dashboard/open-PnL calc would keep showing
+        # the original full size and both TP legs forever.
         self.position["qty"] = abs(float(pos.get("size") or 0))
         if DRY_RUN:
             # The sim order itself already carries its own "type" (set at
@@ -3942,6 +5001,32 @@ class AthenaInstrument:
                  "tracks_gex_flip": o.get("type") == "GEX Flip",
                  "type": o.get("type", "?")}
                 for o in sim_orders.values() if o["symbol"] == symbol and o["kind"] == "tp"]
+        else:
+            # Real mode — added 2026-07-25, the SAME resting-order
+            # reconciliation reconcile_startup now uses on restart, run
+            # here every cycle too so a partial TP fill's tp_legs display
+            # doesn't go stale mid-session (the gap flagged, not fixed, in
+            # the earlier real-trading hardening pass), AND so a real SL
+            # that disappears for any reason OTHER than Athena's own
+            # cancel_all (manually cancelled, rejected asynchronously by
+            # Phemex's risk engine, etc.) gets caught here too — not just
+            # the failure paths _place_sl_with_retry already covers.
+            # Best-effort: a lookup failure here leaves tp_legs/sl_missing
+            # exactly as they were rather than guessing either way.
+            try:
+                rows = await fetch_resting_orders(symbol)
+                if rows is not None:
+                    real_sl_price, real_tp_legs = _parse_resting_orders(rows, pos_side)
+                    self.position["tp_legs"] = real_tp_legs
+                    if real_sl_price is not None:
+                        self.position["sl_price"] = real_sl_price
+                        if self._sl_missing:
+                            console_log(f"{self.asset}: {GRN}stop-loss confirmed resting at {fmt_num(real_sl_price)}{RST}")
+                        self._sl_missing = False
+                    else:
+                        self._sl_missing = True
+            except Exception:
+                pass
 
         flipped = (pos_side == "Long" and regime == "short") or (pos_side == "Short" and regime == "long")
         if flipped:
@@ -3953,10 +5038,26 @@ class AthenaInstrument:
             except Exception:
                 pass
             try:
-                await market_close(symbol, pos_side, qty, reason="flip")
+                close_result = await market_close(symbol, pos_side, qty, reason="flip")
             except Exception as e:
                 console_log(f"{self.asset}: emergency close FAILED — {e}")
                 log_event(self.asset, "pcvr_flip_close_failed", {"error": str(e)})
+                return
+            if not _order_ok(close_result):
+                # Hardening fix, 2026-07-25: Phemex responding 200 OK with an
+                # application-level rejection (e.g. bad price, insufficient
+                # margin) never raises an exception — the `except` above only
+                # ever caught a genuine network/transport failure, so this
+                # exact case previously fell straight through and got treated
+                # as a successful close: self.position was cleared and
+                # "closed" was logged while the REAL position was still open
+                # on the exchange, with NOTHING watching it anymore. Now
+                # leaves state as IN_POSITION (unchanged) so the very next
+                # cycle notices the flip is still active and retries the
+                # close, instead of Athena silently believing it's flat.
+                console_log(f"{self.asset}: {RED}{BLD}CRITICAL — emergency close FAILED ({close_result}) — "
+                            f"position is STILL OPEN, will retry next cycle{RST}")
+                log_event(self.asset, "pcvr_flip_close_failed", {"result": close_result})
                 return
             exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
@@ -3965,7 +5066,9 @@ class AthenaInstrument:
             log_event(self.asset, "pcvr_flip_close", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
-            self._update_blackjack(self._trade_net_pnl(pnl_approx))
+            net_pnl = self._trade_net_pnl(pnl_approx)
+            self._update_blackjack(net_pnl)
+            self._update_daily_loss_limit(net_pnl)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -4031,16 +5134,32 @@ class AthenaInstrument:
             # ever placing an unsafe level.
             if leg.get("tracks_gex_flip") and new_gex_level is not None:
                 if _safe(new_gex_level):
+                    self._tp_skip_warned.pop("gex", None)
                     if abs(level - new_gex_level) > 0.005:
                         level, changed = new_gex_level, True
                 else:
-                    console_log(f"{self.asset}: {YLW}GEX Flip too close to fill (${fmt_num(new_gex_level)}) — TP refresh skipped this cycle{RST}")
+                    # Log-spam fix, 2026-07-25 (user-reported: "TP refresh
+                    # is getting skipped constantly") — this branch is
+                    # re-evaluated every engine cycle (as fast as 2s) for
+                    # as long as the target genuinely stays too close to
+                    # the fill price, which is a real, possibly long-lived
+                    # market condition, not a bug — but logging the IDENTICAL
+                    # message every single cycle while it persists was pure
+                    # noise. Now logs once when the skip starts (or the near
+                    # level moves by more than a cent), then stays silent
+                    # until it either clears or moves again.
+                    if self._tp_skip_warned.get("gex") is None or abs(self._tp_skip_warned["gex"] - new_gex_level) > 0.01:
+                        console_log(f"{self.asset}: {YLW}GEX Flip too close to fill (${fmt_num(new_gex_level)}) — TP refresh skipped this cycle{RST}")
+                        self._tp_skip_warned["gex"] = new_gex_level
             elif leg.get("type") == "Cluster" and new_cluster_level is not None:
                 if _safe(new_cluster_level):
+                    self._tp_skip_warned.pop("cluster", None)
                     if abs(level - new_cluster_level) > 0.005:
                         level, changed = new_cluster_level, True
                 else:
-                    console_log(f"{self.asset}: {YLW}nearest Cluster too close to fill (${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
+                    if self._tp_skip_warned.get("cluster") is None or abs(self._tp_skip_warned["cluster"] - new_cluster_level) > 0.01:
+                        console_log(f"{self.asset}: {YLW}nearest Cluster too close to fill (${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
+                        self._tp_skip_warned["cluster"] = new_cluster_level
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?")})
@@ -4051,15 +5170,29 @@ class AthenaInstrument:
         pd = self.position.get("price_decimals", 2)
         qd = self.position.get("qty_decimals", 2)
         try:
-            await cancel_all(symbol)
+            cancel_result = await cancel_all(symbol)
         except Exception as e:
             console_log(f"{self.asset}: TP refresh — cancel failed ({e})")
             return
+        if not _order_ok(cancel_result):
+            # Hardening fix, 2026-07-25: same "check the response, not just
+            # exceptions" gap as the flip-close path — a failed cancel here
+            # must abort the refresh rather than proceeding to re-place SL/
+            # TP on top of whatever's still resting (duplicate orders), and
+            # since nothing was cancelled the ORIGINAL SL/TP are presumably
+            # still in place, so this is a safe abort, not a naked position.
+            console_log(f"{self.asset}: {RED}TP refresh — cancel failed ({cancel_result}), aborting this cycle's refresh{RST}")
+            log_event(self.asset, "tp_refresh_cancel_failed", {"result": cancel_result})
+            return
+        # The cancel above just pulled the SL too — every attempt to
+        # re-place it here is genuinely load-bearing (see _place_sl_with_
+        # retry's own docstring: a naked real position is the worst
+        # failure mode in this whole app), not just a formality.
         sl_price = self.position.get("sl_price")
         if sl_price is not None:
-            await place_sl(symbol, pos_side, sl_price, pd)
+            await self._place_sl_with_retry(symbol, pos_side, sl_price, pd)
         for i, leg in enumerate(new_legs, start=1):
-            await place_tp_leg(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+            await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
         self.position["tp_legs"] = new_legs
         console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
         log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
@@ -4097,10 +5230,21 @@ class AthenaInstrument:
                 pass
             if qty:
                 try:
-                    await market_close(symbol, pos_side, qty, reason=reason)
+                    close_result = await market_close(symbol, pos_side, qty, reason=reason)
                 except Exception as e:
                     console_log(f"{self.asset}: {label} close FAILED — {e}")
                     log_event(self.asset, f"{event_name}_failed", {"error": str(e)})
+                    return
+                if not _order_ok(close_result):
+                    # Same hardening fix as the PCVR-flip-close path — a 200
+                    # OK application-level rejection never raises, so this
+                    # must be checked explicitly or a failed EOD/manual
+                    # flatten gets silently logged and treated as closed
+                    # while the real position stays open with no SL/TP
+                    # (cancel_all already ran above) and nothing watching it.
+                    console_log(f"{self.asset}: {RED}{BLD}CRITICAL — {label} close FAILED ({close_result}) — "
+                                f"position is STILL OPEN{RST}")
+                    log_event(self.asset, f"{event_name}_failed", {"result": close_result})
                     return
             exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
@@ -4109,7 +5253,9 @@ class AthenaInstrument:
             log_event(self.asset, event_name, {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                 "sim": DRY_RUN})
-            self._update_blackjack(self._trade_net_pnl(pnl_approx))
+            net_pnl = self._trade_net_pnl(pnl_approx)
+            self._update_blackjack(net_pnl)
+            self._update_daily_loss_limit(net_pnl)
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
@@ -4176,7 +5322,11 @@ def recent_closed_trades(n=5):
     DRY_RUN (exact, authoritative PnL straight from SimAccount), or from
     today's athena_logs 'position_closed'/'pcvr_flip_close'/'eod_flatten'
     events otherwise (approximate exit/PnL — see _manage_position's own
-    caveat)."""
+    caveat). Same detail.sim==False guard as scan_all_trade_events's own
+    2026-07-25 fix — today's athena_logs file can still contain events
+    from an EARLIER --dry-run run the same day (log_event writes there
+    regardless of mode), which would otherwise show up in the real-mode
+    blotter too if the process was later restarted without --dry-run."""
     rows = []
     path = sim_log_path() if DRY_RUN else athena_log_path()
     try:
@@ -4188,7 +5338,8 @@ def recent_closed_trades(n=5):
                 d = json.loads(line)
                 if DRY_RUN and d.get("event") == "closed":
                     rows.append(d)
-                elif not DRY_RUN and d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
+                elif (not DRY_RUN and d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten")
+                      and (d.get("detail") or {}).get("sim") is False):
                     rows.append(d)
     except Exception:
         pass
@@ -4233,11 +5384,13 @@ def recent_trade_pairs(n=6):
                            "position_closed": "close"}
         for d in rows:
             ev, asset = d.get("event"), d.get("asset")
+            det = d.get("detail") or {}
+            if det.get("sim") is not False:
+                continue   # same guard as recent_closed_trades/scan_all_trade_events — skip
+                            # any --dry-run-era event mixed into today's athena_logs file
             if ev == "filled":
-                det = d.get("detail") or {}
                 last_fill[asset] = (d.get("ts"), det.get("fill_price"))
             elif ev in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
-                det = d.get("detail") or {}
                 fill = last_fill.get(asset)
                 pairs.append({"asset": asset, "pos_side": det.get("pos_side"),
                                "entry_ts": fill[0] if fill else None,
@@ -4253,7 +5406,21 @@ def scan_all_trade_events(source):
     SimAccount), 'real' reads athena_logs (approximate PnL — same caveat as
     the Recent Closed Trades blotter, Athena has no authoritative
     fill/close price source wired up for real trades). Sorted oldest-first
-    for the equity curve."""
+    for the equity curve.
+
+    CRITICAL bug fixed 2026-07-25, user-reported ("previously cleared sim
+    trades are shown in the PnL chart"): log_event() (unlike sim_log_event)
+    writes to athena_logs on EVERY close regardless of DRY_RUN — each
+    close event's own detail dict already carries `"sim": DRY_RUN` for
+    exactly this reason, but this function's 'real' branch never checked
+    it, so every trade ever closed while running --dry-run permanently
+    bled into the 'real' (LIVE Phemex) tab's all-time chart too — and
+    survived [R]eset/--reset-sim, since those only ever archive sim_logs,
+    never athena_logs. Now requires detail.sim to be explicitly False for
+    the 'real' bucket — a close logged before this field existed (sim
+    missing entirely) is excluded rather than guessed at, since silently
+    including possibly-fake PnL in the REAL account's own chart is the
+    worse failure mode of the two."""
     base = SIM_LOG_DIR_BASE if source == "sim" else ATHENA_LOG_DIR_BASE
     pattern = os.path.join(base, "**", "*.jsonl")
     events = []
@@ -4269,7 +5436,10 @@ def scan_all_trade_events(source):
                         if d.get("event") == "closed" and d.get("pnl") is not None:
                             events.append({"ts": d.get("ts"), "pnl": d.get("pnl")})
                     elif d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
-                        pnl = (d.get("detail") or {}).get("pnl_approx")
+                        detail = d.get("detail") or {}
+                        if detail.get("sim") is not False:
+                            continue
+                        pnl = detail.get("pnl_approx")
                         if pnl is not None:
                             events.append({"ts": d.get("ts"), "pnl": pnl})
         except Exception:
@@ -4387,24 +5557,108 @@ def scan_all_trades_detailed():
             "balance": exits[-1].get("balance"),
         })
     out.sort(key=lambda t: t["exit_ts"] or "")
+
+    # DD ($ and %) — added 2026-07-25, user-requested "DD" column: how far
+    # BELOW the peak account balance-to-date this trade's own close left
+    # the account, walked oldest-to-newest using SimAccount's own real
+    # running balance (exits[-1]["balance"] above) rather than a
+    # PnL-reconstructed one — the exact figure the paper account actually
+    # had, fees included, at that moment.
+    peak_balance = None
+    for t in out:
+        bal = t.get("balance")
+        if bal is None:
+            t["dd"], t["dd_pct"] = None, None
+            continue
+        peak_balance = bal if peak_balance is None else max(peak_balance, bal)
+        t["dd"] = peak_balance - bal
+        t["dd_pct"] = (t["dd"] / peak_balance * 100.0) if peak_balance > 0 else None
     return out
 
-def compute_trade_stats(events):
+def compute_trade_stats(events, source="sim"):
     pnls = [e["pnl"] for e in events]
     n = len(pnls)
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     gross_win = sum(wins)
     gross_loss = -sum(losses)
+    total_pnl = sum(pnls)
+
+    # Max drawdown ($ and %) — added 2026-07-25. Walks the SAME cumulative-
+    # PnL equity curve _draw_equity_curve already renders (oldest to
+    # newest), tracking the running peak and the worst drop below it —
+    # works identically for 'sim' and 'real' since both sources produce
+    # the same {ts, pnl} shape. % needs a dollar reference to divide by;
+    # 'sim' can back into the starting balance THIS all-time epoch began
+    # at (current SimAccount.balance minus this epoch's own total PnL —
+    # [R]eset/--reset-sim always archives sim_logs, so "all-time" here is
+    # always exactly one continuous epoch from a single known starting
+    # balance, never a mix of several). 'real' has no equivalent running-
+    # balance tracking wired up (same already-documented approximate-PnL-
+    # only gap real mode has everywhere else), so its % stays None —
+    # shown as "n/a", not guessed at. Distinct from (but consistent with)
+    # scan_all_trades_detailed's own PER-TRADE "dd"/"dd_pct" columns,
+    # which use SimAccount's real running balance per trade instead of a
+    # PnL-reconstructed one — that one's sim-only and more precise; this
+    # one's the summary metric for the chart shared with real mode too.
+    # NOTE: max $ drawdown and max % drawdown are tracked as two genuinely
+    # independent running maximums, each against its OWN contemporaneous
+    # peak — not the dollar figure divided by the FINAL/overall peak after
+    # the fact. A later, larger peak can otherwise make an earlier, smaller
+    # -peak drawdown look proportionally tinier than it really was at the
+    # time it happened (caught by this function's own test suite: a
+    # sequence peaking at $150 then dropping to $50 before later climbing
+    # to $200 must still score that $100 drop as ~0.99% of a ~$10,150
+    # peak-equity, not ~0.98% of the eventual ~$10,200).
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    max_dd_pct = None
+    if source == "sim" and n:
+        starting_balance = get_sim_account().balance - total_pnl
+        peak_equity = starting_balance
+        max_dd_pct = 0.0
+        for p in pnls:
+            cum += p
+            equity = starting_balance + cum
+            peak = max(peak, cum)
+            peak_equity = max(peak_equity, equity)
+            max_dd = max(max_dd, peak - cum)
+            if peak_equity > 0:
+                max_dd_pct = max(max_dd_pct, (peak_equity - equity) / peak_equity * 100.0)
+    else:
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+
+    # Sharpe ratio — added 2026-07-25. mean(trade net PnL) / stdev(trade
+    # net PnL) across the whole trade sequence. This is a PER-TRADE
+    # Sharpe, not an annualized one: trades don't land on a fixed time
+    # interval (no consistent "daily return" to annualize from), so this
+    # uses the standard simplification for discrete-trade systems —
+    # reward-to-variability per trade, unitless, comparable across
+    # different account sizes. Needs >=2 trades (a single data point has
+    # no variance to divide by) and non-zero variance.
+    sharpe = None
+    if n >= 2:
+        mean_pnl = total_pnl / n
+        variance = sum((p - mean_pnl) ** 2 for p in pnls) / (n - 1)
+        stdev = variance ** 0.5
+        if stdev > 0:
+            sharpe = mean_pnl / stdev
+
     return {
         "count": n, "wins": len(wins), "losses": len(losses),
         "win_rate": (len(wins) / n * 100.0) if n else 0.0,
-        "total_pnl": sum(pnls),
+        "total_pnl": total_pnl,
         "avg_win": (gross_win / len(wins)) if wins else 0.0,
         "avg_loss": (gross_loss / len(losses)) if losses else 0.0,
         "largest_win": max(wins) if wins else 0.0,
         "largest_loss": min(losses) if losses else 0.0,
         "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (None if gross_win <= 0 else float("inf")),
+        "max_drawdown": max_dd, "max_drawdown_pct": max_dd_pct,
+        "sharpe": sharpe,
     }
 
 def _draw_equity_curve(db, y0, y1, cols, events):
@@ -4530,7 +5784,7 @@ def _fmt_duration(entry_ts, exit_ts):
 TRADES_TABLE_COLS = [
     ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6),
     ("NET PNL", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
-    ("REASON", 10), ("GROSS", 10), ("FEES", 7), ("BALANCE", 11),
+    ("REASON", 10), ("GROSS", 10), ("FEES", 7), ("BALANCE", 11), ("DD", 10),
     ("R$", 7), ("TP1", 9), ("TP2", 9), ("DUR", 7),
 ]
 
@@ -4588,6 +5842,7 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
             (fmt_money(t["gross_pnl"]), pnl_pair(t["gross_pnl"])),
             (fmt_money(-t["fees"]) if t["fees"] else "$0.00", P_DIM),
             (fmt_money(t["balance"]) if t["balance"] is not None else "—", P_DIM),
+            (fmt_money(-t["dd"]) if t.get("dd") is not None else "—", P_RED if t.get("dd") else P_DIM),
             (fmt_money(t["r_dollars"]), P_DIM),
             (fmt_num(t["tp1"]["price"]) if t["tp1"] else "—", P_DIM),
             (fmt_num(t["tp2"]["price"]) if t["tp2"] else "—", P_DIM),
@@ -4623,6 +5878,11 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll):
     pf_txt = "n/a" if pf is None else ("inf" if pf == float("inf") else f"{pf:.2f}")
     db.puts_ansi(y, 0, f"{BLD}Extremes{RST}  Largest Win {GRN}{fmt_money(stats['largest_win'])}{RST}   "
                        f"Largest Loss {RED}{fmt_money(stats['largest_loss'])}{RST}   Profit Factor {pf_txt}")
+    y += 1
+    dd_pct_txt = f" ({stats['max_drawdown_pct']:.1f}%)" if stats.get("max_drawdown_pct") is not None else ""
+    sharpe_txt = f"{stats['sharpe']:.2f}" if stats.get("sharpe") is not None else "n/a"
+    db.puts_ansi(y, 0, f"{BLD}Risk{RST}      Max Drawdown {RED}{fmt_money(-stats['max_drawdown'])}{dd_pct_txt}{RST}   "
+                       f"Sharpe {sharpe_txt}")
     y += 2
 
     remaining_top, remaining_bottom = y, rows - 2
@@ -4737,6 +5997,7 @@ def ansi_segments(s):
         elif part == GRN: pair = P_GREEN
         elif part == YLW: pair = P_YELLOW
         elif part == CYN: pair = P_CYAN
+        elif part == MAG: pair = P_MAGENTA
         elif part == BLD: bold = True
         elif part == DIM: pair = P_DIM
         elif part == RST: pair, bold = P_DEFAULT, False
@@ -4758,22 +6019,24 @@ OPEN_MARKER = "○"
 CLOSE_MARKER = "●"
 VP_BLOCK_FULL = "█"
 VP_GHOST_CH = "|"
+CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair vertical line — matches footprint.py's own
 IMBALANCE_RATIO = 3.0
 MIN_IMBALANCE_VOL = 0.0
 STACK_COUNT = 3
 BIG_TRADE_SIZE = 100.0
 PROFILE_MODES = ("volume", "delta", "ohlc", "off")
-DASHBOARD_H = 24   # fixed row budget so the chart region's top edge never
+DASHBOARD_H = 25   # fixed row budget so the chart region's top edge never
                    # jitters cycle to cycle regardless of how much optional
                    # content (pending order/position/TP-leg line) is present
-                   # — 4 header/account rows + 2×6 per-instrument rows
-                   # (rule/meter+price/lights/position/TP/spacer) + 4
-                   # closed-trades (incl. spacer) + 4 activity (incl.
-                   # trailing spacer before the chart) = 24. A single
-                   # blank row separates each section, INCLUDING between
-                   # Recent Activity and the chart below it (2026-07-23,
-                   # explicit user request) — was 19 with no inter-section
-                   # spacing before that. This budget sits ABOVE the chart
+                   # — 4 header/account rows + 1 Margin Used row (added
+                   # 2026-07-25) + 2×6 per-instrument rows (rule/meter+
+                   # price/lights/position/TP/spacer) + 4 closed-trades
+                   # (incl. spacer) + 4 activity (incl. trailing spacer
+                   # before the chart) = 25. A single blank row separates
+                   # each section, INCLUDING between Recent Activity and
+                   # the chart below it (2026-07-23, explicit user
+                   # request) — was 19 with no inter-section spacing
+                   # before that. This budget sits ABOVE the chart
                    # on every screen, and its size directly determines how
                    # many price rows the chart gets (see
                    # draw_footprint_panel's plot_h/group_size) —
@@ -4869,15 +6132,26 @@ def fmt_delta(d):
     return f"{sign}{mag:.2f}"
 
 def read_last_n_footprint_bars(asset, n):
-    path = footprint_log_glob(asset)
-    if not path:
-        return []
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = [l for l in f if l.strip()]
-        return [json.loads(l) for l in lines[-n:]]
-    except Exception:
-        return []
+    """Spans across day-folders (footprint_log_paths), not a single
+    footprint_log_glob file — see that function's own 2026-07-25 fix
+    note: without this, the chart's history silently truncated to
+    whatever's in ONLY the newest day-folder's file the instant a local
+    day rollover occurred, mid-session, with no warning."""
+    paths = footprint_log_paths(asset)
+    bars = []
+    for path in reversed(paths):
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]
+        except Exception:
+            continue
+        try:
+            bars = [json.loads(l) for l in lines] + bars
+        except Exception:
+            continue
+        if len(bars) >= n:
+            break
+    return bars[-n:]
 
 def compute_chart_rows(bars, plot_h):
     """(group_size, group_to_row) — simplified, non-scrolling version of
@@ -4963,7 +6237,8 @@ def build_trade_markers(asset, bars, inst_snap, trade_pairs):
     return events
 
 def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mode, trade_events,
-                          hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False):
+                          hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False,
+                          crosshair_bar_idx=None):
     """One footprint chart pane within rows [y0,y1) / cols [x0,x1) — ported
     rendering from footprint.py's draw(), adapted to (a) write into a
     DoubleBuffer instead of directly to a curses window, (b) a fixed
@@ -4980,7 +6255,16 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     hscroll_bars==0 — a forming bar has no place in a scrolled-back
     historical view) is Athena's own O/H/L/C-only approximation of the
     still-forming bar footprint.py never persists to disk — see
-    engine_loop's live_bar_state tracking for why."""
+    engine_loop's live_bar_state tracking for why.
+
+    crosshair_bar_idx (2026-07-25, re-created per explicit user request —
+    footprint.py's own [Z]/[X] crosshair was deliberately dropped during
+    the original port as "always a live tail, read-only") is the SAME "N
+    bars back from newest" addressing as hscroll_bars, identifying the one
+    bar the crosshair currently has selected; None means inactive. Only
+    ever addresses a real CLOSED bar (never the synthetic live_bar) —
+    same restriction footprint.py's own crosshair has, since a forming
+    bar has no persisted OHLC/levels to select in the first place."""
     cols, rows = x1 - x0, y1 - y0
     if cols < CHART_AXIS_W + CHART_COL_W or rows < 10:
         db.puts(y0, x0, f"{asset}: pane too small"[:max(0, cols)], P_DIM)
@@ -5002,7 +6286,23 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # user reported. Building it into one single header string avoids any
     # possibility of two separate draws colliding on the same row.
     closed_tag = "  [MARKET CLOSED]" if market_closed else ""
-    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag} "
+    # Compact crosshair readout — folded into the SAME header string for
+    # the same reason closed_tag is (see the comment block above): a
+    # second db.puts() overlay on this row is exactly what caused the
+    # "QQQ closed" corruption bug. Full O/H/L/C are already visible via
+    # the reverse-video stat table below once the crosshair is active
+    # (see crosshair_i, computed further down) — this is a short "which
+    # bar, what time" confirmation, not a restatement of every value,
+    # since a split pane rarely has room for footprint.py's own
+    # full-width status-bar readout.
+    ch_header_bar = None
+    if crosshair_bar_idx is not None:
+        ch_abs = len(bars) - 1 - crosshair_bar_idx
+        if 0 <= ch_abs < len(bars):
+            ch_header_bar = bars[ch_abs]
+    ch_tag = (f"  ✛ {datetime.fromtimestamp(ch_header_bar['ts']).strftime('%H:%M:%S')} "
+              f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}") if ch_header_bar else ""
+    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
     top = y0 + 1
@@ -5022,6 +6322,15 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     if not visible:
         db.puts(top, x0 + CHART_AXIS_W, "no bar data yet", P_DIM)
         return
+
+    crosshair_i = None
+    crosshair_bar = None
+    if crosshair_bar_idx is not None:
+        abs_idx = len(bars) - 1 - crosshair_bar_idx
+        start = max(0, end - hist_n)
+        if start <= abs_idx < end:
+            crosshair_i = abs_idx - start
+            crosshair_bar = bars[abs_idx]
 
     group_size, group_to_row = compute_chart_rows(visible, plot_h)
     tick = visible[-1].get("tick", 1.0)
@@ -5154,6 +6463,22 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
         else:
             has_live_cell.append(False)
 
+        # [Z]/[X] crosshair vertical line — runs down the visual CENTER of
+        # the selected bar's column (ported from footprint.py's own
+        # draw(), charthacker.py:2732+ note above). Non-destructive: only
+        # drawn into a cell that's still blank, same principle the live
+        # price line above already uses, checked directly against
+        # db.buf (this IS the "shadow buffer" footprint.py's own version
+        # needs a separate structure for, since DoubleBuffer already
+        # tracks exactly this).
+        if i == crosshair_i:
+            center_x = cx + (CHART_COL_W - 1) // 2
+            if x0 <= center_x < x1:
+                for r_i in range(plot_h):
+                    row_y = top + r_i
+                    if db.buf[row_y][center_x][0] == " ":
+                        db.put(row_y, center_x, CROSSHAIR_LINE_CH, P_CYAN)
+
         poc_price = poc_g * group_size * tick if poc_g is not None else None
         vah_price = va_high * group_size * tick if va_high is not None else None
         val_price = va_low * group_size * tick if va_low is not None else None
@@ -5166,6 +6491,18 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
             for i in range(len(visible)):
                 if not has_live_cell[i]:
                     db.puts(live_row_y, col_x[i], "─" * (CHART_COL_W - 1), P_YELLOW)
+            # TradingView-style price-axis badge — user request 2026-07-25:
+            # "the live price line should have a label of the same color
+            # with the live price on the price axis... the same way
+            # TradingView does." Same P_YELLOW as the line itself, solid
+            # reverse-video so it reads as a filled badge rather than plain
+            # text (same badge convention _level_line's own Entry/SL/TP
+            # tags already use elsewhere in this function) — overwrites
+            # whatever regular dim gridline label might otherwise land on
+            # this exact row, same priority TradingView's own current-price
+            # badge always takes over a coincidentally-aligned gridline.
+            db.puts(live_row_y, x0, fmt_price(live_price).rjust(CHART_AXIS_W - 1),
+                    P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
 
     # Historical trade markers — short text labels ("ENTRY"/"TP"/"SL"/
     # "FLIP"/"EOD") at the specific bar+price they happened at.
@@ -5220,11 +6557,18 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     for i, bar in enumerate(visible):
         cx = col_x[i]
         w = CHART_COL_W - 1
-        db.puts(o_row, cx, fmt_price(bar["o"]).center(w), P_CYAN, curses.A_BOLD)
-        db.puts(h_row, cx, fmt_price(bar["h"]).center(w), P_GREEN, curses.A_BOLD)
-        db.puts(l_row, cx, fmt_price(bar["l"]).center(w), P_RED, curses.A_BOLD)
+        # rev: the crosshair's selected column gets reverse-video across
+        # every row of this stat table (plus the time-axis label below),
+        # same as footprint.py's own convention — makes the selected bar
+        # unambiguous without needing a separate status-bar readout to
+        # spell out every value (the header's compact readout, added
+        # below, is a supplement, not a replacement, for this).
+        rev = curses.A_REVERSE if i == crosshair_i else 0
+        db.puts(o_row, cx, fmt_price(bar["o"]).center(w), P_CYAN, curses.A_BOLD | rev)
+        db.puts(h_row, cx, fmt_price(bar["h"]).center(w), P_GREEN, curses.A_BOLD | rev)
+        db.puts(l_row, cx, fmt_price(bar["l"]).center(w), P_RED, curses.A_BOLD | rev)
         c_pair = P_GREEN if bar["c"] >= bar["o"] else P_RED
-        db.puts(c_row, cx, fmt_price(bar["c"]).center(w), c_pair, curses.A_BOLD)
+        db.puts(c_row, cx, fmt_price(bar["c"]).center(w), c_pair, curses.A_BOLD | rev)
 
         delta = bar.get("delta", 0.0)
         prev_delta = visible[i - 1].get("delta") if i > 0 else None
@@ -5244,25 +6588,44 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
         delta_text = fmt_delta(delta)
         full_text = delta_text + shift
         centered = full_text.center(w)
-        db.puts(delta_row, cx, centered, d_pair, curses.A_BOLD)
+        db.puts(delta_row, cx, centered, d_pair, curses.A_BOLD | rev)
         if shift:
             shift_pair = P_GREEN if shift.strip() == "(+)" else P_RED
             shift_col = cx + centered.find(full_text) + len(delta_text)
-            db.puts(delta_row, shift_col, shift, shift_pair, curses.A_BOLD)
+            db.puts(delta_row, shift_col, shift, shift_pair, curses.A_BOLD | rev)
 
         poc_price, vah_price, val_price = bar_stats[i]
-        db.puts(vah_row, cx, fmt_price(vah_price).center(w), P_DIM)
-        db.puts(val_row, cx, fmt_price(val_price).center(w), P_DIM)
+        db.puts(vah_row, cx, fmt_price(vah_price).center(w), P_DIM, rev)
+        db.puts(val_row, cx, fmt_price(val_price).center(w), P_DIM, rev)
         prev_poc = bar_stats[i - 1][0] if i > 0 else None
         if poc_price is not None and prev_poc is not None and poc_price > prev_poc: p_pair = P_GREEN
         elif poc_price is not None and prev_poc is not None and poc_price < prev_poc: p_pair = P_RED
         else: p_pair = P_DEFAULT
-        db.puts(poc_row, cx, fmt_price(poc_price).center(w), p_pair, curses.A_BOLD)
+        db.puts(poc_row, cx, fmt_price(poc_price).center(w), p_pair, curses.A_BOLD | rev)
 
         # Time axis — HH:MM:SS, same "fine" cadence footprint.py's own
         # fmt_time uses for any interval under 5 minutes (90s bars qualify).
         time_txt = "LIVE" if bar.get("live") else datetime.fromtimestamp(bar["ts"]).strftime("%H:%M:%S")
-        db.puts(time_row, cx, time_txt.center(w), P_YELLOW if bar.get("live") else P_DIM)
+        db.puts(time_row, cx, time_txt.center(w), P_YELLOW if bar.get("live") else P_DIM, rev)
+
+def _footprint_crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est):
+    """Ported verbatim (in spirit) from footprint.py's own _crosshair_clamp
+    (footprint.py:2935-2950) — keeps the crosshair bar inside the current
+    view, panning hscroll_bars just enough to follow it past either edge.
+    footprint.py's own version has a `historical_mode` flag (its --date
+    playback feature) that skips the final live-edge clamp; Athena has no
+    historical/date-playback mode at all — always live — so that clamp
+    always applies here unconditionally, the one adaptation this port
+    needed. Pure function, directly testable without a real curses
+    screen, same reasoning footprint.py's own docstring gives for pulling
+    it out of the key-handling loop."""
+    crosshair_bar_idx = max(0, min(crosshair_bar_idx, max(0, total - 1)))
+    if crosshair_bar_idx < hscroll_bars:
+        hscroll_bars = crosshair_bar_idx
+    elif crosshair_bar_idx > hscroll_bars + n_est - 1:
+        hscroll_bars = max(0, crosshair_bar_idx - (n_est - 1))
+    hscroll_bars = max(0, min(hscroll_bars, max(0, total - n_est)))
+    return crosshair_bar_idx, hscroll_bars
 
 # ── Bridging the async trading engine into the (sync) curses render loop ─────
 # The entire trading engine (AthenaInstrument state machine, SimAccount,
@@ -5280,6 +6643,7 @@ class AppState:
         self.snapshot_age = "no snapshot found yet"
         self.balance = None
         self.available = None
+        self.margin_used = None
         self.open_pnl = None
         self.closed_pnl = None
         self.event_log = []
@@ -5307,7 +6671,7 @@ class AppState:
 
     def publish(self, instruments, age, acc, live_prices, qqq_market_closed):
         symbols = {i.cfg["phemex_symbol"] for i in instruments}
-        balance, available = account_balance_fields(acc)
+        balance, available, margin_used = account_balance_fields(acc)
         open_pnl_total = sum((instrument_open_pnl(i, live_prices.get(i.asset)) or 0.0) for i in instruments)
         has_open = any(i.position for i in instruments)
         closed_pnl = (get_sim_account().realized_pnl_today if DRY_RUN
@@ -5320,6 +6684,8 @@ class AppState:
                 "position": dict(i.position) if i.position else None,
                 "live_price": live_prices.get(i.asset),
                 "market_closed": i.market_closed,
+                "sl_missing": i._sl_missing,
+                "daily_loss_blocked": DAILY_LOSS_STATE[i.asset]["blocked"],
             }
         # Enough history to actually scroll back through, not just the
         # live tail — CHART_HISTORY_BARS, not the handful the visible pane
@@ -5331,6 +6697,7 @@ class AppState:
             self.snapshot_age = age
             self.balance = balance
             self.available = available
+            self.margin_used = margin_used
             self.open_pnl = open_pnl_total if has_open else None
             self.closed_pnl = closed_pnl
             self.event_log = list(_event_log)
@@ -5343,7 +6710,7 @@ class AppState:
         with self.lock:
             return {
                 "instruments": self.instruments, "snapshot_age": self.snapshot_age,
-                "balance": self.balance, "available": self.available,
+                "balance": self.balance, "available": self.available, "margin_used": self.margin_used,
                 "open_pnl": self.open_pnl, "closed_pnl": self.closed_pnl,
                 "event_log": self.event_log, "closed_trades": self.closed_trades,
                 "trade_pairs": self.trade_pairs,
@@ -5490,7 +6857,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  M=dashboard  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" q=quit  Esc=dashboard  M=next(Status)  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -5607,7 +6974,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-    hint = (f" q=quit  M=dashboard  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
+    hint = (f" q=quit  Esc=dashboard  M=next(Status)  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
             f"g=by-strike  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
@@ -5652,7 +7019,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  M=dashboard  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" q=quit  Esc=dashboard  M=next(Status)  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -5777,7 +7144,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-    hint = (f" q=quit  M=dashboard  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
+    hint = (f" q=quit  Esc=dashboard  M=next(Status)  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
             f"g=interval map  n=net/separate  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
@@ -5830,11 +7197,19 @@ async def engine_loop():
 
     console_log(f"{BLD}Athena starting{RST} — interval={INTERVAL}s pct={PCT}% dry_run={DRY_RUN}")
     log_event("SYSTEM", "startup", {"interval": INTERVAL, "pct": PCT, "dry_run": DRY_RUN, "no_session": NO_SESSION})
+    if not DRY_RUN:
+        # Safety requirement (explicit user request 2026-07-25) — ATHENA_ENABLED
+        # was already initialized to False for every asset at module load
+        # (see its own comment) whenever DRY_RUN starts False; this just makes
+        # that fact loud and visible the moment the real account comes up.
+        console_log(f"{RED}{BLD}LIVE ACCOUNT{RST} — {YLW}every asset PAUSED, press [A] to enable trading{RST}")
 
     if DRY_RUN:
         sim = get_sim_account()
         if RESET_SIM:
             sim.reset(SIM_BALANCE_ARG)
+            _reset_blackjack_state()
+            _reset_daily_loss_state()
             console_log(f"{YLW}Paper account reset to ${SIM_BALANCE_ARG:,.2f}{RST}")
         else:
             console_log(f"{DIM}Paper account balance: ${sim.balance:,.2f}{RST}")
@@ -5860,6 +7235,8 @@ async def engine_loop():
             if DRY_RUN:
                 new_balance = _reset_sim_balance[0]
                 get_sim_account().reset(new_balance)
+                _reset_blackjack_state()
+                _reset_daily_loss_state()
                 # A wiped sim ledger has no positions/orders left for these
                 # to match against — force them back to WATCHING too, or
                 # _check_fill/_manage_position would just poll forever
@@ -5968,6 +7345,15 @@ def draw_dashboard(db, snap, cols):
                        f"Open PnL {pnl_color(op) if op is not None else DIM}"
                        f"{fmt_money(op) if op is not None else 'n/a'}{RST}   "
                        f"Closed PnL Today {pnl_color(cpnl)}{fmt_money(cpnl)}{RST}")
+    y += 1
+    # Margin actively in use across ALL open positions (Phemex's own
+    # totalUsedBalanceRv, SimAccount.to_account_snapshot mirrors the same
+    # field for DRY_RUN) — user request 2026-07-25. Own row, not crammed
+    # onto the ACCOUNT line above, which was already at 4 fields.
+    margin_used = snap.get("margin_used")
+    margin_pct = (margin_used / snap["balance"] * 100.0) if margin_used is not None and snap.get("balance") else None
+    pct_tag = f" ({margin_pct:.1f}% of balance)" if margin_pct is not None else ""
+    db.puts_ansi(y, 0, f"{DIM}Margin Used{RST}   {fmt_money(margin_used) if margin_used is not None else 'n/a'}{DIM}{pct_tag}{RST}")
     y += 2   # blank row separates ACCOUNT from the first instrument block
 
     for asset in ASSETS:
@@ -5977,7 +7363,8 @@ def draw_dashboard(db, snap, cols):
         segs = "".join((GRN if lights.get(n) else RED) + "█" + RST for n in names)
         count = sum(1 for n in names if lights.get(n))
         paused_tag = " [PAUSED]" if not ATHENA_ENABLED[asset] else ""
-        title = f"── {asset}{paused_tag} "
+        loss_limit_tag = " [LOSS LIMIT]" if inst.get("daily_loss_blocked") else ""
+        title = f"── {asset}{paused_tag}{loss_limit_tag} "
         db.puts(y, 0, (title + "─" * max(2, min(cols, BOX_W) - len(title)))[:cols], P_DIM)
         if paused_tag:
             # Overlay just the tag in red/bold — the dash-fill above is
@@ -5985,6 +7372,11 @@ def draw_dashboard(db, snap, cols):
             # to color the few characters the tag itself occupies.
             tag_x = len(f"── {asset}")
             db.puts(y, tag_x, paused_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
+        if loss_limit_tag:
+            # Same overlay technique, positioned after paused_tag (both
+            # can show at once — paused and loss-limited are independent).
+            tag_x = len(f"── {asset}{paused_tag}")
+            db.puts(y, tag_x, loss_limit_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         y += 1
         if inst.get("market_closed"):
             regime_txt, state_txt = "n/a", "CLOSED"
@@ -6017,8 +7409,23 @@ def draw_dashboard(db, snap, cols):
             live = inst.get("live_price")
             if live is not None:
                 pnl = (live - p["fill_price"]) * p["qty"] if p["pos_side"] == "Long" else (p["fill_price"] - live) * p["qty"]
+            # sl_missing (2026-07-25): a real position whose SL placement
+            # failed (initial fill or a moving-TP refresh's re-place, after
+            # every retry) has NO resting stop right now — _manage_position
+            # keeps retrying it every cycle in the background, but that's
+            # invisible unless it's ALSO surfaced here; a naked real
+            # position is exactly the kind of thing that must never be
+            # silent.
+            sl_warn = f"  {RED}{BLD}⚠ NO STOP-LOSS RESTING{RST}" if inst.get("sl_missing") else ""
+            # SL distance tag — user request 2026-07-25, same "[X.XX away]"
+            # convention the TP legs line already uses, so the position
+            # line reads consistently with it: how far live price
+            # currently is from the resting stop, i.e. how much room is
+            # left before it triggers.
+            sl_dist_tag = f" {RED}[{fmt_num(abs(live - p['sl_price']))} away]{RST}" \
+                          if live is not None and p.get("sl_price") is not None else ""
             line3 = (f"  {YLW}Position: {p['pos_side']} {fmt_num(p['qty'], 2)} @ {fmt_num(p['fill_price'])}   "
-                     f"SL {fmt_num(p.get('sl_price'))}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}")
+                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}")
         if line3:
             db.puts_ansi(y, 0, line3)
         y += 1
@@ -6038,9 +7445,16 @@ def draw_dashboard(db, snap, cols):
             parts = []
             for i, leg in enumerate(tp_legs[:2], start=1):
                 gex_tag = f"{DIM}(GEX){RST}" if leg.get("tracks_gex_flip") else ""
-                dist_tag = f"{DIM}[{fmt_num(abs(live_for_tp - leg['level']))} away]{RST} " \
+                # User request 2026-07-25: the target label inside the "()"
+                # and the distance-to-target tag should both be green — was
+                # DIM (gray) for both, same as the surrounding "TP{i} (...)"
+                # punctuation, which made the actually-useful bits (which
+                # HPL this leg targets, how far price still has to go) no
+                # more visually prominent than the label scaffolding around
+                # them.
+                dist_tag = f"{GRN}[{fmt_num(abs(live_for_tp - leg['level']))} away]{RST} " \
                            if live_for_tp is not None else ""
-                parts.append(f"{DIM}TP{i} ({leg.get('type', '?')}){RST} "
+                parts.append(f"{DIM}TP{i} ({RST}{GRN}{leg.get('type', '?')}{RST}{DIM}){RST} "
                              f"{fmt_num(leg['qty'], 2)} @ {fmt_num(leg['level'])} {dist_tag}{gex_tag}")
             db.puts_ansi(y, 0, "       " + "    ".join(parts))
         y += 2   # blank row separates this instrument block from the next one
@@ -6125,6 +7539,123 @@ def _prompt_number(stdscr, label, default=None):
     except ValueError:
         return default
 
+# ── [G] Switch to live account ────────────────────────────────────────────────
+def _prompt_confirm_text(stdscr, box_lines, confirm_word):
+    """Blocking modal warning pop-up — a bordered box (box_lines, plain
+    strings, centered) drawn in bold red, with a type-to-confirm text
+    prompt underneath requiring the user to type `confirm_word` exactly
+    (case-insensitive) before proceeding. Esc cancels at any point, same
+    as every other blocking dialog in this file. Deliberately a stronger
+    gate than the [R]eset/[F]latten "press the same key again" 2-step
+    convention — those undo a PAPER balance or close positions Athena
+    itself opened; this one switches to placing REAL-money orders, which
+    warrants a real typed confirmation, not just a second keypress that
+    could land accidentally. Writes directly to stdscr (bypassing
+    DoubleBuffer), same established pattern _prompt_number/_prompt_text
+    already use for blocking dialogs — caller must set db.prev = None
+    afterward to force a full repaint. Returns True only if the user
+    typed the exact confirm word and pressed Enter."""
+    rows, cols = stdscr.getmaxyx()
+    box_w = min(cols - 4, 74)
+    prompt = f'Type "{confirm_word}" to confirm, Esc to cancel: '
+    box_h = len(box_lines) + 4
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+    input_row = y0 + 1 + len(box_lines) + 1
+
+    buf = ""
+    result = False
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    try:
+        while True:
+            attrs = curses.color_pair(P_RED) | curses.A_BOLD
+            try:
+                stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+                for i, line in enumerate(box_lines):
+                    stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+                stdscr.addstr(y0 + 1 + len(box_lines), x0, ("│" + " " * (box_w - 2) + "│"), attrs)
+                stdscr.addstr(input_row, x0, ("│" + (prompt + buf).ljust(box_w - 2)[:box_w - 2] + "│"), attrs)
+                stdscr.addstr(input_row + 1, x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+            except curses.error:
+                pass
+            try:
+                stdscr.move(input_row, min(cols - 1, x0 + 1 + len(prompt) + len(buf)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch == "\x1b":
+                result = False
+                break
+            if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                result = buf.strip().upper() == confirm_word.upper()
+                break
+            if ch in ("\x08", "\x7f") or ch == curses.KEY_BACKSPACE:
+                buf = buf[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                buf += ch
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+    return result
+
+def _go_live(stdscr):
+    """[G] — switch from --dry-run paper trading to the REAL Phemex
+    account, from within the running UI (explicit user request 2026-07-25).
+    Gated by a blocking warning pop-up (_prompt_confirm_text) requiring
+    the user to type LIVE, not just a second keypress — the stakes here
+    are real money, not a paper balance, so this is deliberately a
+    stronger confirmation than [R]eset/[F]latten's own arm-then-confirm
+    convention.
+
+    SAFETY REQUIREMENT: the instant live mode is entered — from here, or
+    from launching `python athena.py` without --dry-run in the first
+    place (see ATHENA_ENABLED's own module-level comment) — every
+    asset's ATHENA_ENABLED goes False. Athena will not place a single new
+    trade until the user manually reviews the situation and presses [A]
+    for each asset they actually want trading; PENDING_FILL/IN_POSITION
+    management is unaffected either way (same scope [A] already has).
+
+    Refuses outright if PHEMEX_API_KEY/PHEMEX_API_SECRET aren't set —
+    going live with no credentials would just fail on the very first real
+    order anyway; better to catch it here with a clear message than let
+    the user find out via a failed entry."""
+    global DRY_RUN
+    if not DRY_RUN:
+        console_log(f"{YLW}Already on the live Phemex account{RST}")
+        return
+    if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
+        console_log(f"{RED}{BLD}Cannot switch to live — PHEMEX_API_KEY/PHEMEX_API_SECRET not set in .env{RST}")
+        log_event("SYSTEM", "go_live_refused_no_keys", {})
+        return
+
+    warning = [
+        "",
+        f"{BLD}⚠  SWITCHING TO YOUR LIVE PHEMEX ACCOUNT  ⚠{RST}",
+        "",
+        "All orders and trades placed from this point on will be",
+        "executed with REAL FUNDS on your real Phemex account.",
+        "",
+        "Every asset's trading will start PAUSED — you must",
+        "manually press [A] to enable each one before Athena",
+        "places any new trade.",
+        "",
+    ]
+    confirmed = _prompt_confirm_text(stdscr, warning, confirm_word="LIVE")
+    if not confirmed:
+        console_log(f"{DIM}Switch to live account cancelled{RST}")
+        return
+
+    DRY_RUN = False
+    for a in ASSETS:
+        ATHENA_ENABLED[a] = False
+    console_log(f"{RED}{BLD}LIVE ACCOUNT ACTIVE{RST} — {YLW}every asset PAUSED, press [A] to enable trading{RST}")
+    log_event("SYSTEM", "switched_to_live", {"assets_paused": list(ASSETS.keys())})
+
 # ── [L] Full Recent Activity log popup ────────────────────────────────────────
 def draw_activity_log_popup(db, rows, cols, event_log, scroll):
     """Centered box overlay showing the FULL in-memory activity buffer
@@ -6157,6 +7688,46 @@ def draw_activity_log_popup(db, rows, cols, event_log, scroll):
     scroll_tag = f"  [{start + 1}-{end} of {total}]" if total else "  (empty)"
     footer = f" [↑/↓] scroll{scroll_tag}   [L]/Esc close "
     db.puts(y0 + box_h - 2, x0 + 1, footer[:box_w - 2].center(box_w - 2), P_DIM)
+
+def draw_status_screen(db, y0, y1, x0, x1, scroll):
+    """Phase 3c of the standalone-merge plan: a full-screen curses rendering
+    of status.py's own render() output (see _status_build_render_lines),
+    drawn from the pre-computed STATUS_RENDER_LINES cache (refreshed every
+    STATUS_SNAPSHOT_INTERVAL by _status_snapshot_loop) via db.puts_ansi —
+    the SAME ANSI-tag-parsing helper draw_activity_log_popup already uses,
+    so every RED/GRN/YLW/CYN/MAG/BLD/DIM color status.py's own render()
+    embeds in a line just works here unchanged. Unlike status.py's own
+    fixed-height terminal (which just reprints the whole thing every
+    cycle), this content can be taller than the available screen — plain
+    top-to-bottom scroll (scroll=0 is the top), clamped here so callers
+    don't need to know the content length in advance.
+
+    Returns the clamped scroll value so the caller's own state stays in
+    sync with what was actually drawn (same convention table_scroll/
+    activity_log_scroll already use elsewhere in this file)."""
+    h, w = y1 - y0, x1 - x0
+    with STATUS_STATE_LOCK:
+        lines = list(STATUS_RENDER_LINES)
+
+    bottom_hint_rows = 1
+    visible_rows = max(1, h - bottom_hint_rows)
+
+    if not lines:
+        msg = "Waiting for first status snapshot…"
+        db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg[:w], P_CYAN)
+        hint = " q=quit  Esc=dashboard  M=next(Trading) "
+        db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
+        return 0
+
+    total = len(lines)
+    scroll = max(0, min(scroll, max(0, total - visible_rows)))
+    for i, line in enumerate(lines[scroll:scroll + visible_rows]):
+        db.puts_ansi(y0 + i, x0, line[:w])
+
+    scroll_tag = f"  [{scroll + 1}-{min(total, scroll + visible_rows)} of {total}]" if total > visible_rows else ""
+    hint = f" q=quit  Esc=dashboard  M=next(Trading)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
+    db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
+    return scroll
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
@@ -6211,6 +7782,16 @@ def curses_main(stdscr):
     threading.Thread(target=_status_full_refresh_loop, args=(_quit_evt,), daemon=True).start()
     threading.Thread(target=_status_live_price_loop, args=(_quit_evt,), daemon=True).start()
     threading.Thread(target=_status_snapshot_loop, args=(_quit_evt,), daemon=True).start()
+    # CH engine (Phase 3b of the standalone-merge plan) — charthacker.py's
+    # own live-WS-fed VAH/VWAP layer, one thread per asset (mirrors its own
+    # ws_phemex/ws_yahoo feeds) plus one shared export loop (mirrors its
+    # status_export_loop). Independent of the status engine threads above —
+    # evaluate_hpls picks this up automatically via read_status_charthacker_
+    # export the moment it starts producing fresh data, no other change
+    # needed (same "zero consumer-side changes" pattern as every prior phase).
+    threading.Thread(target=_ch_engine_thread_eth, args=(_quit_evt,), daemon=True).start()
+    threading.Thread(target=_ch_engine_thread_qqq, args=(_quit_evt,), daemon=True).start()
+    threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
 
     rows, cols = stdscr.getmaxyx()
     db = DoubleBuffer(rows, cols)
@@ -6223,9 +7804,25 @@ def curses_main(stdscr):
     chart_focus = "ETH"
     chart_zoom = False   # [Z] — fullscreen whichever pane is [Tab]-focused
                           # instead of the normal ETH/QQQ side-by-side split
-    gex_mode = False   # [M] — full-screen GEX mode (Phase 2 of the
-                        # standalone-merge plan), replacing the dashboard+
-                        # chart entirely while active, same as data_view
+    # [X] crosshair — re-created 2026-07-25 per explicit user request
+    # (footprint.py's own [Z]/[X] crosshair was deliberately dropped
+    # during the original port as "always a live tail, read-only").
+    # footprint.py's own Z/X keys aren't both available here — [Z] is
+    # already Athena's own pane-zoom toggle — so this uses ONE key,
+    # [X], to activate/deactivate, and repurposes the EXISTING [←]/[→]
+    # keys to move the crosshair bar-by-bar (instead of panning the
+    # whole view) while it's active, auto-panning the view to follow it
+    # via _footprint_crosshair_clamp exactly like footprint.py's own
+    # auto-follow does. Esc/[Home] deactivate it, same as every other
+    # panning key already resets to live.
+    chart_crosshair_active = {"ETH": False, "QQQ": False}
+    chart_crosshair_idx = {"ETH": 0, "QQQ": 0}      # "N bars back from newest"
+    gex_mode = False   # full-screen GEX mode (Phase 2 of the standalone-
+                        # merge plan), replacing the dashboard+chart
+                        # entirely while active, same as data_view. Phase 4:
+                        # [M] cycles Trading -> GEX -> Status -> Trading —
+                        # gex_mode/status_mode are never both True at once;
+                        # see the [M]/Esc key dispatch for each mode below.
     gex_by_strike = False   # [G] within gex_mode — dot-map (False) vs
                              # GEX-by-strike bar chart (True)
     gex_by_strike_net = False   # [N] within gex_mode's by-strike view
@@ -6233,6 +7830,9 @@ def curses_main(stdscr):
     gex_view_end_idx = {"ETH": 0, "QQQ": 0}           # frozen time-axis index when panned
     gex_vert_follow = {"ETH": True, "QQQ": True}      # strike-axis auto-center
     gex_vert_center_idx = {"ETH": 0, "QQQ": 0}        # frozen strike-axis index when scrolled
+    status_mode = False   # full-screen Status mode (Phase 3c) — the [M]
+                            # cycle's next stop after GEX; see gex_mode above
+    status_scroll = 0
     dashboard_hidden = False   # [H] — gives the chart the ENTIRE terminal,
                                # same row budget footprint.py's own
                                # full-screen view uses, for when even the
@@ -6281,7 +7881,7 @@ def curses_main(stdscr):
             if data_cache["source"] != data_source or now_mono - data_cache["ts"] > 2.0:
                 events = scan_all_trade_events(data_source)
                 data_cache = {"source": data_source, "ts": now_mono, "events": events,
-                              "stats": compute_trade_stats(events)}
+                              "stats": compute_trade_stats(events, source=data_source)}
             if trades_cache.get("source") != data_source or now_mono - trades_cache["ts"] > 2.0:
                 trades = scan_all_trades_detailed() if data_source == "sim" else []
                 trades_cache = {"source": data_source, "ts": now_mono, "trades": trades}
@@ -6301,6 +7901,12 @@ def curses_main(stdscr):
                 draw_gex_by_strike(db, gex_asset, 0, rows, 0, cols, gex_ui)
             else:
                 draw_gex_map(db, gex_asset, 0, rows, 0, cols, gex_ui)
+        elif status_mode:
+            # Full screen, same convention as gex_mode above — draw_status_
+            # screen draws its own hint row at the very last line, so no
+            # separate Athena footer is drawn underneath (see the footer
+            # dispatch below).
+            status_scroll = draw_status_screen(db, 0, rows, 0, cols, status_scroll)
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
@@ -6332,17 +7938,20 @@ def curses_main(stdscr):
                     draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
                                           profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll[zoom_asset], live_price=live, live_bar=live_bar,
-                                          focused=True, market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]))
+                                          focused=True, market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
+                                          crosshair_bar_idx=(chart_crosshair_idx[zoom_asset] if chart_crosshair_active[zoom_asset] else None))
                 else:
                     mid = cols // 2
                     draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, mid,
                                           profile_mode, build_trade_markers("ETH", eth_bars, eth_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["ETH"], live_price=eth_live, live_bar=eth_live_bar,
-                                          focused=(chart_focus == "ETH"))
+                                          focused=(chart_focus == "ETH"),
+                                          crosshair_bar_idx=(chart_crosshair_idx["ETH"] if chart_crosshair_active["ETH"] else None))
                     draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, mid, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
-                                          focused=(chart_focus == "QQQ"), market_closed=snap["qqq_market_closed"])
+                                          focused=(chart_focus == "QQQ"), market_closed=snap["qqq_market_closed"],
+                                          crosshair_bar_idx=(chart_crosshair_idx["QQQ"] if chart_crosshair_active["QQQ"] else None))
 
         if activity_log_open:
             draw_activity_log_popup(db, rows, cols, snap["event_log"], activity_log_scroll)
@@ -6369,6 +7978,9 @@ def curses_main(stdscr):
                    # full status/hint row at the screen's very last line —
                    # same as gex.py's own screen does — so there's nothing
                    # left for Athena's own generic footer to add here.
+        elif status_mode:
+            pass   # draw_status_screen already drew its own hint row —
+                   # same reasoning as gex_mode above.
         else:
             # [Tab] hint placed right after the scroll hint it's directly
             # related to (not appended at the very end) — the footer is
@@ -6377,10 +7989,11 @@ def curses_main(stdscr):
             # below, which is exactly what was hiding this hint before.
             tab_hint = f" [Tab]:{chart_focus} [Z]:{'full' if chart_zoom else 'split'}" if both_panes else ""
             focus_asset = chart_focus if both_panes else "ETH"
+            x_hint = " [X]:crosshair-ON" if chart_crosshair_active.get(focus_asset) else " [X]:crosshair"
             footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
-                      f" [←→]scroll{tab_hint} [Home]live"
-                      f" [P]ct:{PCT:g}% [B]:{'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX"
-                      + ("  [R]eset" if DRY_RUN else "")
+                      f" [←→]scroll{x_hint}{tab_hint} [Home]live"
+                      f" [P]ct:{PCT:g}% [B]:{'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                      + ("  [R]eset  [G]o live" if DRY_RUN else "")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
@@ -6425,6 +8038,31 @@ def curses_main(stdscr):
                 activity_log_scroll = max(0, activity_log_scroll - 10)
             continue
 
+        if status_mode:
+            # Scrollable full-screen text, not a chart with pan state, so
+            # the key set is smaller than gex_mode's. Phase 4: [M] and Esc
+            # both land back on Trading here — Status is the LAST stop in
+            # the Trading -> GEX -> Status -> Trading cycle, so "next" and
+            # "exit" coincide at this one stop (see the gex_mode block
+            # below for where they diverge).
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key in (ord("m"), ord("M"), 27):
+                status_mode = False
+            elif key == curses.KEY_UP:
+                status_scroll = max(0, status_scroll - 1)
+            elif key == curses.KEY_DOWN:
+                status_scroll += 1
+            elif key == curses.KEY_PPAGE:
+                status_scroll = max(0, status_scroll - 10)
+            elif key == curses.KEY_NPAGE:
+                status_scroll += 10
+            elif key == curses.KEY_HOME:
+                status_scroll = 0
+            elif key == curses.KEY_END:
+                status_scroll = 10 ** 9   # clamped down to the real max inside draw_status_screen
+            continue
+
         if gex_mode:
             # Ported from gex.py's own curses_main key dispatch. One
             # deliberate adaptation: gex.py uses Esc (alongside z/Z/End)
@@ -6432,11 +8070,21 @@ def curses_main(stdscr):
             # LEAVE gex_mode, matching the same cross-mode convention
             # data_view/activity_log_open already use ([mode-key] or Esc
             # = back out). z/Z/End alone still does gex.py's own reset.
+            #
+            # Phase 4: [M] no longer means "exit" here — it means "next
+            # mode" in the Trading -> GEX -> Status -> Trading cycle, so
+            # from GEX it moves on to Status instead of leaving to Trading.
+            # Esc remains the fast "back to Trading" escape hatch from any
+            # mode, unchanged.
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
-            elif key in (ord("m"), ord("M"), 27):
+            elif key == 27:
                 gex_mode = False
+            elif key in (ord("m"), ord("M")):
+                gex_mode = False
+                status_mode = True
+                status_scroll = 0
             elif key in (ord("g"), ord("G")):
                 gex_by_strike = not gex_by_strike
             elif key in (ord("n"), ord("N")) and gex_by_strike:
@@ -6572,6 +8220,10 @@ def curses_main(stdscr):
                 console_log(f"{YLW}Risk changed: {PCT:g}% -> {new_pct:g}% (via [P]){RST}")
                 log_event("SYSTEM", "pct_changed", {"old": PCT, "new": new_pct})
                 PCT = new_pct
+        elif key in (ord("g"), ord("G")) and DRY_RUN:
+            _go_live(stdscr)
+            db.prev = None   # the warning pop-up wrote straight to stdscr, bypassing
+                              # the DoubleBuffer — force a full repaint next frame
         elif key == 9 and both_panes:   # Tab
             chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
         elif key in (ord("z"), ord("Z")) and both_panes:
@@ -6580,18 +8232,40 @@ def curses_main(stdscr):
         elif key in (ord("m"), ord("M")):
             gex_mode = True
             console_log(f"{YLW}GEX mode ({chart_focus if chart_focus in ASSETS else 'ETH'}) — via [M]{RST}")
+        elif key in (ord("x"), ord("X")):
+            asset = chart_focus if both_panes else "ETH"
+            chart_crosshair_active[asset] = not chart_crosshair_active[asset]
+            if chart_crosshair_active[asset]:
+                # Activates at the current right edge of the view, same
+                # first-press behavior footprint.py's own Z/X has.
+                chart_crosshair_idx[asset] = chart_scroll[asset]
         elif key == curses.KEY_LEFT:
             asset = chart_focus if both_panes else "ETH"
-            max_back = max(0, len(snap["footprint_bars"].get(asset) or []) - 1)
-            chart_scroll[asset] = min(max_back, chart_scroll[asset] + 1)
+            if chart_crosshair_active[asset]:
+                total = len(snap["footprint_bars"].get(asset) or [])
+                pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
+                n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
+                chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
+                    chart_crosshair_idx[asset] + 1, chart_scroll[asset], total, n_est)
+            else:
+                max_back = max(0, len(snap["footprint_bars"].get(asset) or []) - 1)
+                chart_scroll[asset] = min(max_back, chart_scroll[asset] + 1)
         elif key == curses.KEY_RIGHT:
             asset = chart_focus if both_panes else "ETH"
-            chart_scroll[asset] = max(0, chart_scroll[asset] - 1)
+            if chart_crosshair_active[asset]:
+                total = len(snap["footprint_bars"].get(asset) or [])
+                pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
+                n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
+                chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
+                    max(0, chart_crosshair_idx[asset] - 1), chart_scroll[asset], total, n_est)
+            else:
+                chart_scroll[asset] = max(0, chart_scroll[asset] - 1)
         elif key in (curses.KEY_HOME, 27):   # Esc — same reset-to-live convention as footprint.py
             if both_panes:
                 chart_scroll["ETH"] = chart_scroll["QQQ"] = 0
             else:
                 chart_scroll["ETH"] = 0
+            chart_crosshair_active["ETH"] = chart_crosshair_active["QQQ"] = False
 
 if __name__ == "__main__":
     curses.wrapper(curses_main)

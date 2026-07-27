@@ -227,6 +227,13 @@ BLACKJACK_STATE_PATH = os.path.join(SCRIPT_DIR, "blackjack_state.json")
 FOOTPRINT_INTERVAL_LABEL = "90s"
 FOOTPRINT_BAR_SECS       = 90   # numeric form of FOOTPRINT_INTERVAL_LABEL, for bucket math
 GEX_EXPORT_MAX_AGE       = 120   # matches status.py's GEX_STATUS_EXPORT_MAX_AGE
+# 2026-07-27 user request: a resting LIMIT entry order shouldn't wait
+# forever for price to revert to the confirming bar's own VAH/VAL — after
+# this many NEW footprint bars have closed since the order was placed
+# with no fill, process_cycle's PENDING_FILL branch cancels it outright
+# and returns to WATCHING (a fresh confirmation is required to try again,
+# rather than re-entering on the same now-stale bar pair).
+ENTRY_ORDER_EXPIRY_BARS  = 4
 
 VALUE_AREA_FRACTION = 0.70
 
@@ -260,6 +267,14 @@ ASSET_BY_SYMBOL = {cfg["phemex_symbol"]: name for name, cfg in ASSETS.items()}
 # own worked example, not a guess.
 BLACKJACK_STEPS = [1.0, 1.0, 2.0, 3.0, 5.0]
 BLACKJACK_MODE = False
+# User-supplied dollar value of "1R" for Blackjack sizing — prompted for
+# in-app the moment [B] turns Blackjack mode ON (2026-07-26 user request),
+# rather than silently reusing the flat-mode balance*PCT/100 formula. None
+# until the user has actually turned Blackjack on at least once this
+# session; _check_confirmation falls back to the flat formula if so (should
+# be unreachable in practice — the prompt runs synchronously on toggle-ON
+# before BLACKJACK_MODE can ever read True with this still unset).
+BLACKJACK_1R_DOLLARS = None
 
 def _default_blackjack_state():
     return {a: {"loss_step": 0, "in_win_progression": False,
@@ -386,6 +401,15 @@ if "--pct" in args:
         PCT = max(0.0, float(args[i + 1]))
     except (IndexError, ValueError):
         pass
+# 2026-07-26 user request: [P] now sets risk EITHER as a % of balance
+# (the original, still-default behavior) OR as a flat $ amount — RISK_MODE
+# picks which one _check_confirmation's flat (non-Blackjack) sizing branch
+# actually uses; RISK_DOLLARS only has meaning when RISK_MODE=="dollars".
+# Independent of Blackjack's own BLACKJACK_1R_DOLLARS (added the same
+# session) — that one only matters when BLACKJACK_MODE is on; this one is
+# the flat-mode risk control PCT always was.
+RISK_MODE = "pct"
+RISK_DOLLARS = None
 
 # ── Footprint startup backfill (--backfill-hours / --backfill-budget-secs) ──
 # Ported from footprint.py's own CLI flags/defaults of the exact same name —
@@ -634,8 +658,12 @@ def reconstruct_targets(log_targets, gex_export, price, regime):
         direction = "above" if regime == "long" else "below"
         clusters = clusters_from_gex_export(gex_export, price, direction)
         clusters.sort(key=lambda kt: 0 if kt[1] == "Large" else 1)
-        for strike, _tier in clusters:
-            full.append({"type": "Cluster", "level": strike})
+        for strike, tier in clusters:
+            # "tier" (Large/Medium) preserved here — 2026-07-27, needed by
+            # _check_confirmation's own tier-aware viability check (see its
+            # docstring) so it can tell a Large cluster apart from a Medium
+            # one without re-deriving clusters a second time.
+            full.append({"type": "Cluster", "level": strike, "tier": tier})
 
     gex_flip = gex_export.get("gex_flip") if gex_export else None
     if gex_flip is not None:
@@ -1071,7 +1099,31 @@ def _run_footprint_backfill(asset):
     until_ts = now if asset == "ETH" else now - 900   # equities: 15-min REST delay, matches footprint.py
 
     if existing:
-        since_ts = existing[-1]["ts"]
+        # CRITICAL bug fixed 2026-07-25, user-reported after a restart
+        # ("duplicate timestamps" in the chart, two TP markers appearing
+        # with no trade active, one disappearing after the next candle):
+        # this used to resume from `existing[-1]["ts"]` — the START of
+        # the last ALREADY-persisted bar's own bucket, not the bucket
+        # AFTER it. LIVE_TAPE is a brand-new in-memory LiveTape() at
+        # process start (self.bars[asset] starts None) with zero
+        # knowledge of what's already on disk, so replaying a trade whose
+        # bucket matches that already-closed bar made LiveTape.ingest()
+        # build a SECOND, incomplete reconstruction of the SAME bucket
+        # from scratch (only whatever trades happened to fall in the
+        # [since_ts, until_ts) fetch window, not the bar's original full
+        # trade set) — which then persisted a SECOND row with the
+        # IDENTICAL timestamp the instant the next bucket's first trade
+        # rolled it over, corrupting the log with a genuine duplicate
+        # (not just a display glitch) and confusing anything that matches
+        # by bar_ts (build_trade_markers, hence the phantom TP labels
+        # that shifted/vanished as bars scrolled). The bucket at
+        # existing[-1]["ts"] is provably ALREADY complete — a bar only
+        # ever gets PERSISTED when the NEXT bucket's first trade triggers
+        # the rollover, meaning no further trade could still belong to
+        # it — so resuming from the very NEXT bucket onward is not an
+        # approximation, it's the actual correct boundary; there was
+        # never a real gap to fill inside the already-closed bar itself.
+        since_ts = existing[-1]["ts"] + FOOTPRINT_BAR_SECS
         if until_ts <= since_ts:
             LIVE_TAPE.set_status(asset, "resumed from today's log")
             return
@@ -2319,6 +2371,25 @@ CH_STATE = {"ETH": CH_AssetState(), "QQQ": CH_AssetState()}
 CH_EXPORT_LOCK = threading.Lock()
 CH_EXPORT = {"ETH": None, "QQQ": None}
 CH_EXPORT_INTERVAL = 5   # matches charthacker.py's own STATUS_EXPORT_INTERVAL
+# CRITICAL bug fixed 2026-07-26, user-reported (Status screen's ETH VAH/
+# VAL/POC/VWAP/0.5sd band were wildly different from charthacker.py's own
+# live values for the SAME session, despite Live Price matching closely).
+# Root cause: _ch_export_loop's payload always stamps "updated_at":
+# time.time() every cycle regardless of whether ch_state.candles actually
+# received anything NEW that cycle — so if the live WS feed (_ch_engine_eth/
+# _ch_engine_qqq) ever silently stalls (a malformed message quietly
+# breaking the per-row loop, a reconnect that stops delivering further
+# candles, etc.) without the connection itself ever fully dying (which
+# would trigger the outer reconnect loop), the export kept re-publishing
+# the SAME frozen indicator_levels under an always-fresh timestamp
+# forever — read_status_charthacker_export's own max_age_sec staleness
+# check is USELESS against this, since it only measures "is the export
+# loop still running," not "is the underlying candle data still current."
+# Confirmed independently: a fresh REST fetch + _ch_compute_vp/
+# _ch_build_vwap_map on the SAME real session reproduced charthacker.py's
+# actual live numbers almost exactly — the bootstrap/math were never the
+# problem, only the live engine's own candle feed going stale silently.
+CH_CANDLE_STALE_SECS = 180   # ~3 one-minute bars with nothing new
 
 def _ch_apply_resampled(ch_state, closed, live):
     """Simplified from charthacker.py's own _apply_resampled (charthacker.py:
@@ -2511,9 +2582,22 @@ def _ch_engine_eth(stop_evt):
         with ch_state.lock:
             rows = sorted(klines, key=lambda r: r[0]) if msg_type == "snapshot" else klines
             for row in rows:
-                c = CH_Candle(ts=row[0], o=row[3], h=row[4], l=row[5], c=row[6], v=row[7],
-                               closed=(msg_type == "snapshot"))
-                _ch_apply_resampled(ch_state, None, c)
+                # 2026-07-26 hardening: a single malformed/differently-
+                # shaped row here used to be able to throw an unhandled
+                # exception with no outer try/except around it — since
+                # websocket-client doesn't necessarily kill/reconnect the
+                # socket over an on_message exception, that could silently
+                # stop candle ingestion for the rest of the session while
+                # the connection itself stayed nominally alive (see
+                # CH_CANDLE_STALE_SECS's own comment for the user-reported
+                # bug this was found while diagnosing). Skip just the bad
+                # row instead of risking the whole handler dying quietly.
+                try:
+                    c = CH_Candle(ts=row[0], o=row[3], h=row[4], l=row[5], c=row[6], v=row[7],
+                                   closed=(msg_type == "snapshot"))
+                    _ch_apply_resampled(ch_state, None, c)
+                except Exception:
+                    continue
             if ch_state.candles:
                 ch_state.last_price = ch_state.candles[-1].c
 
@@ -2571,26 +2655,37 @@ def _ch_engine_qqq(stop_evt):
             fresh = []
 
         if fresh:
-            tick = None
-            if fresh[-1][0] % BAR_SECS != 0:
-                tick = fresh.pop()
+            # 2026-07-26 hardening: this whole block previously had no
+            # try/except at all — an exception anywhere in here (a
+            # malformed row, an unexpected Yahoo response shape) would
+            # propagate straight out of the `while` loop and silently kill
+            # this entire polling thread for good (unlike _ch_engine_eth's
+            # WS version, which at least has an outer reconnect loop). See
+            # CH_CANDLE_STALE_SECS's own comment for the user-reported bug
+            # this was found while diagnosing.
+            try:
+                tick = None
+                if fresh[-1][0] % BAR_SECS != 0:
+                    tick = fresh.pop()
 
-            with ch_state.lock:
-                for (ts, o, h, l, c, v) in fresh:
-                    if ts <= last_aligned_ts:
-                        continue
-                    _ch_apply_resampled(ch_state, None, CH_Candle(ts=ts, o=o, h=h, l=l, c=c, v=v, closed=True))
-                if fresh:
-                    last_aligned_ts = max(last_aligned_ts, fresh[-1][0])
-                if tick is not None:
-                    t_ts, _to, _th, _tl, t_c, _tv = tick
-                    bucket = t_ts - (t_ts % BAR_SECS)
-                    if bucket > last_aligned_ts:
-                        _ch_apply_resampled(ch_state, None,
-                                             CH_Candle(ts=bucket, o=t_c, h=t_c, l=t_c, c=t_c, v=0, closed=False))
-                        ch_state.last_price = t_c
-                elif ch_state.candles:
-                    ch_state.last_price = ch_state.candles[-1].c
+                with ch_state.lock:
+                    for (ts, o, h, l, c, v) in fresh:
+                        if ts <= last_aligned_ts:
+                            continue
+                        _ch_apply_resampled(ch_state, None, CH_Candle(ts=ts, o=o, h=h, l=l, c=c, v=v, closed=True))
+                    if fresh:
+                        last_aligned_ts = max(last_aligned_ts, fresh[-1][0])
+                    if tick is not None:
+                        t_ts, _to, _th, _tl, t_c, _tv = tick
+                        bucket = t_ts - (t_ts % BAR_SECS)
+                        if bucket > last_aligned_ts:
+                            _ch_apply_resampled(ch_state, None,
+                                                 CH_Candle(ts=bucket, o=t_c, h=t_c, l=t_c, c=t_c, v=0, closed=False))
+                            ch_state.last_price = t_c
+                    elif ch_state.candles:
+                        ch_state.last_price = ch_state.candles[-1].c
+            except Exception:
+                pass
 
         for _ in range(POLL_SECS):
             if stop_evt.is_set():
@@ -2622,6 +2717,18 @@ def _ch_export_loop(stop_evt):
                 with ch_state.lock:
                     candles_snap = list(ch_state.candles)
                     spot = ch_state.last_price
+
+                # Freshness gate — see this module's own CH_CANDLE_STALE_SECS
+                # comment for the full 2026-07-26 bug this fixes. QQQ's feed
+                # legitimately stops advancing outside market hours (nothing
+                # new to receive), so only ETH (always-on crypto) enforces
+                # this unconditionally; QQQ only enforces it while its own
+                # market is actually open.
+                last_candle_ts = candles_snap[-1].ts if candles_snap else None
+                market_active = True if asset == "ETH" else not status_qqq_market_closed()
+                if market_active and (last_candle_ts is None
+                                       or time.time() - last_candle_ts > CH_CANDLE_STALE_SECS):
+                    continue   # skip publishing — see comment above CH_CANDLE_STALE_SECS
 
                 _prev_ts, curr_open_ts = status_session_open_ts()
                 session_candles = [c for c in candles_snap if c.ts >= curr_open_ts]
@@ -2865,7 +2972,18 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
 
     nearest = status_nearest_gex_clusters(gex_export, price, n=2) if gex_export else []
     if nearest:
-        hit = any(dist <= gamma_tol for _k, _t, dist in nearest)
+        # 2026-07-27 user request: only LARGE clusters count as a genuine
+        # HPL now — Medium clusters are target-only (same treatment BT/ST
+        # already got: excluded from HPLs, still usable as a profit
+        # target elsewhere). Reasoning discussed with the user: a Large
+        # cluster (>=65% of scale_max) is a strong enough dealer-hedging
+        # pin/support-resistance zone to count as "price is near a key
+        # level," a Medium one is weaker/noisier and was mostly just
+        # double-counting the same level Athena might ALSO be using as a
+        # target. The display text below still shows both nearest
+        # clusters regardless of tier (still useful info) — only the
+        # ACTIVE/green determination is now Large-only.
+        hit = any(t == "Large" and dist <= gamma_tol for _k, t, dist in nearest)
         segs = []
         for k, t, dist in nearest:
             dcol = dist_color(dist)
@@ -3141,23 +3259,32 @@ def _status_build_render_lines(display_data):
         # wasn't ported, same documented simplification Phase 3a already
         # made for the gamma-cluster fallback.
         gex_flip = gex_export.get("gex_flip") if gex_export else None
+        # User request 2026-07-27: order the Targets list by PRICE, lowest
+        # to highest — was previously in TYPE priority order (BT/ST, GEX
+        # Flip, then clusters), same ordering convention reconstruct_targets
+        # uses for TP-leg priority elsewhere in this file, but that's the
+        # wrong ordering for a human-readable display list. Collected as
+        # (level, formatted_str) pairs so the sort key is the real numeric
+        # price, not the already-color-coded display string.
         targets = []
         if ratio < 0.98:
             bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if bt is not None:
-                targets.append(f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})")
+                targets.append((bt, f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})"))
             if gex_flip is not None:
-                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
+                targets.append((gex_flip, f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})"))
             above, _below = status_gamma_cluster_targets_directional(gex_export, price)
-            targets += [f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in above]
+            targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in above]
         elif ratio > 1.02:
             _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
             if st is not None:
-                targets.append(f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})")
+                targets.append((st, f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})"))
             if gex_flip is not None:
-                targets.append(f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})")
+                targets.append((gex_flip, f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})"))
             _above, below = status_gamma_cluster_targets_directional(gex_export, price)
-            targets += [f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})" for k, t in below]
+            targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in below]
+        targets.sort(key=lambda t: t[0])
+        targets = [s for _, s in targets]
         has_targets[inst_name] = bool(targets)
         if targets:
             for i in range(0, len(targets), 2):
@@ -3929,7 +4056,7 @@ class SimAccount:
         sim_log_event("filled", {"symbol": symbol, "pos_side": pos_side, "qty": qty,
                                   "price": price, "order_type": order_type})
 
-    def _close(self, symbol, pos_side, qty, price, reason):
+    def _close(self, symbol, pos_side, qty, price, reason, target_type=None):
         pos = self.positions.get(symbol)
         if not pos:
             return
@@ -3940,8 +4067,11 @@ class SimAccount:
         self._roll_day()
         self.realized_pnl_today += pnl
         pos["qty"] -= qty
-        sim_log_event("closed", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
-                                  "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance})
+        detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
+                  "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance}
+        if target_type is not None:
+            detail["type"] = target_type
+        sim_log_event("closed", detail)
         if pos["qty"] <= 1e-9:
             del self.positions[symbol]
             for oid in [k for k, o in self.orders.items() if o["symbol"] == symbol]:
@@ -4036,7 +4166,7 @@ class SimAccount:
                 elif o["kind"] == "tp":
                     hit = (pos_side == "Long" and price >= o["price"]) or (pos_side == "Short" and price <= o["price"])
                     if hit:
-                        self._close(symbol, pos_side, o["qty"], price, "tp")
+                        self._close(symbol, pos_side, o["qty"], price, "tp", target_type=o.get("type"))
                         self.orders.pop(oid, None)
         self._save()
 
@@ -4130,15 +4260,41 @@ def account_balance_fields(acc_data):
     used = float(acc.get('totalUsedBalanceRv') or 0)
     return bal, max(0.0, bal - used), used
 
-def account_realized_pnl_today(acc_data, symbols):
-    """Real mode only: Phemex already tracks today's realized PnL per
-    position (curTermRealisedPnlRv) — sum it across our symbols rather than
-    re-deriving it ourselves. Sim mode uses SimAccount.realized_pnl_today
-    instead (see recent_closed_trades/render)."""
+def athena_realized_pnl_today():
+    """Real mode's own version of SimAccount.realized_pnl_today — sums
+    TODAY's Athena-tagged (detail.sim is False) close events from
+    athena_logs, the exact same filtering recent_closed_trades/
+    scan_all_trade_events's own 'real' branch already uses.
+
+    REPLACES the old account_realized_pnl_today (user-reported 2026-07-26,
+    "showing +$46.53 in closed PnL even though no trades have been taken
+    today or ever on the live account"): that function summed Phemex's own
+    curTermRealisedPnlRv across our symbols — the EXCHANGE's own per-
+    position "current term" realized PnL, which is NOT scoped to Athena's
+    own trades at all. It reflects EVERYTHING that ever happened on that
+    symbol/position term on the account — a manual trade, a stale term
+    predating Athena, anything — exactly the "other positions" data the
+    user explicitly asked to exclude ("In Athena, everything is Athena").
+    Athena's own athena_logs is the only account of what ATHENA itself
+    actually did, so it's the only correct source for this figure now."""
     total = 0.0
-    for p in (acc_data or {}).get('data', {}).get('positions', []) or []:
-        if p.get('symbol') in symbols:
-            total += float(p.get('curTermRealisedPnlRv') or 0)
+    try:
+        with open(athena_log_path(), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                if d.get("event") not in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
+                    continue
+                detail = d.get("detail") or {}
+                if detail.get("sim") is not False:
+                    continue
+                pnl = detail.get("pnl_approx")
+                if pnl is not None:
+                    total += pnl
+    except Exception:
+        pass
     return total
 
 def account_position(acc_data, symbol, pos_side=None):
@@ -4245,6 +4401,14 @@ def _tp_type_code(target_type):
 
 def _tp_type_from_code(code):
     return _TP_TYPE_CODES_REV.get(code, "?")
+
+# Display label for the trades table's TP1/TP2 TYPE columns — collapses
+# BT/ST into one combined label per explicit user request ("GEXFLIP,
+# CLUSTER, or BT/ST"), rather than showing BT and ST as two separate values.
+_TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluster": "CLUSTER"}
+
+def _tp_type_display(target_type):
+    return _TP_TYPE_DISPLAY.get(target_type, "—")
 
 async def place_tp_leg(symbol, pos_side, qty_str, price, price_decimals, suffix, target_type="?"):
     if DRY_RUN:
@@ -4621,7 +4785,30 @@ class AthenaInstrument:
             return
 
         if self.state == "PENDING_FILL":
+            # CRITICAL bug fixed 2026-07-26, user-reported ("trades are
+            # being entered between 19:00:00-19:29:59 CT — NO trades
+            # should be entered in this timeframe"): the blackout gate
+            # only ever blocked NEW entries from being PLACED (it stops
+            # WATCHING->ARMED and disarms an ARMED instrument the moment
+            # the window starts — see above). A LIMIT order placed while
+            # still ARMED just before 19:00 was left resting untouched
+            # here — _check_fill() only ever POLLS for a fill, it never
+            # cancels — so it could still fill (a genuine new trade
+            # entering the account) at any point during the blackout.
+            # _check_fill() runs FIRST, not skipped: if the order already
+            # filled (a real position now exists on the exchange), that
+            # must be detected and its SL/TP placed exactly as normal —
+            # skipping straight to cancellation here would leave a real,
+            # already-filled position with NO stop-loss. Only once it's
+            # confirmed STILL pending (never filled) after that check do
+            # we actively cancel it, guaranteeing no fill can complete
+            # during the window regardless of when the order was placed.
             await self._check_fill()
+            if self.state == "PENDING_FILL":
+                if _in_entry_blackout():
+                    await self._flatten_now("entry_blackout")
+                elif self._entry_order_stale():
+                    await self._flatten_now("stale_entry")
             return
 
         if self.state == "IN_POSITION":
@@ -4749,19 +4936,65 @@ class AthenaInstrument:
             log_event(self.asset, "confirmation_no_entry_price", {"regime": regime})
             return
 
-        nearest_target = targets_full[0]["level"] if targets_full else None
         R = self.cfg["sl"]
         live_price = await reference_price(self.asset, self.cfg["phemex_symbol"])
         if live_price is None:
             live_price = new_bar.get("c", live_price_fallback)
 
-        if nearest_target is None or abs(nearest_target - live_price) < R:
-            dist = None if nearest_target is None else abs(nearest_target - live_price)
-            dist_txt = "n/a" if dist is None else f"{dist:.2f}"
+        # CRITICAL bug fixed 2026-07-26, user-reported (a large gamma
+        # cluster more than $10 above price was clearly visible on the GEX
+        # map, order flow had confirmed, yet Athena rejected every single
+        # setup that whole session): this used to take ONLY
+        # targets_full[0] as "the nearest target" — but reconstruct_targets
+        # orders that list by TYPE PRIORITY (BT/ST first, then Large
+        # clusters, then Medium, then GEX Flip last), NOT by distance from
+        # price, so a close BT/ST always blocked entry regardless of a
+        # genuinely tradeable cluster further out. Fixed to scan the whole
+        # list — but a FOLLOW-UP report the next day (2026-07-27) showed
+        # that fix over-corrected: it entered a trade where BT AND the
+        # Large cluster were BOTH only $2 away, using a distant, low-
+        # conviction Medium cluster ($27 away) to justify the entry. User's
+        # own words: "this alone should invalidate the entry" — i.e.
+        # falling all the way down to a weak fallback target is NOT
+        # acceptable just because it happens to have room, when a
+        # STRONGER target exists but is simply sitting too close to price
+        # (a sign price is already AT the meaningful level, not that the
+        # setup has room to run).
+        #
+        # Reconciled rule (both reports satisfied, confirmed with the user
+        # via worked trade examples before implementing): BT/ST and Large
+        # clusters are "top-tier" targets; Medium clusters and GEX Flip are
+        # fallback-only. A fallback target may justify entry ONLY when NO
+        # top-tier target exists anywhere in targets_full at all (nothing
+        # stronger is being passed over) — never merely because the
+        # existing top-tier target(s) happen to be too close. Skipping
+        # WITHIN the top tier (e.g. a close Large cluster in favor of a
+        # farther Large cluster, or a close BT in favor of a farther Large
+        # cluster) is still fine either way — that's not settling for
+        # something weaker.
+        def _is_top_tier(t):
+            return t["type"] in ("BT", "ST") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+
+        top_tier_present = any(_is_top_tier(t) for t in targets_full)
+        usable_target = None
+        for t in targets_full:
+            if abs(t["level"] - live_price) < R:
+                continue
+            if top_tier_present and not _is_top_tier(t):
+                continue   # a stronger target exists somewhere -- don't settle for this weaker one
+            usable_target = t["level"]
+            break
+
+        if usable_target is None:
+            nearest_dist = min((abs(t["level"] - live_price) for t in targets_full), default=None)
+            dist_txt = "n/a" if nearest_dist is None else f"{nearest_dist:.2f}"
+            reason = ("a top-tier (BT/ST/Large cluster) target exists but none clear it"
+                      if top_tier_present else f"no target >= {R}R away")
             console_log(f"{self.asset}: order flow confirmed {regime.upper()} but rejected — "
-                        f"distance to nearest target ({dist_txt}) < {R}R")
-            log_event(self.asset, "confirmation_rejected_viability", {"regime": regime, "nearest_target": nearest_target,
-                                                                        "distance": dist, "R": R})
+                        f"{reason} (nearest {dist_txt})")
+            log_event(self.asset, "confirmation_rejected_viability", {"regime": regime, "targets": targets_full,
+                                                                        "nearest_distance": nearest_dist, "R": R,
+                                                                        "top_tier_present": top_tier_present})
             return
 
         order_type = "market" if ((regime == "long" and live_price <= entry_price) or
@@ -4791,15 +5024,33 @@ class AthenaInstrument:
         # = ~7.5% of the intended trade_risk, not the full risk budget).
         # Not a price-based notional/price conversion either; this is the
         # sizing rule itself, independent of the asset's current price.
-        one_r_dollars = balance * (PCT / 100.0)
         if BLACKJACK_MODE:
+            # 2026-07-26 user request: Blackjack's own "1R" is a fixed
+            # dollar amount the user is prompted for the moment [B] turns
+            # Blackjack mode on (see curses_main's [B] handler) — NOT
+            # derived from balance*PCT/100 the way flat-mode sizing is.
+            # BLACKJACK_1R_DOLLARS should always be set by the time this
+            # branch can run; the balance*PCT/100 fallback only guards
+            # against a theoretical unset case (e.g. BLACKJACK_MODE flipped
+            # by something other than the [B] prompt flow).
+            one_r_dollars = BLACKJACK_1R_DOLLARS if BLACKJACK_1R_DOLLARS is not None else balance * (PCT / 100.0)
             bj = BLACKJACK_STATE[self.asset]
             if bj["in_win_progression"]:
                 trade_risk_dollars = bj["win_step_back"] * one_r_dollars + bj["win_profit_dollars"]
             else:
                 trade_risk_dollars = BLACKJACK_STEPS[bj["loss_step"]] * one_r_dollars
         else:
-            trade_risk_dollars = one_r_dollars
+            # 2026-07-26 user request: [P] risk-per-trade can now be set as
+            # either a % of balance (RISK_MODE=="pct", the original/default
+            # behavior — trade_risk scales with balance) OR a flat $ amount
+            # (RISK_MODE=="dollars" — trade_risk is fixed regardless of
+            # balance). RISK_DOLLARS is only meaningful once the user has
+            # actually set it via [P] in dollar mode; falls back to the
+            # %-based formula otherwise (should be unreachable via the
+            # normal [P] flow — see _prompt_risk_value, which always sets
+            # both together).
+            trade_risk_dollars = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) \
+                else balance * (PCT / 100.0)
         raw_qty = trade_risk_dollars / R
         qty = floor_to_step(raw_qty, qty_step)
         if qty <= 0:
@@ -4829,13 +5080,45 @@ class AthenaInstrument:
 
         self.pending = {"pos_side": pos_side, "qty": qty, "qty_decimals": qty_decimals,
                          "price_decimals": price_decimals, "targets": targets_full, "regime": regime,
-                         "order_type": order_type, "entry_price": entry_price if order_type == "limit" else live_price}
+                         "order_type": order_type, "entry_price": entry_price if order_type == "limit" else live_price,
+                         # 2026-07-27 user request: a resting LIMIT entry
+                         # shouldn't wait forever for price to revert to
+                         # the confirming bar's own VAH/VAL — see
+                         # ENTRY_ORDER_EXPIRY_BARS/process_cycle's own
+                         # PENDING_FILL staleness check. Anchored to the
+                         # CONFIRMING bar's own ts (not wall-clock), so bar
+                         # count elapsed is measured the same way the
+                         # confirmation logic itself measures time.
+                         "placed_bar_ts": new_bar.get("ts")}
         self.state = "PENDING_FILL"
         self.lights["Order Flow"] = True
         tag = " (sim)" if DRY_RUN else ""
         console_log(f"{self.asset}: entry order placed{tag} — {pos_side} {order_type} {qty_str} @ "
                     f"{price_str or 'market'}")
         log_event(self.asset, "entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
+
+    def _entry_order_stale(self):
+        """True once ENTRY_ORDER_EXPIRY_BARS new footprint bars have closed
+        since this pending LIMIT entry was placed, with no fill yet — see
+        ENTRY_ORDER_EXPIRY_BARS' own module-level comment for why. Counts
+        actual CLOSED bars (not wall-clock elapsed time) since that's the
+        same unit the confirming bar itself was measured in, and bar
+        cadence can vary slightly with real trade activity. A market-order
+        entry never reaches PENDING_FILL for more than an instant in
+        practice (fills essentially immediately), so this only ever
+        meaningfully fires for a still-resting LIMIT order."""
+        if not self.pending:
+            return False
+        placed_ts = self.pending.get("placed_bar_ts")
+        if placed_ts is None:
+            return False
+        recent_bars = read_last_n_footprint_bars(self.asset, ENTRY_ORDER_EXPIRY_BARS + 2)
+        bars_since = sum(1 for b in recent_bars if (b.get("ts") or 0) > placed_ts)
+        if bars_since >= ENTRY_ORDER_EXPIRY_BARS:
+            console_log(f"{self.asset}: {YLW}entry order stale ({bars_since} bars unfilled, "
+                        f"no fill) — cancelling{RST}")
+            return True
+        return False
 
     async def _check_fill(self):
         p = self.pending
@@ -5114,16 +5397,34 @@ class AthenaInstrument:
         if gex_flip is not None:
             new_gex_level = gex_flip - GEX_FLIP_TP_BUFFER if pos_side == "Long" else gex_flip + GEX_FLIP_TP_BUFFER
 
-        new_cluster_level = None
+        # CRITICAL bug fixed 2026-07-27, user-reported (TP1 and TP2 both
+        # showing the SAME Cluster level — "the second TP should have been
+        # adjusted to the medium cluster at $2,000 but it was not, both
+        # TPs are set to $1,975"): this used to compute a single
+        # `new_cluster_level = clusters[0][0]` (just the nearest/highest-
+        # priority cluster) and apply THAT SAME value to every leg whose
+        # `type == "Cluster"` — so a position with TWO cluster-tracking
+        # legs (TP1 = Large cluster, TP2 = Medium cluster, same
+        # Large-before-Medium ordering _check_fill used at entry) had BOTH
+        # collapsed onto the one nearest cluster the instant either one's
+        # refresh fired. Fixed: build the FULL current cluster list (same
+        # sort _check_fill/reconstruct_targets already use) and assign each
+        # cluster-type leg its own ordinal position — TP1's cluster (if
+        # any) gets clusters[0], the NEXT cluster-type leg encountered
+        # (TP2, if it's also type "Cluster") gets clusters[1], etc. This
+        # is derived fresh from tp_legs' own existing TP1->TP2 order every
+        # cycle — no new persisted field needed, so it works identically
+        # whether tp_legs came from a live fill or a restart reconciliation.
+        new_cluster_levels = []
         if gex_export:
             direction = "above" if pos_side == "Long" else "below"
             clusters = clusters_from_gex_export(gex_export, fill_price, direction)
             clusters.sort(key=lambda kt: 0 if kt[1] == "Large" else 1)
-            if clusters:
-                new_cluster_level = clusters[0][0]
+            new_cluster_levels = [k for k, _tier in clusters]
 
         new_legs = []
         changed = False
+        cluster_rank = 0   # which cluster-tracking leg, in tp_legs' own order, we're on
         for leg in tp_legs:
             level = leg["level"]
             # Same guard as the initial placement (_check_fill) — if the
@@ -5151,15 +5452,29 @@ class AthenaInstrument:
                     if self._tp_skip_warned.get("gex") is None or abs(self._tp_skip_warned["gex"] - new_gex_level) > 0.01:
                         console_log(f"{self.asset}: {YLW}GEX Flip too close to fill (${fmt_num(new_gex_level)}) — TP refresh skipped this cycle{RST}")
                         self._tp_skip_warned["gex"] = new_gex_level
-            elif leg.get("type") == "Cluster" and new_cluster_level is not None:
-                if _safe(new_cluster_level):
-                    self._tp_skip_warned.pop("cluster", None)
-                    if abs(level - new_cluster_level) > 0.005:
-                        level, changed = new_cluster_level, True
-                else:
-                    if self._tp_skip_warned.get("cluster") is None or abs(self._tp_skip_warned["cluster"] - new_cluster_level) > 0.01:
-                        console_log(f"{self.asset}: {YLW}nearest Cluster too close to fill (${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
-                        self._tp_skip_warned["cluster"] = new_cluster_level
+            elif leg.get("type") == "Cluster":
+                # This leg's own ordinal position among Cluster-type legs
+                # (0 = the first one encountered in tp_legs' TP1->TP2
+                # order, i.e. whichever leg originally got the nearest/
+                # Large cluster; 1 = the next such leg, etc.) — NOT always
+                # the single nearest cluster, which was the bug.
+                warn_key = f"cluster{cluster_rank}"
+                if cluster_rank < len(new_cluster_levels):
+                    new_cluster_level = new_cluster_levels[cluster_rank]
+                    if _safe(new_cluster_level):
+                        self._tp_skip_warned.pop(warn_key, None)
+                        if abs(level - new_cluster_level) > 0.005:
+                            level, changed = new_cluster_level, True
+                    else:
+                        if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_cluster_level) > 0.01:
+                            console_log(f"{self.asset}: {YLW}Cluster (rank {cluster_rank}) too close to fill "
+                                        f"(${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
+                            self._tp_skip_warned[warn_key] = new_cluster_level
+                # else: fewer qualifying clusters exist now than this leg's
+                # own rank needs — leave it resting at its last-known level
+                # rather than guessing; same "don't place an unverified
+                # level" caution the R-distance guard above already uses.
+                cluster_rank += 1
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?")})
@@ -5199,17 +5514,26 @@ class AthenaInstrument:
 
     async def _flatten_now(self, reason):
         """Force-flat regardless of state/regime — cancels any resting
-        entry/SL/TP order and market-closes an open position. Two callers:
+        entry/SL/TP order and market-closes an open position. Callers:
         `reason="eod"` (QQQ-only, 15:00 CT regular close, unchanged
-        behavior) and `reason="manual"` ([F]latten All, any asset/state,
-        triggered by the user). Mirrors the PCVR-flip-close branch of
+        behavior), `reason="manual"` ([F]latten All, any asset/state,
+        triggered by the user), and `reason="entry_blackout"` (2026-07-26 —
+        cancels a still-unfilled PENDING_FILL entry the instant the
+        19:00-19:30 CT blackout starts, see process_cycle's own PENDING_FILL
+        branch), and `reason="stale_entry"` (2026-07-27 — cancels a
+        LIMIT entry that's sat unfilled for ENTRY_ORDER_EXPIRY_BARS bars,
+        see _entry_order_stale). Mirrors the PCVR-flip-close branch of
         _manage_position above (same approximate-exit/PnL caveat for real
         trades — see that method's own comment). Event names stay distinct
-        per reason ("eod_flatten"/"manual_flatten") — same one-event-name-
-        per-cause convention "pcvr_flip_close" already established, so the
-        trades table/blotter/chart markers can tell them apart."""
+        per reason ("eod_flatten"/"manual_flatten"/"entry_blackout_flatten"/
+        "stale_entry_flatten") — same one-event-name-per-cause convention
+        "pcvr_flip_close" already established, so the trades table/
+        blotter/chart markers can tell them apart."""
         symbol = self.cfg["phemex_symbol"]
-        label = "15:00 CT — flattening for EOD" if reason == "eod" else "manual Flatten All"
+        label = ("15:00 CT — flattening for EOD" if reason == "eod"
+                 else "19:00-19:30 CT entry blackout — cancelling pending order" if reason == "entry_blackout"
+                 else "entry order stale — cancelling unfilled pending order" if reason == "stale_entry"
+                 else "manual Flatten All")
         console_log(f"{self.asset}: {YLW}{label}{RST}")
         event_name = f"{reason}_flatten"
         try:
@@ -5447,8 +5771,8 @@ def scan_all_trade_events(source):
     events.sort(key=lambda e: e.get("ts") or "")
     return events
 
-PHEMEX_TAKER_FEE = 0.0006   # market orders — SL/PCVR-flip/EOD-flatten closes
-PHEMEX_MAKER_FEE = 0.0001   # limit orders — TP leg fills
+PHEMEX_FEE_RATE = 0.0006   # user-confirmed flat rate for every leg, entry or exit,
+                           # regardless of order type — fee = 0.0006 * (qty * price)
 PHEMEX_SYMBOL_TO_ASSET = {cfg["phemex_symbol"]: a for a, cfg in ASSETS.items()}
 
 def scan_all_trades_detailed():
@@ -5476,11 +5800,9 @@ def scan_all_trades_detailed():
     well-formed trade. A reasonable, documented heuristic, not guaranteed
     exact if fills raced.
 
-    Fees: Phemex's own published taker/maker rates (PHEMEX_TAKER_FEE/
-    PHEMEX_MAKER_FEE), applied per-leg on notional (qty * price) — the
-    entry leg's rate depends on its recorded order_type (market/limit);
-    each exit leg's rate is maker for a 'tp' reason (limit fill) and taker
-    for 'sl'/'flip'/'eod' (stop/market close)."""
+    Fees: flat PHEMEX_FEE_RATE (0.0006) applied per-leg on notional
+    (qty * price), entry and every exit leg alike — user-confirmed
+    2026-07-26, no maker/taker distinction."""
     pattern = os.path.join(SIM_LOG_DIR_BASE, "**", "*.jsonl")
     rows = []
     for path in glob.glob(pattern, recursive=True):
@@ -5511,7 +5833,8 @@ def scan_all_trades_detailed():
         elif ev == "closed" and key in open_trades:
             t = open_trades[key]
             t["exits"].append({"ts": d.get("ts"), "price": d.get("price"), "qty": d.get("qty"),
-                                "reason": d.get("reason"), "pnl": d.get("pnl"), "balance": d.get("balance")})
+                                "reason": d.get("reason"), "pnl": d.get("pnl"), "balance": d.get("balance"),
+                                "type": d.get("type")})
             if sum(x["qty"] for x in t["exits"]) >= t["qty"] - 1e-9:
                 closed_trades.append(open_trades.pop(key))
 
@@ -5521,13 +5844,11 @@ def scan_all_trades_detailed():
         if not exits:
             continue
         entry_qty, entry_price = t["qty"], t["entry_price"]
-        entry_fee_rate = PHEMEX_MAKER_FEE if t.get("entry_order_type") == "limit" else PHEMEX_TAKER_FEE
-        entry_fee = entry_qty * entry_price * entry_fee_rate
+        entry_fee = entry_qty * entry_price * PHEMEX_FEE_RATE
         exit_qty_total = sum(x["qty"] for x in exits)
         exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
         gross_pnl = sum(x["pnl"] for x in exits)
-        exit_fees = sum(x["qty"] * x["price"] * (PHEMEX_MAKER_FEE if x["reason"] == "tp" else PHEMEX_TAKER_FEE)
-                         for x in exits)
+        exit_fees = sum(x["qty"] * x["price"] * PHEMEX_FEE_RATE for x in exits)
         total_fees = entry_fee + exit_fees
         net_pnl = gross_pnl - total_fees
         # trade_risk = qty * sl_distance (THIS asset's own fixed SL
@@ -5556,6 +5877,62 @@ def scan_all_trades_detailed():
             "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
             "balance": exits[-1].get("balance"),
         })
+
+    # CRITICAL bug fixed 2026-07-25, user-reported ("trade closed in sim
+    # but did not show up in the trade log"): a position with AT LEAST ONE
+    # realized exit but not yet FULLY closed (e.g. TP1 filled, TP2 still
+    # resting) stayed in `open_trades` forever and never appeared here —
+    # even though its realized PnL from the TP1 leg already counts in the
+    # equity-curve stats above (scan_all_trade_events counts each 'closed'
+    # event independently, regardless of whether the rest of the position
+    # has closed). The table is titled "All Trades", not "All CLOSED
+    # Trades", so a trade with real, already-locked-in profit showing "no
+    # closed trades yet" read as data loss, not as "still in progress."
+    # Surfaced here as its own row, `reason` prefixed "OPEN" so it still
+    # reads as unfinished — net_pnl/fees reflect ONLY what's actually
+    # realized so far (the entry fee on the full original qty, already
+    # paid at fill time, plus whatever exit legs have landed), not the
+    # still-open remainder's unrealized PnL — this table has no live
+    # price feed to mark that against, same caveat `recent_closed_trades`
+    # already documents for real mode elsewhere. A position with ZERO
+    # exits yet (nothing realized) still isn't shown — the dashboard's
+    # own Position/Pending line already covers a bare, untouched open
+    # position; this table's job is trade HISTORY, not a live duplicate.
+    for t in open_trades.values():
+        exits = t["exits"]
+        if not exits:
+            continue
+        entry_qty, entry_price = t["qty"], t["entry_price"]
+        entry_fee = entry_qty * entry_price * PHEMEX_FEE_RATE
+        exit_qty_total = sum(x["qty"] for x in exits)
+        exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
+        gross_pnl = sum(x["pnl"] for x in exits)
+        exit_fees = sum(x["qty"] * x["price"] * PHEMEX_FEE_RATE for x in exits)
+        total_fees = entry_fee + exit_fees
+        net_pnl = gross_pnl - total_fees
+        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
+        sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
+        r_dollars = entry_qty * sl_distance
+        rr = (net_pnl / r_dollars) if r_dollars else None
+        reasons = ["OPEN"]
+        for x in exits:
+            r = (x.get("reason") or "close").upper()
+            if r not in reasons:
+                reasons.append(r)
+        tp_exits = [x for x in exits if x.get("reason") == "tp"]
+        out.append({
+            "symbol": t["symbol"], "asset": asset or t["symbol"],
+            "pos_side": t["pos_side"], "qty": entry_qty,
+            "entry_ts": t["entry_ts"], "entry_price": entry_price,
+            "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
+            "reason": "+".join(reasons),
+            "tp1": tp_exits[0] if len(tp_exits) >= 1 else None,
+            "tp2": tp_exits[1] if len(tp_exits) >= 2 else None,
+            "r_dollars": r_dollars, "fees": total_fees,
+            "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
+            "balance": exits[-1].get("balance"),
+        })
+
     out.sort(key=lambda t: t["exit_ts"] or "")
 
     # DD ($ and %) — added 2026-07-25, user-requested "DD" column: how far
@@ -5776,16 +6153,18 @@ def _fmt_duration(entry_ts, exit_ts):
 # Column order prioritizes the most important fields FIRST — a narrow
 # terminal's [:cols] clip (same convention every other view in this file
 # uses for wide content) drops the tail (TP1/TP2/duration) before anything
-# essential, rather than clipping arbitrarily. NET PNL moved right after
-# QTY/DIR (2026-07-23, was much further right at column ~93 — invisible on
-# anything but a very wide terminal, which is why it looked "missing"
-# despite already existing) since it's arguably the single most important
-# number in the whole row.
+# essential, rather than clipping arbitrarily. GROSS moved right after
+# QTY/DIR (2026-07-26, user request to swap it with NET PNL — was the
+# reverse order before, GROSS further right at ~column 93) since it's the
+# first PnL figure a reader hits; NET PNL (after fees) now sits where GROSS
+# used to, right after REASON. TP1 TYPE/TP2 TYPE (2026-07-26, new) sit
+# immediately after their own TP1/TP2 price column, showing which HPL/
+# target (BT/ST, GEXFLIP, CLUSTER) that leg was tied to.
 TRADES_TABLE_COLS = [
     ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6),
-    ("NET PNL", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
-    ("REASON", 10), ("GROSS", 10), ("FEES", 7), ("BALANCE", 11), ("DD", 10),
-    ("R$", 7), ("TP1", 9), ("TP2", 9), ("DUR", 7),
+    ("GROSS", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
+    ("REASON", 10), ("NET PNL", 10), ("FEES", 7), ("BALANCE", 11), ("DD", 10),
+    ("R$", 7), ("TP1", 9), ("TP1 TYPE", 9), ("TP2", 9), ("TP2 TYPE", 9), ("DUR", 7),
 ]
 
 def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
@@ -5834,18 +6213,20 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
             (t["asset"], P_DEFAULT),
             (t["pos_side"] or "—", P_GREEN if t["pos_side"] == "Long" else P_RED),
             (fmt_num(t["qty"], 2), P_DEFAULT),
-            (fmt_money(t["net_pnl"]), pnl_pair(t["net_pnl"])),
+            (fmt_money(t["gross_pnl"]), pnl_pair(t["gross_pnl"])),
             (f"{t['rr']:.2f}" if t["rr"] is not None else "—", pnl_pair(t["rr"] or 0)),
             (fmt_num(t["entry_price"]), P_DEFAULT),
             (fmt_num(t["exit_price"]), P_DEFAULT),
             (t["reason"], P_DEFAULT),
-            (fmt_money(t["gross_pnl"]), pnl_pair(t["gross_pnl"])),
+            (fmt_money(t["net_pnl"]), pnl_pair(t["net_pnl"])),
             (fmt_money(-t["fees"]) if t["fees"] else "$0.00", P_DIM),
             (fmt_money(t["balance"]) if t["balance"] is not None else "—", P_DIM),
             (fmt_money(-t["dd"]) if t.get("dd") is not None else "—", P_RED if t.get("dd") else P_DIM),
             (fmt_money(t["r_dollars"]), P_DIM),
             (fmt_num(t["tp1"]["price"]) if t["tp1"] else "—", P_DIM),
+            (_tp_type_display(t["tp1"]["type"]) if t["tp1"] else "—", P_DIM),
             (fmt_num(t["tp2"]["price"]) if t["tp2"] else "—", P_DIM),
+            (_tp_type_display(t["tp2"]["type"]) if t["tp2"] else "—", P_DIM),
             (_fmt_duration(t["entry_ts"], t["exit_ts"]), P_DIM),
         ]
         x = 0
@@ -6699,12 +7080,11 @@ class AppState:
                     inst["live_price"] = bar["c"]
 
     def publish(self, instruments, age, acc, live_prices, qqq_market_closed):
-        symbols = {i.cfg["phemex_symbol"] for i in instruments}
         balance, available, margin_used = account_balance_fields(acc)
         open_pnl_total = sum((instrument_open_pnl(i, live_prices.get(i.asset)) or 0.0) for i in instruments)
         has_open = any(i.position for i in instruments)
         closed_pnl = (get_sim_account().realized_pnl_today if DRY_RUN
-                      else account_realized_pnl_today(acc, symbols))
+                      else athena_realized_pnl_today())
         inst_snap = {}
         for i in instruments:
             inst_snap[i.asset] = {
@@ -7568,6 +7948,71 @@ def _prompt_number(stdscr, label, default=None):
     except ValueError:
         return default
 
+def _prompt_risk_value(stdscr, label, current_mode, current_value):
+    """[P]'s combined value+unit prompt (2026-07-26 user request: "Turn [P]
+    into both a value and a toggle between $ and %") — one prompt does
+    both jobs instead of a separate toggle key. Typing a plain number
+    keeps the CURRENT unit (e.g. "2" while already in % mode sets 2%).
+    Typing a number followed by % or $ SWITCHES the unit and sets the
+    value in the same step (e.g. "50$" switches to flat-dollar mode at
+    $50, "2.5%" switches to percent mode at 2.5%, regardless of whatever
+    mode was active before). Enter on an empty buffer changes neither —
+    keeps the current mode AND value. Esc cancels the same way. Same
+    blocking get_wch() pattern as _prompt_number (see its own docstring
+    for the "never break on a failed first get_wch()" gotcha this shares).
+    Returns (mode, value)."""
+    rows, cols = stdscr.getmaxyx()
+    row = rows - 1
+    buf = ""
+    stdscr.nodelay(False)
+    curses.curs_set(1)
+    try:
+        while True:
+            stdscr.move(row, 0)
+            stdscr.clrtoeol()
+            text = f"{label}{buf}"
+            try:
+                stdscr.addstr(row, 0, text[:max(0, cols - 1)])
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                break
+            if ch == "\x1b":   # Esc — cancel
+                buf = None
+                break
+            if ch in ("\x08", "\x7f") or ch == curses.KEY_BACKSPACE:
+                buf = buf[:-1]
+            elif isinstance(ch, str) and (ch.isdigit() or ch in ".$%"):
+                buf += ch
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+    return _parse_risk_input(buf, current_mode, current_value)
+
+def _parse_risk_input(buf, current_mode, current_value):
+    """Pure parsing half of _prompt_risk_value, split out so the actual
+    parsing rules are unit-testable without a curses screen. See
+    _prompt_risk_value's own docstring for the input convention."""
+    if not buf:
+        return current_mode, current_value
+    buf = buf.strip()
+    mode = current_mode
+    numeric = buf
+    if buf.endswith("%"):
+        mode, numeric = "pct", buf[:-1]
+    elif buf.endswith("$"):
+        mode, numeric = "dollars", buf[:-1]
+    try:
+        value = max(0.0, float(numeric))
+    except ValueError:
+        return current_mode, current_value
+    return mode, value
+
 # ── [G] Switch to live account ────────────────────────────────────────────────
 def _prompt_confirm_text(stdscr, box_lines, confirm_word):
     """Blocking modal warning pop-up — a bordered box (box_lines, plain
@@ -7662,9 +8107,29 @@ def _go_live(stdscr):
         log_event("SYSTEM", "go_live_refused_no_keys", {})
         return
 
+    # 2026-07-26 CRITICAL bug fixed, user-reported with a screenshot
+    # ("broken emojis and the border is broken on the right side"):
+    # _prompt_confirm_text writes box_lines DIRECTLY via stdscr.addstr —
+    # curses does NOT interpret ANSI escape sequences the way puts_ansi()/
+    # ansi_segments() do elsewhere in this file, so the {BLD}/{RST} tags
+    # below (real \x1b[...m byte sequences) rendered as literal garbage
+    # ("^[[1m") AND, worse, those invisible-on-a-real-terminal-but-still-
+    # counted bytes threw off line.center(box_w - 2)'s width math, pushing
+    # the right border out of alignment. _prompt_confirm_text already
+    # draws the WHOLE box in one fixed bold-red attrs — these tags were
+    # always redundant even when they worked. Plain text only, no ANSI
+    # tags, in every box_lines entry passed to this function.
     warning = [
         "",
-        f"{BLD}⚠  SWITCHING TO YOUR LIVE PHEMEX ACCOUNT  ⚠{RST}",
+        # Plain ASCII, not the "⚠" glyph — this dialog draws box_lines via
+        # a raw stdscr.addstr(string) call, which advances the cursor per
+        # Python str.len(), not per rendered terminal column; a glyph whose
+        # actual display width the terminal treats as 2 columns (common
+        # for emoji) would silently reintroduce the same right-border
+        # misalignment this whole fix is for. The dashboard's own "⚠ NO
+        # STOP-LOSS RESTING" (elsewhere in this file) is safe because it
+        # goes through DoubleBuffer's cell-by-cell put/puts, not addstr.
+        "!!  SWITCHING TO YOUR LIVE PHEMEX ACCOUNT  !!",
         "",
         "All orders and trades placed from this point on will be",
         "executed with REAL FUNDS on your real Phemex account.",
@@ -7717,18 +8182,20 @@ def _go_sim(stdscr, snap):
     open_real = [a for a in ASSETS
                  if (snap.get("instruments", {}).get(a) or {}).get("state") in ("PENDING_FILL", "IN_POSITION")]
 
+    # See _go_live's own 2026-07-26 comment above _prompt_confirm_text's
+    # call — no ANSI tags in box_lines, plain text only.
     warning = [
         "",
-        f"{BLD}SWITCHING BACK TO PAPER (SIM) TRADING{RST}",
+        "SWITCHING BACK TO PAPER (SIM) TRADING",
         "",
         "Athena will start reading/writing the paper account again.",
     ]
     if open_real:
         warning += [
             "",
-            f"{BLD}WARNING: {', '.join(open_real)} still has an OPEN REAL{RST}",
-            f"{BLD}position/order — it will STOP being managed by Athena{RST}",
-            f"{BLD}(no SL sync, no PCVR-flip-close) once you switch.{RST}",
+            f"WARNING: {', '.join(open_real)} still has an OPEN REAL",
+            "position/order — it will STOP being managed by Athena",
+            "(no SL sync, no PCVR-flip-close) once you switch.",
         ]
     warning += [
         "",
@@ -7822,7 +8289,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE
+    global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(0)
@@ -8081,9 +8548,10 @@ def curses_main(stdscr):
             tab_hint = f" [Tab]:{chart_focus} [Z]:{'full' if chart_zoom else 'split'}" if both_panes else ""
             focus_asset = chart_focus if both_panes else "ETH"
             x_hint = " [X]:crosshair-ON" if chart_crosshair_active.get(focus_asset) else " [X]:crosshair"
+            risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
             footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                      f" [P]ct:{PCT:g}% [B]:{'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                      f"{risk_hint} {'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
                       + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
@@ -8300,17 +8768,47 @@ def curses_main(stdscr):
             log_event(focus_asset, "athena_enabled_toggled", {"enabled": ATHENA_ENABLED[focus_asset]})
         elif key in (ord("b"), ord("B")):
             BLACKJACK_MODE = not BLACKJACK_MODE
-            console_log((f"{YLW}{BLD}Blackjack sizing ON{RST} — 1R,1R,2R,3R,5R loss progression, "
-                          f"2-trade win progression (via [B]){RST}") if BLACKJACK_MODE
-                         else f"{GRN}{BLD}Blackjack sizing OFF — back to flat {PCT:g}% risk (via [B]){RST}")
-            log_event("SYSTEM", "blackjack_mode_toggled", {"enabled": BLACKJACK_MODE})
+            if BLACKJACK_MODE:
+                # 2026-07-26 user request: ask for the 1R dollar value right
+                # here, the moment Blackjack mode turns ON — this becomes
+                # the base risk unit the loss/win progressions multiply
+                # (see BLACKJACK_STEPS/_check_confirmation). Defaults to
+                # whatever was last entered this session, or the flat-mode
+                # balance*PCT/100 amount the very first time, as a
+                # reasonable starting suggestion — not a silent fallback,
+                # the user sees and can overwrite it in the prompt itself.
+                default_1r = BLACKJACK_1R_DOLLARS if BLACKJACK_1R_DOLLARS is not None \
+                    else snap.get("balance", 0.0) * (PCT / 100.0)
+                new_1r = _prompt_number(stdscr, f"Blackjack 1R value in $ (Enter keeps {fmt_num(default_1r)}): ",
+                                         default=default_1r)
+                db.prev = None
+                BLACKJACK_1R_DOLLARS = new_1r
+                console_log(f"{YLW}{BLD}Blackjack sizing ON{RST} — 1R = {fmt_money(BLACKJACK_1R_DOLLARS)}, "
+                              f"1R,1R,2R,3R,5R loss progression, 2-trade win progression (via [B]){RST}")
+            else:
+                console_log(f"{GRN}{BLD}Blackjack sizing OFF — back to flat {PCT:g}% risk (via [B]){RST}")
+            log_event("SYSTEM", "blackjack_mode_toggled", {"enabled": BLACKJACK_MODE, "one_r_dollars": BLACKJACK_1R_DOLLARS})
         elif key in (ord("p"), ord("P")):
-            new_pct = _prompt_number(stdscr, f"New risk %% per trade (current {PCT:g}%, Enter keeps it): ", default=PCT)
+            # 2026-07-26 user request: [P] is now both the value AND the
+            # $/% unit toggle in one prompt — see _prompt_risk_value's own
+            # docstring. Label shows the CURRENT mode's value so the user
+            # knows what a bare Enter keeps.
+            cur_display = f"{PCT:g}%" if RISK_MODE == "pct" else f"${RISK_DOLLARS:,.2f}"
+            new_mode, new_value = _prompt_risk_value(
+                stdscr, f"Risk per trade (current {cur_display} — type e.g. 2.5%% or 50$, Enter keeps it): ",
+                RISK_MODE, PCT if RISK_MODE == "pct" else RISK_DOLLARS)
             db.prev = None
-            if new_pct is not None and new_pct != PCT:
-                console_log(f"{YLW}Risk changed: {PCT:g}% -> {new_pct:g}% (via [P]){RST}")
-                log_event("SYSTEM", "pct_changed", {"old": PCT, "new": new_pct})
-                PCT = new_pct
+            if new_mode != RISK_MODE or new_value != (PCT if RISK_MODE == "pct" else RISK_DOLLARS):
+                old_display = cur_display
+                new_display = f"{new_value:g}%" if new_mode == "pct" else f"${new_value:,.2f}"
+                console_log(f"{YLW}Risk changed: {old_display} -> {new_display} (via [P]){RST}")
+                log_event("SYSTEM", "risk_changed", {"old_mode": RISK_MODE, "old_value": cur_display,
+                                                       "new_mode": new_mode, "new_value": new_display})
+                RISK_MODE = new_mode
+                if new_mode == "pct":
+                    PCT = new_value
+                else:
+                    RISK_DOLLARS = new_value
         elif key in (ord("g"), ord("G")):
             # [G] toggles both directions (2026-07-25, user-reported: "I'm
             # unable to switch back to sim from live" — _go_live was

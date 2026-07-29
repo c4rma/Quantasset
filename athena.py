@@ -272,19 +272,23 @@ ASSET_BY_SYMBOL = {cfg["phemex_symbol"]: name for name, cfg in ASSETS.items()}
 # AskUserQuestion — every branch above is a direct quote/paraphrase of their
 # own worked example, not a guess.
 BLACKJACK_STEPS = [1.0, 1.0, 2.0, 3.0, 5.0]
-BLACKJACK_MODE = False
+BLACKJACK_MODE = False   # placeholder default — overwritten below by
+                          # _load_blackjack_settings() once defined (2026-07-29
+                          # persistence fix); kept here since these names must
+                          # exist before that point in the file.
 # User-supplied dollar value of "1R" for Blackjack sizing — prompted for
 # in-app the moment [B] turns Blackjack mode ON (2026-07-26 user request),
 # rather than silently reusing the flat-mode balance*PCT/100 formula. None
-# until the user has actually turned Blackjack on at least once this
-# session; _check_confirmation falls back to the flat formula if so (should
-# be unreachable in practice — the prompt runs synchronously on toggle-ON
-# before BLACKJACK_MODE can ever read True with this still unset).
+# until the user has actually turned Blackjack on at least once ever (now
+# PERSISTED across restarts — see _load_blackjack_settings — so in
+# practice this is only really None on the very first run ever);
+# _check_confirmation falls back to the flat formula if still unset.
 BLACKJACK_1R_DOLLARS = None
 
 def _default_blackjack_state():
     return {a: {"loss_step": 0, "in_win_progression": False,
-                "win_step_back": None, "win_profit_dollars": None} for a in ASSETS}
+                "win_step_back": None, "win_profit_dollars": None,
+                "reset_day": None} for a in ASSETS}
 
 def _load_blackjack_state():
     try:
@@ -298,14 +302,48 @@ def _load_blackjack_state():
     except Exception:
         return _default_blackjack_state()
 
+def _load_blackjack_settings():
+    """BLACKJACK_MODE/BLACKJACK_1R_DOLLARS persistence — CRITICAL fix,
+    2026-07-29, user-reported (several real trades unexpectedly showed
+    "Flat" in the trades-table SEQUENCE column despite the user's own
+    account that Blackjack mode had been on the whole time): these two
+    globals were NEVER persisted anywhere before this fix — only
+    BLACKJACK_STATE (the per-asset ladder position) was. Every Athena
+    restart silently reset BLACKJACK_MODE back to its module-level
+    default (False) and BLACKJACK_1R_DOLLARS to None, with no warning —
+    any trade entered before the user noticed and pressed [B] again got
+    sized/labeled as a flat-mode trade ("Flat"), and — since
+    _update_blackjack itself no-ops entirely whenever BLACKJACK_MODE
+    reads False at CLOSE time too — silently broke the ladder's own
+    win/loss chain for every trade in between, corrupting the sequence
+    label of trades entered even AFTER the user re-enabled it (the
+    ladder's own position no longer reflected what actually happened).
+    Stored in the SAME blackjack_state.json file under reserved
+    top-level keys ("_mode"/"_one_r_dollars") that can never collide
+    with a real asset name (ASSETS is always "ETH"/"QQQ" — see
+    _load_blackjack_state's own per-asset-key loop, unaffected by these
+    extra keys). Returns (False, None) — matching the original
+    hardcoded defaults — if the file doesn't exist or predates this
+    fix."""
+    try:
+        with open(BLACKJACK_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("_mode", False)), data.get("_one_r_dollars")
+    except Exception:
+        return False, None
+
 def _save_blackjack_state():
     try:
+        payload = dict(BLACKJACK_STATE)
+        payload["_mode"] = BLACKJACK_MODE
+        payload["_one_r_dollars"] = BLACKJACK_1R_DOLLARS
         with open(BLACKJACK_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(BLACKJACK_STATE, f)
+            json.dump(payload, f)
     except Exception:
         pass
 
 BLACKJACK_STATE = _load_blackjack_state()
+BLACKJACK_MODE, BLACKJACK_1R_DOLLARS = _load_blackjack_settings()
 
 def _reset_blackjack_state():
     """CRITICAL bug fixed 2026-07-25, user-reported (QQQ still showing
@@ -392,6 +430,27 @@ def _next_1930_ct_after(dt_ct):
     if candidate <= dt_ct:
         candidate += timedelta(days=1)
     return candidate
+
+def _bj_reset_window_key(asset, dt_ct):
+    """Which daily Blackjack-ladder reset window `dt_ct` (CT) falls into,
+    as a date string — 2026-07-29 user request: "Sequences reset each day
+    (ETH resets at 19:30 CT; QQQ resets at 15:00 CT after open trades are
+    flattened)." A DIFFERENT boundary per asset, and deliberately a
+    DIFFERENT concept from `_trading_day_key`'s own 19:00 CT boundary
+    (that one anchors the Daily Loss Limit's consecutive-loss counter,
+    a distinct rule with its own distinct boundary the user specified
+    separately) — not reused here even though both are "anchor to
+    whichever day's own boundary instant this timestamp falls after"
+    patterns. QQQ's 15:00 CT boundary coincides with the EXISTING EOD
+    flatten trigger (`market_closed`/`_flatten_now("eod")`), so by the
+    time this window key actually changes, any open QQQ position is
+    already being flattened in the same or an immediately following
+    cycle — satisfying "after open trades are flattened" in practice
+    without needing a separate flatten-completion signal."""
+    boundary = (19, 30) if asset == "ETH" else (15, 0)
+    if (dt_ct.hour, dt_ct.minute) < boundary:
+        return str((dt_ct - timedelta(days=1)).date())
+    return str(dt_ct.date())
 
 # A TP leg targeting GEX Flip never sits exactly at the flip level — $3 on
 # the near side (below for a long, above for a short), applied both at
@@ -789,6 +848,19 @@ def _footprint_log_path_for_bar(asset, bar_ts):
     day_dir = os.path.join(FOOTPRINT_DATA_DIR, f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}")
     os.makedirs(day_dir, exist_ok=True)
     cfg = ASSETS[asset]
+    return os.path.join(day_dir, f"footprint_{cfg['footprint_symbol']}_{FOOTPRINT_INTERVAL_LABEL}_{cfg['tick']}.jsonl")
+
+def _footprint_log_path_for_day(asset, dt):
+    """Read-only sibling of _footprint_log_path_for_bar: same day-folder/
+    filename convention, computed from a plain datetime instead of a bar
+    timestamp, WITHOUT the os.makedirs side effect — appropriate for a
+    write path (a bar is about to be persisted there) but not for a
+    lookup that may run many times against dates that never had any data
+    at all (see _trade_worst_adverse_dollars, added 2026-07-29 to replace
+    its old full-tree footprint_log_paths glob with just the day(s) a
+    single trade's own entry->exit window could span)."""
+    cfg = ASSETS[asset]
+    day_dir = os.path.join(FOOTPRINT_DATA_DIR, f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}")
     return os.path.join(day_dir, f"footprint_{cfg['footprint_symbol']}_{FOOTPRINT_INTERVAL_LABEL}_{cfg['tick']}.jsonl")
 
 def _persist_closed_footprint_bar(asset, bar):
@@ -5044,6 +5116,13 @@ class AthenaInstrument:
                                                                      "tp_legs": tp_legs, "sl_missing": self._sl_missing})
 
     async def process_cycle(self, snapshot):
+        # 2026-07-29 user request: the Blackjack ladder resets to 1R once
+        # per day (ETH at 19:30 CT, QQQ at 15:00 CT) — checked every cycle,
+        # for every state, unconditionally (regardless of BLACKJACK_MODE,
+        # market-closed, or anything else below), so the ladder is always
+        # correct whenever the user next needs it.
+        self._check_bj_daily_reset()
+
         lights5, regime, price, targets_full, market_closed = instrument_lights(snapshot, self.asset)
         self.lights.update(lights5)
         self.regime = regime
@@ -5220,6 +5299,36 @@ class AthenaInstrument:
             status_txt = f"now at {BLACKJACK_STEPS[bj['loss_step']]:g}R"
         console_log(f"{self.asset}: {YLW}Blackjack — {status_txt} (trade pnl {fmt_money(pnl)}){RST}")
         log_event(self.asset, "blackjack_progression_updated", {"pnl": pnl, "state": dict(bj)})
+
+    def _check_bj_daily_reset(self):
+        """2026-07-29 user request: "Sequences reset each day (ETH resets
+        at 19:30 CT; QQQ resets at 15:00 CT after open trades are
+        flattened)." Called every cycle, for every state, regardless of
+        BLACKJACK_MODE (the ladder's own position must be correct whenever
+        the user next enables it, even if it's off right now). Compares
+        this asset's own `_bj_reset_window_key` against the last-recorded
+        one; resets the loss/win progression back to defaults the moment
+        it changes. The very first check ever (reset_day still None, e.g.
+        a brand new blackjack_state.json) seeds the key WITHOUT logging a
+        "reset" — there's nothing meaningful to reset from yet, and
+        loss_step is already 0 by construction."""
+        if not TZ_CT:
+            return
+        now = datetime.now(TZ_CT)
+        key = _bj_reset_window_key(self.asset, now)
+        bj = BLACKJACK_STATE[self.asset]
+        if bj.get("reset_day") == key:
+            return
+        first_ever = bj.get("reset_day") is None
+        bj["loss_step"] = 0
+        bj["in_win_progression"] = False
+        bj["win_step_back"] = None
+        bj["win_profit_dollars"] = None
+        bj["reset_day"] = key
+        _save_blackjack_state()
+        if not first_ever:
+            console_log(f"{self.asset}: {YLW}Blackjack progression reset to 1R (new trading day){RST}")
+            log_event(self.asset, "blackjack_daily_reset", {"reset_day": key})
 
     def _update_daily_loss_limit(self, pnl):
         """Daily Loss Limit tracking (explicit user request, 2026-07-25) —
@@ -6436,18 +6545,39 @@ def _trade_worst_adverse_dollars(asset, pos_side, entry_price, entry_qty, exits,
     figure can never show a nonzero DD for a winner in the first place).
 
     Real intra-trade price path IS actually available in this app — the
-    persisted 90s footprint bars (`footprint_log_paths`, the same OHLC
-    history the confirmation logic and chart both already read) — this
-    scans every bar between the trade's own entry and exit timestamps
-    and returns the worst dollar-adverse point actually reached, using
-    the position size that was ACTUALLY open at each bar's own time (a
-    TP1 partial fill reduces the size a later dip would be scaled
-    against — using the ORIGINAL full qty throughout would overstate DD
-    for the remainder-only portion of the trade's life). Returns None
-    (not 0) if no bars are found in the window at all (predates
-    footprint persistence, or the window is narrower than one 90s bar) —
-    the caller falls back to the coarser isolated-net-based figure in
-    that case, rather than silently claiming a confident $0.00."""
+    persisted 90s footprint bars, the same OHLC history the confirmation
+    logic and chart both already read — this scans every bar between the
+    trade's own entry and exit timestamps and returns the worst dollar-
+    adverse point actually reached, using the position size that was
+    ACTUALLY open at each bar's own time (a TP1 partial fill reduces the
+    size a later dip would be scaled against — using the ORIGINAL full
+    qty throughout would overstate DD for the remainder-only portion of
+    the trade's life). Returns None (not 0) if no bars are found in the
+    window at all (predates footprint persistence, or the window is
+    narrower than one 90s bar) — the caller falls back to the coarser
+    isolated-net-based figure in that case, rather than silently claiming
+    a confident $0.00.
+
+    CRITICAL performance bug fixed 2026-07-29, user-reported ("long delay
+    when loading the Data page... scrolling is very laggy in the trading
+    log"): this used to call `footprint_log_paths(asset)`, which globs
+    and fully re-reads EVERY footprint bar file EVER WRITTEN — for EVERY
+    trade — and `scan_all_trades_detailed` (the caller) itself gets
+    re-run from scratch every 2s while the Data view is open (see
+    curses_main's own `trades_cache`), regardless of whether the user is
+    just scrolling. With months of real 90s-bar history across many day-
+    folders and dozens of trades, that's the entire footprint archive
+    re-globbed and re-parsed dozens of times, every 2 seconds — the exact
+    cause of the reported lag. Fixed: only the day-folder(s) this trade's
+    OWN entry->exit window could actually span (almost always exactly
+    one, occasionally two if it crosses local midnight — never the whole
+    history) are read, via the same Y/M/D/filename convention
+    `_footprint_log_path_for_bar` uses for writing, but through a
+    dedicated READ-ONLY path helper (`_footprint_log_path_for_day`) that
+    never creates a directory as a side effect — appropriate for a write
+    path, not for a lookup that runs many times a second across
+    potentially many long-past historical dates that never had any data
+    at all."""
     try:
         entry_epoch = datetime.fromisoformat(entry_ts_str).timestamp()
         exit_epoch = datetime.fromisoformat(exit_ts_str).timestamp()
@@ -6472,8 +6602,19 @@ def _trade_worst_adverse_dollars(asset, pos_side, entry_price, entry_qty, exits,
                 break
         return max(0.0, remaining)
 
+    paths = []
+    seen_days = set()
+    day = datetime.fromtimestamp(entry_epoch)
+    end_day = datetime.fromtimestamp(exit_epoch)
+    while (day.year, day.month, day.day) <= (end_day.year, end_day.month, end_day.day):
+        key = (day.year, day.month, day.day)
+        if key not in seen_days:
+            seen_days.add(key)
+            paths.append(_footprint_log_path_for_day(asset, day))
+        day += timedelta(days=1)
+
     worst_dollars = None
-    for path in footprint_log_paths(asset):
+    for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -9654,6 +9795,13 @@ def curses_main(stdscr):
             else:
                 console_log(f"{GRN}{BLD}Blackjack sizing OFF — back to flat {PCT:g}% risk (via [B]){RST}")
             log_event("SYSTEM", "blackjack_mode_toggled", {"enabled": BLACKJACK_MODE, "one_r_dollars": BLACKJACK_1R_DOLLARS})
+            # 2026-07-29 CRITICAL fix, user-reported (several real trades
+            # unexpectedly showed "Flat" despite the user's own account that
+            # Blackjack mode had been on the whole time): BLACKJACK_MODE/
+            # BLACKJACK_1R_DOLLARS were never persisted before — a restart
+            # silently reverted to flat sizing with no warning. Persist the
+            # toggle immediately, same file BLACKJACK_STATE already uses.
+            _save_blackjack_state()
         elif key == ord("1"):
             # 2026-07-27 user request: reset Blackjack's own loss/win
             # progression back to 1R at any time, independent of a full

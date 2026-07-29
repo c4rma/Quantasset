@@ -5711,6 +5711,14 @@ class AthenaInstrument:
 
         candidates = [(_tp_level(t), t) for t in targets]
         valid = [(lvl, t) for lvl, t in candidates if _valid_tp(lvl)]
+        # 2026-07-29 user-reported bug: TP1 must always be the NEARER
+        # target and TP2 the FARTHER one, so TP1 is reachable first as
+        # price moves in the trade's favor — targets/targets_full are
+        # ordered by tier/priority, not by distance from the actual fill,
+        # so a lower-priority-but-closer target could otherwise land in
+        # the TP2 slot while a higher-priority-but-farther one took TP1,
+        # meaning TP2 would fill before TP1 ever could.
+        valid.sort(key=lambda lt: abs(lt[0] - fill_price))
         dropped = [t for lvl, t in candidates if not _valid_tp(lvl)]
         if dropped:
             console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
@@ -5974,6 +5982,21 @@ class AthenaInstrument:
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
             net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
+            # 2026-07-29 user clarification (correcting an earlier, wrong
+            # reading of this same rule): "a PCVR flip closes the trade,
+            # but the loss/win progression rules still apply based on the
+            # Net PnL of the trade (win progression begins if positive Net
+            # PnL / move up one step in the loss progression if negative
+            # Net PnL)." So a flip is just the CLOSE REASON — it does not
+            # skip or independently reset the ladder; _update_blackjack
+            # runs here exactly like every other close reason, driven by
+            # this trade's own net pnl. The only PCVR-flip-specific
+            # behavior is the Daily Loss Limit reactivation described in
+            # the user's original message, and that needs no separate
+            # handling: _update_daily_loss_limit already forces the ladder
+            # to 1R the MOMENT the limit is hit (not when it's later
+            # cleared), so by the time a flip ever reactivates a blocked
+            # asset the ladder is already sitting at 1R.
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
             self.position = None
@@ -6775,68 +6798,34 @@ def scan_all_trades_detailed():
             "sequence": t.get("sequence_label") or "—",
         })
 
-    # CRITICAL bug fixed 2026-07-25, user-reported ("trade closed in sim
-    # but did not show up in the trade log"): a position with AT LEAST ONE
-    # realized exit but not yet FULLY closed (e.g. TP1 filled, TP2 still
-    # resting) stayed in `open_trades` forever and never appeared here —
-    # even though its realized PnL from the TP1 leg already counts in the
-    # equity-curve stats above (scan_all_trade_events counts each 'closed'
-    # event independently, regardless of whether the rest of the position
-    # has closed). The table is titled "All Trades", not "All CLOSED
-    # Trades", so a trade with real, already-locked-in profit showing "no
-    # closed trades yet" read as data loss, not as "still in progress."
-    # Surfaced here as its own row, `reason` prefixed "OPEN" so it still
-    # reads as unfinished — net_pnl/fees reflect ONLY what's actually
-    # realized so far (the entry fee on the full original qty, already
-    # paid at fill time, plus whatever exit legs have landed), not the
-    # still-open remainder's unrealized PnL — this table has no live
-    # price feed to mark that against, same caveat `recent_closed_trades`
-    # already documents for real mode elsewhere. A position with ZERO
-    # exits yet (nothing realized) still isn't shown — the dashboard's
-    # own Position/Pending line already covers a bare, untouched open
-    # position; this table's job is trade HISTORY, not a live duplicate.
-    for t in open_trades.values():
-        exits = t["exits"]
-        if not exits:
-            continue
-        entry_qty, entry_price = t["qty"], t["entry_price"]
-        entry_fee = entry_qty * entry_price * PHEMEX_FEE_RATE
-        exit_qty_total = sum(x["qty"] for x in exits)
-        exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
-        gross_pnl = sum(x["pnl"] for x in exits)
-        exit_fees = sum(x["qty"] * x["price"] * PHEMEX_FEE_RATE for x in exits)
-        total_fees = entry_fee + exit_fees
-        net_pnl = gross_pnl - total_fees
-        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
-        sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
-        r_dollars = entry_qty * sl_distance
-        rr = (net_pnl / r_dollars) if r_dollars else None
-        reasons = ["OPEN"]
-        for x in exits:
-            r = (x.get("reason") or "close").upper()
-            if r not in reasons:
-                reasons.append(r)
-        tp_exits = [x for x in exits if x.get("reason") == "tp"]
-        planned_tp_legs = t.get("planned_tp_legs") or []
-        worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
-                                                      exits, t["entry_ts"], exits[-1]["ts"])
-        dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
-        balance_after = exits[-1].get("balance")
-        balance_before = (balance_after - net_pnl) if balance_after is not None else None
-        dd_pct = (dd / balance_before * 100.0) if balance_before else None
-        out.append({
-            "symbol": t["symbol"], "asset": asset or t["symbol"],
-            "pos_side": t["pos_side"], "qty": entry_qty,
-            "entry_ts": t["entry_ts"], "entry_price": entry_price,
-            "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
-            "reason": "+".join(reasons),
-            "tp1": _tp_slot(planned_tp_legs, tp_exits, 0),
-            "tp2": _tp_slot(planned_tp_legs, tp_exits, 1),
-            "r_dollars": r_dollars, "fees": total_fees,
-            "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
-            "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
-            "sequence": t.get("sequence_label") or "—",
-        })
+    # 2026-07-25 (now REVERTED 2026-07-29, see below): a partial-fill
+    # trade (e.g. TP1 filled, TP2 still resting) used to be surfaced as
+    # its own "OPEN"-tagged row here, before the position was actually
+    # fully closed.
+    #
+    # 2026-07-29 explicit user instruction, reversing that: "For a trade
+    # to be considered 'closed', all of its relevant orders must be
+    # closed (all TPs and/or SL). In the trading log, only input the
+    # trade data once all of its relevant orders are closed... This is
+    # also the point at which the next win/loss progression sequence
+    # decision is made." A still-partially-open trade's net pnl/DD/R:R
+    # aren't final (the still-open remainder can still move for or
+    # against it before its own exit fires), so surfacing it as a row
+    # read as premature, not-yet-real trade data — removed. This also
+    # restores this function's own original documented scope from its
+    # top-level docstring ("A trade still open at the end of the log...
+    # is dropped — this table is CLOSED trades only"), which the OPEN-row
+    # addition had quietly broken for partially-open trades specifically.
+    # The win/loss progression decision itself was NEVER driven from this
+    # table — `_update_blackjack` is only ever called once the exchange/
+    # sim position is confirmed fully flat (`_manage_position`'s own
+    # "position flat" branch, the PCVR-flip-close branch, and
+    # `_flatten_now` — all three check the ACTUAL remaining position
+    # size, not this reporting table), so that half of the user's
+    # instruction was already correctly in place and needed no change.
+    # A bare, untouched open position (no exits realized yet) was never
+    # shown here either way — the dashboard's own Position/Pending line
+    # covers that; this table's job is closed trade HISTORY only.
 
     out.sort(key=lambda t: t["exit_ts"] or "")
     return out
@@ -7056,7 +7045,7 @@ def _fmt_duration(entry_ts, exit_ts):
 # _draw_trades_table's own hscroll param) rather than truncation alone to
 # reach the columns this pushed further right.
 TRADES_TABLE_COLS = [
-    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 10),
+    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 20),
     ("GROSS", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
     ("REASON", 10), ("FEES", 7), ("NET PNL", 10), ("BALANCE", 11), ("DD", 10),
     ("R$", 7), ("TP1", 9), ("TP1 TYPE", 9), ("TP2", 9), ("TP2 TYPE", 9), ("DUR", 7),
@@ -7169,8 +7158,20 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
     y += 1
     dd_pct_txt = f" ({stats['max_drawdown_pct']:.1f}%)" if stats.get("max_drawdown_pct") is not None else ""
     sharpe_txt = f"{stats['sharpe']:.2f}" if stats.get("sharpe") is not None else "n/a"
+    # Avg R:R (2026-07-29, user request) — "rr" only exists on the
+    # detailed sim trades list (scan_all_trades_detailed reconstructs it
+    # from entry/exit price vs. this asset's own SL distance), NOT the
+    # generic {ts,pnl} events compute_trade_stats works from — real mode's
+    # own `trades` is always [] (see _draw_trades_table's own DRY_RUN-only
+    # gate), so this naturally shows "n/a" there rather than a fabricated
+    # number. Follow-up user request, same day: "should only be calculated
+    # from profitable trades. Disregard losses" — a losing trade's rr is
+    # always <= 0 (net_pnl/r_dollars, same sign as net_pnl), so excluded
+    # by requiring rr > 0, not just non-None.
+    rr_vals = [t["rr"] for t in trades if t.get("rr") is not None and t["rr"] > 0]
+    avg_rr_txt = f"{sum(rr_vals) / len(rr_vals):.2f}" if rr_vals else "n/a"
     db.puts_ansi(y, 0, f"{BLD}Risk{RST}      Max Drawdown {RED}{fmt_money(-stats['max_drawdown'])}{dd_pct_txt}{RST}   "
-                       f"Sharpe {sharpe_txt}")
+                       f"Sharpe {sharpe_txt}   Avg R:R {avg_rr_txt}")
     y += 2
 
     remaining_top, remaining_bottom = y, rows - 2

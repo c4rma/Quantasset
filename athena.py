@@ -243,8 +243,14 @@ VALUE_AREA_FRACTION = 0.70
 # (SimAccount.to_account_snapshot's totalUsedBalanceRv — real Phemex
 # margin usage per the account's configured leverage per symbol).
 ASSETS = {
+    # SL distances are user-adjustable live via [W] (curses_main) — mutates
+    # these dicts in place (self.cfg = ASSETS[asset] is a live reference,
+    # not a copy — see the [W] handler's own docstring), so every existing
+    # self.cfg["sl"] read site picks up a change with no further plumbing.
+    # Defaults confirmed explicitly by the user 2026-07-28 (QQQ raised from
+    # its earlier 0.75 to 1.00).
     "ETH": {"phemex_symbol": "ETHUSDT", "footprint_symbol": "ETH", "sl": 10.00, "snap_key": "eth", "leverage": 100, "tick": 0.10},
-    "QQQ": {"phemex_symbol": "QQQUSDT", "footprint_symbol": "QQQ", "sl": 0.75,  "snap_key": "qqq", "leverage": 10,  "tick": 0.05},
+    "QQQ": {"phemex_symbol": "QQQUSDT", "footprint_symbol": "QQQ", "sl": 1.00,  "snap_key": "qqq", "leverage": 10,  "tick": 0.05},
 }
 LEVERAGE_BY_SYMBOL = {cfg["phemex_symbol"]: cfg["leverage"] for cfg in ASSETS.values()}
 ASSET_BY_SYMBOL = {cfg["phemex_symbol"]: name for name, cfg in ASSETS.items()}
@@ -330,7 +336,8 @@ DAILY_LOSS_STATE_PATH = os.path.join(SCRIPT_DIR, "daily_loss_state.json")
 DAILY_LOSS_LIMIT = 5
 
 def _default_daily_loss_state():
-    return {a: {"consecutive_losses": 0, "blocked": False, "blocked_regime": None, "blocked_at": None} for a in ASSETS}
+    return {a: {"consecutive_losses": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
+                "loss_streak_day": None} for a in ASSETS}
 
 def _load_daily_loss_state():
     try:
@@ -361,6 +368,20 @@ def _reset_daily_loss_state():
     global DAILY_LOSS_STATE
     DAILY_LOSS_STATE = _default_daily_loss_state()
     _save_daily_loss_state()
+
+def _trading_day_key(dt_ct):
+    """Which 'trading day' (19:00 CT to 19:00 CT the next day — the same
+    session-boundary convention status_session_open_ts uses) dt_ct falls
+    into, as a date string. 2026-07-28 user request: the Daily Loss
+    Limit's own consecutive-loss counter must not let a streak spanning
+    across this boundary combine into one trigger — 3 losses late one
+    evening plus 2 more the next trading day is NOT '5 consecutive losses
+    in the same day,' even with no intervening win to naturally break the
+    streak. Anchored to whichever calendar date each trading day's own
+    19:00 CT open falls on, exactly like status_session_open_ts."""
+    if dt_ct.hour < 19:
+        return str((dt_ct - timedelta(days=1)).date())
+    return str(dt_ct.date())
 
 def _next_1930_ct_after(dt_ct):
     """The next 19:30 CT instant strictly after dt_ct (a tz-aware CT
@@ -1909,6 +1930,30 @@ def status_dvol_layers(dvol):
     else:
         return "25% base unit", "1R cap"
 
+def dvol_layer_values(dvol):
+    """Numeric (base_unit_pct, r_cap) pair — the SAME fixed lookup table
+    status_dvol_layers uses for its display strings ("Full/75%/50%/25%
+    base unit", "5R/3R/2R/1R cap"), but as actual numbers sizing code can
+    use directly (2026-07-28 user request: "ensure that Layer 1 & Layer 2
+    rules are applied to the risk sizing" — these were computed every
+    cycle and displayed on the dashboard/Status screen since this session
+    began, but never actually fed into a single sizing decision; kept as
+    a SEPARATE function from status_dvol_layers rather than parsing its
+    display strings back into numbers, which would be fragile). Returns
+    (1.0, None) — no scaling, no cap — when dvol is unavailable, rather
+    than blocking every entry just because DVOL happened to be
+    momentarily unfetchable this cycle."""
+    if dvol is None:
+        return 1.0, None
+    if dvol <= 60.00:
+        return 1.00, 5.0
+    elif dvol <= 75.00:
+        return 0.75, 3.0
+    elif dvol <= 90.00:
+        return 0.50, 2.0
+    else:
+        return 0.25, 1.0
+
 STATUS_DERIBIT_BASE = "https://www.deribit.com/api/v2"
 
 def _status_deribit_api(path, **params):
@@ -2091,20 +2136,58 @@ def fetch_status_pcvr():
 
 STATUS_BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}
 STATUS_BT_ST_MAX_STRIKES_FROM_ATM = 10
-STATUS_BT_ST_RUN_LEN = {"crypto": 3, "equity": 5}
+# 2026-07-27 user-requested change, DELIBERATE divergence from status.py's
+# own original (crypto: 3) — confirmed byte-for-byte identical to
+# status.py's own compute_bt_st before this change (verified against a
+# real live Deribit chain), so a 3-strike run was never a porting bug; the
+# spec itself just let a near-ATM, none-too-meaningful 3-run qualify as
+# BT/ST, since ATM strikes often show a slight volume lean from both
+# sides just from normal ATM activity. A 5-strike run requires a much
+# more durable, decisive dominance shift before it counts — the user's
+# own worked example (a run of well over 5 consecutive put-dominant
+# strikes below $1,880) confirmed this wouldn't break a genuine case.
+STATUS_BT_ST_RUN_LEN = {"crypto": 5, "equity": 5}
 
-def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
-    """Ported verbatim from status.py's own compute_bt_st — see its own
-    docstring there for the full spec. Scans outward from the strike
-    nearest spot for the first consecutive-strike run where one side's
-    option volume dominates; returns (bt, st, active)."""
+def compute_bt_st(strikes, is_crypto, spot):
+    """Scans outward from the strike nearest spot for the first
+    consecutive-strike run where one side's option volume dominates;
+    returns (bt, st, active).
+
+    CRITICAL fix, 2026-07-28, user-reported (BT/ST badly wrong for BOTH
+    ETH and QQQ — off by dozens of dollars/strikes from the real,
+    hand-verified boundary). This function used to take a `pcvr_gt1`
+    param (forwarded from the macro/TLT-based PCVR ratio, `ratio >
+    1.00`) that decided which side's dominance-run to scan for. That
+    formula was degenerate — it's mathematically FIXED at False whenever
+    the caller's own `ratio < 0.98` branch runs it, and FIXED at True
+    whenever `ratio > 1.02` runs it, so it never actually varied with the
+    real option chain at all.
+
+    Verified against two REAL live chains the same day (ETH and QQQ):
+    spot always sits INSIDE whichever zone (call- or put-dominant) is on
+    its own local side already — scanning for that SAME dominance type
+    just finds "the 5-strike window straddling ATM itself," a
+    near-meaningless answer since spot isn't at any real edge there (live
+    QQQ example: gave BT/ST = 678/677, both essentially spot itself,
+    spot=$678.06). Scanning for the OPPOSITE dominance type from
+    wherever spot currently sits correctly finds the real nearby
+    boundary (the SAME live QQQ chain: BT/ST = 674/673, the actual
+    observed put-to-call flip point, confirmed by hand from the chain's
+    own real per-strike volumes).
+
+    Fixed: `want_put` is now derived from the STRIKE NEAREST SPOT's own
+    local call/put volume split, not from the macro PCVR ratio — if that
+    strike is itself call-dominant (or tied), scan for the nearest
+    PUT-dominant run (the boundary below); if it's put-dominant, scan
+    for the nearest CALL-dominant run (the boundary above). Callers no
+    longer pass anything about PCVR — this function derives its own
+    answer purely from the chain's own per-strike volumes and where spot
+    sits among them."""
     band_pct = STATUS_BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
     run_len = STATUS_BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
     lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
     sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
     n = len(sorted_strikes)
-    if n < run_len:
-        return None, None, ("BT" if pcvr_gt1 else "ST")
 
     def vols(k):
         legs = strikes.get(k, {})
@@ -2117,7 +2200,18 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
             pv = float(put.get("volume") or 0) if put else 0.0
         return cv, pv
 
-    def run_ok(start, want_put):
+    if n == 0:
+        return None, None, "ST"
+
+    atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
+    atm_cv, atm_pv = vols(sorted_strikes[atm_idx])
+    want_put = atm_cv >= atm_pv   # scan for the OPPOSITE of spot's own local dominance
+    fallback_active = "BT" if want_put else "ST"
+
+    if n < run_len:
+        return None, None, fallback_active
+
+    def run_ok(start):
         for idx in range(start, start + run_len):
             cv, pv = vols(sorted_strikes[idx])
             if want_put and not (pv > cv):
@@ -2126,10 +2220,9 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
                 return False
         return True
 
-    atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
     max_start = n - run_len
     if max_start < 0:
-        return None, None, ("BT" if pcvr_gt1 else "ST")
+        return None, None, fallback_active
 
     lo_start = max(0, atm_idx - STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
     hi_start = min(max_start, atm_idx + STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
@@ -2146,9 +2239,8 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
         candidates.append((dist, s, near_idx))
     candidates.sort(key=lambda c: c[0])
 
-    want_put = bool(pcvr_gt1)
     for _dist, s, near_idx in candidates:
-        if run_ok(s, want_put):
+        if run_ok(s):
             anchor = sorted_strikes[near_idx]
             if want_put:
                 st = anchor
@@ -2159,7 +2251,7 @@ def compute_bt_st(strikes, is_crypto, pcvr_gt1, spot):
                 st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
                 return bt, st, "ST"
 
-    return None, None, ("BT" if pcvr_gt1 else "ST")
+    return None, None, fallback_active
 
 STATUS_PHEMEX_KLINE_LIST_URL = "https://api.phemex.com/exchange/public/md/v2/kline/list"
 
@@ -2553,14 +2645,66 @@ def _ch_bootstrap(asset):
     except Exception:
         pass
 
+CH_WATCHDOG_STALE_SECS = 90   # see _ch_engine_eth's own watchdog comment —
+                               # 1.5x the 60s candle interval (enough slack
+                               # for normal per-message jitter), well under
+                               # CH_CANDLE_STALE_SECS(180) so the reconnect
+                               # kicks in BEFORE the export loop even starts
+                               # suppressing stale publishes.
+CH_HEARTBEAT_INTERVAL_SECS = 20   # how often _ch_engine_eth's heartbeat
+                                    # thread sends server.ping AND checks the
+                                    # watchdog above — a named constant (not
+                                    # just inlined at the stop_evt.wait() call)
+                                    # so tests can shrink it for speed without
+                                    # waiting out a real 20s poll cycle.
+
 def _ch_engine_eth(stop_evt):
     """Port of charthacker.py's ws_phemex (charthacker.py:888-1067) — public
     kline_p feed, no auth required. See _ch_apply_resampled's docstring for
-    why _Resampler isn't ported: raw kline rows are applied directly."""
+    why _Resampler isn't ported: raw kline rows are applied directly.
+
+    CRITICAL bug fixed 2026-07-28/29, user-reported with screenshots
+    (Athena showing HPLs as INACTIVE — 0.5sd band $13-16 away from live
+    price — while charthacker.py's own live chart clearly showed price
+    well inside its 0.5sd band, no trade taken despite a real order-flow
+    reversal): traced by reading the user's OWN real, currently-running
+    status_logs snapshot log directly — VAH/VAL/POC/VWAP were BYTE-FOR-
+    BYTE IDENTICAL across a 14+ MINUTE window while live price moved
+    $4-8 around, and an independently-recomputed session VWAP (via the
+    REST fallback path, fetching real session candles fresh) gave a
+    value ~$14 different from what Athena's own CH export was reporting.
+    Root cause: this WS connection can go "zombie" — TCP-level still
+    connected (so `run_forever()` never returns to trigger the outer
+    reconnect loop) but silently stops delivering NEW kline_p messages
+    entirely, while the app-level `server.ping`/`pong` heartbeat keeps
+    the low-level socket looking healthy. `ch_state.candles` then never
+    gains new entries (VAH/VAL/POC/VWAP, computed over the FULL session
+    candle history, stay frozen), while `_ch_export_loop`'s own
+    CH_CANDLE_STALE_SECS(180) gate — which only checks candle-timestamp
+    staleness, not whether the FEED ITSELF is still alive — never caught
+    this specific failure mode, since it does nothing to actually recover
+    the connection even once triggered (it only stops publishing, it
+    doesn't reconnect). This exact CLASS of bug (silently-stalled feed,
+    connection nominally alive) was already flagged as a known risk in
+    the 2026-07-26 on_message hardening comment below — that hardening
+    only covered an EXCEPTION inside on_message, not the feed simply
+    going quiet with no exception at all.
+    Fixed: an explicit watchdog, piggybacked on the existing heartbeat
+    thread — tracks the last time a kline message was actually
+    processed; if that exceeds CH_WATCHDOG_STALE_SECS, force-closes the
+    current WebSocket so the outer reconnect loop (which already existed
+    and works fine once actually triggered) re-establishes a fresh
+    connection, rather than passively trusting the low-level ping/pong
+    mechanism to ever notice."""
     ch_state = CH_STATE["ETH"]
     symbol = ASSETS["ETH"]["phemex_symbol"]
+    _last_kline_at = [time.time()]
 
     def on_open(ws):
+        _last_kline_at[0] = time.time()   # reset on every (re)connect — don't
+                                            # immediately trip the watchdog
+                                            # before the new connection has had
+                                            # a chance to deliver anything yet
         ws.send(json.dumps({"id": 1, "method": "kline_p.subscribe", "params": [symbol, 60]}))
 
     def on_message(ws, message):
@@ -2600,6 +2744,7 @@ def _ch_engine_eth(stop_evt):
                     continue
             if ch_state.candles:
                 ch_state.last_price = ch_state.candles[-1].c
+        _last_kline_at[0] = time.time()
 
     def on_error(ws, err):
         pass
@@ -2610,13 +2755,30 @@ def _ch_engine_eth(stop_evt):
     _ping_ws = [None]
 
     def _heartbeat():
-        while not stop_evt.wait(timeout=20):
+        while not stop_evt.wait(timeout=CH_HEARTBEAT_INTERVAL_SECS):
             ws = _ping_ws[0]
             if ws:
                 try:
                     ws.send(json.dumps({"id": 0, "method": "server.ping", "params": []}))
                 except Exception:
                     pass
+                # Watchdog (see _ch_engine_eth's own docstring for the full
+                # 2026-07-28/29 bug this fixes): the low-level WS ping/pong
+                # above can keep succeeding even once Phemex's kline_p feed
+                # has silently stopped delivering new data — force a
+                # reconnect if it's been too long since the last kline was
+                # actually processed, rather than trusting run_forever()'s
+                # own dead-connection detection to ever notice this
+                # specific failure mode.
+                if time.time() - _last_kline_at[0] > CH_WATCHDOG_STALE_SECS:
+                    console_log(f"ETH: {YLW}CH engine — no new kline in "
+                                f"{CH_WATCHDOG_STALE_SECS}s, forcing WS reconnect{RST}")
+                    _last_kline_at[0] = time.time()   # avoid re-triggering every 20s
+                                                        # while the reconnect is in flight
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
 
     threading.Thread(target=_heartbeat, daemon=True).start()
 
@@ -2840,7 +3002,7 @@ HPL_CATEGORIES = (
     ("Miscellaneous", ("Prev EOD Close",)),
 )
 
-def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamma_tol, pcvr_gt1, is_crypto,
+def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamma_tol, is_crypto,
                    export=None, gamma_yellow_tol=None, gex_export=None, ratio=None):
     """Ported from status.py's own evaluate_hpls. If `export` is given (a
     fresh status_<ASSET>.json — Phase 3b's not-yet-built charthacker WS
@@ -2850,7 +3012,12 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     ALWAYS used for Gamma Clusters here — see this section's own
     module-level comment for why status.py's live-options-chain fallback
     for clusters isn't reachable/ported. BT/ST/PCVR always come from
-    Athena's own options-chain fetches regardless, same as status.py."""
+    Athena's own options-chain fetches regardless, same as status.py.
+
+    2026-07-28: no longer takes a `pcvr_gt1` param — see compute_bt_st's
+    own docstring for why that macro-PCVR-driven value never actually
+    affected which side BT/ST scanned for correctly; compute_bt_st now
+    derives it directly from the chain's own per-strike volumes."""
     rows = []
 
     def near(level):
@@ -2961,7 +3128,7 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         rows.append(("ER 100%", "n/a", False))
         rows.append(("ER 150%", "n/a", False))
 
-    bt, st, active = compute_bt_st(chain["strikes"], is_crypto, pcvr_gt1, price)
+    bt, st, active = compute_bt_st(chain["strikes"], is_crypto, price)
     bt_green = active == "BT" and bt is not None and price >= bt
     st_green = active == "ST" and st is not None and price <= st
     rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}{dist_tag(bt)}" if bt is not None else "n/a", bt_green))
@@ -3030,7 +3197,6 @@ def compute_dashboard_snapshot(data):
 
     pcvr = data.get("pcvr")
     snap["pcvr"] = pcvr
-    pcvr_gt1 = bool(pcvr and pcvr["ratio"] > 1.00)
     pcvr_extreme = bool(pcvr) and (pcvr["ratio"] <= 0.98 or pcvr["ratio"] >= 1.02)
 
     instruments = {}
@@ -3050,7 +3216,7 @@ def compute_dashboard_snapshot(data):
 
         export = read_status_charthacker_export(inst_name)
         gex_export = read_gex_export(inst_name)
-        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
+        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
                               export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
                               ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and status_qqq_market_closed()
@@ -3076,13 +3242,13 @@ def compute_dashboard_snapshot(data):
         targets = []
         if ratio is not None and not closed:
             if ratio < 0.98:
-                bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
                 if bt is not None:
                     targets.append({"type": "BT", "level": bt, "tier": None})
                 above, _below = status_gamma_cluster_targets_directional(gex_export, price)
                 targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in above]
             elif ratio > 1.02:
-                _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+                _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
                 if st is not None:
                     targets.append({"type": "ST", "level": st, "tier": None})
                 _above, below = status_gamma_cluster_targets_directional(gex_export, price)
@@ -3172,8 +3338,6 @@ def _status_build_render_lines(display_data):
         p(f"     {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")
     p()
 
-    pcvr_gt1 = bool(pcvr and pcvr["ratio"] > 1.00)
-
     p(f"  {BLD}4. High-Probability Levels{RST}")
     active_status = {}
     for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
@@ -3200,7 +3364,7 @@ def _status_build_render_lines(display_data):
             active_status[inst_name] = False
             continue
         p(f"        {STATUS_LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
-        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, pcvr_gt1, is_crypto,
+        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
                               export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
                               ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and status_qqq_market_closed()
@@ -3268,7 +3432,7 @@ def _status_build_render_lines(display_data):
         # price, not the already-color-coded display string.
         targets = []
         if ratio < 0.98:
-            bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
             if bt is not None:
                 targets.append((bt, f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})"))
             if gex_flip is not None:
@@ -3276,7 +3440,7 @@ def _status_build_render_lines(display_data):
             above, _below = status_gamma_cluster_targets_directional(gex_export, price)
             targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in above]
         elif ratio > 1.02:
-            _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, ratio > 1.00, price)
+            _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
             if st is not None:
                 targets.append((st, f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})"))
             if gex_flip is not None:
@@ -3287,6 +3451,8 @@ def _status_build_render_lines(display_data):
         targets = [s for _, s in targets]
         has_targets[inst_name] = bool(targets)
         if targets:
+            # 2 targets per line (2026-07-28 user request, reverting the
+            # brief 1-per-line change made to fix a truncation bug).
             for i in range(0, len(targets), 2):
                 chunk = targets[i:i + 2]
                 label = f"{DIM}{inst_name:<6}{RST}" if i == 0 else " " * 6
@@ -3412,6 +3578,38 @@ def _status_full_refresh_loop(stop_evt):
             raw = status_run_cycle()
             data = status_assemble(raw)
             with _status_last_full_lock:
+                prev = _status_last_full_data
+                if prev:
+                    # 2026-07-28 CRITICAL fix, user-reported ("several
+                    # instances where all of ETH's HPLs and data disappear
+                    # in Status and show everything as 'unavailable' even
+                    # though charthacker.py always runs perfectly fine"):
+                    # status_run_cycle() catches each sub-fetch's own
+                    # exception INDIVIDUALLY (same as status.py's own
+                    # design) and sets that one key to None rather than
+                    # letting the whole cycle fail — which means a single
+                    # transient Deribit/CBOE/Yahoo hiccup for just ETH's
+                    # own chain fetch never raised out of status_run_cycle
+                    # at all, so this loop's own try/except never caught
+                    # anything and happily OVERWROTE the last known-good
+                    # data with this partially-None result. Since
+                    # inst_snap["available"] (compute_dashboard_snapshot)
+                    # is `bool(chain and price is not None)`, one bad
+                    # fetch cycle was enough to blank ETH's entire HPL/
+                    # Targets section for a full STATUS_REFRESH_SEC
+                    # interval — a completely separate process
+                    # (charthacker.py, its own WS connection) was
+                    # naturally unaffected, exactly matching the report.
+                    # Fixed: keep serving the last known-good value for
+                    # any key that came back None this cycle, instead of
+                    # blanking it — a persistent, non-transient outage
+                    # still eventually shows through once genuinely fresh
+                    # data never arrives across a full session restart,
+                    # but a single transient blip no longer wipes out an
+                    # otherwise-healthy dashboard.
+                    for k, v in data.items():
+                        if v is None and prev.get(k) is not None:
+                            data[k] = prev[k]
                 _status_last_full_data = data
             STATUS_ENGINE_STATE[0] = "live"
         except Exception as e:
@@ -4045,7 +4243,7 @@ class SimAccount:
         self._seq += 1
         return f"sim_{prefix}_{int(time.time() * 1000)}_{self._seq}"
 
-    def _apply_fill(self, symbol, pos_side, qty, price, order_type):
+    def _apply_fill(self, symbol, pos_side, qty, price, order_type, sequence_label=None):
         pos = self.positions.get(symbol)
         if pos and pos.get("pos_side") == pos_side:
             total = pos["qty"] + qty
@@ -4053,8 +4251,19 @@ class SimAccount:
             pos["qty"] = total
         else:
             self.positions[symbol] = {"pos_side": pos_side, "qty": qty, "avg_entry": price}
-        sim_log_event("filled", {"symbol": symbol, "pos_side": pos_side, "qty": qty,
-                                  "price": price, "order_type": order_type})
+        detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty,
+                  "price": price, "order_type": order_type}
+        if sequence_label is not None:
+            # 2026-07-27 user request: the trades table's new SEQUENCE
+            # column needs to know which Blackjack step (1R/1R/2R/3R/5R,
+            # or a win-progression amount) each trade was actually entered
+            # at — captured once, at PLACEMENT time in _check_confirmation
+            # (BLACKJACK_STATE could theoretically change by the time a
+            # resting LIMIT order eventually fills), threaded through
+            # place_entry -> here so it lands on the SAME 'filled' event
+            # scan_all_trades_detailed already reconstructs trades from.
+            detail["sequence_label"] = sequence_label
+        sim_log_event("filled", detail)
 
     def _close(self, symbol, pos_side, qty, price, reason, target_type=None):
         pos = self.positions.get(symbol)
@@ -4077,17 +4286,17 @@ class SimAccount:
             for oid in [k for k, o in self.orders.items() if o["symbol"] == symbol]:
                 del self.orders[oid]
 
-    async def place_entry(self, symbol, pos_side, order_type, qty_str, price_str):
+    async def place_entry(self, symbol, pos_side, order_type, qty_str, price_str, sequence_label=None):
         qty = float(qty_str)
         if order_type == "market":
             price = await live_price_for_symbol(symbol)
             if price is None:
                 return {"code": -1, "msg": "sim: no live price available"}
-            self._apply_fill(symbol, pos_side, qty, price, "market")
+            self._apply_fill(symbol, pos_side, qty, price, "market", sequence_label)
         else:
             oid = self._next_id("entry")
             self.orders[oid] = {"symbol": symbol, "kind": "entry", "posSide": pos_side,
-                                 "qty": qty, "price": float(price_str)}
+                                 "qty": qty, "price": float(price_str), "sequence_label": sequence_label}
             sim_log_event("order_placed", {"symbol": symbol, "kind": "entry", "pos_side": pos_side,
                                             "qty": qty, "price": float(price_str)})
         self._save()
@@ -4147,7 +4356,7 @@ class SimAccount:
                     continue
                 pos_side = o["posSide"]
                 if (pos_side == "Long" and price <= o["price"]) or (pos_side == "Short" and price >= o["price"]):
-                    self._apply_fill(symbol, pos_side, o["qty"], price, "limit")
+                    self._apply_fill(symbol, pos_side, o["qty"], price, "limit", o.get("sequence_label"))
                     del self.orders[oid]
             pos = self.positions.get(symbol)
             if not pos:
@@ -4358,9 +4567,9 @@ def floor_to_step(value, step):
     steps = math.floor(value / step + 1e-9)
     return steps * step
 
-async def place_entry(symbol, pos_side, order_type, qty_str, price_str=None):
+async def place_entry(symbol, pos_side, order_type, qty_str, price_str=None, sequence_label=None):
     if DRY_RUN:
-        return await get_sim_account().place_entry(symbol, pos_side, order_type, qty_str, price_str)
+        return await get_sim_account().place_entry(symbol, pos_side, order_type, qty_str, price_str, sequence_label)
     side = 'Buy' if pos_side == 'Long' else 'Sell'
     params = {
         'symbol': symbol, 'clOrdID': f'athena_{int(time.time() * 1000)}',
@@ -4580,6 +4789,9 @@ class AthenaInstrument:
                                      # safety net, added 2026-07-25 as part of
                                      # hardening the real-money order path,
                                      # which had never actually been exercised.
+        self._tp1_lock_done = False   # 2026-07-28 — see _apply_tp1_breakeven_lock;
+                                        # reset to False on every new fill (_check_fill)
+                                        # so it fires exactly once per trade's own TP1.
 
     async def _place_sl_with_retry(self, symbol, pos_side, sl_price, price_decimals, retries=3):
         """A resting stop-loss is the single most important order this app
@@ -4630,6 +4842,95 @@ class AthenaInstrument:
                        {"suffix": suffix, "level": level, "type": target_type, "result": result, "sim": DRY_RUN})
             return False
         return True
+
+    def _realized_since_last_fill(self, symbol, pos_side):
+        """Sum of already-realized 'closed' event pnl for the CURRENTLY-
+        open (symbol, pos_side) position, since its own most recent
+        'filled' event — i.e. whatever partial exits (a TP1 leg, say)
+        already banked profit/loss on this same still-open trade, before
+        NOW. Used by reconcile_startup to correctly re-seed
+        _entry_balance_baseline after a restart.
+
+        CRITICAL bug fixed 2026-07-28, user-reported (Daily Loss Limit hit
+        after only 4 real trades, not 5 — the daily_loss_state.json log
+        didn't match reality): reconcile_startup never set
+        _entry_balance_baseline at all for a reconciled DRY_RUN position —
+        it stayed None (the __init__ default). A restart while a position
+        had ALREADY had a partial exit (e.g. TP1 filled, TP2 still
+        resting) meant _trade_net_pnl fell through to the cruder
+        pnl_approx fallback once the position finally closed — which only
+        reflects the LAST leg's own isolated exit-vs-entry math, silently
+        losing whatever was already realized on the earlier leg(s). A
+        trade that was genuinely a net WIN overall (TP1's gain outweighing
+        a later SL on the remainder) could therefore get judged as a LOSS
+        by _update_blackjack/_update_daily_loss_limit specifically — while
+        the dashboard/balance/trades-table all correctly showed the true,
+        full economics the whole time, since those don't depend on this
+        baseline at all. Confirmed against the user's own real sim_logs:
+        a trade with a real +$13.04 TP1 gain followed by a -$5.11 SL on
+        the remainder (true net +$7.94, a WIN) was miscounted as a LOSS
+        for the daily-loss-limit's own consecutive-loss counter, the
+        actual cause of it reaching its limit one loss "early."""
+        pattern = os.path.join(SIM_LOG_DIR_BASE, "**", "*.jsonl")
+        rows = []
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+            except Exception:
+                continue
+        rows.sort(key=lambda d: d.get("ts") or "")
+        realized = 0.0
+        seen_fill = False
+        for d in rows:
+            if d.get("symbol") != symbol or d.get("pos_side") != pos_side:
+                continue
+            if d.get("event") == "filled":
+                realized = 0.0   # a NEW fill starts a fresh trade — only
+                                  # count exits after the LATEST one
+                seen_fill = True
+            elif d.get("event") == "closed" and seen_fill:
+                realized += d.get("pnl") or 0.0
+        return realized
+
+    def _last_tp_fill_price(self, symbol, pos_side):
+        """DRY_RUN only — the EXACT fill price of the most recent 'closed'
+        (reason=='tp') sim_logs event for this still-open (symbol,
+        pos_side) position since its own most recent 'filled' event. Used
+        by _apply_tp1_breakeven_lock to know precisely what TP1 actually
+        filled at, rather than assuming it landed exactly on its own
+        resting order's level (real mode has no choice but to assume
+        that — see _apply_tp1_breakeven_lock's own docstring — DRY_RUN
+        doesn't need to guess since SimAccount's ledger is authoritative).
+        Returns None if no such event is found (shouldn't happen if this
+        is only called right after detecting a genuine partial fill, but
+        never raises either way)."""
+        pattern = os.path.join(SIM_LOG_DIR_BASE, "**", "*.jsonl")
+        rows = []
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+            except Exception:
+                continue
+        rows.sort(key=lambda d: d.get("ts") or "")
+        last_tp_price = None
+        seen_fill = False
+        for d in rows:
+            if d.get("symbol") != symbol or d.get("pos_side") != pos_side:
+                continue
+            if d.get("event") == "filled":
+                last_tp_price = None
+                seen_fill = True
+            elif d.get("event") == "closed" and seen_fill and d.get("reason") == "tp":
+                last_tp_price = d.get("price")
+        return last_tp_price
 
     async def reconcile_startup(self):
         # CRITICAL: seed the "already evaluated" baseline with whatever bar
@@ -4695,6 +4996,13 @@ class AthenaInstrument:
                         tp_legs.append({"level": o["price"], "qty": o["qty"],
                                         "tracks_gex_flip": leg_type == "GEX Flip", "type": leg_type})
                 tp_legs.sort(key=lambda leg: leg["level"], reverse=(pos_side == "Short"))
+                # See _realized_since_last_fill's own docstring for the
+                # 2026-07-28 bug this fixes — without this, a position
+                # reconciled after a restart that ALREADY had a partial
+                # exit (e.g. TP1 filled) would lose track of that realized
+                # amount the moment it finally closes.
+                already_realized = self._realized_since_last_fill(symbol, pos_side)
+                self._entry_balance_baseline = get_sim_account().balance - already_realized
             else:
                 try:
                     rows = await fetch_resting_orders(symbol)
@@ -4710,7 +5018,18 @@ class AthenaInstrument:
             # failures that happen while Athena is already running.
             self._sl_missing = (not DRY_RUN) and sl_price is None
 
-            self.position = {"pos_side": pos_side, "qty": size, "fill_price": fill_price,
+            # _tp1_lock_done (see _apply_tp1_breakeven_lock): a reconciled
+            # position still resting BOTH its original TP legs has provably
+            # never had a partial TP1 fill yet, so `orig_qty=size` here is
+            # exactly right and the lock feature should still arm normally.
+            # One resting leg (or none) means TP1 already fired BEFORE this
+            # restart — orig_qty is unrecoverable at that point (this
+            # restart has no record of what it originally was), so marked
+            # already-done rather than risk computing a WRONG lock price
+            # off an assumed orig_qty that's actually too small.
+            self._tp1_lock_done = len(tp_legs) < 2
+
+            self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "tp_legs": tp_legs,
                               "price_decimals": pd, "qty_decimals": qd}
             self.state = "IN_POSITION"
@@ -4758,7 +5077,20 @@ class AthenaInstrument:
             self.state = "ARMED"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching order flow ({regime})"
                         + (" [24H MODE]" if NO_SESSION else ""))
-            log_event(self.asset, "armed", {"regime": regime, "no_session": NO_SESSION})
+            # 2026-07-28 debugging aid, user-reported ("ETH entered a trade
+            # while only ST was active, which should NOT validate an entry
+            # since BT/ST are targets only") — hpl_any_active() DOES already
+            # exclude BT/ST from what counts (verified by direct code
+            # read), so this couldn't be reproduced from the report alone;
+            # no historical log previously recorded WHICH specific HPL
+            # row(s) were active at the exact moment of arming, only the
+            # regime. Logging the real active-row labels here (straight
+            # from this cycle's own STATUS_SNAPSHOT hpl dict, the same data
+            # the dashboard/Status screen read) means any FUTURE recurrence
+            # can be diagnosed conclusively instead of re-guessing.
+            active_hpls = sorted(label for label, v in ((snapshot.get(self.cfg["snap_key"]) or {}).get("hpl") or {}).items()
+                                  if v.get("status") == "active")
+            log_event(self.asset, "armed", {"regime": regime, "no_session": NO_SESSION, "active_hpls": active_hpls})
             # Fall through into the ARMED check below in this same cycle —
             # otherwise a bar that already closed (confirming or not) right
             # as/just before arming would get silently treated as the
@@ -4815,13 +5147,42 @@ class AthenaInstrument:
             await self._manage_position(regime)
             return
 
-    def _trade_net_pnl(self, pnl_approx):
+    def _trade_net_pnl(self, pnl_approx, symbol=None, pos_side=None):
         """Exact in DRY_RUN (diffs SimAccount.balance against the snapshot
         taken at fill — see _check_fill), otherwise falls back to the
         caller's own entry-vs-current-price approximation (real mode's
-        existing, already-documented limitation)."""
-        if DRY_RUN and self._entry_balance_baseline is not None:
-            return get_sim_account().balance - self._entry_balance_baseline
+        existing, already-documented limitation).
+
+        CRITICAL bug fixed 2026-07-28, user-reported (QQQ's Blackjack
+        progression stayed frozen at "5R" instead of entering the win
+        progression after a genuinely WINNING trade closed via manual
+        Flatten All): `_entry_balance_baseline` can end up `None` at
+        close time in DRY_RUN for reasons beyond just "never restarted"
+        (the case the 2026-07-28 `_realized_since_last_fill` fix already
+        covers) — whenever that happened, this method fell all the way
+        through to the caller's OWN `pnl_approx` (a live-price
+        approximation computed from a fresh `live_price_for_symbol` call)
+        which can ALSO come back `None` on a transient fetch failure at
+        the exact moment of the close. `_update_blackjack`/
+        `_update_daily_loss_limit` both silently no-op on `pnl=None` — so
+        a real trade's entire outcome was dropped on the floor, not even
+        approximated, leaving the ladder exactly where it was before that
+        trade (confirmed against the user's own real `blackjack_state.
+        json`: `loss_step=4, in_win_progression=false`, unchanged from
+        before the winning trade that should have flipped it into a win
+        progression). Fixed: when the baseline is unavailable, DRY_RUN
+        now falls back to `_realized_since_last_fill` — the SAME
+        authoritative-ledger rescan `reconcile_startup` already trusts —
+        instead of the fragile, independently-failure-prone
+        `pnl_approx`. This is strictly more robust than the baseline
+        itself: it always re-derives the true combined pnl straight from
+        sim_logs' own persisted fill/close events, with no in-memory
+        state that can go missing or stale in the first place."""
+        if DRY_RUN:
+            if self._entry_balance_baseline is not None:
+                return get_sim_account().balance - self._entry_balance_baseline
+            if symbol is not None and pos_side is not None:
+                return self._realized_since_last_fill(symbol, pos_side)
         return pnl_approx
 
     def _update_blackjack(self, pnl):
@@ -4864,13 +5225,27 @@ class AthenaInstrument:
         """Daily Loss Limit tracking (explicit user request, 2026-07-25) —
         see the DAILY_LOSS_STATE module-level comment for the full spec.
         Called alongside _update_blackjack from every close site,
-        regardless of BLACKJACK_MODE (this tracks independently of it)."""
+        regardless of BLACKJACK_MODE (this tracks independently of it).
+
+        2026-07-28 user request: 5 consecutive losses must all fall within
+        the SAME trading day (19:00 CT to 19:00 CT — see _trading_day_key)
+        to trigger — a streak spanning across that boundary, even with no
+        intervening win, must not combine into one trigger. Tracked via
+        the new 'loss_streak_day' field: a loss on a DIFFERENT trading day
+        than the streak's own last loss resets the counter to 0 first, as
+        if starting fresh, before counting this one."""
         if pnl is None:
             return
         dl = DAILY_LOSS_STATE[self.asset]
         if pnl > 0:
             dl["consecutive_losses"] = 0
+            dl["loss_streak_day"] = None
         else:
+            now = datetime.now(TZ_CT) if TZ_CT else None
+            today_key = _trading_day_key(now) if now else None
+            if today_key is not None and dl.get("loss_streak_day") != today_key:
+                dl["consecutive_losses"] = 0
+                dl["loss_streak_day"] = today_key
             dl["consecutive_losses"] += 1
             if dl["consecutive_losses"] >= DAILY_LOSS_LIMIT:
                 dl["consecutive_losses"] = 0
@@ -5013,6 +5388,32 @@ class AthenaInstrument:
         price_step = price_step or DEFAULT_PRICE_STEP[self.asset]
         price_decimals = _decimals_for_step(price_step)
 
+        # 2026-07-28 user request: "ensure that Layer 1 & Layer 2 rules
+        # are applied to the risk sizing" — status_dvol_layers'/
+        # dvol_layer_values' own DVOL-based lookup table was computed and
+        # DISPLAYED (dashboard, Status screen) every cycle this whole
+        # session, but never actually fed into a sizing decision until
+        # now. Confirmed with the user via AskUserQuestion before
+        # implementing (this changes real position sizing): Layer 1
+        # scales the EFFECTIVE 1R dollar value itself (whatever it
+        # currently equals — Blackjack's BLACKJACK_1R_DOLLARS, or flat
+        # mode's own risk-per-trade $/%), applied BEFORE sizing; Layer 2
+        # caps the R-MULTIPLE actually risked at entry (loss_step/
+        # win_step_back keep advancing normally underneath — only the
+        # dollar amount THIS trade risks is capped, same "cap the trade,
+        # not the ladder" answer the user picked); scoped to ETH ONLY —
+        # status.py's own header comment ties Layer 1/2 specifically to
+        # ETH's DVOL, QQQ has its own separate VXN measure with no
+        # analogous layer table ever defined. Layer 2 (an R-multiple cap)
+        # has no meaningful application in flat mode (no escalating
+        # R-multiple exists there to cap) — Layer 1's $ scaling still
+        # applies to flat mode too.
+        if self.asset == "ETH":
+            dvol_for_layers = (read_last_status_snapshot() or {}).get("dvol")
+            layer1_mult, layer2_r_cap = dvol_layer_values(dvol_for_layers)
+        else:
+            layer1_mult, layer2_r_cap = 1.0, None
+
         # Per spec: size = trade_risk / sl_distance, where trade_risk =
         # accountBalance * riskPercentage and sl_distance is THIS asset's
         # own fixed SL distance (R, $10 ETH / $0.75 QQQ — self.cfg["sl"],
@@ -5034,11 +5435,31 @@ class AthenaInstrument:
             # against a theoretical unset case (e.g. BLACKJACK_MODE flipped
             # by something other than the [B] prompt flow).
             one_r_dollars = BLACKJACK_1R_DOLLARS if BLACKJACK_1R_DOLLARS is not None else balance * (PCT / 100.0)
+            one_r_dollars *= layer1_mult
             bj = BLACKJACK_STATE[self.asset]
             if bj["in_win_progression"]:
-                trade_risk_dollars = bj["win_step_back"] * one_r_dollars + bj["win_profit_dollars"]
+                risked_r = bj["win_step_back"]
+                if layer2_r_cap is not None and risked_r > layer2_r_cap:
+                    console_log(f"{self.asset}: {YLW}Layer 2 cap — {risked_r:g}R risk capped to "
+                                f"{layer2_r_cap:g}R (DVOL {fmt_num(dvol_for_layers)}){RST}")
+                    risked_r = layer2_r_cap
+                trade_risk_dollars = risked_r * one_r_dollars + bj["win_profit_dollars"]
+                # 2026-07-27 user request: the trades table's new SEQUENCE
+                # column needs a human-readable record of which step of
+                # the loss/win ladder THIS trade was actually sized at —
+                # captured here, at the moment of the sizing decision
+                # itself, not re-derived later from BLACKJACK_STATE (which
+                # will have moved on by the time this trade eventually
+                # closes).
+                sequence_label = f"Win ({risked_r:g}R+${bj['win_profit_dollars']:,.2f})"
             else:
-                trade_risk_dollars = BLACKJACK_STEPS[bj["loss_step"]] * one_r_dollars
+                risked_r = BLACKJACK_STEPS[bj["loss_step"]]
+                if layer2_r_cap is not None and risked_r > layer2_r_cap:
+                    console_log(f"{self.asset}: {YLW}Layer 2 cap — {risked_r:g}R risk capped to "
+                                f"{layer2_r_cap:g}R (DVOL {fmt_num(dvol_for_layers)}){RST}")
+                    risked_r = layer2_r_cap
+                trade_risk_dollars = risked_r * one_r_dollars
+                sequence_label = f"{risked_r:g}R"
         else:
             # 2026-07-26 user request: [P] risk-per-trade can now be set as
             # either a % of balance (RISK_MODE=="pct", the original/default
@@ -5051,6 +5472,8 @@ class AthenaInstrument:
             # both together).
             trade_risk_dollars = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) \
                 else balance * (PCT / 100.0)
+            trade_risk_dollars *= layer1_mult
+            sequence_label = "Flat"
         raw_qty = trade_risk_dollars / R
         qty = floor_to_step(raw_qty, qty_step)
         if qty <= 0:
@@ -5064,7 +5487,8 @@ class AthenaInstrument:
         price_str = f"{entry_price:.{price_decimals}f}" if order_type == "limit" else None
 
         detail = {"regime": regime, "order_type": order_type, "pos_side": pos_side, "qty": qty_str,
-                   "price": price_str or f"market (~{live_price})", "targets": targets_full, "sl_distance": R}
+                   "price": price_str or f"market (~{live_price})", "targets": targets_full, "sl_distance": R,
+                   "layer1_mult": layer1_mult, "layer2_r_cap": layer2_r_cap}
 
         # DRY_RUN and real trading share this exact same path from here on —
         # place_entry()/place_sl()/place_tp_leg()/cancel_all()/market_close()
@@ -5072,7 +5496,7 @@ class AthenaInstrument:
         # machine (PENDING_FILL -> IN_POSITION -> closed, SL/TP, PCVR-flip
         # close) runs identically either way, against a paper ledger instead
         # of real money.
-        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, price_str)
+        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, price_str, sequence_label)
         if not (isinstance(result, dict) and result.get("code") == 0):
             console_log(f"{self.asset}: entry order FAILED — {result}")
             log_event(self.asset, "entry_order_failed", {"result": result, **detail})
@@ -5203,14 +5627,61 @@ class AthenaInstrument:
                 console_log(f"{self.asset}: {YLW}no valid TP target — position has SL only{RST}")
         tp_desc = [leg["level"] for leg in tp_legs]
 
-        self.position = {"pos_side": p["pos_side"], "qty": qty, "fill_price": fill_price,
+        # 2026-07-28 user request: the trades table's TP1/TP1 TYPE/TP2/TP2
+        # TYPE columns only ever showed data when a tp-reason EXIT actually
+        # happened — a trade that closed via SL alone (never touched
+        # either TP) showed nothing at all, even though it genuinely HAD
+        # configured TP targets, they just never got hit. Logged here (the
+        # ONLY place the planned tp_legs — level + type — are known, right
+        # when they're computed/placed) so scan_all_trades_detailed can
+        # show the ORIGINAL planned target for every trade regardless of
+        # outcome, not just the ones that got hit. DRY_RUN/sim_logs only,
+        # same existing scope as the rest of that table.
+        if DRY_RUN and tp_legs:
+            sim_log_event("tp_targets_set", {"symbol": symbol, "pos_side": p["pos_side"],
+                                              "tp_legs": [{"level": leg["level"], "type": leg["type"]} for leg in tp_legs]})
+
+        self.position = {"pos_side": p["pos_side"], "qty": qty, "orig_qty": qty, "fill_price": fill_price,
                           "sl_price": sl_price, "tp_legs": tp_legs,
                           "price_decimals": p["price_decimals"], "qty_decimals": qd}
+        self._tp1_lock_done = False
         self.pending = None
         self.state = "IN_POSITION"
         tag = " (sim)" if DRY_RUN else ""
         console_log(f"{self.asset}: filled{tag} @ {fill_price} — SL {sl_price}, TP {tp_desc}")
         log_event(self.asset, "filled", {"fill_price": fill_price, "qty": qty, "sl": sl_price, "tp": tp_desc, "sim": DRY_RUN})
+
+    def _infer_close_reason(self, pos_side, exit_price):
+        """REAL mode only (see _manage_position's own 'position flat' branch
+        for the DRY_RUN case, which has an exact answer already in
+        sim_logs) — best-effort classification of WHY a real position that
+        Athena's own poll just discovered flat actually closed, since no
+        Phemex fill-history endpoint is wired up here (same documented gap
+        as exit_price itself being an approximation). Uses the last-known
+        resting SL price / TP leg levels from `self.position` (still set at
+        call time — cleared by the caller right after) and picks whichever
+        is closest to the polled exit_price, within a tolerance scaled off
+        this asset's own SL distance (R) to absorb normal poll-lag slippage
+        without conflating a genuinely different level. Returns "SL", "TP",
+        or "MANUAL" (neither resting level was close — most likely closed
+        outside Athena entirely, e.g. manually on the exchange UI) — never
+        raises, never returns None (falls back to "MANUAL" if the position
+        had no sl_price/tp_legs recorded at all, e.g. after a restart before
+        reconciliation ran)."""
+        if exit_price is None:
+            return "MANUAL"
+        R = self.cfg["sl"]
+        tol = max(R * 0.20, 0.01)
+        sl_price = self.position.get("sl_price")
+        candidates = []
+        if sl_price is not None:
+            candidates.append(("SL", abs(exit_price - sl_price)))
+        for leg in (self.position.get("tp_legs") or []):
+            candidates.append(("TP", abs(exit_price - leg["level"])))
+        if not candidates:
+            return "MANUAL"
+        best_label, best_dist = min(candidates, key=lambda c: c[1])
+        return best_label if best_dist <= tol else "MANUAL"
 
     async def _manage_position(self, regime):
         symbol = self.cfg["phemex_symbol"]
@@ -5240,10 +5711,29 @@ class AthenaInstrument:
             pnl_approx = None
             if exit_price is not None and entry:
                 pnl_approx = (exit_price - entry) * qty if pos_side == "Long" else (entry - exit_price) * qty
+            # 2026-07-28 user request: "show whether TP or SL is hit (unless
+            # closed manually...) and give the exit price." exit_price above
+            # already covers the second half; `reason` here is a best-effort
+            # CLASSIFICATION for the case this branch itself exists for —
+            # Athena's own poll discovered the position ALREADY flat, with no
+            # _flatten_now call of its own responsible (those already log
+            # their own distinct, exact reason — "eod"/"manual"/
+            # "entry_blackout"/"stale_entry" — this branch only ever fires
+            # for a bracket order filling on the exchange, or someone closing
+            # it manually outside Athena entirely). DRY_RUN has an exact
+            # answer already sitting in sim_logs (SimAccount._close's own
+            # "reason"); REAL mode has no fill-history API wired up (same
+            # documented gap as the price itself), so it's inferred from
+            # which of the last-known resting SL/TP levels the exit price
+            # landed closest to — correct whenever the fill was reasonably
+            # close to its own resting level (the normal case), approximate
+            # under heavy slippage, which is why it's tagged "(approx)" in
+            # the dashboard rather than presented as certain.
+            reason = self._infer_close_reason(pos_side, exit_price) if not DRY_RUN else None
             log_event(self.asset, "position_closed", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
-                                                        "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx)
+                                                        "reason": reason, "sim": DRY_RUN})
+            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
             self.position = None
@@ -5266,6 +5756,11 @@ class AthenaInstrument:
         # going fully flat — keep the displayed size (and the resting TP
         # legs) in sync, or the dashboard/open-PnL calc would keep showing
         # the original full size and both TP legs forever.
+        old_qty = self.position.get("qty")            # pre-update size, for
+        old_tp_legs = self.position.get("tp_legs") or []   # detecting a fresh
+                                                             # partial fill below
+                                                             # (see _apply_tp1_
+                                                             # breakeven_lock)
         self.position["qty"] = abs(float(pos.get("size") or 0))
         if DRY_RUN:
             # The sim order itself already carries its own "type" (set at
@@ -5311,6 +5806,26 @@ class AthenaInstrument:
             except Exception:
                 pass
 
+        # TP1 breakeven-lock (2026-07-28, see _apply_tp1_breakeven_lock's
+        # own docstring for the full derivation) — a partial fill just
+        # happened (size shrank but is still open) and this hasn't been
+        # applied to this trade yet. tp1_qty is exact regardless of mode
+        # (a straight size diff); tp1_price is exact in DRY_RUN (read back
+        # from sim_logs' own authoritative ledger) or approximated off the
+        # fill-triggering leg's own resting order level in real mode (no
+        # fill-history API wired up — same documented gap as elsewhere in
+        # this file).
+        new_qty = self.position["qty"]
+        if (not self._tp1_lock_done and old_qty is not None
+                and new_qty > 1e-9 and new_qty < old_qty - 1e-9):
+            tp1_qty = old_qty - new_qty
+            tp1_price = self._last_tp_fill_price(symbol, pos_side) if DRY_RUN else None
+            if tp1_price is None and old_tp_legs:
+                tp1_price = old_tp_legs[0]["level"]
+            if tp1_price is not None:
+                await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
+            self._tp1_lock_done = True
+
         flipped = (pos_side == "Long" and regime == "short") or (pos_side == "Short" and regime == "long")
         if flipped:
             qty = abs(float(pos.get("size") or 0))
@@ -5349,7 +5864,7 @@ class AthenaInstrument:
             log_event(self.asset, "pcvr_flip_close", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx)
+            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
             self.position = None
@@ -5361,16 +5876,24 @@ class AthenaInstrument:
 
     async def _sync_moving_tps(self, symbol, pos_side):
         """Refreshes any TP leg tracking a MOVING target — GEX Flip (a
-        single level status.py/gex.py recompute every cycle) or a gamma
+        single level status.py/gex.py recompute every cycle), a gamma
         Cluster (explicit user request 2026-07-24: the qualifying Medium/
         Large cluster set can itself change shape mid-trade as gamma
         builds/decays — a Large cluster appearing where only a Medium one
         existed before should retarget that TP leg to it, same
         Large-over-Medium precedence used when the position was first
-        entered — see reconstruct_targets/clusters_from_gex_export). A TP
-        leg's own `type` field (set at entry — "GEX Flip" or "Cluster",
-        see _check_fill/tp_legs) says which rule applies to it; a leg
-        whose target type never moves (BT/ST) is left untouched here.
+        entered — see reconstruct_targets/clusters_from_gex_export), or
+        BT/ST (2026-07-28 bugfix — user-reported: QQQ's BT moved from
+        $675.00 to $672.00 mid-trade but the TP1 leg tracking it stayed
+        resting at $675.00. BT/ST were originally assumed to "never move"
+        — wrong: compute_bt_st recomputes them every status-engine cycle
+        off the live PCVR-weighted strike ladder, same as a gamma cluster
+        recomputing off live gamma. Tracked the same way clusters are: the
+        freshest value comes from STATUS_SNAPSHOT's own targets list via
+        read_last_status_snapshot(), no buffer applied (matches _check_
+        fill's own _tp_level, which only buffers GEX Flip, never BT/ST).
+        A TP leg's own `type` field (set at entry — "GEX Flip", "Cluster",
+        "BT", or "ST", see _check_fill/tp_legs) says which rule applies.
 
         Full bracket refresh (cancel everything, re-place SL + all TP legs
         at current prices) rather than a selective single-order amend/
@@ -5381,7 +5904,7 @@ class AthenaInstrument:
         position briefly has no resting SL between the cancel and
         re-place calls."""
         tp_legs = self.position.get("tp_legs") or []
-        if not any(leg.get("tracks_gex_flip") or leg.get("type") == "Cluster" for leg in tp_legs):
+        if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST") for leg in tp_legs):
             return
 
         fill_price = self.position.get("fill_price")
@@ -5391,6 +5914,17 @@ class AthenaInstrument:
             return (level >= fill_price + R) if pos_side == "Long" else (level <= fill_price - R)
 
         gex_export = read_gex_export(self.asset)
+
+        new_bt_st_level = None
+        bt_st_type = "BT" if pos_side == "Long" else "ST"
+        snap = read_last_status_snapshot()
+        if snap:
+            inst_snap = snap.get(self.asset.lower())
+            if inst_snap:
+                for t in (inst_snap.get("targets") or []):
+                    if t.get("type") == bt_st_type:
+                        new_bt_st_level = t.get("level")
+                        break
 
         new_gex_level = None
         gex_flip = gex_export.get("gex_flip") if gex_export else None
@@ -5475,6 +6009,16 @@ class AthenaInstrument:
                 # rather than guessing; same "don't place an unverified
                 # level" caution the R-distance guard above already uses.
                 cluster_rank += 1
+            elif leg.get("type") in ("BT", "ST") and new_bt_st_level is not None:
+                warn_key = leg["type"]
+                if _safe(new_bt_st_level):
+                    self._tp_skip_warned.pop(warn_key, None)
+                    if abs(level - new_bt_st_level) > 0.005:
+                        level, changed = new_bt_st_level, True
+                else:
+                    if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_bt_st_level) > 0.01:
+                        console_log(f"{self.asset}: {YLW}{leg['type']} too close to fill (${fmt_num(new_bt_st_level)}) — TP refresh skipped this cycle{RST}")
+                        self._tp_skip_warned[warn_key] = new_bt_st_level
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?")})
@@ -5511,6 +6055,102 @@ class AthenaInstrument:
         self.position["tp_legs"] = new_legs
         console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
         log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
+
+    async def _apply_tp1_breakeven_lock(self, symbol, pos_side, tp1_price, tp1_qty):
+        """2026-07-28 user request: "once TP1 is achieved, adjust the SL to
+        what would equate to 1 point of net profit (accounting for fees as
+        well). If price doesn't make it to TP2 and retraces all the way
+        back to entry, this protects the account from unnecessary drawdown
+        and guarantees a 1 point net profit, even after fees." Called
+        exactly once per trade, right after _manage_position detects the
+        position went from full size to a smaller-but-still-open size (the
+        only way that happens in this app is a TP leg filling — SL always
+        closes the FULL remaining size, never partially).
+
+        "1 point" here means $1.00 of net profit per unit of the ORIGINAL
+        entry quantity (orig_qty) — e.g. a 2.0 qty entry guarantees $2.00
+        total, matching how R-multiples/position sizing already scale with
+        qty elsewhere in this file, not a flat $1 regardless of size.
+
+        Derivation (Long case; Short is the mirror image) — let R_target =
+        orig_qty * $1.00 be the required TOTAL combined net profit across
+        BOTH legs (the already-closed TP1 leg and this remaining leg once
+        IT closes too, at the new SL), with PHEMEX_FEE_RATE (FR) applied to
+        every leg's own notional (entry once for the whole position, TP1's
+        exit, and this new SL's own future exit):
+
+            entry_fee = entry * orig_qty * FR
+            tp1_fee   = tp1_price * tp1_qty * FR
+            tp1_gross = (tp1_price - entry) * tp1_qty              [Long]
+            needed_remaining_net = R_target - tp1_gross + entry_fee + tp1_fee
+            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FR)
+
+        (Short mirrors this with tp1_gross = (entry - tp1_price) * tp1_qty
+        and new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FR).)
+
+        Solving for new_sl this way (rather than just "entry + $1 worth of
+        points") is what makes the guarantee EXACT net of all 3 fee legs,
+        not just entry+exit on the remainder alone — verified algebraically
+        by expanding the full net-PnL equation and isolating new_sl, cross-
+        checked against hand-computed examples in this session's own test
+        suite (test_tp1_breakeven_lock_20260728.py).
+
+        Safety guard: only ever tightens the SL (moves it in the
+        protective direction) — if the computed level would actually be
+        WORSE than the current resting SL (can happen with a very small
+        tp1_qty relative to orig_qty, leaving little room), the existing
+        SL is left untouched rather than loosening protection.
+
+        Same full-bracket-refresh mechanism _sync_moving_tps already uses
+        (cancel everything, re-place SL at the new price + every remaining
+        TP leg unchanged) — same brief no-resting-SL window between cancel
+        and re-place, same accepted trade-off, for the same reason (no
+        verified single-order amend endpoint wired up here)."""
+        entry = self.position["fill_price"]
+        rem_qty = self.position["qty"]
+        if rem_qty <= 0:
+            return
+        orig_qty = self.position.get("orig_qty") or (tp1_qty + rem_qty)
+        FR = PHEMEX_FEE_RATE
+        entry_fee = entry * orig_qty * FR
+        tp1_fee = tp1_price * tp1_qty * FR
+        target_total_net = orig_qty * 1.00
+        if pos_side == "Long":
+            tp1_gross = (tp1_price - entry) * tp1_qty
+            needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
+            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FR)
+        else:
+            tp1_gross = (entry - tp1_price) * tp1_qty
+            needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
+            new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FR)
+
+        cur_sl = self.position.get("sl_price")
+        if cur_sl is not None:
+            if pos_side == "Long" and new_sl <= cur_sl:
+                return
+            if pos_side == "Short" and new_sl >= cur_sl:
+                return
+
+        pd = self.position.get("price_decimals", 2)
+        qd = self.position.get("qty_decimals", 2)
+        tp_legs = self.position.get("tp_legs") or []
+        try:
+            cancel_result = await cancel_all(symbol)
+        except Exception as e:
+            console_log(f"{self.asset}: TP1 breakeven-lock — cancel failed ({e})")
+            return
+        if not _order_ok(cancel_result):
+            console_log(f"{self.asset}: {RED}TP1 breakeven-lock — cancel failed ({cancel_result}), aborting{RST}")
+            log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
+            return
+        await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
+        for i, leg in enumerate(tp_legs, start=1):
+            await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+        self.position["sl_price"] = new_sl
+        console_log(f"{self.asset}: {GRN}{BLD}TP1 hit — SL locked to guarantee "
+                    f"{fmt_money(target_total_net)} net profit (SL -> {fmt_num(new_sl)}){RST}")
+        log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price,
+                                                        "tp1_qty": tp1_qty, "target_total_net": target_total_net})
 
     async def _flatten_now(self, reason):
         """Force-flat regardless of state/regime — cancels any resting
@@ -5577,7 +6217,7 @@ class AthenaInstrument:
             log_event(self.asset, event_name, {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                 "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx)
+            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
         else:
@@ -5704,8 +6344,7 @@ def recent_trade_pairs(n=6):
                                "exit_ts": d.get("ts"), "exit_price": d.get("price"),
                                "reason": d.get("reason", "close")})
     else:
-        reason_by_event = {"pcvr_flip_close": "flip", "eod_flatten": "eod", "manual_flatten": "manual",
-                           "position_closed": "close"}
+        reason_by_event = {"pcvr_flip_close": "flip", "eod_flatten": "eod", "manual_flatten": "manual"}
         for d in rows:
             ev, asset = d.get("event"), d.get("asset")
             det = d.get("detail") or {}
@@ -5716,11 +6355,20 @@ def recent_trade_pairs(n=6):
                 last_fill[asset] = (d.get("ts"), det.get("fill_price"))
             elif ev in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
                 fill = last_fill.get(asset)
+                # "position_closed" fires when Athena's own poll discovers a
+                # bracket order already filled on the exchange (or the
+                # position was closed manually, outside Athena) — 2026-07-28
+                # fix: use _infer_close_reason's own "SL"/"TP"/"MANUAL"
+                # classification (see AthenaInstrument._infer_close_reason)
+                # instead of a flat "close" label that couldn't distinguish
+                # them. Falls back to "close" only for log entries written
+                # before this field existed.
+                reason = det.get("reason") if ev == "position_closed" else None
                 pairs.append({"asset": asset, "pos_side": det.get("pos_side"),
                                "entry_ts": fill[0] if fill else None,
                                "entry_price": fill[1] if fill else det.get("entry"),
                                "exit_ts": d.get("ts"), "exit_price": det.get("exit_approx"),
-                               "reason": reason_by_event.get(ev, "close")})
+                               "reason": reason or reason_by_event.get(ev, "close")})
     return pairs[-n:]
 
 # ── [D] Data view — all-time trading statistics + PnL equity curve ───────────
@@ -5775,6 +6423,81 @@ PHEMEX_FEE_RATE = 0.0006   # user-confirmed flat rate for every leg, entry or ex
                            # regardless of order type — fee = 0.0006 * (qty * price)
 PHEMEX_SYMBOL_TO_ASSET = {cfg["phemex_symbol"]: a for a, cfg in ASSETS.items()}
 
+def _trade_worst_adverse_dollars(asset, pos_side, entry_price, entry_qty, exits, entry_ts_str, exit_ts_str):
+    """2026-07-28 user request: "The drawdown in the trading log is
+    supposed to measure the maximum loss an individual trade incurs -
+    every trade will have drawdown unless it happens to go into profit
+    straightaway and not go against it" — i.e. the TRUE intra-trade max
+    adverse excursion (MAE), which a winning trade can still have (price
+    dipped against the position before recovering to close in profit),
+    not just `max(0, -net_pnl)` (that 2026-07-28-earlier-the-same-day fix
+    correctly solved the DIFFERENT bug of DD carrying over a PRIOR
+    trade's account-level decline, but a pure win/loss-outcome-based
+    figure can never show a nonzero DD for a winner in the first place).
+
+    Real intra-trade price path IS actually available in this app — the
+    persisted 90s footprint bars (`footprint_log_paths`, the same OHLC
+    history the confirmation logic and chart both already read) — this
+    scans every bar between the trade's own entry and exit timestamps
+    and returns the worst dollar-adverse point actually reached, using
+    the position size that was ACTUALLY open at each bar's own time (a
+    TP1 partial fill reduces the size a later dip would be scaled
+    against — using the ORIGINAL full qty throughout would overstate DD
+    for the remainder-only portion of the trade's life). Returns None
+    (not 0) if no bars are found in the window at all (predates
+    footprint persistence, or the window is narrower than one 90s bar) —
+    the caller falls back to the coarser isolated-net-based figure in
+    that case, rather than silently claiming a confident $0.00."""
+    try:
+        entry_epoch = datetime.fromisoformat(entry_ts_str).timestamp()
+        exit_epoch = datetime.fromisoformat(exit_ts_str).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+    exit_points = []
+    for x in exits:
+        try:
+            ts = datetime.fromisoformat(x["ts"]).timestamp()
+        except (ValueError, TypeError, KeyError):
+            continue
+        exit_points.append((ts, x.get("qty") or 0.0))
+    exit_points.sort(key=lambda p: p[0])
+
+    def _open_qty_at(bar_ts):
+        remaining = entry_qty
+        for ts, q in exit_points:
+            if ts <= bar_ts:
+                remaining -= q
+            else:
+                break
+        return max(0.0, remaining)
+
+    worst_dollars = None
+    for path in footprint_log_paths(asset):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    bar = json.loads(line)
+                    bar_ts = bar.get("ts")
+                    if bar_ts is None or not (entry_epoch <= bar_ts <= exit_epoch):
+                        continue
+                    open_qty = _open_qty_at(bar_ts)
+                    if open_qty <= 0:
+                        continue
+                    if pos_side == "Long":
+                        adverse = max(0.0, entry_price - bar.get("l", entry_price))
+                    else:
+                        adverse = max(0.0, bar.get("h", entry_price) - entry_price)
+                    dollars = adverse * open_qty
+                    if worst_dollars is None or dollars > worst_dollars:
+                        worst_dollars = dollars
+        except Exception:
+            continue
+    return worst_dollars
+
 def scan_all_trades_detailed():
     """Full per-trade records (entry+every closing leg+fees+duration+R:R),
     reconstructed from ALL sim_logs across every day — DRY_RUN only. Real
@@ -5828,8 +6551,17 @@ def scan_all_trades_detailed():
                 "symbol": d.get("symbol"), "pos_side": d.get("pos_side"),
                 "entry_ts": d.get("ts"), "entry_price": d.get("price"),
                 "qty": d.get("qty"), "entry_order_type": d.get("order_type"),
+                "sequence_label": d.get("sequence_label"),
+                "planned_tp_legs": [],
                 "exits": [],
             }
+        elif ev == "tp_targets_set" and key in open_trades:
+            # The ORIGINAL planned TP1/TP2 (level + type), logged once at
+            # _check_fill time — lets a trade that closed via SL alone
+            # (never touched either TP) still show what its targets WERE,
+            # instead of leaving those columns blank just because they
+            # were never actually hit.
+            open_trades[key]["planned_tp_legs"] = d.get("tp_legs") or []
         elif ev == "closed" and key in open_trades:
             t = open_trades[key]
             t["exits"].append({"ts": d.get("ts"), "price": d.get("price"), "qty": d.get("qty"),
@@ -5837,6 +6569,22 @@ def scan_all_trades_detailed():
                                 "type": d.get("type")})
             if sum(x["qty"] for x in t["exits"]) >= t["qty"] - 1e-9:
                 closed_trades.append(open_trades.pop(key))
+
+    def _tp_slot(planned_tp_legs, tp_exits, idx):
+        # 2026-07-28: show the ORIGINAL planned target (level + type) for
+        # this TP slot even if it was never actually hit (a trade that
+        # closed via SL alone still HAD configured TP targets) — only
+        # falls back to nothing if this slot was never configured at all
+        # (a single-target trade has no TP2 slot, say). An actually-hit
+        # leg (in tp_exits) always takes priority over the merely-planned
+        # one, since it carries the real fill price/pnl.
+        if idx < len(tp_exits):
+            x = tp_exits[idx]
+            return {"price": x["price"], "type": x.get("type"), "hit": True}
+        if idx < len(planned_tp_legs):
+            leg = planned_tp_legs[idx]
+            return {"price": leg.get("level"), "type": leg.get("type"), "hit": False}
+        return None
 
     out = []
     for t in closed_trades:
@@ -5865,17 +6613,25 @@ def scan_all_trades_detailed():
             if r not in reasons:
                 reasons.append(r)
         tp_exits = [x for x in exits if x.get("reason") == "tp"]
+        planned_tp_legs = t.get("planned_tp_legs") or []
+        worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
+                                                      exits, t["entry_ts"], exits[-1]["ts"])
+        dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
+        balance_after = exits[-1].get("balance")
+        balance_before = (balance_after - net_pnl) if balance_after is not None else None
+        dd_pct = (dd / balance_before * 100.0) if balance_before else None
         out.append({
             "symbol": t["symbol"], "asset": asset or t["symbol"],
             "pos_side": t["pos_side"], "qty": entry_qty,
             "entry_ts": t["entry_ts"], "entry_price": entry_price,
             "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
             "reason": "+".join(reasons),
-            "tp1": tp_exits[0] if len(tp_exits) >= 1 else None,
-            "tp2": tp_exits[1] if len(tp_exits) >= 2 else None,
+            "tp1": _tp_slot(planned_tp_legs, tp_exits, 0),
+            "tp2": _tp_slot(planned_tp_legs, tp_exits, 1),
             "r_dollars": r_dollars, "fees": total_fees,
             "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
-            "balance": exits[-1].get("balance"),
+            "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
+            "sequence": t.get("sequence_label") or "—",
         })
 
     # CRITICAL bug fixed 2026-07-25, user-reported ("trade closed in sim
@@ -5920,36 +6676,28 @@ def scan_all_trades_detailed():
             if r not in reasons:
                 reasons.append(r)
         tp_exits = [x for x in exits if x.get("reason") == "tp"]
+        planned_tp_legs = t.get("planned_tp_legs") or []
+        worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
+                                                      exits, t["entry_ts"], exits[-1]["ts"])
+        dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
+        balance_after = exits[-1].get("balance")
+        balance_before = (balance_after - net_pnl) if balance_after is not None else None
+        dd_pct = (dd / balance_before * 100.0) if balance_before else None
         out.append({
             "symbol": t["symbol"], "asset": asset or t["symbol"],
             "pos_side": t["pos_side"], "qty": entry_qty,
             "entry_ts": t["entry_ts"], "entry_price": entry_price,
             "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
             "reason": "+".join(reasons),
-            "tp1": tp_exits[0] if len(tp_exits) >= 1 else None,
-            "tp2": tp_exits[1] if len(tp_exits) >= 2 else None,
+            "tp1": _tp_slot(planned_tp_legs, tp_exits, 0),
+            "tp2": _tp_slot(planned_tp_legs, tp_exits, 1),
             "r_dollars": r_dollars, "fees": total_fees,
             "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
-            "balance": exits[-1].get("balance"),
+            "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
+            "sequence": t.get("sequence_label") or "—",
         })
 
     out.sort(key=lambda t: t["exit_ts"] or "")
-
-    # DD ($ and %) — added 2026-07-25, user-requested "DD" column: how far
-    # BELOW the peak account balance-to-date this trade's own close left
-    # the account, walked oldest-to-newest using SimAccount's own real
-    # running balance (exits[-1]["balance"] above) rather than a
-    # PnL-reconstructed one — the exact figure the paper account actually
-    # had, fees included, at that moment.
-    peak_balance = None
-    for t in out:
-        bal = t.get("balance")
-        if bal is None:
-            t["dd"], t["dd_pct"] = None, None
-            continue
-        peak_balance = bal if peak_balance is None else max(peak_balance, bal)
-        t["dd"] = peak_balance - bal
-        t["dd_pct"] = (t["dd"] / peak_balance * 100.0) if peak_balance > 0 else None
     return out
 
 def compute_trade_stats(events, source="sim"):
@@ -6159,21 +6907,35 @@ def _fmt_duration(entry_ts, exit_ts):
 # first PnL figure a reader hits; NET PNL (after fees) now sits where GROSS
 # used to, right after REASON. TP1 TYPE/TP2 TYPE (2026-07-26, new) sit
 # immediately after their own TP1/TP2 price column, showing which HPL/
-# target (BT/ST, GEXFLIP, CLUSTER) that leg was tied to.
+# target (BT/ST, GEXFLIP, CLUSTER) that leg was tied to. SEQUENCE
+# (2026-07-27, new) sits right after QTY — which step of the Blackjack
+# loss/win ladder (1R/1R/2R/3R/5R, or a win-progression amount) this
+# trade was actually sized at ("Flat" when Blackjack mode was off);
+# narrower terminals now rely on [←]/[→] horizontal scroll (see
+# _draw_trades_table's own hscroll param) rather than truncation alone to
+# reach the columns this pushed further right.
 TRADES_TABLE_COLS = [
-    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6),
+    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 10),
     ("GROSS", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
-    ("REASON", 10), ("NET PNL", 10), ("FEES", 7), ("BALANCE", 11), ("DD", 10),
+    ("REASON", 10), ("FEES", 7), ("NET PNL", 10), ("BALANCE", 11), ("DD", 10),
     ("R$", 7), ("TP1", 9), ("TP1 TYPE", 9), ("TP2", 9), ("TP2 TYPE", 9), ("DUR", 7),
 ]
 
-def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
+def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
     """The all-trades table, bounded to rows [y0, y1) — split out of the
     old full-screen draw_trades_table so it can share the screen with the
     equity curve (top half chart / bottom half table) per explicit user
     request, instead of a [T]-toggled full-screen alternate page. Returns
     (visible_rows, total) so the caller's footer/scroll-hint can report the
-    EXACT window shown without duplicating this function's own row math."""
+    EXACT window shown without duplicating this function's own row math.
+
+    hscroll (2026-07-27, new, user request "make the trade log horizontally
+    scrollable"): number of LEFTMOST columns to skip, not a character
+    offset — [←]/[→] in curses_main step it one whole column at a time
+    (see that key dispatch for why: TP1 TYPE's "GEXFLIP"/"CLUSTER" text
+    already made character-granularity scrolling awkward to land cleanly
+    on a column boundary). Clamped here the same way `scroll` already is,
+    so the caller never needs to know TRADES_TABLE_COLS' own length."""
     y = y0
     db.puts(y, 0, f" All Trades — {'SIM (Paper)' if source == 'sim' else 'LIVE (Phemex)'} ".center(cols, "─")[:cols],
             P_CYAN, curses.A_BOLD)
@@ -6184,8 +6946,11 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
                       "athena_logs has no order-type/TP-leg data to build it from.", P_DIM)
         return 0, 0
 
+    hscroll = max(0, min(hscroll, len(TRADES_TABLE_COLS) - 1))
+    visible_cols = TRADES_TABLE_COLS[hscroll:]
+
     header = ""
-    for name, w in TRADES_TABLE_COLS:
+    for name, w in visible_cols:
         header += name.ljust(w + 1)
     db.puts(y, 0, header[:cols], P_DIM, curses.A_BOLD)
     y += 1
@@ -6213,13 +6978,14 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
             (t["asset"], P_DEFAULT),
             (t["pos_side"] or "—", P_GREEN if t["pos_side"] == "Long" else P_RED),
             (fmt_num(t["qty"], 2), P_DEFAULT),
+            (t.get("sequence", "—"), P_YELLOW if "Win" in (t.get("sequence") or "") else P_DIM),
             (fmt_money(t["gross_pnl"]), pnl_pair(t["gross_pnl"])),
             (f"{t['rr']:.2f}" if t["rr"] is not None else "—", pnl_pair(t["rr"] or 0)),
             (fmt_num(t["entry_price"]), P_DEFAULT),
             (fmt_num(t["exit_price"]), P_DEFAULT),
             (t["reason"], P_DEFAULT),
-            (fmt_money(t["net_pnl"]), pnl_pair(t["net_pnl"])),
             (fmt_money(-t["fees"]) if t["fees"] else "$0.00", P_DIM),
+            (fmt_money(t["net_pnl"]), pnl_pair(t["net_pnl"])),
             (fmt_money(t["balance"]) if t["balance"] is not None else "—", P_DIM),
             (fmt_money(-t["dd"]) if t.get("dd") is not None else "—", P_RED if t.get("dd") else P_DIM),
             (fmt_money(t["r_dollars"]), P_DIM),
@@ -6228,9 +6994,9 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
             (fmt_num(t["tp2"]["price"]) if t["tp2"] else "—", P_DIM),
             (_tp_type_display(t["tp2"]["type"]) if t["tp2"] else "—", P_DIM),
             (_fmt_duration(t["entry_ts"], t["exit_ts"]), P_DIM),
-        ]
+        ][hscroll:]
         x = 0
-        for (text, pair), (name, w) in zip(cells, TRADES_TABLE_COLS):
+        for (text, pair), (name, w) in zip(cells, visible_cols):
             if x >= cols:
                 break
             db.puts(row_y, x, text.ljust(w)[:max(0, min(w, cols - x))], pair)
@@ -6238,7 +7004,7 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll):
 
     return visible_rows, total
 
-def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll):
+def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, table_hscroll=0):
     """Stats stay put (unchanged), then the screen splits in half: equity
     curve on top, all-trades table on the bottom — replaces the old
     [T]-toggled full-screen alternate page per explicit user request
@@ -6269,7 +7035,7 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll):
     remaining_top, remaining_bottom = y, rows - 2
     mid = remaining_top + max(3, (remaining_bottom - remaining_top) // 2)
     _draw_equity_curve(db, remaining_top, mid, cols, events)
-    return _draw_trades_table(db, mid, remaining_bottom, cols, source, trades, table_scroll)
+    return _draw_trades_table(db, mid, remaining_bottom, cols, source, trades, table_scroll, table_hscroll)
 
 # ── Curses app shell ─────────────────────────────────────────────────────────
 # DoubleBuffer ported verbatim from charthacker.py — a plain (char,
@@ -7140,6 +7906,10 @@ _flatten_all_evt = threading.Event()   # [F] (armed+confirmed) sets this; engine
                                         # Phemex/SimAccount close functions, so the
                                         # actual flatten happens there, not on the
                                         # curses thread — same convention as _reset_sim_evt
+_flatten_scope = ["ALL"]   # 2026-07-28 — curses thread writes "ETH"/"QQQ"/"ALL" here
+                            # (from the new [F] asset-picker dialog) before setting
+                            # _flatten_all_evt, same single-item cross-thread box
+                            # _reset_sim_balance already established for [R].
 _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] key can cycle it in place
 
 GEX_COL_W = 2   # matches gex.py's own COL_W (terminal columns per time interval)
@@ -7660,13 +8430,17 @@ async def engine_loop():
 
         if _flatten_all_evt.is_set():
             _flatten_all_evt.clear()
-            console_log(f"{RED}{BLD}Flatten All triggered — closing every position, cancelling every order{RST}")
-            log_event("SYSTEM", "flatten_all_triggered", {})
+            scope = _flatten_scope[0]
+            scope_label = "every asset" if scope == "ALL" else scope
+            console_log(f"{RED}{BLD}Flatten triggered ({scope_label}) — closing position(s), cancelling order(s){RST}")
+            log_event("SYSTEM", "flatten_all_triggered", {"scope": scope})
             for inst in instruments:
+                if scope != "ALL" and inst.asset != scope:
+                    continue
                 try:
                     await inst._flatten_now("manual")
                 except Exception as e:
-                    console_log(f"{inst.asset}: Flatten All FAILED — {e}")
+                    console_log(f"{inst.asset}: Flatten FAILED — {e}")
                     log_event(inst.asset, "manual_flatten_failed", {"error": str(e)})
 
         for inst in instruments:
@@ -7749,7 +8523,15 @@ def draw_dashboard(db, snap, cols):
 
     op, cpnl = snap["open_pnl"], snap["closed_pnl"]
     bal_tag = "SIM" if DRY_RUN else "Phemex"
+    # Equity (2026-07-28 user request) = Balance + Open PnL — the account's
+    # real current worth including whatever's unrealized on any open
+    # position(s) right now, vs. Balance alone (realized-only, unchanged by
+    # an open position until it closes). Falls back to Balance itself when
+    # Open PnL isn't available (no live price yet) rather than showing
+    # "n/a" — equity with zero open exposure IS exactly the balance.
+    equity = snap["balance"] + op if op is not None else snap["balance"]
     db.puts_ansi(y, 0, f"{BLD}ACCOUNT{RST} ({bal_tag})   Balance {fmt_money(snap['balance'])}   "
+                       f"Equity {pnl_color(equity - snap['balance']) if op is not None else DIM}{fmt_money(equity)}{RST}   "
                        f"Available {fmt_money(snap['available'])}   "
                        f"Open PnL {pnl_color(op) if op is not None else DIM}"
                        f"{fmt_money(op) if op is not None else 'n/a'}{RST}   "
@@ -7881,8 +8663,19 @@ def draw_dashboard(db, snap, cols):
                 entry, exitp, pnl, reason = t.get("entry"), t.get("price"), t.get("pnl"), t.get("reason", "")
             else:
                 d = t.get("detail") or {}
+                ev = t.get("event")
                 sym, side, qty = t.get("asset", "?"), d.get("pos_side", "?"), d.get("qty")
-                entry, exitp, pnl, reason = d.get("entry"), d.get("exit_approx"), d.get("pnl_approx"), "~approx"
+                entry, exitp, pnl = d.get("entry"), d.get("exit_approx"), d.get("pnl_approx")
+                # 2026-07-28 fix: show the actual TP/SL/MANUAL/flip/eod cause
+                # instead of the old flat "~approx" placeholder — exit_approx
+                # itself is still an approximation (no real fill-price API
+                # wired up), tagged "approx" alongside whichever reason
+                # applies, rather than pretending either is exact.
+                if ev == "position_closed":
+                    reason = f"{(d.get('reason') or 'MANUAL').lower()} approx"
+                else:
+                    reason = {"pcvr_flip_close": "flip approx", "eod_flatten": "eod approx",
+                               "manual_flatten": "manual"}.get(ev, "approx")
             db.puts_ansi(y, 0, f"  {DIM}{ts}{RST}  {sym:<8} {side:<5} {fmt_num(qty, 2)} @ {fmt_num(entry)} -> "
                                f"{fmt_num(exitp)}   PnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}  {DIM}({reason}){RST}")
         y += 1
@@ -8074,6 +8867,72 @@ def _prompt_confirm_text(stdscr, box_lines, confirm_word):
                 buf += ch
     finally:
         curses.curs_set(0)
+        stdscr.nodelay(True)
+    return result
+
+def _prompt_flatten_scope(stdscr):
+    """[F] confirmation, 2026-07-28 user request: "make a pop-up with
+    similar design as the one used for switching from live to sim that
+    asks the user if they want to flatten ETH, QQQ, or all." Same
+    bordered-box visual style as _prompt_confirm_text (the go-live/go-sim
+    warning) — centered, bold red border — but a single-keypress SCOPE
+    PICKER instead of a type-to-confirm gate: Flatten only ever touches
+    Athena's OWN open positions/orders (never account mode), so a single
+    confirmed keypress matches the stakes of its prior arm-then-confirm
+    convention; it now also picks WHICH asset(s) rather than assuming
+    every one. Returns "ETH", "QQQ", "ALL", or None if cancelled (Esc or
+    any key other than E/Q/A)."""
+    rows, cols = stdscr.getmaxyx()
+    box_lines = [
+        "",
+        "FLATTEN — closes position(s), cancels order(s)",
+        "",
+        "[E]TH only    [Q]QQ only    [A]ll assets    [Esc] cancel",
+        "",
+    ]
+    box_w = min(cols - 4, 74)
+    box_h = len(box_lines) + 2
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+
+    result = None
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    try:
+        attrs = curses.color_pair(P_RED) | curses.A_BOLD
+        try:
+            stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+            for i, line in enumerate(box_lines):
+                stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+            stdscr.addstr(y0 + 1 + len(box_lines), x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        while True:
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch == "\x1b":
+                result = None
+                break
+            if isinstance(ch, str) and ch.lower() == "e":
+                result = "ETH"
+                break
+            if isinstance(ch, str) and ch.lower() == "q":
+                result = "QQQ"
+                break
+            if isinstance(ch, str) and ch.lower() == "a":
+                result = "ALL"
+                break
+            # any other key: treat as cancel, same as _prompt_confirm_text's
+            # Esc-only behavior would be too easy to trigger accidentally
+            # for a flatten action — but here ANY non-E/Q/A key cancels
+            # outright rather than looping, since there's no text buffer
+            # to keep editing.
+            result = None
+            break
+    finally:
         stdscr.nodelay(True)
     return result
 
@@ -8396,14 +9255,12 @@ def curses_main(stdscr):
                                # full-screen view uses, for when even the
                                # compacted DASHBOARD_H isn't enough room
     reset_armed = False
-    flatten_armed = False   # [F] — arm-then-confirm, same convention as [R],
-                             # for an action that closes real positions/cancels
-                             # real orders when not in --dry-run
     data_view = False
     data_source = "sim" if DRY_RUN else "real"
     data_cache = {"source": None, "ts": 0.0, "events": [], "stats": None}
     trades_cache = {"source": None, "ts": 0.0, "trades": []}
     table_scroll = 0
+    table_hscroll = 0   # [←]/[→] in Data view — see _draw_trades_table's own docstring
     data_table_info = (0, 0)   # (visible_rows, total) — set from draw_data_view's
                                # own return each frame, so the footer's scroll
                                # hint never drifts from the table's real layout
@@ -8444,7 +9301,7 @@ def curses_main(stdscr):
                 trades = scan_all_trades_detailed() if data_source == "sim" else []
                 trades_cache = {"source": data_source, "ts": now_mono, "trades": trades}
             data_table_info = draw_data_view(db, rows, cols, data_source, data_cache["events"],
-                                              data_cache["stats"], trades_cache["trades"], table_scroll)
+                                              data_cache["stats"], trades_cache["trades"], table_scroll, table_hscroll)
         elif gex_mode:
             # Full screen (0..rows, not 0..footer_row) — draw_gex_map/
             # draw_gex_by_strike own their entire own status/hint row at
@@ -8515,11 +9372,7 @@ def curses_main(stdscr):
             draw_activity_log_popup(db, rows, cols, snap["event_log"], activity_log_scroll)
 
         ts = datetime.now().strftime("%H:%M:%S")
-        if flatten_armed:
-            footer = (f"{ts}   {RED}{BLD}FLATTEN ALL — closes every position, cancels every order{RST}"
-                      f"{YLW} — [F] again to CONFIRM, any other key to cancel{RST}")
-            db.puts_ansi(footer_row, 0, footer.ljust(cols)[:cols])
-        elif reset_armed:
+        if reset_armed:
             footer = f"{ts}   {YLW}Reset paper account — [R] again to enter a new balance, any other key to cancel{RST}"
             db.puts_ansi(footer_row, 0, footer.ljust(cols)[:cols])
         elif data_view:
@@ -8528,7 +9381,7 @@ def curses_main(stdscr):
             if total:
                 shown = min(table_scroll + 1, total)
                 shown_end = min(table_scroll + visible_rows, total)
-                scroll_tag = f"  [{shown}-{shown_end} of {total}, ↑/↓ scroll table]"
+                scroll_tag = f"  [{shown}-{shown_end} of {total}, ↑/↓ scroll table, ←/→ scroll columns]"
             footer = f"{ts}   [D]ashboard   [S]witch source ({data_source}){scroll_tag}   [Q]uit"
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
         elif gex_mode:
@@ -8549,9 +9402,11 @@ def curses_main(stdscr):
             focus_asset = chart_focus if both_panes else "ETH"
             x_hint = " [X]:crosshair-ON" if chart_crosshair_active.get(focus_asset) else " [X]:crosshair"
             risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
+            bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
+            sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
             footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                      f"{risk_hint} {'BJ' if BLACKJACK_MODE else 'flat'} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                      f"{risk_hint}{sl_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
                       + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
@@ -8563,12 +9418,6 @@ def curses_main(stdscr):
 
         key = stdscr.getch()
         if key == -1:
-            continue
-
-        if flatten_armed:
-            flatten_armed = False
-            if key in (ord("f"), ord("F")):
-                _flatten_all_evt.set()
             continue
 
         if reset_armed:
@@ -8712,6 +9561,7 @@ def curses_main(stdscr):
             elif key in (ord("s"), ord("S")):
                 data_source = "real" if data_source == "sim" else "sim"
                 table_scroll = 0
+                table_hscroll = 0
             elif key == curses.KEY_UP:
                 table_scroll += 1
             elif key == curses.KEY_DOWN:
@@ -8720,6 +9570,10 @@ def curses_main(stdscr):
                 table_scroll += 10
             elif key == curses.KEY_NPAGE:
                 table_scroll = max(0, table_scroll - 10)
+            elif key == curses.KEY_RIGHT:
+                table_hscroll += 1   # clamped inside _draw_trades_table itself
+            elif key == curses.KEY_LEFT:
+                table_hscroll = max(0, table_hscroll - 1)
             continue
 
         if key in (ord("q"), ord("Q")):
@@ -8729,10 +9583,22 @@ def curses_main(stdscr):
         elif key in (ord("r"), ord("R")) and DRY_RUN:
             reset_armed = True
         elif key in (ord("f"), ord("F")):
-            flatten_armed = True
+            # 2026-07-28 user request: same bordered-box visual style as
+            # the go-live/go-sim warning (_prompt_confirm_text), but a
+            # single-keypress SCOPE PICKER instead of a type-to-confirm
+            # gate — Flatten only ever touches Athena's OWN open
+            # positions/orders (not account mode), so its existing
+            # arm-then-confirm precedent's stakes are matched by a single
+            # confirmed keypress; it just now also picks WHICH asset(s).
+            scope = _prompt_flatten_scope(stdscr)
+            db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
+            if scope is not None:
+                _flatten_scope[0] = scope
+                _flatten_all_evt.set()
         elif key in (ord("d"), ord("D")):
             data_view = True
-            table_scroll = 0   # always reopen scrolled to the newest trades —
+            table_scroll = 0
+            table_hscroll = 0   # always reopen scrolled to the newest trades —
                                 # without this, a scroll from a PRIOR visit
                                 # (e.g. to check older trades) silently stayed
                                 # in effect on every later reopen, pinning the
@@ -8788,6 +9654,40 @@ def curses_main(stdscr):
             else:
                 console_log(f"{GRN}{BLD}Blackjack sizing OFF — back to flat {PCT:g}% risk (via [B]){RST}")
             log_event("SYSTEM", "blackjack_mode_toggled", {"enabled": BLACKJACK_MODE, "one_r_dollars": BLACKJACK_1R_DOLLARS})
+        elif key == ord("1"):
+            # 2026-07-27 user request: reset Blackjack's own loss/win
+            # progression back to 1R at any time, independent of a full
+            # paper-account [R]eset (which also wipes balance/trade
+            # history) — acts on whichever pane is [Tab]-focused, same
+            # per-asset convention [A] already uses.
+            focus_asset = chart_focus if both_panes else "ETH"
+            BLACKJACK_STATE[focus_asset] = _default_blackjack_state()[focus_asset]
+            _save_blackjack_state()
+            console_log(f"{focus_asset}: {GRN}Blackjack progression manually reset to 1R (via [1]){RST}")
+            log_event(focus_asset, "blackjack_manually_reset", {})
+        elif key in (ord("w"), ord("W")):
+            # 2026-07-28 user request: "Allow the user to set the default SL
+            # amount in points for ETH and QQQ" — acts on whichever pane is
+            # [Tab]-focused, same per-asset convention [A]/[1] already use.
+            # ASSETS[asset] is mutated IN PLACE rather than reassigned —
+            # self.cfg = ASSETS[asset] (AthenaInstrument.__init__) is a live
+            # reference, not a copy, so every existing self.cfg["sl"] read
+            # site (bracket placement, position sizing, _sync_moving_tps's
+            # R-distance safety guard, the dashboard's SL-distance display,
+            # etc.) picks up the new value on its very next read with no
+            # further plumbing needed. Does NOT retroactively change the SL
+            # of an already-open position — only affects trades entered
+            # AFTER this changes, same as changing PCT/RISK_DOLLARS via [P]
+            # doesn't resize an already-open position either.
+            w_asset = chart_focus if both_panes else "ETH"
+            cur_sl = ASSETS[w_asset]["sl"]
+            new_sl = _prompt_number(stdscr, f"{w_asset} SL distance in points (current {fmt_num(cur_sl)}, Enter keeps it): ",
+                                     default=cur_sl)
+            db.prev = None
+            if new_sl is not None and new_sl > 0 and abs(new_sl - cur_sl) > 1e-9:
+                console_log(f"{w_asset}: {YLW}SL distance changed {fmt_num(cur_sl)} -> {fmt_num(new_sl)} (via [W]){RST}")
+                log_event(w_asset, "sl_distance_changed", {"old_sl": cur_sl, "new_sl": new_sl})
+                ASSETS[w_asset]["sl"] = new_sl
         elif key in (ord("p"), ord("P")):
             # 2026-07-26 user request: [P] is now both the value AND the
             # $/% unit toggle in one prompt — see _prompt_risk_value's own

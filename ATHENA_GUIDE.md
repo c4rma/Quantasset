@@ -320,7 +320,21 @@ Two independent systems, never combined:
 ## 10. Entry Logic — the Confirmation Gate
 
 Once all required lights are green and a footprint bar closes confirming
-direction (POC + net delta both moved the same way as the PCVR regime),
+direction, `_check_confirmation` runs a further **target-viability check**
+before placing any order.
+
+**`footprint_confirmation` (order-flow reversal check)** — for a **long**,
+requires BOTH: POC moved up vs. the previous bar, AND delta improved vs.
+the previous bar (`new_delta > prev_delta`) — a **short** is the exact
+mirror (POC down, delta decreased). This is a purely **relative**
+comparison against the previous bar, by design — not an absolute
+threshold on the current bar's own sign. (2026-07-30: briefly changed to
+also require the current bar's delta sit on the correct side of zero,
+based on a misread of a reported incident's actual numbers; reverted once
+the real values were confirmed — prev delta +210.00, new delta -65.0 is
+already a plain decrease that the relative comparison alone correctly
+rejects, no extra condition needed.)
+
 `_check_confirmation` runs a further **target-viability check** before
 placing any order:
 

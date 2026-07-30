@@ -3341,7 +3341,7 @@ _STATUS_SEP_MARKER    = "\0SEP\0"
 _STATUS_TITLE_MARKER  = "\0TITLE\0"
 _STATUS_FOOTER_MARKER = "\0FOOTER\0"
 _STATUS_STATUS_MARKER = "\0STATUS\0"
-STATUS_TITLE_TEXT = "BLACKJACK FRAMEWORK DASHBOARD"
+STATUS_TITLE_TEXT = "CCCCWDE/BLACKJACK FRAMEWORK DASHBOARD"
 
 def _status_visible_len(s):
     return len(_ANSI_RE.sub("", s))
@@ -4170,7 +4170,17 @@ def footprint_confirmation(prev_bar, new_bar, regime):
     """True if new_bar confirms `regime` against prev_bar: POC and net delta
     both moved the same direction the regime needs (both up for long, both
     down for short) — per the user's exact spec, a value/sign comparison
-    against the previous bar, not an absolute threshold."""
+    against the previous bar, not an absolute threshold.
+
+    2026-07-30: briefly changed to ALSO require the new bar's own delta to
+    sit on the correct side of zero, based on a misread of a reported
+    incident's actual bar values — reverted per the user's own correction
+    with the real numbers (prev delta +210.00, new delta -65.0): a
+    decrease already fails `new_delta > prev_delta` on its own (-65.0 is
+    not > 210.0), so the plain relative comparison below is correct as
+    originally written and needs no additional sign condition. Whatever
+    let that specific QQQ trade through was not a flaw in this function's
+    own logic."""
     prev_poc, _, _ = bar_poc_vah_val(prev_bar)
     new_poc, new_vah, new_val = bar_poc_vah_val(new_bar)
     if prev_poc is None or new_poc is None:

@@ -2283,7 +2283,6 @@ def fetch_status_pcvr():
     return {"underlying": underlying, "put_vol": put_vol, "call_vol": call_vol, "ratio": ratio}
 
 STATUS_BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}
-STATUS_BT_ST_MAX_STRIKES_FROM_ATM = 10
 # 2026-07-27 user-requested change, DELIBERATE divergence from status.py's
 # own original (crypto: 3) — confirmed byte-for-byte identical to
 # status.py's own compute_bt_st before this change (verified against a
@@ -2361,8 +2360,25 @@ def compute_bt_st(strikes, is_crypto, spot, ratio):
     max_start = n - run_len
     if max_start < 0:
         return None, None
-    lo_start = max(0, atm_idx - STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
-    hi_start = min(max_start, atm_idx + STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
+    # 2026-07-31 CRITICAL fix, user-reported (QQQ BT/ST off by exactly
+    # $10 — showed $682/$681, real values were $692/$691): the search
+    # window used to be additionally capped to
+    # STATUS_BT_ST_MAX_STRIKES_FROM_ATM (10) INDEX positions from ATM, on
+    # top of the already-price-bounded `sorted_strikes` (lo_bound/
+    # hi_bound above, the real 12%/20% band). That index cap doesn't
+    # scale with strike SPACING: for ETH's ~$20-wide strikes, 10 indices
+    # spans ~$200 (already narrower than the intended $380 20%-band half-
+    # width, just not narrow enough to have caused a visible bug yet);
+    # for QQQ's $1-wide strikes, 10 indices spans only ~$10 — a small
+    # fraction of the intended ~$82 12%-band half-width for a ~$682
+    # spot. The real BT run at $692 sat 10 strikes from spot, right at
+    # (or just past) that artificial edge, so the search silently
+    # settled for a nearer but WRONG run inside the too-tight window
+    # instead. Fixed: search the ENTIRE already-price-bounded
+    # `sorted_strikes` list — the band_pct filter above is the real,
+    # meaningful constraint; this extra index-based cap was redundant at
+    # best and actively wrong at worst.
+    lo_start, hi_start = 0, max_start
 
     def run_ok(start):
         for idx in range(start, start + run_len):
@@ -4397,6 +4413,24 @@ class SimAccount:
             pos["qty"] = total
         else:
             self.positions[symbol] = {"pos_side": pos_side, "qty": qty, "avg_entry": price}
+        # CRITICAL fix, 2026-07-31, user-reported ("the Balance... have
+        # [not] been calculated correctly from the very beginning" — a
+        # hand-walked balance using each trade's own NET PNL never
+        # matched the real persisted balance): this ledger never actually
+        # deducted trading fees from `self.balance` at all — only
+        # scan_all_trades_detailed's own SEPARATE, display-only
+        # reconstruction subtracted PHEMEX_FEE_RATE to compute the trade
+        # table's "NET PNL"/"FEES" columns, with zero effect on the real
+        # running balance. Confirmed against the real ledger: 46 trades
+        # since the last reset had accumulated $683.67 in fees never
+        # deducted (real balance $1,299.92 vs. the true $616.26 it should
+        # have been). Fixed: charge the entry fee HERE, at fill time, on
+        # the actual filled qty/price — the exit fee is charged
+        # symmetrically in _close, per leg — together exactly matching
+        # scan_all_trades_detailed's own existing fee formula, so the
+        # real balance and the trade log's own NET PNL walk forward
+        # identically from now on.
+        self.balance -= qty * price * PHEMEX_FEE_RATE
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty,
                   "price": price, "order_type": order_type}
         if sequence_label is not None:
@@ -4419,6 +4453,15 @@ class SimAccount:
         entry = pos["avg_entry"]
         pnl = (price - entry) * qty if pos_side == "Long" else (entry - price) * qty
         self.balance += pnl
+        # See _apply_fill's own comment — the matching exit-leg fee,
+        # charged on THIS leg's own qty/price (a multi-leg trade, e.g.
+        # TP1 partial + SL for the remainder, correctly pays a separate
+        # exit fee per leg, exactly matching scan_all_trades_detailed's
+        # own per-leg fee summation). `pnl` itself stays pure GROSS
+        # (unchanged) — it still feeds the trade log's own GROSS column
+        # and sim_logs' own historical "pnl" field; the fee is a
+        # separate balance effect, same as a real exchange.
+        self.balance -= qty * price * PHEMEX_FEE_RATE
         pos["qty"] -= qty
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
                   "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance}
@@ -6790,6 +6833,26 @@ def scan_all_trades_detailed():
             continue
     rows.sort(key=lambda d: d.get("ts") or "")
 
+    # CRITICAL fix, 2026-07-31, user-reported: the "balance" column below
+    # used to read each trade's own PERSISTED "balance" field straight off
+    # its 'closed' event — a value SimAccount wrote at the time, using
+    # whatever balance-tracking logic was live THEN. A restart alone can't
+    # retroactively fix trades that closed under the old (fee-blind)
+    # logic — those log entries are frozen forever with their own old,
+    # wrong balance snapshot baked in. Recomputed here instead as a TRUE
+    # running total: starting from this epoch's own real starting balance
+    # (the most recent "reset" event's own balance, or SIM_DEFAULT_BALANCE
+    # if this epoch never had one), walking forward by each trade's own
+    # (already correctly fee-adjusted) net_pnl in chronological order —
+    # self-healing regardless of what any individual historical log entry
+    # happens to say, and immediately correct the moment this function is
+    # called, no separate backfill step needed ever again.
+    reset_balance = SIM_DEFAULT_BALANCE
+    for d in rows:
+        if d.get("event") == "reset" and d.get("balance") is not None:
+            reset_balance = d["balance"]
+    running_balance = reset_balance
+
     open_trades = {}
     closed_trades = []
     for d in rows:
@@ -6868,8 +6931,15 @@ def scan_all_trades_detailed():
         worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
                                                       exits, t["entry_ts"], exits[-1]["ts"])
         dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
-        balance_after = exits[-1].get("balance")
-        balance_before = (balance_after - net_pnl) if balance_after is not None else None
+        # balance_after: a TRUE running total (see the reset_balance/
+        # running_balance setup above), NOT exits[-1]'s own persisted
+        # "balance" field — that field is frozen at whatever
+        # SimAccount's balance-tracking logic was AT THE TIME this trade
+        # closed, so old trades from before the 2026-07-31 fee-deduction
+        # fix would otherwise show their old, wrong balance forever.
+        balance_before = running_balance
+        running_balance += net_pnl
+        balance_after = running_balance
         dd_pct = (dd / balance_before * 100.0) if balance_before else None
         out.append({
             "symbol": t["symbol"], "asset": asset or t["symbol"],
@@ -7009,7 +7079,12 @@ def _draw_equity_curve(db, y0, y1, cols, events):
     (top half chart / bottom half table) instead of taking the whole
     remaining screen, per explicit user request."""
     db.puts(y0, 0, "── Cumulative PnL ".ljust(min(cols, BOX_W), "─")[:cols], P_DIM)
-    chart_top, chart_bottom = y0 + 1, y1 - 1
+    # 2026-07-31 user request: the x-axis represents each closed trade in
+    # sequence, one point per trade (already true of the plotting logic
+    # below — points are spread evenly by TRADE INDEX, not by elapsed
+    # time) — it just had no label saying so. Reserves one extra row at
+    # the bottom for that label/tick line, one row shorter than before.
+    chart_top, chart_bottom = y0 + 1, y1 - 2
     chart_h = max(3, chart_bottom - chart_top)
     if not events:
         db.puts(y0 + 1, 0, "no closed trades yet", P_DIM)
@@ -7090,6 +7165,20 @@ def _draw_equity_curve(db, y0, y1, cols, events):
                 db.put(r, c, "·", pair, curses.A_DIM)
         db.put(row, col, "●", pair, curses.A_BOLD)
         prev_col, prev_row = col, row
+
+    # X-axis label row (2026-07-31 user request: "PnL chart's x-axis
+    # should be 'Trade Number'") — the plotting above already spaces
+    # points evenly by TRADE INDEX (x_scale = plot_w / (m-1)), never by
+    # elapsed time; this just makes that existing axis explicit with a
+    # tick at the first/last trade and a centered title.
+    axis_row = chart_bottom + 1
+    db.puts(axis_row, axis_w, "─" * plot_w, P_DIM)
+    first_label, last_label = "1", str(n)
+    title = "Trade Number"
+    title_col = axis_w + max(0, (plot_w - len(title)) // 2)
+    db.puts(axis_row, axis_w, first_label, P_DIM)
+    db.puts(axis_row, min(cols - len(last_label), axis_w + plot_w - len(last_label)), last_label, P_DIM)
+    db.puts(axis_row, title_col, title[:max(0, cols - title_col)], P_DIM, curses.A_BOLD)
 
 def _fmt_ts_short(iso_ts):
     if not iso_ts:
@@ -9523,13 +9612,37 @@ def curses_main(stdscr):
 
         if data_view:
             now_mono = time.time()
-            if data_cache["source"] != data_source or now_mono - data_cache["ts"] > 2.0:
-                events = scan_all_trade_events(data_source)
-                data_cache = {"source": data_source, "ts": now_mono, "events": events,
-                              "stats": compute_trade_stats(events, source=data_source)}
+            # 2026-07-31 CRITICAL fix, user-reported ("the Balance and
+            # possibly the Cumulative PnL have [not] been calculated
+            # correctly from the very beginning... if you continue
+            # through each trade and compare the Net PnL with what the
+            # new Balance should be, you will see it is all incorrect"):
+            # scan_all_trade_events's own 'pnl' field is the RAW per-LEG
+            # GROSS pnl straight from each persisted 'closed' event —
+            # it was never fee-adjusted, so the Cumulative PnL chart and
+            # the stats header (Total PnL/Avg Win/Max Drawdown/Sharpe)
+            # have always reflected GROSS performance, silently
+            # inconsistent with the trade table's own correctly
+            # fee-adjusted NET PNL column. For 'sim' specifically, build
+            # the chart/stats' own "events" from scan_all_trades_
+            # detailed's ALREADY-computed per-TRADE net_pnl (entry fee
+            # counted once, exit fee per leg) instead of re-deriving from
+            # raw per-leg gross pnl — trades_cache is refreshed FIRST so
+            # this always uses the current cycle's own fresh data, not a
+            # stale value from 2s ago. 'real' mode is unaffected (no
+            # per-trade fee data exists there at all — same already-
+            # documented approximate-pnl gap as everywhere else in real
+            # mode), still sourced from scan_all_trade_events as before.
             if trades_cache.get("source") != data_source or now_mono - trades_cache["ts"] > 2.0:
                 trades = scan_all_trades_detailed() if data_source == "sim" else []
                 trades_cache = {"source": data_source, "ts": now_mono, "trades": trades}
+            if data_cache["source"] != data_source or now_mono - data_cache["ts"] > 2.0:
+                if data_source == "sim":
+                    events = [{"ts": t["exit_ts"], "pnl": t["net_pnl"]} for t in trades_cache["trades"]]
+                else:
+                    events = scan_all_trade_events(data_source)
+                data_cache = {"source": data_source, "ts": now_mono, "events": events,
+                              "stats": compute_trade_stats(events, source=data_source)}
             data_table_info = draw_data_view(db, rows, cols, data_source, data_cache["events"],
                                               data_cache["stats"], trades_cache["trades"], table_scroll, table_hscroll)
         elif gex_mode:

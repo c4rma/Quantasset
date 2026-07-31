@@ -407,6 +407,82 @@ def _reset_daily_loss_state():
     DAILY_LOSS_STATE = _default_daily_loss_state()
     _save_daily_loss_state()
 
+# ── "Closed PnL Today" dashboard stat (explicit user request, 2026-07-30) ────
+# "Closed PnL Today should be calculated from all trades entered on the
+# same day. Resets at 00:00 CT." A trade is attributed to whichever CT
+# CALENDAR day it was ENTERED on (self.position["entry_day_ct"], tagged at
+# fill time in _check_fill — a plain midnight-to-midnight CT boundary,
+# deliberately DIFFERENT from _trading_day_key's own 19:00 CT trading-day
+# boundary and _bj_reset_window_key's per-asset boundaries, since the user
+# specified 00:00 CT specifically for this one stat), NOT the day it
+# happens to CLOSE on — a position opened late one day and closed just
+# after midnight still counts toward the day it was entered, and a
+# position entered TODAY that hasn't closed yet contributes nothing until
+# it does (this is CLOSED pnl, not open/unrealized). Sim and real are
+# tracked in completely SEPARATE buckets so switching accounts via [G]
+# never mixes the two, matching every other sim-vs-real separation
+# already established in this file (SimAccount's own state vs athena_logs'
+# sim=False filtering). Replaces the old SimAccount.realized_pnl_today
+# (reset at local-wall-clock midnight, attributed by CLOSE day) and
+# athena_realized_pnl_today() (same close-day attribution, real mode) —
+# both silently misattributed a trade's pnl to the day it closed rather
+# than the day the user actually put it on.
+CLOSED_PNL_STATE_PATH = os.path.join(SCRIPT_DIR, "closed_pnl_state.json")
+
+def _default_closed_pnl_state():
+    return {"sim": {}, "real": {}}
+
+def _load_closed_pnl_state():
+    try:
+        with open(CLOSED_PNL_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        state = _default_closed_pnl_state()
+        for k in ("sim", "real"):
+            if isinstance(data.get(k), dict):
+                state[k] = data[k]
+        return state
+    except Exception:
+        return _default_closed_pnl_state()
+
+def _save_closed_pnl_state():
+    try:
+        with open(CLOSED_PNL_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(CLOSED_PNL_STATE, f)
+    except Exception:
+        pass
+
+CLOSED_PNL_STATE = _load_closed_pnl_state()
+
+def _reset_closed_pnl_state_sim():
+    """[R]/--reset-sim gives the paper account a clean slate everywhere
+    else (balance, positions, Blackjack ladder, Daily Loss Limit) — this
+    keeps 'Closed PnL Today' consistent with that for the sim side only;
+    the real-money bucket is completely untouched by a sim reset."""
+    CLOSED_PNL_STATE["sim"] = {}
+    _save_closed_pnl_state()
+
+def _ct_calendar_day_key(dt_ct):
+    """Plain midnight-to-midnight CT calendar day, as a date string —
+    the boundary "Closed PnL Today" explicitly resets at, per the user's
+    own words ("Resets at 00:00 CT"). Deliberately its own distinct
+    concept from _trading_day_key (19:00 CT) and _bj_reset_window_key
+    (per-asset boundaries) — this file already has multiple different
+    "which day does this CT instant belong to" rules, each anchored to
+    whatever boundary its own feature was explicitly specified with."""
+    return str(dt_ct.date())
+
+def closed_pnl_today(sim):
+    """The account-wide (both ETH+QQQ combined) realized pnl for trades
+    ENTERED during today's CT calendar day, for the sim or real bucket as
+    requested. Returns 0.0 (not None) if TZ_CT failed to load — same
+    fail-safe-empty convention every other CT-boundary feature in this
+    file already uses rather than guessing at a boundary with no
+    timezone."""
+    if not TZ_CT:
+        return 0.0
+    bucket = CLOSED_PNL_STATE["sim" if sim else "real"]
+    return bucket.get(_ct_calendar_day_key(datetime.now(TZ_CT)), 0.0)
+
 def _trading_day_key(dt_ct):
     """Which 'trading day' (19:00 CT to 19:00 CT the next day — the same
     session-boundary convention status_session_open_ts uses) dt_ct falls
@@ -2220,46 +2296,52 @@ STATUS_BT_ST_MAX_STRIKES_FROM_ATM = 10
 # strikes below $1,880) confirmed this wouldn't break a genuine case.
 STATUS_BT_ST_RUN_LEN = {"crypto": 5, "equity": 5}
 
-def compute_bt_st(strikes, is_crypto, spot):
-    """Scans outward from the strike nearest spot for the first
-    consecutive-strike run where one side's option volume dominates;
-    returns (bt, st, active).
+def compute_bt_st(strikes, is_crypto, spot, ratio):
+    """Computes ONE side ("primary") by scanning for the nearest-to-spot
+    consecutive-strike run where that side's option volume dominates,
+    then sets the OTHER side ("secondary") to the single strike
+    immediately adjacent to the primary — unconditionally, regardless of
+    that adjacent strike's own volume shape (even a blank/'-' field).
+    Which side is primary is driven by the CURRENT PCVR regime: `ratio >=
+    1.02` (put-heavy/bearish territory) makes ST primary and BT the
+    strike just ABOVE it; `ratio <= 0.98` (call-heavy/bullish territory)
+    makes BT primary and ST the strike just BELOW it. Neutral PCVR
+    (0.98 < ratio < 1.02, or ratio is None) has no clear target
+    territory at all — returns (None, None), same as every other
+    PCVR-gated target list in this file already does for that zone.
 
-    CRITICAL fix, 2026-07-28, user-reported (BT/ST badly wrong for BOTH
-    ETH and QQQ — off by dozens of dollars/strikes from the real,
-    hand-verified boundary). This function used to take a `pcvr_gt1`
-    param (forwarded from the macro/TLT-based PCVR ratio, `ratio >
-    1.00`) that decided which side's dominance-run to scan for. That
-    formula was degenerate — it's mathematically FIXED at False whenever
-    the caller's own `ratio < 0.98` branch runs it, and FIXED at True
-    whenever `ratio > 1.02` runs it, so it never actually varied with the
-    real option chain at all.
+    CRITICAL fix, 2026-07-31, user-reported with an annotated
+    option-chain screenshot, the SECOND correction to this exact
+    function in two days: BT now correctly showed $1,920.00, but ST
+    still showed "n/a" even though BT's own immediate neighbor strike
+    ($1,900) was right there in the chain. User's exact words: "BT is
+    $1920, so ST should be the first strike beneath it... If a new
+    strike is added to the chain at any point in time, recalculate the
+    target territory (PCVR >= 1.02, calculate ST; PCVR <= 0.98,
+    calculate BT) and ensure that the opposite territory is ALWAYS the
+    first strike above/below, even if there is a '-' for the volume
+    field."
 
-    Verified against two REAL live chains the same day (ETH and QQQ):
-    spot always sits INSIDE whichever zone (call- or put-dominant) is on
-    its own local side already — scanning for that SAME dominance type
-    just finds "the 5-strike window straddling ATM itself," a
-    near-meaningless answer since spot isn't at any real edge there (live
-    QQQ example: gave BT/ST = 678/677, both essentially spot itself,
-    spot=$678.06). Scanning for the OPPOSITE dominance type from
-    wherever spot currently sits correctly finds the real nearby
-    boundary (the SAME live QQQ chain: BT/ST = 674/673, the actual
-    observed put-to-call flip point, confirmed by hand from the chain's
-    own real per-strike volumes).
-
-    Fixed: `want_put` is now derived from the STRIKE NEAREST SPOT's own
-    local call/put volume split, not from the macro PCVR ratio — if that
-    strike is itself call-dominant (or tied), scan for the nearest
-    PUT-dominant run (the boundary below); if it's put-dominant, scan
-    for the nearest CALL-dominant run (the boundary above). Callers no
-    longer pass anything about PCVR — this function derives its own
-    answer purely from the chain's own per-strike volumes and where spot
-    sits among them."""
+    The PRIOR version (fixed 2026-07-30) scanned BT and ST as two fully
+    INDEPENDENT 5-consecutive-strike dominance runs, with no relationship
+    to each other at all and no PCVR awareness. That broke exactly this
+    case: a single stray strike sitting in the middle of an otherwise
+    heavily put-dominant zone (one call-dominant outlier among five
+    consecutive would-be put-dominant strikes) was enough to fail the
+    strict "all 5 must dominate" check for ST's OWN independent scan,
+    even though the correct ST — by this app's own actual spec — was
+    never supposed to need its own 5-run verification at all: only the
+    PCVR-current-regime side needs the real scan; the opposite side is
+    always just the physically next-door strike, full stop."""
     band_pct = STATUS_BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
     run_len = STATUS_BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
     lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
     sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
     n = len(sorted_strikes)
+
+    if ratio is None or (0.98 < ratio < 1.02):
+        return None, None
+    want_put = ratio >= 1.02   # PCVR >= 1.02 -> ST is the primary (scanned) side
 
     def vols(k):
         legs = strikes.get(k, {})
@@ -2272,16 +2354,15 @@ def compute_bt_st(strikes, is_crypto, spot):
             pv = float(put.get("volume") or 0) if put else 0.0
         return cv, pv
 
-    if n == 0:
-        return None, None, "ST"
+    if n == 0 or n < run_len:
+        return None, None
 
     atm_idx = min(range(n), key=lambda idx: abs(sorted_strikes[idx] - spot))
-    atm_cv, atm_pv = vols(sorted_strikes[atm_idx])
-    want_put = atm_cv >= atm_pv   # scan for the OPPOSITE of spot's own local dominance
-    fallback_active = "BT" if want_put else "ST"
-
-    if n < run_len:
-        return None, None, fallback_active
+    max_start = n - run_len
+    if max_start < 0:
+        return None, None
+    lo_start = max(0, atm_idx - STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
+    hi_start = min(max_start, atm_idx + STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
 
     def run_ok(start):
         for idx in range(start, start + run_len):
@@ -2291,13 +2372,6 @@ def compute_bt_st(strikes, is_crypto, spot):
             if not want_put and not (cv > pv):
                 return False
         return True
-
-    max_start = n - run_len
-    if max_start < 0:
-        return None, None, fallback_active
-
-    lo_start = max(0, atm_idx - STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
-    hi_start = min(max_start, atm_idx + STATUS_BT_ST_MAX_STRIKES_FROM_ATM)
 
     candidates = []
     for s in range(lo_start, hi_start + 1):
@@ -2317,13 +2391,13 @@ def compute_bt_st(strikes, is_crypto, spot):
             if want_put:
                 st = anchor
                 bt = sorted_strikes[near_idx + 1] if near_idx + 1 < n else None
-                return bt, st, "BT"
+                return bt, st
             else:
                 bt = anchor
                 st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
-                return bt, st, "ST"
+                return bt, st
 
-    return None, None, fallback_active
+    return None, None
 
 STATUS_PHEMEX_KLINE_LIST_URL = "https://api.phemex.com/exchange/public/md/v2/kline/list"
 
@@ -3200,9 +3274,14 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         rows.append(("ER 100%", "n/a", False))
         rows.append(("ER 150%", "n/a", False))
 
-    bt, st, active = compute_bt_st(chain["strikes"], is_crypto, price)
-    bt_green = active == "BT" and bt is not None and price >= bt
-    st_green = active == "ST" and st is not None and price <= st
+    # 2026-07-31 fix: BT/ST is now PCVR-regime-driven (see compute_bt_st's
+    # own docstring) — one side is genuinely scanned (whichever the
+    # current PCVR regime picks), the other is always just the strike
+    # immediately next door, unconditionally. Greenness is still judged
+    # independently for each side (price past its own level).
+    bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
+    bt_green = bt is not None and price >= bt
+    st_green = st is not None and price <= st
     rows.append(("BT", f"{GRN}{BLD}${bt:,.2f}{RST}{dist_tag(bt)}" if bt is not None else "n/a", bt_green))
     rows.append(("ST", f"{RED}{BLD}${st:,.2f}{RST}{dist_tag(st)}" if st is not None else "n/a", st_green))
 
@@ -3314,13 +3393,13 @@ def compute_dashboard_snapshot(data):
         targets = []
         if ratio is not None and not closed:
             if ratio < 0.98:
-                bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
+                bt, _st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
                 if bt is not None:
                     targets.append({"type": "BT", "level": bt, "tier": None})
                 above, _below = status_gamma_cluster_targets_directional(gex_export, price)
                 targets += [{"type": "Cluster", "level": k, "tier": t} for k, t in above]
             elif ratio > 1.02:
-                _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
+                _bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
                 if st is not None:
                     targets.append({"type": "ST", "level": st, "tier": None})
                 _above, below = status_gamma_cluster_targets_directional(gex_export, price)
@@ -3504,7 +3583,7 @@ def _status_build_render_lines(display_data):
         # price, not the already-color-coded display string.
         targets = []
         if ratio < 0.98:
-            bt, _st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
+            bt, _st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
             if bt is not None:
                 targets.append((bt, f"BT {GRN}{BLD}${bt:,.2f}{RST} ({target_rel(bt)})"))
             if gex_flip is not None:
@@ -3512,7 +3591,7 @@ def _status_build_render_lines(display_data):
             above, _below = status_gamma_cluster_targets_directional(gex_export, price)
             targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in above]
         elif ratio > 1.02:
-            _bt, st, _active = compute_bt_st(chain["strikes"], is_crypto, price)
+            _bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
             if st is not None:
                 targets.append((st, f"ST {GRN}{BLD}${st:,.2f}{RST} ({target_rel(st)})"))
             if gex_flip is not None:
@@ -4275,8 +4354,6 @@ class SimAccount:
 
     def __init__(self, default_balance=SIM_DEFAULT_BALANCE):
         self.balance = default_balance
-        self.day = datetime.now().strftime("%m_%d_%Y")
-        self.realized_pnl_today = 0.0
         self.positions = {}   # symbol -> {"pos_side","qty","avg_entry"}
         self.orders = {}      # clOrdID -> order dict
         self._seq = 0
@@ -4287,34 +4364,21 @@ class SimAccount:
             with open(SIM_STATE_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             self.balance = data.get("balance", self.balance)
-            self.day = data.get("day", self.day)
-            self.realized_pnl_today = data.get("realized_pnl_today", 0.0)
             self.positions = data.get("positions", {})
             self.orders = data.get("orders", {})
         except Exception:
             pass
-        self._roll_day()
-
-    def _roll_day(self):
-        today = datetime.now().strftime("%m_%d_%Y")
-        if today != self.day:
-            self.day = today
-            self.realized_pnl_today = 0.0
 
     def _save(self):
-        self._roll_day()
         try:
             with open(SIM_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"balance": self.balance, "day": self.day,
-                           "realized_pnl_today": self.realized_pnl_today,
+                json.dump({"balance": self.balance,
                            "positions": self.positions, "orders": self.orders}, f, indent=2)
         except Exception:
             pass
 
     def reset(self, balance):
         self.balance = balance
-        self.day = datetime.now().strftime("%m_%d_%Y")
-        self.realized_pnl_today = 0.0
         self.positions = {}
         self.orders = {}
         self._save()
@@ -4355,8 +4419,6 @@ class SimAccount:
         entry = pos["avg_entry"]
         pnl = (price - entry) * qty if pos_side == "Long" else (entry - price) * qty
         self.balance += pnl
-        self._roll_day()
-        self.realized_pnl_today += pnl
         pos["qty"] -= qty
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
                   "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance}
@@ -4550,43 +4612,6 @@ def account_balance_fields(acc_data):
     bal = float(acc.get('accountBalanceRv') or 0)
     used = float(acc.get('totalUsedBalanceRv') or 0)
     return bal, max(0.0, bal - used), used
-
-def athena_realized_pnl_today():
-    """Real mode's own version of SimAccount.realized_pnl_today — sums
-    TODAY's Athena-tagged (detail.sim is False) close events from
-    athena_logs, the exact same filtering recent_closed_trades/
-    scan_all_trade_events's own 'real' branch already uses.
-
-    REPLACES the old account_realized_pnl_today (user-reported 2026-07-26,
-    "showing +$46.53 in closed PnL even though no trades have been taken
-    today or ever on the live account"): that function summed Phemex's own
-    curTermRealisedPnlRv across our symbols — the EXCHANGE's own per-
-    position "current term" realized PnL, which is NOT scoped to Athena's
-    own trades at all. It reflects EVERYTHING that ever happened on that
-    symbol/position term on the account — a manual trade, a stale term
-    predating Athena, anything — exactly the "other positions" data the
-    user explicitly asked to exclude ("In Athena, everything is Athena").
-    Athena's own athena_logs is the only account of what ATHENA itself
-    actually did, so it's the only correct source for this figure now."""
-    total = 0.0
-    try:
-        with open(athena_log_path(), encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                d = json.loads(line)
-                if d.get("event") not in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
-                    continue
-                detail = d.get("detail") or {}
-                if detail.get("sim") is not False:
-                    continue
-                pnl = detail.get("pnl_approx")
-                if pnl is not None:
-                    total += pnl
-    except Exception:
-        pass
-    return total
 
 def account_position(acc_data, symbol, pos_side=None):
     for p in ((acc_data or {}).get('data', {}).get('positions', []) or []):
@@ -5111,8 +5136,16 @@ class AthenaInstrument:
             # off an assumed orig_qty that's actually too small.
             self._tp1_lock_done = len(tp_legs) < 2
 
+            # entry_day_ct (see _update_closed_pnl_today): a reconciled
+            # position surviving a restart has no persisted record of its
+            # TRUE original entry day, so this is a best-effort
+            # approximation (today's CT day, the restart moment) rather
+            # than losing the tag entirely — same "approximate rather than
+            # drop" philosophy _tp1_lock_done above already uses for this
+            # exact restart-reconciliation gap.
             self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "tp_legs": tp_legs,
+                              "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                               "price_decimals": pd, "qty_decimals": qd}
             self.state = "IN_POSITION"
             self.lights["Order Flow"] = True
@@ -5381,6 +5414,41 @@ class AthenaInstrument:
                             f"No new entries until PCVR switches or 19:30 CT. Loss progression reset to 1R.{RST}")
                 log_event(self.asset, "daily_loss_limit_hit", {"blocked_regime": dl["blocked_regime"]})
         _save_daily_loss_state()
+
+    def _update_closed_pnl_today(self, gross_pnl, entry_price, exit_price, exit_qty):
+        """Books this trade's realized NET pnl (fees deducted) into
+        today's 'Closed PnL Today' bucket, attributed to the CT calendar
+        day this trade was ENTERED on (self.position's own
+        "entry_day_ct", tagged at fill time in _check_fill) rather than
+        whatever day it happens to close on. 2026-07-30 user request,
+        then clarified same day: "'Closed PnL Today' is supposed to be
+        the total Net PnL of all trades opened in the same day" — this
+        must be true NET pnl (fees subtracted), not the gross figure
+        `_update_blackjack`/`_update_daily_loss_limit` use for their own
+        (unrelated, unchanged) progression decisions. Fee is approximated
+        the same way real mode's pnl itself already is (no fill-history
+        API, no per-leg breakdown once a position is fully flat) —
+        `orig_qty` (the ORIGINAL full entry size, before any partial
+        exits) on the entry leg, `exit_qty`/`exit_price` (this call's own
+        final leg) on the exit leg — at PHEMEX_FEE_RATE per leg, same
+        rate `scan_all_trades_detailed`'s own exact per-leg DRY_RUN fee
+        column already uses. Called from every close site (the "position
+        flat" branch of _manage_position, the PCVR-flip-close branch, and
+        _flatten_now) — self.position must still be set when this runs
+        (read entry_day_ct/orig_qty BEFORE the caller clears it)."""
+        if gross_pnl is None or not TZ_CT:
+            return
+        entry_day_ct = (self.position or {}).get("entry_day_ct")
+        if entry_day_ct is None:
+            return
+        net_pnl = gross_pnl
+        if entry_price and exit_price and exit_qty:
+            orig_qty = (self.position or {}).get("orig_qty") or exit_qty
+            fee = (orig_qty * entry_price + exit_qty * exit_price) * PHEMEX_FEE_RATE
+            net_pnl = gross_pnl - fee
+        bucket = CLOSED_PNL_STATE["sim" if DRY_RUN else "real"]
+        bucket[entry_day_ct] = bucket.get(entry_day_ct, 0.0) + net_pnl
+        _save_closed_pnl_state()
 
     def _clear_daily_loss_block(self, reason):
         dl = DAILY_LOSS_STATE[self.asset]
@@ -5679,11 +5747,10 @@ class AthenaInstrument:
             return
 
         # Snapshot DRY_RUN's own exact running balance right at fill —
-        # diffing sim.balance (not realized_pnl_today, which resets every
-        # day and would corrupt this across a midnight rollover) against
-        # this baseline once the position goes fully flat gives Blackjack
-        # an EXACT trade net pnl in sim mode, vs. real mode's existing
-        # entry-vs-current-price approximation (see _manage_position/
+        # diffing sim.balance against this baseline once the position
+        # goes fully flat gives Blackjack an EXACT trade net pnl in sim
+        # mode, vs. real mode's existing entry-vs-current-price
+        # approximation (see _manage_position/
         # _flatten_now — same documented gap the rest of the app already
         # accepts for real-mode exit pricing).
         self._entry_balance_baseline = get_sim_account().balance if DRY_RUN else None
@@ -5770,6 +5837,13 @@ class AthenaInstrument:
 
         self.position = {"pos_side": p["pos_side"], "qty": qty, "orig_qty": qty, "fill_price": fill_price,
                           "sl_price": sl_price, "tp_legs": tp_legs,
+                          # entry_day_ct (see _update_closed_pnl_today):
+                          # tagged HERE, at the real fill moment, so
+                          # "Closed PnL Today" attributes this trade's
+                          # eventual pnl to the CT calendar day it was
+                          # actually ENTERED on, not whatever day it
+                          # happens to close on.
+                          "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                           "price_decimals": p["price_decimals"], "qty_decimals": qd}
         self._tp1_lock_done = False
         self.pending = None
@@ -5863,6 +5937,7 @@ class AthenaInstrument:
             net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -6009,6 +6084,7 @@ class AthenaInstrument:
             # asset the ladder is already sitting at 1R.
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -6362,6 +6438,7 @@ class AthenaInstrument:
             net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
@@ -8001,8 +8078,7 @@ class AppState:
         balance, available, margin_used = account_balance_fields(acc)
         open_pnl_total = sum((instrument_open_pnl(i, live_prices.get(i.asset)) or 0.0) for i in instruments)
         has_open = any(i.position for i in instruments)
-        closed_pnl = (get_sim_account().realized_pnl_today if DRY_RUN
-                      else athena_realized_pnl_today())
+        closed_pnl = closed_pnl_today(DRY_RUN)
         inst_snap = {}
         for i in instruments:
             inst_snap[i.asset] = {
@@ -8541,6 +8617,7 @@ async def engine_loop():
             sim.reset(SIM_BALANCE_ARG)
             _reset_blackjack_state()
             _reset_daily_loss_state()
+            _reset_closed_pnl_state_sim()
             console_log(f"{YLW}Paper account reset to ${SIM_BALANCE_ARG:,.2f}{RST}")
         else:
             console_log(f"{DIM}Paper account balance: ${sim.balance:,.2f}{RST}")
@@ -8568,6 +8645,7 @@ async def engine_loop():
                 get_sim_account().reset(new_balance)
                 _reset_blackjack_state()
                 _reset_daily_loss_state()
+                _reset_closed_pnl_state_sim()
                 # A wiped sim ledger has no positions/orders left for these
                 # to match against — force them back to WATCHING too, or
                 # _check_fill/_manage_position would just poll forever

@@ -2301,46 +2301,43 @@ def compute_bt_st(strikes, is_crypto, spot, ratio):
     then sets the OTHER side ("secondary") to the single strike
     immediately adjacent to the primary — unconditionally, regardless of
     that adjacent strike's own volume shape (even a blank/'-' field).
-    Which side is primary is driven by the CURRENT PCVR regime: `ratio >=
-    1.02` (put-heavy/bearish territory) makes ST primary and BT the
-    strike just ABOVE it; `ratio <= 0.98` (call-heavy/bullish territory)
-    makes BT primary and ST the strike just BELOW it. Neutral PCVR
-    (0.98 < ratio < 1.02, or ratio is None) has no clear target
-    territory at all — returns (None, None), same as every other
-    PCVR-gated target list in this file already does for that zone.
+    Which side is primary is driven by the CURRENT PCVR regime: `ratio >
+    1.00` (put-heavy/bearish territory) makes ST primary and BT the
+    strike just ABOVE it; anything else (`ratio <= 1.00`, INCLUDING
+    `ratio is None`) makes BT primary and ST the strike just BELOW it.
 
-    CRITICAL fix, 2026-07-31, user-reported with an annotated
-    option-chain screenshot, the SECOND correction to this exact
-    function in two days: BT now correctly showed $1,920.00, but ST
-    still showed "n/a" even though BT's own immediate neighbor strike
-    ($1,900) was right there in the chain. User's exact words: "BT is
-    $1920, so ST should be the first strike beneath it... If a new
-    strike is added to the chain at any point in time, recalculate the
-    target territory (PCVR >= 1.02, calculate ST; PCVR <= 0.98,
-    calculate BT) and ensure that the opposite territory is ALWAYS the
-    first strike above/below, even if there is a '-' for the volume
-    field."
+    CRITICAL fix, 2026-07-31, user-reported: "The BT/ST values keep
+    disappearing in Athena, whereas in charthacker.py they stay in place
+    and are nearly always the correct values... Mirror charthacker's
+    logic for BT/ST." This function used to have its OWN separate
+    0.98/1.02 neutral-zone dead band (returning (None, None) whenever
+    ratio sat between them, or was ever None) — but charthacker.py's own
+    compute_bt_st (its docstring: "verbatim port of status.py's
+    compute_bt_st") has NO such dead zone at all: `want_put =
+    bool(pcvr_gt1)`, a plain `ratio > 1.00` threshold that ALWAYS picks a
+    primary side, defaulting to BT whenever ratio is None. That's the
+    actual, working spec this function is supposed to match — the
+    0.98/1.02 band is a real Athena-specific concept, but it only ever
+    belonged at the 4 call sites that decide whether a level enters the
+    TRADEABLE target list (gated externally by `ratio < 0.98`/`ratio >
+    1.02`, unchanged by this fix); it was never supposed to blank the
+    DISPLAY row too, since evaluate_hpls calls this function unconditionally
+    every cycle, independent of that external gate.
 
-    The PRIOR version (fixed 2026-07-30) scanned BT and ST as two fully
-    INDEPENDENT 5-consecutive-strike dominance runs, with no relationship
-    to each other at all and no PCVR awareness. That broke exactly this
-    case: a single stray strike sitting in the middle of an otherwise
-    heavily put-dominant zone (one call-dominant outlier among five
-    consecutive would-be put-dominant strikes) was enough to fail the
-    strict "all 5 must dominate" check for ST's OWN independent scan,
-    even though the correct ST — by this app's own actual spec — was
-    never supposed to need its own 5-run verification at all: only the
-    PCVR-current-regime side needs the real scan; the opposite side is
-    always just the physically next-door strike, full stop."""
+    Two PRIOR corrections to this exact function, now superseded: (1)
+    fixed 2026-07-30, scanned BT/ST as two fully INDEPENDENT
+    5-consecutive-strike runs with no relationship to each other — broke
+    whenever a single stray strike interrupted an otherwise-dominant run
+    on the secondary side. (2) fixed 2026-07-31 earlier the same day,
+    introduced the 0.98/1.02 neutral zone above, which is what THIS fix
+    now removes."""
     band_pct = STATUS_BT_ST_BAND_PCT["crypto" if is_crypto else "equity"]
     run_len = STATUS_BT_ST_RUN_LEN["crypto" if is_crypto else "equity"]
     lo_bound, hi_bound = spot * (1 - band_pct), spot * (1 + band_pct)
     sorted_strikes = sorted(k for k in strikes.keys() if lo_bound <= k <= hi_bound)
     n = len(sorted_strikes)
 
-    if ratio is None or (0.98 < ratio < 1.02):
-        return None, None
-    want_put = ratio >= 1.02   # PCVR >= 1.02 -> ST is the primary (scanned) side
+    want_put = bool(ratio is not None and ratio > 1.00)   # charthacker-mirrored: no dead zone, None -> BT primary
 
     def vols(k):
         legs = strikes.get(k, {})
@@ -4430,7 +4427,7 @@ class SimAccount:
         # scan_all_trades_detailed's own existing fee formula, so the
         # real balance and the trade log's own NET PNL walk forward
         # identically from now on.
-        self.balance -= qty * price * PHEMEX_FEE_RATE
+        self.balance -= fee_for_leg(PHEMEX_SYMBOL_TO_ASSET.get(symbol), qty, price)
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty,
                   "price": price, "order_type": order_type}
         if sequence_label is not None:
@@ -4461,7 +4458,7 @@ class SimAccount:
         # (unchanged) — it still feeds the trade log's own GROSS column
         # and sim_logs' own historical "pnl" field; the fee is a
         # separate balance effect, same as a real exchange.
-        self.balance -= qty * price * PHEMEX_FEE_RATE
+        self.balance -= fee_for_leg(PHEMEX_SYMBOL_TO_ASSET.get(symbol), qty, price)
         pos["qty"] -= qty
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
                   "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance}
@@ -5473,12 +5470,13 @@ class AthenaInstrument:
         API, no per-leg breakdown once a position is fully flat) —
         `orig_qty` (the ORIGINAL full entry size, before any partial
         exits) on the entry leg, `exit_qty`/`exit_price` (this call's own
-        final leg) on the exit leg — at PHEMEX_FEE_RATE per leg, same
-        rate `scan_all_trades_detailed`'s own exact per-leg DRY_RUN fee
-        column already uses. Called from every close site (the "position
-        flat" branch of _manage_position, the PCVR-flip-close branch, and
-        _flatten_now) — self.position must still be set when this runs
-        (read entry_day_ct/orig_qty BEFORE the caller clears it)."""
+        final leg) on the exit leg — via `fee_for_leg` (this asset's own
+        user-configurable fee model), same per-leg convention
+        `scan_all_trades_detailed`'s own exact fee column already uses.
+        Called from every close site (the "position flat" branch of
+        _manage_position, the PCVR-flip-close branch, and _flatten_now)
+        — self.position must still be set when this runs (read
+        entry_day_ct/orig_qty BEFORE the caller clears it)."""
         if gross_pnl is None or not TZ_CT:
             return
         entry_day_ct = (self.position or {}).get("entry_day_ct")
@@ -5487,7 +5485,7 @@ class AthenaInstrument:
         net_pnl = gross_pnl
         if entry_price and exit_price and exit_qty:
             orig_qty = (self.position or {}).get("orig_qty") or exit_qty
-            fee = (orig_qty * entry_price + exit_qty * exit_price) * PHEMEX_FEE_RATE
+            fee = fee_for_leg(self.asset, orig_qty, entry_price) + fee_for_leg(self.asset, exit_qty, exit_price)
             net_pnl = gross_pnl - fee
         bucket = CLOSED_PNL_STATE["sim" if DRY_RUN else "real"]
         bucket[entry_day_ct] = bucket.get(entry_day_ct, 0.0) + net_pnl
@@ -6336,25 +6334,38 @@ class AthenaInstrument:
         Derivation (Long case; Short is the mirror image) — let R_target =
         orig_qty * $1.00 be the required TOTAL combined net profit across
         BOTH legs (the already-closed TP1 leg and this remaining leg once
-        IT closes too, at the new SL), with PHEMEX_FEE_RATE (FR) applied to
-        every leg's own notional (entry once for the whole position, TP1's
+        IT closes too, at the new SL), with this asset's own fee model
+        (`fee_for_leg`, 2026-07-31 user-configurable per asset) applied to
+        every leg's own fill (entry once for the whole position, TP1's
         exit, and this new SL's own future exit):
 
-            entry_fee = entry * orig_qty * FR
-            tp1_fee   = tp1_price * tp1_qty * FR
+            entry_fee = fee_for_leg(asset, orig_qty, entry)
+            tp1_fee   = fee_for_leg(asset, tp1_qty, tp1_price)
             tp1_gross = (tp1_price - entry) * tp1_qty              [Long]
             needed_remaining_net = R_target - tp1_gross + entry_fee + tp1_fee
-            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FR)
 
-        (Short mirrors this with tp1_gross = (entry - tp1_price) * tp1_qty
-        and new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FR).)
+        Solving for `new_sl` (the remaining leg's own future exit price)
+        depends on whether THIS asset's fee model depends on that unknown
+        price at all — ETH's %-of-notional fee does (the exit fee is
+        itself a function of new_sl), so it requires isolating new_sl via
+        division by `(1 -/+ FEE_ETH_PCT)`:
+
+            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FEE_ETH_PCT)   [Long]
+            new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FEE_ETH_PCT)   [Short]
+
+        QQQ's flat $/unit fee does NOT depend on new_sl at all (it's the
+        same `FEE_QQQ_PER_UNIT * rem_qty` regardless of what price the
+        remainder eventually exits at), so it solves directly/linearly
+        instead — see `_new_sl_for_target_net`'s own docstring for the
+        parallel QQQ derivation.
 
         Solving for new_sl this way (rather than just "entry + $1 worth of
         points") is what makes the guarantee EXACT net of all 3 fee legs,
         not just entry+exit on the remainder alone — verified algebraically
         by expanding the full net-PnL equation and isolating new_sl, cross-
         checked against hand-computed examples in this session's own test
-        suite (test_tp1_breakeven_lock_20260728.py).
+        suite (test_tp1_breakeven_lock_20260728.py, updated 2026-07-31 for
+        the asset-aware fee model).
 
         Safety guard: only ever tightens the SL (moves it in the
         protective direction) — if the computed level would actually be
@@ -6372,18 +6383,16 @@ class AthenaInstrument:
         if rem_qty <= 0:
             return
         orig_qty = self.position.get("orig_qty") or (tp1_qty + rem_qty)
-        FR = PHEMEX_FEE_RATE
-        entry_fee = entry * orig_qty * FR
-        tp1_fee = tp1_price * tp1_qty * FR
+        entry_fee = fee_for_leg(self.asset, orig_qty, entry)
+        tp1_fee = fee_for_leg(self.asset, tp1_qty, tp1_price)
         target_total_net = orig_qty * 1.00
         if pos_side == "Long":
             tp1_gross = (tp1_price - entry) * tp1_qty
             needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
-            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FR)
         else:
             tp1_gross = (entry - tp1_price) * tp1_qty
             needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
-            new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FR)
+        new_sl = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
 
         cur_sl = self.position.get("sl_price")
         if cur_sl is not None:
@@ -6681,8 +6690,57 @@ def scan_all_trade_events(source):
     events.sort(key=lambda e: e.get("ts") or "")
     return events
 
-PHEMEX_FEE_RATE = 0.0006   # user-confirmed flat rate for every leg, entry or exit,
-                           # regardless of order type — fee = 0.0006 * (qty * price)
+# 2026-07-31 user request: "Allow the user to set the fees for each
+# asset. ETH will be in terms of % of position value (default is 0.06%)
+# and QQQ will be in terms of $ per share/contract (default is $0.85)."
+# Replaces the old single flat PHEMEX_FEE_RATE (0.0006 applied uniformly
+# to both assets) — these are genuinely DIFFERENT fee MODELS per asset,
+# not just different rates: ETH scales with notional (qty*price*pct),
+# QQQ is a flat $ amount per unit, independent of price entirely.
+# User-adjustable live via [E] (curses_main), same session-only (not
+# persisted across restarts) convention [W]'s SL-distance/[P]'s risk
+# value already use.
+FEE_ETH_PCT = 0.0006          # 0.06% of notional, per leg
+FEE_QQQ_PER_UNIT = 0.85       # flat $ per share/contract, per leg
+
+def fee_for_leg(asset, qty, price):
+    """One leg's trading fee (entry or exit alike) — QQQ is a flat $
+    amount per unit (price-independent); ETH is a % of that leg's own
+    notional. `asset` must be "ETH" or "QQQ" — falls back to the ETH
+    (%-of-notional) model for anything else, since that's the more
+    conservative assumption (never silently charges $0)."""
+    if asset == "QQQ":
+        return qty * FEE_QQQ_PER_UNIT
+    return qty * price * FEE_ETH_PCT
+
+def _new_sl_for_target_net(asset, pos_side, entry, rem_qty, needed_remaining_net):
+    """Solves for the SL price that gives EXACTLY `needed_remaining_net`
+    combined net profit on the remaining leg once it eventually closes at
+    that price — used by `_apply_tp1_breakeven_lock`. The algebra depends
+    on whether this asset's own fee model depends on the unknown exit
+    price at all:
+
+    ETH (%-of-notional) — the exit fee IS a function of new_sl itself
+    (`new_sl * rem_qty * FEE_ETH_PCT`), so isolating new_sl requires
+    dividing through by `(1 -/+ FEE_ETH_PCT)`:
+        net = rem_qty*(new_sl - entry) - new_sl*rem_qty*FEE_ETH_PCT   [Long]
+            = rem_qty*(new_sl*(1-FEE_ETH_PCT) - entry)
+        -> new_sl = (entry + net/rem_qty) / (1 - FEE_ETH_PCT)
+
+    QQQ (flat $/unit) — the exit fee is `rem_qty * FEE_QQQ_PER_UNIT`
+    regardless of what new_sl turns out to be, so it drops straight out
+    as a constant offset, no division needed:
+        net = rem_qty*(new_sl - entry) - rem_qty*FEE_QQQ_PER_UNIT      [Long]
+        -> new_sl = entry + net/rem_qty + FEE_QQQ_PER_UNIT
+
+    Both mirror for Short (sign-flipped around entry)."""
+    if asset == "QQQ":
+        offset = needed_remaining_net / rem_qty + FEE_QQQ_PER_UNIT
+        return entry + offset if pos_side == "Long" else entry - offset
+    if pos_side == "Long":
+        return (entry + needed_remaining_net / rem_qty) / (1 - FEE_ETH_PCT)
+    return (entry - needed_remaining_net / rem_qty) / (1 + FEE_ETH_PCT)
+
 PHEMEX_SYMBOL_TO_ASSET = {cfg["phemex_symbol"]: a for a, cfg in ASSETS.items()}
 
 def _trade_worst_adverse_dollars(asset, pos_side, entry_price, entry_qty, exits, entry_ts_str, exit_ts_str):
@@ -6817,9 +6875,10 @@ def scan_all_trades_detailed():
     well-formed trade. A reasonable, documented heuristic, not guaranteed
     exact if fills raced.
 
-    Fees: flat PHEMEX_FEE_RATE (0.0006) applied per-leg on notional
-    (qty * price), entry and every exit leg alike — user-confirmed
-    2026-07-26, no maker/taker distinction."""
+    Fees: per-asset, via fee_for_leg() — ETH is 0.06% of notional
+    (qty * price) per leg, QQQ is a flat $/unit per leg — applied to the
+    entry leg and every exit leg alike, no maker/taker distinction.
+    User-configurable live via [E] (session-only, not persisted)."""
     pattern = os.path.join(SIM_LOG_DIR_BASE, "**", "*.jsonl")
     rows = []
     for path in glob.glob(pattern, recursive=True):
@@ -6906,18 +6965,21 @@ def scan_all_trades_detailed():
         if not exits:
             continue
         entry_qty, entry_price = t["qty"], t["entry_price"]
-        entry_fee = entry_qty * entry_price * PHEMEX_FEE_RATE
+        # asset resolved first — fee_for_leg's own model (%-of-notional for
+        # ETH, flat $/unit for QQQ) is asset-specific, unlike the old flat
+        # PHEMEX_FEE_RATE this replaced.
+        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
+        entry_fee = fee_for_leg(asset, entry_qty, entry_price)
         exit_qty_total = sum(x["qty"] for x in exits)
         exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
         gross_pnl = sum(x["pnl"] for x in exits)
-        exit_fees = sum(x["qty"] * x["price"] * PHEMEX_FEE_RATE for x in exits)
+        exit_fees = sum(fee_for_leg(asset, x["qty"], x["price"]) for x in exits)
         total_fees = entry_fee + exit_fees
         net_pnl = gross_pnl - total_fees
         # trade_risk = qty * sl_distance (THIS asset's own fixed SL
         # distance — $10 ETH / $0.75 QQQ), not a flat *10 — that was
         # ETH-specific and would understate QQQ's real R by ~13x, same
         # underlying mixup _check_confirmation's entry sizing itself had.
-        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
         sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
         r_dollars = entry_qty * sl_distance
         rr = (net_pnl / r_dollars) if r_dollars else None
@@ -8934,8 +8996,19 @@ def draw_dashboard(db, snap, cols):
             # left before it triggers.
             sl_dist_tag = f" {RED}[{fmt_num(abs(live - p['sl_price']))} away]{RST}" \
                           if live is not None and p.get("sl_price") is not None else ""
+            # Fees — 2026-07-31 user request: estimated TOTAL round-trip
+            # fee for this position (entry fee * 2, per the user's own
+            # worked example: "0.06% fee of $2.35... 'Fees' field should
+            # show '-$4.70' (-2.35*2)") — an ESTIMATE using the entry
+            # fee doubled, not entry+actual-exit (the exit price/qty
+            # aren't known yet while the position is still open; QQQ's
+            # flat $/unit fee makes this exact regardless, ETH's
+            # %-of-notional estimate assumes the exit fills near the
+            # entry price).
+            est_fee = fee_for_leg(asset, p["qty"], p["fill_price"]) * 2
+            fee_tag = f"   Fees {RED}-${est_fee:,.2f}{RST}"
             line3 = (f"  {YLW}Position: {p['pos_side']} {fmt_num(p['qty'], 2)} @ {fmt_num(p['fill_price'])}   "
-                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}")
+                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}{fee_tag}")
         if line3:
             db.puts_ansi(y, 0, line3)
         y += 1
@@ -9468,6 +9541,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS
+    global FEE_ETH_PCT, FEE_QQQ_PER_UNIT
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(0)
@@ -9747,9 +9821,10 @@ def curses_main(stdscr):
             risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
             bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
             sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
+            fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
             footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                       f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                      f"{risk_hint}{sl_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                      f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
                       + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                       + "  [F]latten"
                       + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
@@ -10038,6 +10113,38 @@ def curses_main(stdscr):
                 console_log(f"{w_asset}: {YLW}SL distance changed {fmt_num(cur_sl)} -> {fmt_num(new_sl)} (via [W]){RST}")
                 log_event(w_asset, "sl_distance_changed", {"old_sl": cur_sl, "new_sl": new_sl})
                 ASSETS[w_asset]["sl"] = new_sl
+        elif key in (ord("e"), ord("E")):
+            # 2026-07-31 user request: "Allow the user to set the fees for
+            # each asset. ETH will be in terms of % of position value
+            # (default is 0.06%) and QQQ will be in terms of $ per
+            # share/contract (default is $0.85)." Mirrors [W]'s exact
+            # pattern (per-[Tab]-focused-asset, session-only — not
+            # persisted, same as [W]/[P]) but with a different UNIT per
+            # asset since the two fee models aren't just different rates:
+            # ETH's prompt is in PERCENT (matching how the user described
+            # it, "0.06%"), converted to/from the internal fraction
+            # FEE_ETH_PCT (0.0006) on entry/display; QQQ's prompt is a
+            # flat dollar amount straight onto FEE_QQQ_PER_UNIT, no
+            # conversion needed.
+            e_asset = chart_focus if both_panes else "ETH"
+            if e_asset == "QQQ":
+                cur_fee = FEE_QQQ_PER_UNIT
+                new_fee = _prompt_number(stdscr, f"QQQ fee $ per share/contract (current ${cur_fee:.2f}, Enter keeps it): ",
+                                          default=cur_fee)
+                db.prev = None
+                if new_fee is not None and new_fee >= 0 and abs(new_fee - cur_fee) > 1e-9:
+                    console_log(f"QQQ: {YLW}Fee changed ${cur_fee:.2f}/unit -> ${new_fee:.2f}/unit (via [E]){RST}")
+                    log_event("QQQ", "fee_changed", {"old_fee": cur_fee, "new_fee": new_fee, "unit": "per_unit"})
+                    FEE_QQQ_PER_UNIT = new_fee
+            else:
+                cur_pct = FEE_ETH_PCT * 100
+                new_pct = _prompt_number(stdscr, f"ETH fee % of position value (current {cur_pct:.4g}%, Enter keeps it): ",
+                                          default=cur_pct)
+                db.prev = None
+                if new_pct is not None and new_pct >= 0 and abs(new_pct - cur_pct) > 1e-9:
+                    console_log(f"ETH: {YLW}Fee changed {cur_pct:.4g}% -> {new_pct:.4g}% (via [E]){RST}")
+                    log_event("ETH", "fee_changed", {"old_fee_pct": cur_pct, "new_fee_pct": new_pct, "unit": "pct_notional"})
+                    FEE_ETH_PCT = new_pct / 100
         elif key in (ord("p"), ord("P")):
             # 2026-07-26 user request: [P] is now both the value AND the
             # $/% unit toggle in one prompt — see _prompt_risk_value's own

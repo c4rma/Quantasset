@@ -2273,12 +2273,24 @@ def fetch_status_cboe_pcvr(symbol):
     return put_vol, call_vol
 
 def fetch_status_pcvr():
+    """PCVR source outside the TLT window reverted to ETH's own Deribit
+    options volume, 2026-08-01 user request: "Instead of using BTC's
+    PCVR, I would like to go back to using ETH's as I had since the
+    beginning" — this is how Athena computed PCVR before the status.py
+    merge (Phase 3a) ported status.py's own single shared macro-PCVR
+    design verbatim (status.py itself, and charthacker.py, both still use
+    BTC here — this is now a DELIBERATE Athena-specific divergence from
+    that verbatim port, not a bug). Explicitly scoped to the BTC/crypto
+    branch only, per the user's own follow-up clarification ("this should
+    only change for when BTC is the primary asset - all of TLT's
+    rules/processes still apply, unchanged") — the TLT/CBOE branch below
+    is untouched."""
     if status_in_tlt_window():
         underlying = "TLT"
         put_vol, call_vol = fetch_status_cboe_pcvr("TLT")
     else:
-        underlying = "BTC"
-        put_vol, call_vol = fetch_status_deribit_pcvr("BTC")
+        underlying = "ETH"
+        put_vol, call_vol = fetch_status_deribit_pcvr("ETH")
     ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
     return {"underlying": underlying, "put_vol": put_vol, "call_vol": call_vol, "ratio": ratio}
 
@@ -5183,10 +5195,28 @@ class AthenaInstrument:
             # than losing the tag entirely — same "approximate rather than
             # drop" philosophy _tp1_lock_done above already uses for this
             # exact restart-reconciliation gap.
+            # Realized PnL (2026-08-01) — starts at the negative entry fee
+            # (see the fresh-fill site's own comment for why), then for
+            # DRY_RUN adds back `already_realized` (the GROSS pnl of any
+            # TP leg that already closed on this trade BEFORE this
+            # restart, per _realized_since_last_fill above) as a best-
+            # effort approximation — the exit fee on that already-closed
+            # leg isn't separately recoverable here (sim_logs' own
+            # "closed" event has qty/price to re-derive it, but that's
+            # more precision than this restart-recovery display value
+            # needs), same "approximate rather than drop" trade-off
+            # _tp1_lock_done/entry_day_ct above already accept for this
+            # exact scenario. Real mode has no history to recover at all
+            # (same documented no-fill-history-API gap as elsewhere) —
+            # stays at just the negative entry fee.
+            realized_pnl = -fee_for_leg(self.asset, size, fill_price)
+            if DRY_RUN:
+                realized_pnl += already_realized
             self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "tp_legs": tp_legs,
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
-                              "price_decimals": pd, "qty_decimals": qd}
+                              "price_decimals": pd, "qty_decimals": qd,
+                              "realized_pnl": realized_pnl}
             self.state = "IN_POSITION"
             self.lights["Order Flow"] = True
             sl_note = ""
@@ -5885,7 +5915,15 @@ class AthenaInstrument:
                           # actually ENTERED on, not whatever day it
                           # happens to close on.
                           "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
-                          "price_decimals": p["price_decimals"], "qty_decimals": qd}
+                          "price_decimals": p["price_decimals"], "qty_decimals": qd,
+                          # Realized PnL (2026-08-01 user request, replaces
+                          # the old static "Fees" dashboard field) — starts
+                          # negative (the entry fee, already a sunk/realized
+                          # cost the instant this fill happened) and grows
+                          # by each TP leg's own net contribution as legs
+                          # actually close — see _manage_position's partial-
+                          # fill block below.
+                          "realized_pnl": -fee_for_leg(self.asset, qty, fill_price)}
         self._tp1_lock_done = False
         self.pending = None
         self.state = "IN_POSITION"
@@ -6066,6 +6104,19 @@ class AthenaInstrument:
             if tp1_price is None and old_tp_legs:
                 tp1_price = old_tp_legs[0]["level"]
             if tp1_price is not None:
+                # Realized PnL (2026-08-01) — this TP1 leg's own net
+                # contribution (gross minus its own exit fee; the entry
+                # fee was already folded in when self.position was first
+                # created, see its own comment) gets added to the running
+                # total right here, the one place a partial fill is
+                # structurally guaranteed to be detected (TP2/SL always
+                # close the FULL remainder, never partially, per this
+                # block's own docstring below) — independent of whether
+                # the breakeven-lock itself ends up actually moving the SL.
+                entry = self.position["fill_price"]
+                leg_fee = fee_for_leg(self.asset, tp1_qty, tp1_price)
+                leg_gross = (tp1_price - entry) * tp1_qty if pos_side == "Long" else (entry - tp1_price) * tp1_qty
+                self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
                 await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
             self._tp1_lock_done = True
 
@@ -8996,19 +9047,22 @@ def draw_dashboard(db, snap, cols):
             # left before it triggers.
             sl_dist_tag = f" {RED}[{fmt_num(abs(live - p['sl_price']))} away]{RST}" \
                           if live is not None and p.get("sl_price") is not None else ""
-            # Fees — 2026-07-31 user request: estimated TOTAL round-trip
-            # fee for this position (entry fee * 2, per the user's own
-            # worked example: "0.06% fee of $2.35... 'Fees' field should
-            # show '-$4.70' (-2.35*2)") — an ESTIMATE using the entry
-            # fee doubled, not entry+actual-exit (the exit price/qty
-            # aren't known yet while the position is still open; QQQ's
-            # flat $/unit fee makes this exact regardless, ETH's
-            # %-of-notional estimate assumes the exit fills near the
-            # entry price).
-            est_fee = fee_for_leg(asset, p["qty"], p["fill_price"]) * 2
-            fee_tag = f"   Fees {RED}-${est_fee:,.2f}{RST}"
+            # Realized PnL — 2026-08-01 user request, replaces the old
+            # static "Fees" estimate: the NET pnl already actually booked
+            # on THIS trade so far, fees included. Starts negative (the
+            # entry fee — already a sunk, realized cost the instant the
+            # fill happened) and grows by each TP leg's own net
+            # contribution the moment it actually closes (see
+            # self.position's own creation sites + _manage_position's
+            # partial-fill block for where this is computed/updated) — so
+            # it reads $0-ish-negative on a fresh untouched position and
+            # steps up the moment TP1 (or any partial exit) fills, unlike
+            # the old Fees field which was a static estimate that never
+            # changed across the position's lifetime.
+            realized = p.get("realized_pnl")
+            realized_tag = f"   Realized {pnl_color(realized)}{fmt_money(realized)}{RST}"
             line3 = (f"  {YLW}Position: {p['pos_side']} {fmt_num(p['qty'], 2)} @ {fmt_num(p['fill_price'])}   "
-                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}{fee_tag}")
+                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}{realized_tag}")
         if line3:
             db.puts_ansi(y, 0, line3)
         y += 1

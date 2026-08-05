@@ -1336,6 +1336,7 @@ def _backfill_then_feeds(asset, feed_starters):
         _run_footprint_backfill(asset)
     except Exception as e:
         console_log(f"{asset}: backfill failed ({e}) — starting live feed anyway")
+    _backfill_ready[asset].set()
     for target, fargs in feed_starters:
         threading.Thread(target=target, args=fargs, daemon=True).start()
 
@@ -3027,10 +3028,12 @@ def _ch_engine_qqq(stop_evt):
 
 def _ch_engine_thread_eth(stop_evt):
     _ch_bootstrap("ETH")
+    _ch_ready["ETH"].set()
     _ch_engine_eth(stop_evt)
 
 def _ch_engine_thread_qqq(stop_evt):
     _ch_bootstrap("QQQ")
+    _ch_ready["QQQ"].set()
     _ch_engine_qqq(stop_evt)
 
 def _ch_export_loop(stop_evt):
@@ -8325,6 +8328,18 @@ class AppState:
 
 APP_STATE = AppState()
 _quit_evt = threading.Event()
+_backfill_ready = {a: threading.Event() for a in ASSETS}   # set by _backfill_then_feeds
+                    # once this asset's REST backfill attempt has finished (success
+                    # OR failure — either way there's nothing further to wait on).
+                    # Read only by the startup loading screen (see draw_loading_
+                    # screen/curses_main) to know when it's safe to cut over to the
+                    # real dashboard; GEX_STATUS/STATUS_ENGINE_STATE already give the
+                    # loading screen the same signal for those two subsystems for
+                    # free, but backfill had no existing "done" marker of its own.
+_ch_ready = {a: threading.Event() for a in ASSETS}   # set by _ch_engine_thread_eth/
+                    # _ch_engine_thread_qqq once this asset's one-shot _ch_bootstrap
+                    # REST seed has returned — same "loading screen only" purpose as
+                    # _backfill_ready above.
 _reset_sim_evt = threading.Event()   # [R] (armed+confirmed) sets this; engine_loop
                                       # is the only thing that ever mutates SimAccount,
                                       # so the actual reset() call happens there, not
@@ -9592,6 +9607,196 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
     db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
     return scroll
 
+# ── Startup loading screen ───────────────────────────────────────────────────
+# Shown by curses_main from the moment its startup threads are launched until
+# every one of them has done its first real unit of work (backfill complete,
+# first live fetch/publish landed) — see _startup_progress(). Purely cosmetic:
+# nothing downstream depends on this ever running (the dashboard already
+# tolerates any of these subsystems still reading "connecting…" on its own
+# first real frame), it just replaces what would otherwise be a first frame
+# of half-populated panels with a splash that's honest about still loading.
+LOADING_SPINNER = "|/-\\"
+LOADING_MAX_WAIT_SEC = 30   # safety net — a subsystem stuck on a slow/dead
+                             # network call (bad creds, no internet) would
+                             # otherwise splash-lock the whole app forever;
+                             # past this, cut over anyway and let the
+                             # dashboard's own per-item "connecting…"/error
+                             # text show whatever's still not up.
+
+# Sword and shield, per the user-supplied reference art exactly (sword
+# hilt/blade standing behind a round shield).
+_ATHENA_BUST_ASCII = [
+    "                  /¯¯\\ ",
+    "                  \\__/ ",
+    "                   || ",
+    "                   || ",
+    "                  |  | ",
+    "                  |  | ",
+    "                  |  | ",
+    "                  |  | ",
+    "                  |  | ",
+    "                  |  | ",
+    "              .--.----.--. ",
+    "            .-----\\__/-----. ",
+    "    ___---¯¯////¯¯|\\/|¯¯\\\\\\\\¯¯---___ ",
+    " /¯¯ __O_--////   |  |   \\\\\\\\--_O__ ¯¯\\ ",
+    "| O?¯      ¯¯¯    |  |    ¯¯¯      ¯?O | ",
+    "|  '    _.-.      |  |      .-._    '  | ",
+    "|O|    ?..?      ./  \\.      ?..?    |O| ",
+    "| |     '?. .-.  | /\\ |  .-. .?'     | | ",
+    "| ---__  ¯?__?  /|\\¯¯/|\\  ?__?¯  __--- | ",
+    "|O     \\         ||\\/ |         /     O| ",
+    "|       \\  /¯?_  ||   |  _?¯\\  /       | ",
+    "|       / /    - ||   | -    \\ \\       | ",
+    "|O   __/  | __   ||   |   __ |  \\__   O| ",
+    "| ---     |/  -_/||   |\\_-  \\|     --- | ",
+    "|O|            \\ ||   | /            |O| ",
+    "\\ '              ||   |        ^~DLF ' / ",
+    " \\O\\    _-¯?.    ||   |    .?¯-_    /O/ ",
+    "  \\ \\  /  /¯¯¯?  ||   |  ?¯¯¯\\  \\  / / ",
+    "   \\O\\/   |      ||   |      |   \\/O/ ",
+    "    \\     |      ||   |      |     / ",
+    "     '.O  |_     ||   |     _|  O.' ",
+    "        '._O'.__/||   |\\__.'O_.' ",
+    "           '._ O ||   | O _.' ",
+    "              '._||   |_.' ",
+    "                 ||   | ",
+    "                 ||   | ",
+    "                 | \\/ | ",
+    "                 |  | | ",
+    "                  \\ |/ ",
+    "                   \\/ ",
+]
+
+_ATHENA_WORDMARK_ASCII = [
+    r" ███   █████  █   █  █████  █   █   ███ ",
+    r"█   █    █    █   █  █      ██  █  █   █ ",
+    r"█   █    █    █   █  █      █ █ █  █   █ ",
+    r"█████    █    █████  ████   █  ██  █████ ",
+    r"█   █    █    █   █  █      █   █  █   █ ",
+    r"█   █    █    █   █  █      █   █  █   █ ",
+    r"█   █    █    █   █  █████  █   █  █   █ ",
+]
+
+def _startup_progress():
+    """Live readiness snapshot for every subsystem curses_main starts on its
+    own background thread — used only by the loading screen to decide when
+    to stop showing the splash and cut over to the real dashboard loop.
+    Reuses each subsystem's OWN existing status signal (GEX_STATUS/
+    STATUS_ENGINE_STATE/APP_STATE.instruments) rather than a parallel
+    tracking mechanism, plus the two dedicated one-shot Events
+    (_backfill_ready/_ch_ready) added for the two subsystems that had no
+    such "first cycle done" signal of their own. Returns a list of
+    (label, done) pairs, engine first then per-asset groups in the same
+    order curses_main itself starts their threads in."""
+    steps = [("Trading engine", bool(APP_STATE.snapshot()["instruments"]))]
+    for asset in ASSETS:
+        steps.append((f"{asset} order-flow backfill", _backfill_ready[asset].is_set()))
+    for asset in ASSETS:
+        steps.append((f"{asset} GEX engine", GEX_STATUS.get(asset) not in (None, "connecting…")))
+    steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
+    for asset in ASSETS:
+        steps.append((f"{asset} chart engine", _ch_ready[asset].is_set()))
+    return steps
+
+LOADING_GAP = 2   # blank rows between each of the loading screen's own
+                    # sections (art / wordmark / tagline / checklist) when
+                    # there's room — draw_loading_screen tightens this down
+                    # (2 -> 1 -> 0) before ever dropping the bust art on a
+                    # merely-short-on-a-few-rows terminal (the 40-row bust
+                    # art is tall enough that "just drop it" was throwing
+                    # away the splash entirely on perfectly reasonable
+                    # ~60-row terminals over a couple of rows of padding).
+
+def _loading_content_h(show_bust, show_word, bust_h, word_h, total_n, gap):
+    """Total row count draw_loading_screen's own layout below actually
+    uses for a given show_bust/show_word/gap combination — shared by both
+    the real draw call and its own size-gating checks so they can't
+    disagree. The tagline-to-checklist gap is deliberately one row
+    tighter than the other two (see its own `max(0, gap - 1)` in
+    draw_loading_screen) — kept in sync here too."""
+    h = 0
+    if show_bust:
+        h += bust_h + gap
+    h += word_h if show_word else 1
+    h += gap + 1 + max(0, gap - 1) + total_n
+    return h
+
+def _loading_best_gap(show_bust, show_word, bust_h, word_h, total_n, avail_rows):
+    """Largest gap in (LOADING_GAP, 1, 0) whose resulting _loading_content_h
+    fits avail_rows, or None if even a gap of 0 doesn't fit."""
+    for gap in (LOADING_GAP, 1, 0):
+        if _loading_content_h(show_bust, show_word, bust_h, word_h, total_n, gap) <= avail_rows:
+            return gap
+    return None
+
+def draw_loading_screen(db, rows, cols, steps, tick):
+    """Full-screen ASCII splash — the user-supplied sword-and-shield art
+    plus a live per-subsystem checklist built from `steps` (see
+    _startup_progress). Degrades gracefully on a small terminal: first
+    tightens the inter-section gap, then drops the bust art, then the
+    wordmark, rather than ever risking an off-screen curses write."""
+    done_n = sum(1 for _, d in steps if d)
+    total_n = len(steps)
+
+    bust_w = max(len(l) for l in _ATHENA_BUST_ASCII)
+    bust_h = len(_ATHENA_BUST_ASCII)
+    word_w = max(len(l) for l in _ATHENA_WORDMARK_ASCII)
+    word_h = len(_ATHENA_WORDMARK_ASCII)
+    tagline = "AUTOMATED TRADING ALGORITHM"
+    avail = rows - 1
+
+    show_bust = show_word = False
+    gap = 0
+    if cols >= bust_w + 2:
+        g = _loading_best_gap(True, True, bust_h, word_h, total_n, avail)
+        if g is not None:
+            show_bust = show_word = True
+            gap = g
+    if not show_bust and cols >= word_w + 2:
+        g = _loading_best_gap(False, True, bust_h, word_h, total_n, avail)
+        if g is not None:
+            show_word = True
+            gap = g
+
+    content_h = _loading_content_h(show_bust, show_word, bust_h, word_h, total_n, gap)
+    y = max(0, (avail - content_h) // 2)
+
+    if show_bust:
+        x = max(0, (cols - bust_w) // 2)
+        for line in _ATHENA_BUST_ASCII:
+            db.puts(y, x, line[:max(0, cols - x)], P_CYAN)
+            y += 1
+        y += gap
+
+    if show_word:
+        x = max(0, (cols - word_w) // 2)
+        for line in _ATHENA_WORDMARK_ASCII:
+            db.puts(y, x, line[:max(0, cols - x)], P_YELLOW, curses.A_BOLD)
+            y += 1
+    else:
+        title = "A T H E N A"
+        db.puts(y, max(0, (cols - len(title)) // 2), title[:cols], P_YELLOW, curses.A_BOLD)
+        y += 1
+    y += gap
+
+    tag_x = max(0, (cols - len(tagline)) // 2)
+    db.puts(y, tag_x, tagline[:cols], P_DIM)
+    y += 1 + max(0, gap - 1)
+
+    spin = LOADING_SPINNER[tick % len(LOADING_SPINNER)]
+    label_w = max(len(s) for s, _ in steps)
+    list_x = max(0, (cols - (label_w + 5)) // 2)
+    for label, done in steps:
+        mark = "[OK]" if done else f"[{spin} ]"
+        pair = P_GREEN if done else P_DIM
+        db.puts(y, list_x, mark, pair, curses.A_BOLD if done else 0)
+        db.puts(y, list_x + 5, label[:max(0, cols - list_x - 5)], pair)
+        y += 1
+
+    hint = f" {done_n}/{total_n} ready — q=quit  any other key=skip "
+    db.puts(rows - 1, 0, hint.ljust(cols)[:cols], P_STATUS)
+
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS
@@ -9656,6 +9861,33 @@ def curses_main(stdscr):
     threading.Thread(target=_ch_engine_thread_eth, args=(_quit_evt,), daemon=True).start()
     threading.Thread(target=_ch_engine_thread_qqq, args=(_quit_evt,), daemon=True).start()
     threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
+
+    # Loading screen — holds here (all the above threads are already running
+    # in the background) until every one of them reports its first cycle
+    # done, or LOADING_MAX_WAIT_SEC elapses, or the user skips/quits.
+    loading_deadline = time.time() + LOADING_MAX_WAIT_SEC
+    loading_tick = 0
+    while not _quit_evt.is_set():
+        steps = _startup_progress()
+        if all(done for _, done in steps) or time.time() > loading_deadline:
+            break
+        lrows, lcols = stdscr.getmaxyx()
+        ldb = DoubleBuffer(lrows, lcols)
+        draw_loading_screen(ldb, lrows, lcols, steps, loading_tick)
+        ldb.flush(stdscr)
+        loading_tick += 1
+        key = stdscr.getch()
+        if key != -1:
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            break
+    curses.napms(30)   # one extra idle wait so the tail of the splash's own
+                        # last frame doesn't visibly tear against the
+                        # dashboard's first full repaint below
+    stdscr.clearok(True)   # force a full repaint for the dashboard's first
+                            # frame — the splash left the real screen content
+                            # in an unrelated state, so DoubleBuffer's own
+                            # cell-diff can't be trusted for just this one frame
 
     rows, cols = stdscr.getmaxyx()
     db = DoubleBuffer(rows, cols)

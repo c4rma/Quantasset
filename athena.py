@@ -80,6 +80,7 @@ import hmac
 import hashlib
 import asyncio
 import threading
+import socket
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,28 +89,28 @@ try:
     import requests
 except ModuleNotFoundError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"], stdout=subprocess.DEVNULL)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "requests"], stdout=subprocess.DEVNULL)
     import requests
 
 try:
     import httpx
 except ModuleNotFoundError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx"], stdout=subprocess.DEVNULL)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "httpx"], stdout=subprocess.DEVNULL)
     import httpx
 
 try:
     import curses
 except ModuleNotFoundError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"], stdout=subprocess.DEVNULL)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "windows-curses"], stdout=subprocess.DEVNULL)
     import curses
 
 try:
     import websocket
 except ModuleNotFoundError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"], stdout=subprocess.DEVNULL)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "websocket-client"], stdout=subprocess.DEVNULL)
     import websocket
 
 try:
@@ -125,7 +126,7 @@ def _load_tz(name):
     except Exception:
         try:
             import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "tzdata"], stdout=subprocess.DEVNULL)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "tzdata"], stdout=subprocess.DEVNULL)
             return ZoneInfo(name)
         except Exception:
             return None
@@ -1842,6 +1843,46 @@ def _gex_snapshot_state(asset):
     with GEX_STATE_LOCK:
         return (list(GEX_HISTORY[asset]), set(GEX_GRID[asset]), GEX_SCALE_MAX[asset], dict(GEX_META[asset]))
 
+# ── Server Mode / Client Mode — GEX wire (de)serialization ─────────────────
+# col["ts"] is a live datetime.datetime, col["gex"]/col["gex_by_type"] are
+# dicts keyed by float strike prices — neither is JSON-safe as-is. Mirrors
+# gex_append_log/gex_load_log's own already-working shape for exactly this
+# problem (see their docstrings), with one addition: scale_at_ingest, which
+# the on-disk log omits (a reloaded historical day recomputes scale
+# differently) but a live wire push must include verbatim to reproduce the
+# exact column a Server render would use.
+def _gex_col_to_wire(col):
+    return {"ts": col["ts"].isoformat(), "spot": col["spot"],
+            "gex": {str(k): v for k, v in col["gex"].items()},
+            "gex_by_type": {str(k): v for k, v in (col.get("gex_by_type") or {}).items()},
+            "nearest": col.get("nearest"), "scale_at_ingest": col.get("scale_at_ingest")}
+
+def _gex_col_from_wire(d):
+    return {"ts": datetime.fromisoformat(d["ts"]), "spot": d["spot"],
+            "gex": {float(k): v for k, v in d["gex"].items()},
+            "gex_by_type": {float(k): v for k, v in (d.get("gex_by_type") or {}).items()},
+            "nearest": d.get("nearest"), "scale_at_ingest": d.get("scale_at_ingest")}
+
+def _gex_apply_wire_state(asset, msg):
+    """Client side — rebuilds this asset's GEX_HISTORY/GEX_GRID/
+    GEX_SCALE_MAX/GEX_META from a received {"type": "gex_state", ...}
+    message (see _sync_broadcast_gex_state for the sender). Called only by
+    _sync_client_connect_loop — never on a Server instance."""
+    with GEX_STATE_LOCK:
+        GEX_HISTORY[asset] = deque((_gex_col_from_wire(c) for c in msg["history"]), maxlen=GEX_HISTORY_MAXLEN)
+        GEX_GRID[asset] = set(msg["grid"])
+        GEX_SCALE_MAX[asset] = msg["scale_max"]
+        GEX_META[asset] = msg["meta"]
+
+def _gex_apply_wire_status(asset, msg):
+    """Client side — GEX_STATUS/GEX_LOG_ROWS/GEX_DIAG_COUNT, unlocked, same
+    convention the Server's own draw code already reads these three with
+    (see draw_gex_map/draw_gex_by_strike — a pre-existing non-issue, not
+    something this sync layer introduces)."""
+    GEX_STATUS[asset] = msg.get("status")
+    GEX_LOG_ROWS[asset] = msg.get("log_rows", 0)
+    GEX_DIAG_COUNT[asset] = msg.get("diag_count", 0)
+
 def _gex_atm_idx(asset):
     """Ported from gex.py's own _atm_idx — index of the strike nearest
     the latest spot, used to seed vert_center_idx the moment the user
@@ -1976,8 +2017,10 @@ def _gex_engine_loop(asset, stop_evt):
             gex_export_status_snapshot(asset, col, scale_max, _flip)
             GEX_STATUS[asset] = "live"
             prev_col = col
+            _sync_broadcast_gex_state(asset)   # no-op on a Client / with no connected clients
         except Exception as e:
             GEX_STATUS[asset] = f"error: {e}"[:60]
+        _sync_broadcast_gex_status(asset)   # status/log_rows/diag_count either way
         elapsed = time.time() - t0
         stop_evt.wait(max(1.0, GEX_REFRESH_SEC - elapsed))
 
@@ -3741,6 +3784,17 @@ STATUS_RENDER_LINES = []   # latest _status_build_render_lines() output — Phas
 _status_last_full_lock = threading.Lock()
 _status_last_full_data = None
 
+def _status_apply_wire_lines(msg):
+    """Client side — draw_status_screen reads nothing but STATUS_RENDER_LINES
+    (a list[str] of already-fully-formatted ANSI-tagged display strings), so
+    this is the entire Status mirror: overwrite it verbatim from a received
+    {"type": "status_lines", "lines": [...]} message. The Client's own
+    db.puts_ansi renders these completely unchanged — no new parsing logic
+    needed anywhere. Called only by _sync_client_connect_loop."""
+    global STATUS_RENDER_LINES
+    with STATUS_STATE_LOCK:
+        STATUS_RENDER_LINES = list(msg["lines"])
+
 # Deliberately NOT ported: status.py's own check_pcvr_alert/play_alert
 # (plays alert.wav on a PCVR sentiment flip) — a terminal-audio notification
 # for a human watching status.py's OWN screen, not data Athena's trading
@@ -3848,6 +3902,7 @@ def _status_snapshot_loop(stop_evt):
                 lines = _status_build_render_lines(display_data)
                 with STATUS_STATE_LOCK:
                     STATUS_RENDER_LINES = lines
+                _sync_broadcast_status_lines()   # no-op on a Client / with no connected clients
             except Exception:
                 pass
         stop_evt.wait(STATUS_SNAPSHOT_INTERVAL)
@@ -8278,6 +8333,7 @@ class AppState:
                 inst = self.instruments.get(asset)
                 if inst is not None:
                     inst["live_price"] = bar["c"]
+        _sync_broadcast_app_state()   # no-op on a Client / with no connected clients
 
     def publish(self, instruments, age, acc, live_prices, qqq_market_closed):
         balance, available, margin_used = account_balance_fields(acc)
@@ -8313,6 +8369,7 @@ class AppState:
             self.trade_pairs = recent_trade_pairs(8)
             self.footprint_bars = bars
             self.qqq_market_closed = qqq_market_closed
+        _sync_broadcast_app_state()   # no-op on a Client / with no connected clients
 
     def snapshot(self):
         with self.lock:
@@ -8326,7 +8383,110 @@ class AppState:
                 "qqq_market_closed": self.qqq_market_closed,
             }
 
+    def apply_snapshot(self, data):
+        """Client side — counterpart to snapshot() above; writes every
+        field from a received {"type": "app_state", "data": {...}} message
+        onto self under self.lock. The one wire-format wrinkle: live_bars'
+        "levels" sub-dict has real Python int keys server-side, which JSON
+        silently stringifies on the wire — recast here with int(k), the
+        same cast already used at every other footprint_bars/live_bars
+        consumption site in this file (footprint_bars itself needs no such
+        cast: it's always string-keyed, on the Server too, since it's read
+        straight off an on-disk JSON log). Called only by
+        _sync_client_connect_loop — never on a Server instance."""
+        live_bars = {}
+        for asset, bar in (data.get("live_bars") or {}).items():
+            if bar is None:
+                live_bars[asset] = None
+                continue
+            bar = dict(bar)
+            if bar.get("levels"):
+                bar["levels"] = {int(k): v for k, v in bar["levels"].items()}
+            live_bars[asset] = bar
+        with self.lock:
+            self.instruments = data.get("instruments", {})
+            self.snapshot_age = data.get("snapshot_age", "no snapshot found yet")
+            self.balance = data.get("balance")
+            self.available = data.get("available")
+            self.margin_used = data.get("margin_used")
+            self.open_pnl = data.get("open_pnl")
+            self.closed_pnl = data.get("closed_pnl")
+            self.event_log = data.get("event_log", [])
+            self.closed_trades = data.get("closed_trades", [])
+            self.trade_pairs = data.get("trade_pairs", [])
+            self.footprint_bars = data.get("footprint_bars", {})
+            self.live_bars = live_bars
+            self.qqq_market_closed = data.get("qqq_market_closed", True)
+
 APP_STATE = AppState()
+
+# ── Server Mode / Client Mode (sync layer) ──────────────────────────────────
+# A Server instance is just today's athena.py, unchanged, PLUS it streams its
+# live dashboard state to any connected Clients. A Client instance is a pure
+# view-only mirror — it never starts the trading engine or any backfill/GEX/
+# status/chart thread (see curses_main's own thread-startup block, gated on
+# CLIENT_MODE), never needs broker credentials, and can never place/modify/
+# cancel a trade. It just keeps these SAME globals (APP_STATE/GEX_HISTORY/
+# GEX_GRID/GEX_SCALE_MAX/GEX_META/GEX_STATUS/STATUS_RENDER_LINES) populated
+# from the network instead of from local threads — every draw_* function
+# already reads only from these, so nothing about rendering changes at all.
+SYNC_SECRET = os.environ.get('ATHENA_SYNC_SECRET', '')   # shared secret — used for
+                    # BOTH the login screen and the HMAC socket handshake; the
+                    # secret itself never crosses the wire (see the handshake
+                    # in _sync_client_handler/_sync_client_connect_loop).
+ATHENA_LOGIN_USER = os.environ.get('ATHENA_LOGIN_USER', '')
+
+CLIENT_MODE = False   # set once at startup by curses_main's own mode-select
+SERVER_MODE = False   # screen, never changes at runtime — gates every trading-
+                       # mutating keypress (see CLIENT_BLOCKED_KEYS below) and
+                       # the entire thread-startup block.
+
+SYNC_PORT_DEFAULT = 8765
+
+SYNC_SERVER_LOCK = threading.Lock()   # SYNC_CLIENTS is a genuine multi-writer
+SYNC_CLIENTS = {}                     # structure — N per-client handler threads
+                    # each add/remove their own entry — unlike every other box
+                    # below, which has exactly one writer thread and is safe
+                    # unlocked (same convention STATUS_ENGINE_STATE/GEX_STATUS
+                    # already use elsewhere in this file). Keyed by a simple
+                    # incrementing connection id -> {"conn": socket, "addr": (ip,port)}.
+SYNC_SERVER_STATUS = ["not started"]   # "listening on 100.x.x.x:8765" / "error: ..."
+SYNC_SERVER_BIND_IP = [None]           # resolved Tailscale IP (see _get_tailscale_ip)
+
+SYNC_CLIENT_STATUS = ["disconnected"]      # "connecting…" / "connected" /
+                                            # "reconnecting in Ns…" / "auth failed…"
+SYNC_CLIENT_LAST_MSG_TS = [0.0]            # time.time() of the last applied push —
+                                            # _startup_progress's Client-Mode branch
+                                            # and the footer both read this
+SYNC_SERVER_ADDR = [None, None]            # [host, port] the user typed into
+                                            # _client_connect_screen
+
+# [D]ata view content — unlike everything else synced (which is already
+# in-memory state the engine/GEX/status threads maintain continuously),
+# this is normally computed by scanning on-disk trade logs fresh, on
+# demand, only while [D]ata is actually open locally (scan_all_trades_
+# detailed/scan_all_trade_events). A Server broadcasts BOTH sim and real
+# payloads on its own timer (see _sync_data_view_loop) so a Client's own
+# [D]ata view works regardless of whether/which source the Server
+# operator currently has open locally — see _gather_data_view_payload/
+# _data_view_apply_wire. Defaults to a valid zeroed stats dict (not None)
+# so a Client's very first [D]ata-view frame, before any push has arrived
+# yet, renders "all zeros" instead of crashing on stats['count'].
+SYNC_DATA_VIEW_LOCK = threading.Lock()
+SYNC_DATA_VIEW = {"sim": {"trades": [], "events": [], "stats": compute_trade_stats([], source="sim")},
+                   "real": {"trades": [], "events": [], "stats": compute_trade_stats([], source="real")}}
+
+# Every keypress that starts/stops/modifies trading in ANY way — blocked
+# outright in Client Mode via a single guard near the top of curses_main's
+# key-dispatch chain (see CLIENT_MODE check right after the [Q]uit handler),
+# rather than editing each handler individually. [D]ata is NOT in this set
+# — it's a read-only view backed by the sync layer above, safe in Client
+# Mode like every other view-only key.
+CLIENT_BLOCKED_KEYS = {ord("r"), ord("R"), ord("f"), ord("F"), ord("n"), ord("N"),
+                        ord("a"), ord("A"), ord("b"), ord("B"), ord("1"),
+                        ord("w"), ord("W"), ord("e"), ord("E"), ord("p"), ord("P"),
+                        ord("g"), ord("G")}
+
 _quit_evt = threading.Event()
 _backfill_ready = {a: threading.Event() for a in ASSETS}   # set by _backfill_then_feeds
                     # once this asset's REST backfill attempt has finished (success
@@ -8356,6 +8516,300 @@ _flatten_scope = ["ALL"]   # 2026-07-28 — curses thread writes "ETH"/"QQQ"/"AL
                             # _flatten_all_evt, same single-item cross-thread box
                             # _reset_sim_balance already established for [R].
 _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] key can cycle it in place
+
+# ── Server Mode / Client Mode — networking ──────────────────────────────────
+# Server side: accept loop + per-client handshake thread + a broadcast
+# helper the real producer threads (AppState.publish/publish_live_fast,
+# _gex_engine_loop, _status_snapshot_loop) call right after they update
+# their own data — no separate polling/timer thread anywhere in this layer,
+# every push just piggybacks on whichever thread already just recomputed
+# the thing being pushed.
+def _sync_broadcast(payload_dict):
+    """Send one JSON line to every currently-connected sync client —
+    best-effort: a write failure to one client (dead socket, client closed)
+    just marks that one for removal under SYNC_SERVER_LOCK, never raises
+    into the calling producer thread (AppState.publish etc. must never
+    fail just because a viewer elsewhere dropped its connection)."""
+    if not SYNC_CLIENTS:
+        return
+    line = (json.dumps(payload_dict) + "\n").encode()
+    dead = []
+    with SYNC_SERVER_LOCK:
+        for conn_id, info in SYNC_CLIENTS.items():
+            try:
+                info["conn"].sendall(line)
+            except OSError:
+                dead.append(conn_id)
+        for conn_id in dead:
+            SYNC_CLIENTS.pop(conn_id, None)
+
+def _sync_broadcast_app_state():
+    if SERVER_MODE:
+        _sync_broadcast({"type": "app_state", "data": APP_STATE.snapshot()})
+
+def _sync_broadcast_gex_state(asset):
+    if not SERVER_MODE:
+        return
+    with GEX_STATE_LOCK:
+        history = [_gex_col_to_wire(c) for c in GEX_HISTORY[asset]]
+        grid = list(GEX_GRID[asset])
+        scale_max = GEX_SCALE_MAX[asset]
+        meta = dict(GEX_META[asset])
+    _sync_broadcast({"type": "gex_state", "asset": asset, "history": history,
+                      "grid": grid, "scale_max": scale_max, "meta": meta})
+
+def _sync_broadcast_gex_status(asset):
+    if SERVER_MODE:
+        _sync_broadcast({"type": "gex_status", "asset": asset, "status": GEX_STATUS.get(asset),
+                          "log_rows": GEX_LOG_ROWS.get(asset), "diag_count": GEX_DIAG_COUNT.get(asset)})
+
+def _sync_broadcast_status_lines():
+    if SERVER_MODE:
+        with STATUS_STATE_LOCK:
+            lines = list(STATUS_RENDER_LINES)
+        _sync_broadcast({"type": "status_lines", "lines": lines})
+
+_sync_next_conn_id = [0]   # mutable single-item box, same convention as
+                            # _profile_mode_idx above — only the listener
+                            # thread ever increments this
+
+def _sync_client_handler(conn, addr, stop_evt):
+    """Per-client thread — HMAC challenge/response handshake (server side),
+    then just idles reading (and discarding) whatever the client sends
+    until the socket closes or stop_evt fires; the client never pushes
+    state, only an occasional keepalive line, so there's nothing to
+    dispatch here. Actual state pushes to this client happen from OTHER
+    threads (the producers, via _sync_broadcast above) once this handler
+    has registered the live socket in SYNC_CLIENTS."""
+    conn_id = None
+    try:
+        conn.settimeout(10)
+        nonce = os.urandom(32).hex()
+        conn.sendall((json.dumps({"type": "challenge", "nonce": nonce}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        line, _, buf = buf.partition(b"\n")
+        try:
+            msg = json.loads(line.decode())
+        except Exception:
+            return
+        expected = hmac.new(SYNC_SECRET.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+        if msg.get("type") != "auth" or not hmac.compare_digest(str(msg.get("response", "")), expected):
+            conn.sendall((json.dumps({"type": "auth_fail"}) + "\n").encode())
+            return   # no retry loop on this connection — see security notes
+        conn.sendall((json.dumps({"type": "auth_ok"}) + "\n").encode())
+
+        with SYNC_SERVER_LOCK:
+            _sync_next_conn_id[0] += 1
+            conn_id = _sync_next_conn_id[0]
+            SYNC_CLIENTS[conn_id] = {"conn": conn, "addr": addr}
+        console_log(f"{CYN}Sync client connected: {addr[0]}:{addr[1]}{RST}")
+        log_event("SYSTEM", "sync_client_connected", {"addr": f"{addr[0]}:{addr[1]}"})
+
+        # Send this client a full snapshot immediately on connect (rather
+        # than waiting for the next producer cycle) so its own dashboard
+        # doesn't sit blank/stale for up to a full engine interval.
+        _sync_broadcast_app_state()
+        for asset in ASSETS:
+            _sync_broadcast_gex_state(asset)
+            _sync_broadcast_gex_status(asset)
+        _sync_broadcast_status_lines()
+        try:
+            _sync_broadcast(_gather_data_view_payload())
+        except Exception:
+            pass
+
+        conn.settimeout(1)
+        while not stop_evt.is_set():
+            try:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    except Exception:
+        pass
+    finally:
+        if conn_id is not None:
+            with SYNC_SERVER_LOCK:
+                SYNC_CLIENTS.pop(conn_id, None)
+            console_log(f"{DIM}Sync client disconnected: {addr[0]}:{addr[1]}{RST}")
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+def _sync_server_listen(stop_evt):
+    """Accept-loop thread — binds ONLY to SYNC_SERVER_BIND_IP[0] (the
+    resolved Tailscale IP; curses_main never calls this thread at all if
+    that resolution failed, see its own SERVER_MODE branch) — NEVER 0.0.0.0.
+    Do not change this to bind a wildcard address: the state stream is
+    plaintext JSON after the handshake, acceptable only because it's
+    wrapped in Tailscale's own WireGuard tunnel — this port must never be
+    reachable from, or port-forwarded to, the public internet."""
+    global SYNC_SERVER_STATUS
+    host = SYNC_SERVER_BIND_IP[0]
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, SYNC_PORT_DEFAULT))
+        sock.listen(5)
+        sock.settimeout(1)
+    except OSError as e:
+        SYNC_SERVER_STATUS[0] = f"error: {e}"
+        console_log(f"{RED}Sync server failed to bind {host}:{SYNC_PORT_DEFAULT} — {e}{RST}")
+        return
+    SYNC_SERVER_STATUS[0] = f"listening on {host}:{SYNC_PORT_DEFAULT}"
+    console_log(f"{CYN}Sync server listening on {host}:{SYNC_PORT_DEFAULT}{RST}")
+    try:
+        while not stop_evt.is_set():
+            try:
+                conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_sync_client_handler, args=(conn, addr, stop_evt), daemon=True).start()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        SYNC_SERVER_STATUS[0] = "stopped"
+
+def _sync_client_connect_loop(host, port, stop_evt):
+    """Client Mode's ONE background thread — connects to a Server, does the
+    HMAC handshake (client side), then reads newline-delimited JSON forever,
+    dispatching each message into the same globals a Server's own engine/
+    GEX/status threads would populate (AppState.apply_snapshot/
+    _gex_apply_wire_state/_gex_apply_wire_status/_status_apply_wire_lines).
+    On any failure — connection refused, auth_fail, socket reset — backs
+    off (capped exponential: 1/2/4/8/10s) and retries until stop_evt fires.
+    This is the entire extent of Client Mode's network activity; it never
+    touches a broker credential or the trading engine."""
+    global SYNC_CLIENT_STATUS
+    backoff = 1
+    while not stop_evt.is_set():
+        sock = None
+        auth_failed = False   # set on an explicit auth_fail so the bottom-of-
+                               # loop reconnect message doesn't immediately
+                               # stomp the more specific "check your secret"
+                               # status before the user ever sees it
+        try:
+            SYNC_CLIENT_STATUS[0] = "connecting…"
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((host, port))
+            buf = b""
+
+            def _read_line():
+                nonlocal buf
+                while b"\n" not in buf:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("server closed connection")
+                    buf += chunk
+                line, _, buf = buf.partition(b"\n")
+                return line
+
+            challenge_msg = json.loads(_read_line().decode())
+            if challenge_msg.get("type") != "challenge":
+                raise ConnectionError("unexpected handshake message")
+            nonce = challenge_msg["nonce"]
+            response = hmac.new(SYNC_SECRET.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+            sock.sendall((json.dumps({"type": "auth", "response": response}) + "\n").encode())
+            auth_msg = json.loads(_read_line().decode())
+            if auth_msg.get("type") != "auth_ok":
+                SYNC_CLIENT_STATUS[0] = "auth failed — check ATHENA_SYNC_SECRET"
+                auth_failed = True
+                raise ConnectionError("auth_fail")
+
+            SYNC_CLIENT_STATUS[0] = "connected"
+            backoff = 1
+            sock.settimeout(1)
+            while not stop_evt.is_set():
+                try:
+                    line = _read_line()
+                except socket.timeout:
+                    continue
+                try:
+                    msg = json.loads(line.decode())
+                except Exception:
+                    continue
+                mtype = msg.get("type")
+                if mtype == "app_state":
+                    APP_STATE.apply_snapshot(msg["data"])
+                elif mtype == "gex_state":
+                    _gex_apply_wire_state(msg["asset"], msg)
+                elif mtype == "gex_status":
+                    _gex_apply_wire_status(msg["asset"], msg)
+                elif mtype == "status_lines":
+                    _status_apply_wire_lines(msg)
+                elif mtype == "data_view":
+                    _data_view_apply_wire(msg)
+                # anything else (e.g. a future "ping") is silently ignored —
+                # forward-compatible with message types this version
+                # doesn't know about yet
+                SYNC_CLIENT_LAST_MSG_TS[0] = time.time()
+        except Exception:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        if not stop_evt.is_set():
+            if not auth_failed:
+                SYNC_CLIENT_STATUS[0] = f"reconnecting in {backoff}s…"
+            stop_evt.wait(backoff)
+            backoff = min(10, backoff * 2)
+
+def _gather_data_view_payload():
+    """Server side — BOTH sim and real Data-view content (trades/events/
+    stats), independent of whatever source (or whether) the Server's OWN
+    local dashboard currently has [D]ata open to — a Client picks its own
+    [S]witch-source independently, same as it always could locally. Real
+    disk I/O (scan_all_trades_detailed/scan_all_trade_events) — only ever
+    called when there's actually at least one client to send it to (see
+    _sync_data_view_loop and _sync_client_handler's on-connect push)."""
+    sim_trades = scan_all_trades_detailed()
+    sim_events = [{"ts": t["exit_ts"], "pnl": t["net_pnl"]} for t in sim_trades]
+    real_events = scan_all_trade_events("real")
+    return {"type": "data_view",
+            "sim": {"trades": sim_trades, "events": sim_events,
+                    "stats": compute_trade_stats(sim_events, source="sim")},
+            "real": {"trades": [], "events": real_events,
+                     "stats": compute_trade_stats(real_events, source="real")}}
+
+def _data_view_apply_wire(msg):
+    """Client side — overwrites SYNC_DATA_VIEW wholesale from a received
+    {"type": "data_view", "sim": {...}, "real": {...}} message. Called
+    only by _sync_client_connect_loop."""
+    global SYNC_DATA_VIEW
+    with SYNC_DATA_VIEW_LOCK:
+        SYNC_DATA_VIEW = {"sim": msg.get("sim") or SYNC_DATA_VIEW["sim"],
+                           "real": msg.get("real") or SYNC_DATA_VIEW["real"]}
+
+def _sync_data_view_loop(stop_evt):
+    """Server-side background thread, started alongside _sync_server_listen
+    — periodically broadcasts _gather_data_view_payload(). Only does the
+    actual disk-scanning work while at least one client is connected;
+    SYNC_CLIENTS empty is by far the common case, and the scan functions
+    are real disk I/O, not free."""
+    while not stop_evt.is_set():
+        if SYNC_CLIENTS:
+            try:
+                _sync_broadcast(_gather_data_view_payload())
+            except Exception:
+                pass
+        stop_evt.wait(2.0)
 
 GEX_COL_W = 2   # matches gex.py's own COL_W (terminal columns per time interval)
 GEX_ARROW_STEP = 5      # matches gex.py's own ARROW_STEP (time-axis columns per Left/Right)
@@ -9154,6 +9608,58 @@ def draw_dashboard(db, snap, cols):
 
     return DASHBOARD_H
 
+SYNC_STATUS_BOX_W = 40   # fixed width, deliberately small — this box lives in
+                          # draw_dashboard's own 4-row header span (rows 0-3),
+                          # NOT an extra row of its own, specifically so it
+                          # never has to touch DASHBOARD_H's fixed row-budget
+                          # accounting for the chart region below (see
+                          # DASHBOARD_H's own docstring for why that constant
+                          # stays fixed). 40 is generous for a full
+                          # "100.xxx.xxx.xxx:NNNNN" address either direction.
+
+def draw_sync_status_box(db, cols):
+    """Server Mode: the address Clients should connect to, plus how many
+    are connected right now. Client Mode: the Server address THIS instance
+    is connected to, plus live connection status. A no-op outside either
+    mode. Drawn flush to the top-right corner, spanning the exact same 4
+    rows (0-3) draw_dashboard's own header occupies — chosen specifically
+    so this never needs its own row budget. Draws nothing at all (rather
+    than overlapping the header's own text) if the terminal isn't wide
+    enough for both — the ACCOUNT row above can run to ~120 columns on its
+    own, so this checks for real headroom past that before claiming space,
+    same "skip rather than garble" convention the loading screen's own
+    show_bust/show_word gating already uses."""
+    if not (SERVER_MODE or CLIENT_MODE):
+        return
+    box_w = min(SYNC_STATUS_BOX_W, cols)
+    x0 = cols - box_w
+    if x0 < 122:
+        return
+
+    if SERVER_MODE:
+        title = " SYNC: SERVER "
+        ip = SYNC_SERVER_BIND_IP[0]
+        addr_line = f"{ip}:{SYNC_PORT_DEFAULT}" if ip else "no Tailscale IP found"
+        with SYNC_SERVER_LOCK:
+            n = len(SYNC_CLIENTS)
+        status_line = f"{n} client{'s' if n != 1 else ''} connected" if ip else "not accepting clients"
+        pair = P_CYAN if ip else P_YELLOW
+    else:
+        host, port = SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1]
+        title = " SYNC: CLIENT "
+        addr_line = f"{host}:{port}" if host else "no server address"
+        status_line = SYNC_CLIENT_STATUS[0]
+        pair = P_GREEN if status_line == "connected" else P_YELLOW
+
+    top = ("┌" + title.center(box_w - 2, "─") + "┐")[:box_w]
+    mid1 = "│" + addr_line.center(box_w - 2)[:box_w - 2] + "│"
+    mid2 = "│" + status_line.center(box_w - 2)[:box_w - 2] + "│"
+    bot = "└" + "─" * (box_w - 2) + "┘"
+    db.puts(0, x0, top, pair, curses.A_BOLD)
+    db.puts(1, x0, mid1, pair)
+    db.puts(2, x0, mid2, pair)
+    db.puts(3, x0, bot, pair, curses.A_BOLD)
+
 def _prompt_number(stdscr, label, default=None):
     """Blocking single-line numeric input on the footer row — same pattern
     footprint.py/charthacker.py's own text-entry dialogs use (switch to
@@ -9330,6 +9836,263 @@ def _prompt_confirm_text(stdscr, box_lines, confirm_word):
         curses.curs_set(0)
         stdscr.nodelay(True)
     return result
+
+def _prompt_text(stdscr, box_lines, prompt="> ", mask=False):
+    """General-purpose blocking single-line text-entry dialog — a bordered
+    box (box_lines, plain strings, centered) with a free-text input row
+    underneath. Generalizes _prompt_confirm_text's own loop (same bordered-
+    box look, same "writes directly to stdscr, bypassing DoubleBuffer" —
+    caller must set db.prev = None afterward IF a DoubleBuffer already
+    exists at the call site; the Server-Mode-/Client-Mode-select screens
+    that are this function's only callers today all run before curses_main
+    ever constructs one, so none of them need to) to return the typed
+    string itself rather than a match/no-match bool against a fixed word.
+    Accepts any printable character (not just digits, unlike _prompt_number).
+    mask=True echoes '*' per character instead of the real text — for
+    password entry, so a typed password is never actually drawn to the
+    screen. Esc cancels and returns None; Enter on an empty buffer also
+    returns None (never silently returns an empty string a caller might
+    mistake for deliberate "no input" — every current caller treats None
+    as cancel)."""
+    rows, cols = stdscr.getmaxyx()
+    box_w = min(cols - 4, 90)   # wide enough for "Password: " + a full 64-char
+                                 # secret with real padding to spare, rather than
+                                 # landing right at the edge of the box
+    box_h = len(box_lines) + 4
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+    input_row = y0 + 1 + len(box_lines) + 1
+
+    buf = ""
+    result = None
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    try:
+        while True:
+            attrs = curses.color_pair(P_CYAN) | curses.A_BOLD
+            shown = ("*" * len(buf)) if mask else buf
+            # Scroll rather than silently truncate once the echoed text
+            # would run past the box's own right border — always show the
+            # TRAILING window (the cursor is always at the end while
+            # typing), so both the text AND the cursor stay inside the
+            # border no matter how long buf gets (a 64-char secret on a
+            # narrow terminal previously pushed the cursor clean outside
+            # the box — see the caller's own bug report).
+            avail = max(1, box_w - 2 - len(prompt))
+            visible = shown[-avail:] if len(shown) > avail else shown
+            try:
+                stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+                for i, line in enumerate(box_lines):
+                    stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+                stdscr.addstr(y0 + 1 + len(box_lines), x0, ("│" + " " * (box_w - 2) + "│"), attrs)
+                stdscr.addstr(input_row, x0, ("│" + (prompt + visible).ljust(box_w - 2)[:box_w - 2] + "│"), attrs)
+                stdscr.addstr(input_row + 1, x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+            except curses.error:
+                pass
+            try:
+                cursor_col = min(x0 + 1 + len(prompt) + len(visible), x0 + box_w - 2)
+                stdscr.move(input_row, min(cols - 1, cursor_col))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch == "\x1b":
+                result = None
+                break
+            if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                result = buf if buf else None
+                break
+            if ch in ("\x08", "\x7f") or ch == curses.KEY_BACKSPACE:
+                buf = buf[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                buf += ch
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+    return result
+
+def _blocking_info_screen(stdscr, box_lines, color=None, wait_for_key=True):
+    """Full-screen bordered info/error box — shared by the login/Server-
+    Mode-info screens below for anything that's just a message plus
+    "press any key to continue," rather than a text-entry prompt. erase()s
+    the whole screen first so a differently-sized PRIOR dialog (e.g. a
+    taller login box) can never leave stray border characters behind that
+    this box's own smaller footprint wouldn't overwrite."""
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    box_w = min(cols - 4, 76)
+    lines = list(box_lines) + (["", "Press any key to continue…"] if wait_for_key else [])
+    box_h = len(lines) + 2
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+    attrs = curses.color_pair(color if color is not None else P_CYAN) | curses.A_BOLD
+    try:
+        stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+        for i, line in enumerate(lines):
+            stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+        stdscr.addstr(y0 + 1 + len(lines), x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+    except curses.error:
+        pass
+    stdscr.refresh()
+    if wait_for_key:
+        stdscr.nodelay(False)
+        try:
+            stdscr.get_wch()
+        except Exception:
+            pass
+        finally:
+            stdscr.nodelay(True)
+
+def _get_tailscale_ip():
+    """Best-effort resolution of this machine's Tailscale IPv4 address, via
+    the `tailscale` CLI itself (authoritative — reads the daemon's own
+    state, not a network-interface guess that could pick up the wrong
+    adapter). Returns None on any failure (binary not on PATH, tailscaled
+    not running/not logged in, timeout) — callers must NEVER fall back to
+    binding 0.0.0.0 when this returns None; see _sync_server_listen's own
+    docstring for why."""
+    import subprocess
+    try:
+        result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                                 text=True, timeout=3)
+        out = result.stdout.strip()
+        return out.splitlines()[0].strip() if out else None
+    except Exception:
+        return None
+
+def _login_screen(stdscr):
+    """First screen curses_main shows, before anything else — gates BOTH
+    Server and Client Mode behind one shared username/password stored in
+    .env (ATHENA_LOGIN_USER/ATHENA_SYNC_SECRET — the same secret value the
+    HMAC socket handshake reuses later, see the sync-layer module
+    docstring above SYNC_SECRET). Fails CLOSED: if ATHENA_SYNC_SECRET isn't
+    configured at all, refuses to start rather than let a blank-vs-blank
+    comparison trivially "succeed". Up to 3 attempts, then quits. Both the
+    username and password comparisons use hmac.compare_digest (constant-
+    time), not ==, for the same reason the socket handshake does — no
+    reason to leave a timing side-channel on a comparison that's already
+    right there importing hmac for something else. Returns True only on a
+    successful login."""
+    if not SYNC_SECRET:
+        _blocking_info_screen(stdscr, [
+            "", "LOGIN NOT CONFIGURED", "",
+            "ATHENA_SYNC_SECRET is not set in .env — add",
+            "ATHENA_LOGIN_USER and ATHENA_SYNC_SECRET there",
+            "before starting Athena.", "",
+        ], color=P_RED)
+        return False
+    for attempt in range(3):
+        stdscr.erase()
+        user = _prompt_text(stdscr, ["", "ATHENA LOGIN", ""], prompt="Username: ")
+        if user is None:
+            return False   # Esc — backed out entirely, not a failed attempt
+        stdscr.erase()
+        pw = _prompt_text(stdscr, ["", "ATHENA LOGIN", ""], prompt="Password: ", mask=True)
+        if pw is None:
+            return False
+        if hmac.compare_digest(user, ATHENA_LOGIN_USER) and hmac.compare_digest(pw, SYNC_SECRET):
+            return True
+        remaining = 2 - attempt
+        if remaining > 0:
+            _blocking_info_screen(stdscr, ["", "Login failed.", f"{remaining} attempt(s) remaining.", ""], color=P_RED)
+        else:
+            _blocking_info_screen(stdscr, ["", "Login failed. Too many attempts.", ""], color=P_RED)
+    return False
+
+def _mode_select_screen(stdscr):
+    """Post-login mode picker — Server (today's athena.py, plus streaming
+    to Clients) or Client (pure view-only mirror, no trading engine, no
+    broker credentials — see the sync-layer module docstring above
+    CLIENT_MODE). Same single-keypress modal pattern as
+    _prompt_flatten_scope. Returns "server"/"client"/None (None = quit)."""
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    box_lines = [
+        "", "ATHENA — SELECT MODE", "",
+        "[S]erver  — run the real trading engine, stream to Clients",
+        "[C]lient  — view-only mirror of a running Server, no trading",
+        "", "[Q] quit", "",
+    ]
+    box_w = min(cols - 4, 76)
+    box_h = len(box_lines) + 2
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+    attrs = curses.color_pair(P_CYAN) | curses.A_BOLD
+    try:
+        stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+        for i, line in enumerate(box_lines):
+            stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+        stdscr.addstr(y0 + 1 + len(box_lines), x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+    except curses.error:
+        pass
+    stdscr.refresh()
+    stdscr.nodelay(False)
+    try:
+        while True:
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if isinstance(ch, str) and ch.lower() == "s":
+                return "server"
+            if isinstance(ch, str) and ch.lower() == "c":
+                return "client"
+            if ch == "\x1b" or (isinstance(ch, str) and ch.lower() == "q"):
+                return None
+    finally:
+        stdscr.nodelay(True)
+
+def _server_info_screen(stdscr):
+    """Shown once, right after picking Server Mode — resolves this
+    machine's Tailscale IP (_get_tailscale_ip) and shows it plus the sync
+    port so the user can type it into a Client elsewhere. If Tailscale
+    resolution fails, Server Mode still proceeds — it just runs with no
+    listener thread (see curses_main's own SERVER_MODE branch, which is
+    the actual enforcement point for "never bind 0.0.0.0") rather than
+    ever silently falling back to a public bind address."""
+    ip = _get_tailscale_ip()
+    if ip:
+        _blocking_info_screen(stdscr, [
+            "", "SERVER MODE", "",
+            f"Clients connect to:  {ip}:{SYNC_PORT_DEFAULT}", "",
+            "Tailscale-only — this is NOT reachable from the public",
+            "internet, and must never be port-forwarded to be.", "",
+        ], color=P_CYAN)
+    else:
+        _blocking_info_screen(stdscr, [
+            "", "SERVER MODE — NO TAILSCALE IP FOUND", "",
+            "Couldn't resolve a Tailscale address (is `tailscale`",
+            "installed and `tailscaled` running/logged in?).", "",
+            "Continuing WITHOUT accepting remote clients — the local",
+            "trading engine and dashboard below are unaffected.", "",
+        ], color=P_YELLOW)
+
+def _client_connect_screen(stdscr):
+    """Shown once, right after picking Client Mode — asks for the Server's
+    address (host[:port], port defaults to SYNC_PORT_DEFAULT if omitted).
+    Only loosely validated here (non-empty host) — actual reachability is
+    _sync_client_connect_loop's own job, which retries with backoff rather
+    than failing this screen outright. Returns (None, None) on Esc/empty
+    input — curses_main's own caller treats that as "go back to mode
+    select," not "proceed with nothing to connect to."""
+    stdscr.erase()
+    addr = _prompt_text(stdscr, ["", "CLIENT MODE", "", "Server address, e.g. 100.x.x.x or 100.x.x.x:8765", ""],
+                         prompt="Address: ")
+    if not addr:
+        return None, None
+    addr = addr.strip()
+    if ":" in addr:
+        host, _, port_s = addr.rpartition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            host, port = addr, SYNC_PORT_DEFAULT
+    else:
+        host, port = addr, SYNC_PORT_DEFAULT
+    return (host, port) if host else (None, None)
 
 def _prompt_flatten_scope(stdscr):
     """[F] confirmation, 2026-07-28 user request: "make a pop-up with
@@ -9688,7 +10451,16 @@ def _startup_progress():
     (_backfill_ready/_ch_ready) added for the two subsystems that had no
     such "first cycle done" signal of their own. Returns a list of
     (label, done) pairs, engine first then per-asset groups in the same
-    order curses_main itself starts their threads in."""
+    order curses_main itself starts their threads in.
+
+    Client Mode starts none of those threads at all (see curses_main's own
+    CLIENT_MODE-gated thread-startup block) — its only background thread is
+    _sync_client_connect_loop, so its own readiness checklist is just
+    "connected to the Server" then "received a first pushed snapshot",
+    against SYNC_CLIENT_STATUS/SYNC_CLIENT_LAST_MSG_TS instead."""
+    if CLIENT_MODE:
+        return [("Connecting to server", SYNC_CLIENT_STATUS[0] == "connected"),
+                ("Received first snapshot", SYNC_CLIENT_LAST_MSG_TS[0] > 0.0)]
     steps = [("Trading engine", bool(APP_STATE.snapshot()["instruments"]))]
     for asset in ASSETS:
         steps.append((f"{asset} order-flow backfill", _backfill_ready[asset].is_set()))
@@ -9800,67 +10572,109 @@ def draw_loading_screen(db, rows, cols, steps, tick):
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS
-    global FEE_ETH_PCT, FEE_QQQ_PER_UNIT
+    global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(0)
     init_curses_colors()
     stdscr.timeout(100)
 
-    threading.Thread(target=_run_engine, daemon=True).start()
-    for asset in ASSETS:
-        feed_starters = []
-        # QQQ's live tape prefers Athena's own dedicated Alpaca account
-        # (real QQQ shares, matching footprint.py's own closed-bar source
-        # for QQQ) over Phemex's thinner QQQUSDT perp — per explicit user
-        # request. Falls back to the Phemex tape if those credentials
-        # aren't set, so a missing .env entry degrades gracefully instead
-        # of leaving QQQ's live chart with no feed at all.
-        if asset == "QQQ" and ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
-            feed_starters.append((_alpaca_trade_ws, (asset, _quit_evt)))
+    # Login, then Server/Client mode pick — BEFORE anything trading/network-
+    # related exists. This ordering is what makes Client Mode provably
+    # inert on the trading side: every engine/backfill/GEX/status/CH thread
+    # start below is gated on CLIENT_MODE, which isn't even set until this
+    # returns, so there's no window where a Client briefly touches any of
+    # that (see the sync-layer module docstring above CLIENT_MODE).
+    if not _login_screen(stdscr):
+        return
+    while True:
+        mode = _mode_select_screen(stdscr)
+        if mode is None:
+            return
+        if mode == "server":
+            SERVER_MODE, CLIENT_MODE = True, False
+            _server_info_screen(stdscr)
+            break
         else:
-            if asset == "QQQ":
-                console_log(f"{YLW}ALPACA_API_ATHENA_ID/ALPACA_API_SECRET_KEY_ATHENA not set — "
-                            f"QQQ live tape falling back to Phemex QQQUSDT{RST}")
-            feed_starters.append((_phemex_trade_ws, (asset, _quit_evt)))
-        # ETH's live tape aggregates Phemex + Kraken + Coinbase — matching
-        # footprint.py's own multi-exchange source for ETH's closed bars
-        # exactly, so a live bar isn't blind to a real print that happened
-        # to land on Kraken/Coinbase first (see the module-level comment
-        # above KRAKEN_WS_URL for the confirmed live discrepancy this fixes).
-        if asset == "ETH":
-            feed_starters.append((_kraken_trade_ws, (asset, _quit_evt)))
-            feed_starters.append((_coinbase_trade_ws, (asset, _quit_evt)))
-        # Backfill runs to completion on its OWN thread BEFORE this asset's
-        # live feed(s) start — see _backfill_then_feeds's own docstring for
-        # why (mirrors footprint.py's initialize_today()-then-start_feeds()
-        # sequencing without blocking curses startup for both assets).
-        threading.Thread(target=_backfill_then_feeds, args=(asset, feed_starters), daemon=True).start()
-        # GEX engine (Phase 2 of the standalone-merge plan) — one
-        # background thread per asset, independent of the footprint
-        # backfill/feed sequencing above (GEX has its own separate data
-        # source entirely — options chains, not trade prints — so there's
-        # no shared race to avoid the way footprint's late-trade guard
-        # requires backfill-before-live-feed).
-        threading.Thread(target=_gex_engine_loop, args=(asset, _quit_evt), daemon=True).start()
-    threading.Thread(target=_fast_publish_loop, args=(_quit_evt,), daemon=True).start()
-    # Status engine (Phase 3 of the standalone-merge plan) — 3 threads,
-    # same cadences/shape as status.py's own main()+live_price_loop+
-    # snapshot_logger_loop (one full-refresh cycle covers BOTH assets at
-    # once, unlike the GEX engine above which is genuinely per-asset).
-    threading.Thread(target=_status_full_refresh_loop, args=(_quit_evt,), daemon=True).start()
-    threading.Thread(target=_status_live_price_loop, args=(_quit_evt,), daemon=True).start()
-    threading.Thread(target=_status_snapshot_loop, args=(_quit_evt,), daemon=True).start()
-    # CH engine (Phase 3b of the standalone-merge plan) — charthacker.py's
-    # own live-WS-fed VAH/VWAP layer, one thread per asset (mirrors its own
-    # ws_phemex/ws_yahoo feeds) plus one shared export loop (mirrors its
-    # status_export_loop). Independent of the status engine threads above —
-    # evaluate_hpls picks this up automatically via read_status_charthacker_
-    # export the moment it starts producing fresh data, no other change
-    # needed (same "zero consumer-side changes" pattern as every prior phase).
-    threading.Thread(target=_ch_engine_thread_eth, args=(_quit_evt,), daemon=True).start()
-    threading.Thread(target=_ch_engine_thread_qqq, args=(_quit_evt,), daemon=True).start()
-    threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
+            host, port = _client_connect_screen(stdscr)
+            if host is None:
+                continue   # Esc/empty address — back to the mode picker, not a crash
+            CLIENT_MODE, SERVER_MODE = True, False
+            SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1] = host, port
+            break
+    stdscr.erase()
+
+    if not CLIENT_MODE:
+        threading.Thread(target=_run_engine, daemon=True).start()
+        for asset in ASSETS:
+            feed_starters = []
+            # QQQ's live tape prefers Athena's own dedicated Alpaca account
+            # (real QQQ shares, matching footprint.py's own closed-bar source
+            # for QQQ) over Phemex's thinner QQQUSDT perp — per explicit user
+            # request. Falls back to the Phemex tape if those credentials
+            # aren't set, so a missing .env entry degrades gracefully instead
+            # of leaving QQQ's live chart with no feed at all.
+            if asset == "QQQ" and ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
+                feed_starters.append((_alpaca_trade_ws, (asset, _quit_evt)))
+            else:
+                if asset == "QQQ":
+                    console_log(f"{YLW}ALPACA_API_ATHENA_ID/ALPACA_API_SECRET_KEY_ATHENA not set — "
+                                f"QQQ live tape falling back to Phemex QQQUSDT{RST}")
+                feed_starters.append((_phemex_trade_ws, (asset, _quit_evt)))
+            # ETH's live tape aggregates Phemex + Kraken + Coinbase — matching
+            # footprint.py's own multi-exchange source for ETH's closed bars
+            # exactly, so a live bar isn't blind to a real print that happened
+            # to land on Kraken/Coinbase first (see the module-level comment
+            # above KRAKEN_WS_URL for the confirmed live discrepancy this fixes).
+            if asset == "ETH":
+                feed_starters.append((_kraken_trade_ws, (asset, _quit_evt)))
+                feed_starters.append((_coinbase_trade_ws, (asset, _quit_evt)))
+            # Backfill runs to completion on its OWN thread BEFORE this asset's
+            # live feed(s) start — see _backfill_then_feeds's own docstring for
+            # why (mirrors footprint.py's initialize_today()-then-start_feeds()
+            # sequencing without blocking curses startup for both assets).
+            threading.Thread(target=_backfill_then_feeds, args=(asset, feed_starters), daemon=True).start()
+            # GEX engine (Phase 2 of the standalone-merge plan) — one
+            # background thread per asset, independent of the footprint
+            # backfill/feed sequencing above (GEX has its own separate data
+            # source entirely — options chains, not trade prints — so there's
+            # no shared race to avoid the way footprint's late-trade guard
+            # requires backfill-before-live-feed).
+            threading.Thread(target=_gex_engine_loop, args=(asset, _quit_evt), daemon=True).start()
+        threading.Thread(target=_fast_publish_loop, args=(_quit_evt,), daemon=True).start()
+        # Status engine (Phase 3 of the standalone-merge plan) — 3 threads,
+        # same cadences/shape as status.py's own main()+live_price_loop+
+        # snapshot_logger_loop (one full-refresh cycle covers BOTH assets at
+        # once, unlike the GEX engine above which is genuinely per-asset).
+        threading.Thread(target=_status_full_refresh_loop, args=(_quit_evt,), daemon=True).start()
+        threading.Thread(target=_status_live_price_loop, args=(_quit_evt,), daemon=True).start()
+        threading.Thread(target=_status_snapshot_loop, args=(_quit_evt,), daemon=True).start()
+        # CH engine (Phase 3b of the standalone-merge plan) — charthacker.py's
+        # own live-WS-fed VAH/VWAP layer, one thread per asset (mirrors its own
+        # ws_phemex/ws_yahoo feeds) plus one shared export loop (mirrors its
+        # status_export_loop). Independent of the status engine threads above —
+        # evaluate_hpls picks this up automatically via read_status_charthacker_
+        # export the moment it starts producing fresh data, no other change
+        # needed (same "zero consumer-side changes" pattern as every prior phase).
+        threading.Thread(target=_ch_engine_thread_eth, args=(_quit_evt,), daemon=True).start()
+        threading.Thread(target=_ch_engine_thread_qqq, args=(_quit_evt,), daemon=True).start()
+        threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
+
+    # Sync layer — the ONE thread Client Mode ever starts (never touches an
+    # exchange, a broker credential, or the trading engine); the listener
+    # Server Mode starts alongside its normal engine threads above.
+    if CLIENT_MODE:
+        threading.Thread(target=_sync_client_connect_loop,
+                          args=(SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1], _quit_evt),
+                          daemon=True).start()
+    if SERVER_MODE:
+        ip = _get_tailscale_ip()
+        if ip:
+            SYNC_SERVER_BIND_IP[0] = ip
+            threading.Thread(target=_sync_server_listen, args=(_quit_evt,), daemon=True).start()
+            threading.Thread(target=_sync_data_view_loop, args=(_quit_evt,), daemon=True).start()
+        # else: already surfaced on _server_info_screen — Server just runs
+        # with no listener, never falls back to binding 0.0.0.0.
 
     # Loading screen — holds here (all the above threads are already running
     # in the background) until every one of them reports its first cycle
@@ -9970,7 +10784,17 @@ def curses_main(stdscr):
         profile_mode = PROFILE_MODES[_profile_mode_idx[0]]
         both_panes = False
 
-        if data_view:
+        if data_view and CLIENT_MODE:
+            # Client Mode has no local trade logs to scan — reads whatever
+            # the Server last pushed instead (see SYNC_DATA_VIEW/
+            # _data_view_apply_wire/_sync_data_view_loop). [S]witch source
+            # still works exactly as before; it just changes which half of
+            # the already-synced payload is shown, no request round-trip.
+            with SYNC_DATA_VIEW_LOCK:
+                src = SYNC_DATA_VIEW.get(data_source, SYNC_DATA_VIEW["sim"])
+            data_table_info = draw_data_view(db, rows, cols, data_source, src["events"],
+                                              src["stats"], src["trades"], table_scroll, table_hscroll)
+        elif data_view:
             now_mono = time.time()
             # 2026-07-31 CRITICAL fix, user-reported ("the Balance and
             # possibly the Cumulative PnL have [not] been calculated
@@ -10029,6 +10853,7 @@ def curses_main(stdscr):
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
                 draw_dashboard(db, snap, cols)
+                draw_sync_status_box(db, cols)
             chart_bottom = footer_row
 
             both_panes = chart_bottom - chart_top > 10
@@ -10104,16 +10929,26 @@ def curses_main(stdscr):
             tab_hint = f" [Tab]:{chart_focus} [Z]:{'full' if chart_zoom else 'split'}" if both_panes else ""
             focus_asset = chart_focus if both_panes else "ETH"
             x_hint = " [X]:crosshair-ON" if chart_crosshair_active.get(focus_asset) else " [X]:crosshair"
-            risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
-            bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
-            sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
-            fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
-            footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
-                      f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                      f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
-                      + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
-                      + "  [F]latten"
-                      + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
+            if CLIENT_MODE:
+                # Every trading-control hint below is dead in Client Mode
+                # (see CLIENT_BLOCKED_KEYS) — a completely separate, much
+                # shorter footer instead of interleaving "not available"
+                # markers into the same dense f-string.
+                footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Status"
+                          + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
+            else:
+                risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
+                bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
+                sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
+                fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
+                footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live"
+                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                          + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
+                          + "  [F]latten"
+                          + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
+                          + (f"  [SRV:{len(SYNC_CLIENTS)}]" if SERVER_MODE else ""))
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
 
         db.flush(stdscr)
@@ -10282,6 +11117,14 @@ def curses_main(stdscr):
 
         if key in (ord("q"), ord("Q")):
             _quit_evt.set()
+        elif CLIENT_MODE and key in CLIENT_BLOCKED_KEYS:
+            # Every trading-mutating key, gated in one place rather than N
+            # separate edits — see CLIENT_BLOCKED_KEYS's own module-level
+            # docstring for the full list and why. reset_armed (the [R]
+            # two-step confirm) needs no separate gate: it can only ever
+            # become True via the [R] branch this intercepts, so it's
+            # unreachable here by construction.
+            console_log(f"{DIM}Not available in client mode{RST}")
         elif key in (ord("v"), ord("V")):
             _profile_mode_idx[0] = (_profile_mode_idx[0] + 1) % len(PROFILE_MODES)
         elif key in (ord("r"), ord("R")) and DRY_RUN:

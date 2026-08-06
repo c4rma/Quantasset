@@ -1844,23 +1844,45 @@ def _gex_snapshot_state(asset):
         return (list(GEX_HISTORY[asset]), set(GEX_GRID[asset]), GEX_SCALE_MAX[asset], dict(GEX_META[asset]))
 
 # ── Server Mode / Client Mode — GEX wire (de)serialization ─────────────────
-# col["ts"] is a live datetime.datetime, col["gex"]/col["gex_by_type"] are
-# dicts keyed by float strike prices — neither is JSON-safe as-is. Mirrors
-# gex_append_log/gex_load_log's own already-working shape for exactly this
-# problem (see their docstrings), with one addition: scale_at_ingest, which
-# the on-disk log omits (a reloaded historical day recomputes scale
-# differently) but a live wire push must include verbatim to reproduce the
-# exact column a Server render would use.
+# col["ts"] is a live datetime.datetime; col["gex"]/col["gex_by_type"]/
+# col["oi_by_type"] are dicts keyed by float strike prices — none of these
+# are JSON-safe as-is. Mirrors gex_append_log/gex_load_log's own already-
+# working shape for exactly this problem (see their docstrings), with one
+# addition: scale_at_ingest, which the on-disk log omits (a reloaded
+# historical day recomputes scale differently) but a live wire push must
+# include verbatim to reproduce the exact column a Server render would use.
+#
+# BUG FIXED (2026-08, user-reported "GEX does not load QQQ"): an earlier
+# version of this pair only carried ts/spot/gex/gex_by_type/nearest/
+# scale_at_ingest — silently dropping oi_by_type/bs_gex_curve/expiry_label/
+# is_0dte from every column. draw_gex_map/draw_gex_by_strike both call
+# smoothed_max_pain_and_flip(history, ...) on whatever GEX_HISTORY[asset]
+# holds (the SAME function/call site Server and Client both render
+# through), which reads c.get("oi_by_type") and c.get("bs_gex_curve") from
+# EVERY column in that history to compute Max Pain and the GEX Flip level
+# — on a Client, those were always missing, so Max Pain/Flip silently
+# always came back None/n/a there, never on the Server. Every real column
+# field is now carried through (bs_gex_curve is a list of plain (float,
+# float) tuples — JSON round-trips it to a list of 2-element lists, which
+# _gex_find_nearest_zero_crossing's own tuple-unpacking reads identically
+# either way, so it needs no float-key handling like the strike-keyed
+# dicts do).
 def _gex_col_to_wire(col):
     return {"ts": col["ts"].isoformat(), "spot": col["spot"],
             "gex": {str(k): v for k, v in col["gex"].items()},
             "gex_by_type": {str(k): v for k, v in (col.get("gex_by_type") or {}).items()},
+            "oi_by_type": {str(k): v for k, v in (col.get("oi_by_type") or {}).items()},
+            "bs_gex_curve": col.get("bs_gex_curve") or [],
+            "expiry_label": col.get("expiry_label"), "is_0dte": col.get("is_0dte"),
             "nearest": col.get("nearest"), "scale_at_ingest": col.get("scale_at_ingest")}
 
 def _gex_col_from_wire(d):
     return {"ts": datetime.fromisoformat(d["ts"]), "spot": d["spot"],
             "gex": {float(k): v for k, v in d["gex"].items()},
             "gex_by_type": {float(k): v for k, v in (d.get("gex_by_type") or {}).items()},
+            "oi_by_type": {float(k): v for k, v in (d.get("oi_by_type") or {}).items()},
+            "bs_gex_curve": d.get("bs_gex_curve") or [],
+            "expiry_label": d.get("expiry_label"), "is_0dte": d.get("is_0dte"),
             "nearest": d.get("nearest"), "scale_at_ingest": d.get("scale_at_ingest")}
 
 def _gex_apply_wire_state(asset, msg):
@@ -8301,6 +8323,25 @@ def _footprint_crosshair_clamp(crosshair_bar_idx, hscroll_bars, total, n_est):
 # charthacker.py already uses for its own WS feed/alert/trade-monitor
 # threads (its state/state.lock), just fed by an asyncio loop instead of a
 # plain sync one.
+def _live_bars_from_wire(live_bars_wire):
+    """Client side — shared by AppState.apply_snapshot/apply_live_bars.
+    live_bars' "levels" sub-dict has real Python int keys server-side,
+    which JSON silently stringifies on the wire; recast here, the same
+    int(k) cast already used at every other footprint_bars/live_bars
+    consumption site in this file (footprint_bars itself needs no such
+    cast: it's always string-keyed, on the Server too, since it's read
+    straight off an on-disk JSON log)."""
+    out = {}
+    for asset, bar in (live_bars_wire or {}).items():
+        if bar is None:
+            out[asset] = None
+            continue
+        bar = dict(bar)
+        if bar.get("levels"):
+            bar["levels"] = {int(k): v for k, v in bar["levels"].items()}
+        out[asset] = bar
+    return out
+
 class AppState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -8324,7 +8365,23 @@ class AppState:
         slow REST-heavy trading-engine cycle. Patches self.instruments'
         already-published dicts in place rather than rebuilding them, so
         this never regresses lights/state/position/etc — those still only
-        change when the real publish() below runs."""
+        change when the real publish() below runs.
+
+        Broadcasts the lightweight live_bars-only message (_sync_broadcast_
+        live_bars), NOT the full app_state — this runs every 0.25s
+        (_fast_publish_loop's own cadence), and pushing the ENTIRE snapshot
+        (including up to CHART_HISTORY_BARS footprint bars per asset) at
+        that rate to every connected Client was the actual cause of a
+        user-reported bug: the Server's own sendall() would time out under
+        that sustained volume and silently drop the client from
+        SYNC_CLIENTS — read as "still connected, no network issue" on the
+        Client's own end (its TCP socket was never actually closed, the
+        Server just gave up writing to it), and, worse, meant a dropped
+        client stopped receiving the SLOW cycle's account/balance data too
+        (once removed from SYNC_CLIENTS, EVERY broadcast type skips it) —
+        exactly matching a second report ("live mode shows 0s for
+        everything"), since a real Phemex account's own full snapshot is
+        larger than the sim account's and tripped this even faster."""
         with self.lock:
             for asset, bar in live_bars.items():
                 if bar is None:
@@ -8333,7 +8390,7 @@ class AppState:
                 inst = self.instruments.get(asset)
                 if inst is not None:
                     inst["live_price"] = bar["c"]
-        _sync_broadcast_app_state()   # no-op on a Client / with no connected clients
+        _sync_broadcast_live_bars(live_bars)   # no-op on a Client / with no connected clients
 
     def publish(self, instruments, age, acc, live_prices, qqq_market_closed):
         balance, available, margin_used = account_balance_fields(acc)
@@ -8386,23 +8443,13 @@ class AppState:
     def apply_snapshot(self, data):
         """Client side — counterpart to snapshot() above; writes every
         field from a received {"type": "app_state", "data": {...}} message
-        onto self under self.lock. The one wire-format wrinkle: live_bars'
-        "levels" sub-dict has real Python int keys server-side, which JSON
-        silently stringifies on the wire — recast here with int(k), the
-        same cast already used at every other footprint_bars/live_bars
-        consumption site in this file (footprint_bars itself needs no such
-        cast: it's always string-keyed, on the Server too, since it's read
-        straight off an on-disk JSON log). Called only by
+        onto self under self.lock. Deliberately the FULL-state counterpart
+        to publish() (the slow ~INTERVAL-second cycle), not publish_live_
+        fast() — see apply_live_bars below for that one, and
+        _sync_broadcast_live_bars's own docstring for why the two must
+        stay on separate wire message types. Called only by
         _sync_client_connect_loop — never on a Server instance."""
-        live_bars = {}
-        for asset, bar in (data.get("live_bars") or {}).items():
-            if bar is None:
-                live_bars[asset] = None
-                continue
-            bar = dict(bar)
-            if bar.get("levels"):
-                bar["levels"] = {int(k): v for k, v in bar["levels"].items()}
-            live_bars[asset] = bar
+        live_bars = _live_bars_from_wire(data.get("live_bars"))
         with self.lock:
             self.instruments = data.get("instruments", {})
             self.snapshot_age = data.get("snapshot_age", "no snapshot found yet")
@@ -8417,6 +8464,27 @@ class AppState:
             self.footprint_bars = data.get("footprint_bars", {})
             self.live_bars = live_bars
             self.qqq_market_closed = data.get("qqq_market_closed", True)
+
+    def apply_live_bars(self, live_bars_wire):
+        """Client side — counterpart to publish_live_fast() above, the FAST
+        (0.25s cadence) sync path. Patches self.live_bars/instruments'
+        live_price in place, exactly mirroring publish_live_fast's own
+        local logic — deliberately NOT the full snapshot (see
+        _sync_broadcast_live_bars's own docstring: the fast path pushing
+        the ENTIRE app_state 4x/second, including up to CHART_HISTORY_BARS
+        footprint bars per asset, was overwhelming slow/high-latency
+        connections badly enough that the Server's own sendall() would
+        time out and silently drop the client — see the bug report this
+        fixed). Called only by _sync_client_connect_loop."""
+        live_bars = _live_bars_from_wire(live_bars_wire)
+        with self.lock:
+            for asset, bar in live_bars.items():
+                if bar is None:
+                    continue
+                self.live_bars[asset] = bar
+                inst = self.instruments.get(asset)
+                if inst is not None:
+                    inst["live_price"] = bar["c"]
 
 APP_STATE = AppState()
 
@@ -8528,50 +8596,143 @@ def _sync_broadcast(payload_dict):
     """Send one JSON line to every currently-connected sync client —
     best-effort: a write failure to one client (dead socket, client closed)
     just marks that one for removal under SYNC_SERVER_LOCK, never raises
-    into the calling producer thread (AppState.publish etc. must never
-    fail just because a viewer elsewhere dropped its connection)."""
+    into the calling producer thread. This is a hard requirement, not just
+    a nicety: this function (via _sync_broadcast_app_state) is called
+    UNGUARDED from AppState.publish()/publish_live_fast(), which in turn
+    are called directly from engine_loop()'s and _fast_publish_loop's own
+    while-loop bodies with no surrounding try/except at THOSE call sites
+    either — any exception escaping here (not just a dead socket; a
+    json.dumps failure on some future unexpected payload shape, a KeyError,
+    anything) would propagate all the way out and silently kill the
+    trading engine's own thread. A sync/dashboard bug must never be able
+    to stop Athena from managing real positions, so this catches
+    everything, not just OSError, and only ever logs."""
     if not SYNC_CLIENTS:
         return
-    line = (json.dumps(payload_dict) + "\n").encode()
-    dead = []
-    with SYNC_SERVER_LOCK:
-        for conn_id, info in SYNC_CLIENTS.items():
-            try:
-                info["conn"].sendall(line)
-            except OSError:
-                dead.append(conn_id)
-        for conn_id in dead:
-            SYNC_CLIENTS.pop(conn_id, None)
+    try:
+        line = (json.dumps(payload_dict) + "\n").encode()
+        dead = []
+        with SYNC_SERVER_LOCK:
+            for conn_id, info in SYNC_CLIENTS.items():
+                try:
+                    info["conn"].sendall(line)
+                except OSError:
+                    dead.append(conn_id)
+            for conn_id in dead:
+                SYNC_CLIENTS.pop(conn_id, None)
+    except Exception as e:
+        console_log(f"{DIM}Sync broadcast failed ({payload_dict.get('type', '?')}): {e}{RST}")
 
 def _sync_broadcast_app_state():
-    if SERVER_MODE:
+    # try/except here too, not just inside _sync_broadcast itself — this is
+    # called UNGUARDED from AppState.publish(), which engine_loop() calls
+    # directly from its own while-loop body with no try/except at THAT call
+    # site; anything raised here (even just building the payload, before
+    # _sync_broadcast is ever reached) would otherwise silently kill the
+    # trading engine's thread. The full snapshot (this one) only ever goes
+    # out from publish()'s own ~INTERVAL-second cycle plus once on a new
+    # client's initial connect — NOT from publish_live_fast's 0.25s cadence,
+    # see _sync_broadcast_live_bars below for why that split matters.
+    if not SERVER_MODE:
+        return
+    try:
         _sync_broadcast({"type": "app_state", "data": APP_STATE.snapshot()})
+    except Exception as e:
+        console_log(f"{DIM}Sync app_state broadcast failed: {e}{RST}")
+
+def _sync_broadcast_live_bars(live_bars):
+    """The FAST (0.25s cadence, _fast_publish_loop) sync path — pushes only
+    the raw live_bars dict, matching exactly what publish_live_fast()
+    itself changes (self.live_bars + instruments' live_price), NOT a full
+    app_state snapshot. Sending the entire snapshot at 4x/second — this
+    used to call _sync_broadcast_app_state() directly — was overwhelming
+    enough (up to CHART_HISTORY_BARS footprint bars per asset, re-
+    serialized and re-sent every single tick even though they hadn't
+    changed) that a slow/high-latency connection's sendall() would time
+    out on the Server side and get silently marked dead, dropping the
+    client from SYNC_CLIENTS entirely — which then also cut it off from
+    the SLOW cycle's account/balance data, since a dropped client stops
+    receiving every broadcast type, not just this one. See the bug report
+    this fixed (client count dropping to 0 despite a healthy connection;
+    live-mode accounts showing all zeros, worse than sim since a real
+    Phemex snapshot is larger and tripped the same timeout even faster)."""
+    if not SERVER_MODE:
+        return
+    try:
+        _sync_broadcast({"type": "live_bars", "data": live_bars})
+    except Exception as e:
+        console_log(f"{DIM}Sync live_bars broadcast failed: {e}{RST}")
 
 def _sync_broadcast_gex_state(asset):
     if not SERVER_MODE:
         return
-    with GEX_STATE_LOCK:
-        history = [_gex_col_to_wire(c) for c in GEX_HISTORY[asset]]
-        grid = list(GEX_GRID[asset])
-        scale_max = GEX_SCALE_MAX[asset]
-        meta = dict(GEX_META[asset])
-    _sync_broadcast({"type": "gex_state", "asset": asset, "history": history,
-                      "grid": grid, "scale_max": scale_max, "meta": meta})
+    try:
+        with GEX_STATE_LOCK:
+            history = [_gex_col_to_wire(c) for c in GEX_HISTORY[asset]]
+            grid = list(GEX_GRID[asset])
+            scale_max = GEX_SCALE_MAX[asset]
+            meta = dict(GEX_META[asset])
+        _sync_broadcast({"type": "gex_state", "asset": asset, "history": history,
+                          "grid": grid, "scale_max": scale_max, "meta": meta})
+    except Exception as e:
+        console_log(f"{DIM}Sync gex_state broadcast failed ({asset}): {e}{RST}")
 
 def _sync_broadcast_gex_status(asset):
-    if SERVER_MODE:
+    if not SERVER_MODE:
+        return
+    try:
         _sync_broadcast({"type": "gex_status", "asset": asset, "status": GEX_STATUS.get(asset),
                           "log_rows": GEX_LOG_ROWS.get(asset), "diag_count": GEX_DIAG_COUNT.get(asset)})
+    except Exception as e:
+        console_log(f"{DIM}Sync gex_status broadcast failed ({asset}): {e}{RST}")
 
 def _sync_broadcast_status_lines():
-    if SERVER_MODE:
+    if not SERVER_MODE:
+        return
+    try:
         with STATUS_STATE_LOCK:
             lines = list(STATUS_RENDER_LINES)
         _sync_broadcast({"type": "status_lines", "lines": lines})
+    except Exception as e:
+        console_log(f"{DIM}Sync status_lines broadcast failed: {e}{RST}")
 
 _sync_next_conn_id = [0]   # mutable single-item box, same convention as
                             # _profile_mode_idx above — only the listener
                             # thread ever increments this
+
+def _enable_tcp_keepalive(sock):
+    """Best-effort TCP keepalive on both ends of a sync connection —
+    without it, a genuinely dead link (network drop, laptop sleep/wake, a
+    Tailscale route change) may never surface as an error at all: a SMALL
+    write (like a 76-byte live_bars message) can succeed by landing in the
+    LOCAL kernel send buffer even when the remote end is long gone —
+    sendall() only raises once the buffer genuinely can't accept more, or
+    the OS's own (often very long, tens of minutes by default) TCP
+    retransmission timeout finally gives up — meaning the connection could
+    sit "successfully connected" indefinitely while silently delivering
+    nothing (a user-reported bug: no error message, updates just stop).
+    Keepalive probes force that detection within a bounded ~30-45s instead.
+    SO_KEEPALIVE itself is universal; the tuning options below aren't
+    available on every platform (notably some Windows Python builds), so
+    each is applied only if present — getattr(..., None) rather than a
+    hardcoded name handles Linux's TCP_KEEPIDLE vs macOS's differently-
+    named TCP_KEEPALIVE for the same "seconds idle before first probe"
+    setting."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for opt, val in (
+        (getattr(socket, "TCP_KEEPIDLE", None), 15),    # Linux
+        (getattr(socket, "TCP_KEEPALIVE", None), 15),   # macOS (same idea, different name)
+        (getattr(socket, "TCP_KEEPINTVL", None), 5),    # seconds between probes
+        (getattr(socket, "TCP_KEEPCNT", None), 4),      # failed probes before declaring it dead
+    ):
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+            except OSError:
+                pass
 
 def _sync_client_handler(conn, addr, stop_evt):
     """Per-client thread — HMAC challenge/response handshake (server side),
@@ -8583,6 +8744,7 @@ def _sync_client_handler(conn, addr, stop_evt):
     has registered the live socket in SYNC_CLIENTS."""
     conn_id = None
     try:
+        _enable_tcp_keepalive(conn)
         conn.settimeout(10)
         nonce = os.urandom(32).hex()
         conn.sendall((json.dumps({"type": "challenge", "nonce": nonce}) + "\n").encode())
@@ -8620,10 +8782,23 @@ def _sync_client_handler(conn, addr, stop_evt):
         _sync_broadcast_status_lines()
         try:
             _sync_broadcast(_gather_data_view_payload())
-        except Exception:
-            pass
+        except Exception as e:
+            console_log(f"{DIM}Sync data_view broadcast failed (on-connect): {e}{RST}")
 
-        conn.settimeout(1)
+        # 10s, not 1s — this timeout also bounds every sendall() other
+        # threads make against this same socket (_sync_broadcast, called
+        # from the various producer threads) since a socket's timeout is
+        # per-object, not per-call. A too-tight timeout here was the actual
+        # cause of a user-reported bug: a genuinely healthy but slower/
+        # higher-latency connection couldn't always drain a full app_state
+        # payload inside 1 second, so sendall() raised socket.timeout (a
+        # subclass of OSError), which _sync_broadcast's own per-client
+        # except OSError handling correctly treats as "dead" and drops —
+        # even though the client was never actually disconnected. Splitting
+        # the fast path onto its own much smaller message (see
+        # _sync_broadcast_live_bars) already reduces how often a big send
+        # happens at all; this gives whatever's left real headroom too.
+        conn.settimeout(10)
         while not stop_evt.is_set():
             try:
                 chunk = conn.recv(4096)
@@ -8706,6 +8881,7 @@ def _sync_client_connect_loop(host, port, stop_evt):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10)
             sock.connect((host, port))
+            _enable_tcp_keepalive(sock)
             buf = b""
 
             def _read_line():
@@ -8745,6 +8921,8 @@ def _sync_client_connect_loop(host, port, stop_evt):
                 mtype = msg.get("type")
                 if mtype == "app_state":
                     APP_STATE.apply_snapshot(msg["data"])
+                elif mtype == "live_bars":
+                    APP_STATE.apply_live_bars(msg["data"])
                 elif mtype == "gex_state":
                     _gex_apply_wire_state(msg["asset"], msg)
                 elif mtype == "gex_status":
@@ -8807,8 +8985,8 @@ def _sync_data_view_loop(stop_evt):
         if SYNC_CLIENTS:
             try:
                 _sync_broadcast(_gather_data_view_payload())
-            except Exception:
-                pass
+            except Exception as e:
+                console_log(f"{DIM}Sync data_view broadcast failed: {e}{RST}")
         stop_evt.wait(2.0)
 
 GEX_COL_W = 2   # matches gex.py's own COL_W (terminal columns per time interval)
@@ -9650,6 +9828,22 @@ def draw_sync_status_box(db, cols):
         addr_line = f"{host}:{port}" if host else "no server address"
         status_line = SYNC_CLIENT_STATUS[0]
         pair = P_GREEN if status_line == "connected" else P_YELLOW
+        # Staleness check (2026-08, user-reported "loads once then no new
+        # data comes in, no error shown") — SYNC_CLIENT_STATUS alone can't
+        # catch this: the socket status stays "connected" even if updates
+        # have silently stopped arriving (that's exactly what made the bug
+        # invisible). last_age makes any future freeze immediately visible
+        # instead of relying on the user noticing stale numbers on their
+        # own — the fast path alone should land at least every ~1-2s
+        # under normal operation, so anything past a few seconds is a real
+        # warning sign, not noise.
+        if status_line == "connected" and SYNC_CLIENT_LAST_MSG_TS[0] > 0:
+            age = time.time() - SYNC_CLIENT_LAST_MSG_TS[0]
+            status_line = f"connected ({age:.0f}s since update)"
+            if age > 5:
+                pair = P_YELLOW
+            if age > 20:
+                pair = P_RED
 
     top = ("┌" + title.center(box_w - 2, "─") + "┐")[:box_w]
     mid1 = "│" + addr_line.center(box_w - 2)[:box_w - 2] + "│"
@@ -10749,7 +10943,17 @@ def curses_main(stdscr):
                                # compacted DASHBOARD_H isn't enough room
     reset_armed = False
     data_view = False
-    data_source = "sim" if DRY_RUN else "real"
+    # A Client's own local DRY_RUN is meaningless — Client Mode never trades,
+    # so there's no reason anyone would launch it with --dry-run, and it has
+    # nothing to do with whether the SERVER it's mirroring is in sim or live
+    # mode. Defaulting to "real" there (this line's ordinary DRY_RUN-based
+    # logic) meant a Client's [D]ata view opened on the "real" tab — which
+    # always shows an empty trading log by design (see _gather_data_view_
+    # payload's own "real" field) — with no visible sign the sim data (what
+    # a paper-trading Server's user actually wants to see) was one [S]witch
+    # away. Client Mode defaults straight to "sim" instead; [S] still flips
+    # to "real" same as always if that's what's actually wanted.
+    data_source = "sim" if (CLIENT_MODE or DRY_RUN) else "real"
     data_cache = {"source": None, "ts": 0.0, "events": [], "stats": None}
     trades_cache = {"source": None, "ts": 0.0, "trades": []}
     table_scroll = 0

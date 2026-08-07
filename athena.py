@@ -8886,36 +8886,68 @@ def _sync_server_listen(stop_evt):
     Do not change this to bind a wildcard address: the state stream is
     plaintext JSON after the handshake, acceptable only because it's
     wrapped in Tailscale's own WireGuard tunnel — this port must never be
-    reachable from, or port-forwarded to, the public internet."""
+    reachable from, or port-forwarded to, the public internet.
+
+    BUG FIXED (user-reported: "clients connected drops from 1 to 0 and
+    never comes back", even with the Client itself still retrying):
+    accept()'s own error handling used to be `except OSError: break` —
+    ANY non-timeout error on ANY single accept() call (a transient
+    ECONNABORTED, a momentary resource blip — real conditions that DO
+    happen on a live network, not just hypothetical) silently and
+    PERMANENTLY killed this entire thread. Once that happened, the
+    listening socket was gone for the rest of the process's life — no
+    further connection could ever be accepted again, Client-side retries
+    included, since there was nothing left to retry TO. Nothing logged it,
+    and the dashboard's own sync status box only ever showed len(SYNC_
+    CLIENTS) (naturally 0 once the one client dropped) — visually
+    IDENTICAL to "server's fine, nobody's just connected right now" even
+    though the two are completely different situations. Now: a bad
+    accept() is logged and the loop keeps going; if the listening socket
+    itself somehow needs replacing, the outer loop rebuilds it from
+    scratch rather than giving up for good."""
     global SYNC_SERVER_STATUS
     host = SYNC_SERVER_BIND_IP[0]
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, SYNC_PORT_DEFAULT))
-        sock.listen(5)
-        sock.settimeout(1)
-    except OSError as e:
-        SYNC_SERVER_STATUS[0] = f"error: {e}"
-        console_log(f"{RED}Sync server failed to bind {host}:{SYNC_PORT_DEFAULT} — {e}{RST}")
-        return
-    SYNC_SERVER_STATUS[0] = f"listening on {host}:{SYNC_PORT_DEFAULT}"
-    console_log(f"{CYN}Sync server listening on {host}:{SYNC_PORT_DEFAULT}{RST}")
-    try:
-        while not stop_evt.is_set():
-            try:
-                conn, addr = sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(target=_sync_client_handler, args=(conn, addr, stop_evt), daemon=True).start()
-    finally:
+    while not stop_evt.is_set():
+        sock = None
         try:
-            sock.close()
-        except OSError:
-            pass
-        SYNC_SERVER_STATUS[0] = "stopped"
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, SYNC_PORT_DEFAULT))
+            sock.listen(5)
+            sock.settimeout(1)
+        except OSError as e:
+            SYNC_SERVER_STATUS[0] = f"error: {e}"
+            console_log(f"{RED}Sync server failed to bind {host}:{SYNC_PORT_DEFAULT} — {e}{RST}")
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            stop_evt.wait(5)
+            continue   # retry the bind — e.g. "address already in use" right
+                        # after a restart often clears up on its own shortly
+        SYNC_SERVER_STATUS[0] = f"listening on {host}:{SYNC_PORT_DEFAULT}"
+        console_log(f"{CYN}Sync server listening on {host}:{SYNC_PORT_DEFAULT}{RST}")
+        try:
+            while not stop_evt.is_set():
+                try:
+                    conn, addr = sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    console_log(f"{YLW}Sync accept() error (still listening): {e}{RST}")
+                    continue
+                threading.Thread(target=_sync_client_handler, args=(conn, addr, stop_evt), daemon=True).start()
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if not stop_evt.is_set():
+            SYNC_SERVER_STATUS[0] = "restarting listener…"
+            console_log(f"{YLW}Sync listener socket closed unexpectedly — restarting{RST}")
+            stop_evt.wait(2)
+    SYNC_SERVER_STATUS[0] = "stopped"
 
 def _sync_client_connect_loop(host, port, stop_evt):
     """Client Mode's ONE background thread — connects to a Server, does the
@@ -9912,8 +9944,19 @@ def draw_sync_status_box(db, cols):
         addr_line = f"{ip}:{SYNC_PORT_DEFAULT}" if ip else "no Tailscale IP found"
         with SYNC_SERVER_LOCK:
             n = len(SYNC_CLIENTS)
-        status_line = f"{n} client{'s' if n != 1 else ''} connected" if ip else "not accepting clients"
-        pair = P_CYAN if ip else P_YELLOW
+        listener_ok = SYNC_SERVER_STATUS[0].startswith("listening on")
+        if not ip:
+            status_line, pair = "not accepting clients", P_YELLOW
+        elif not listener_ok:
+            # Surfaces exactly the failure mode a user-reported bug hid
+            # completely: "0 clients connected" used to look IDENTICAL
+            # whether the listener had died outright or was just genuinely
+            # idle — this branch is what makes the two distinguishable on
+            # screen instead of only in the activity log.
+            status_line, pair = SYNC_SERVER_STATUS[0], P_RED
+        else:
+            status_line = f"{n} client{'s' if n != 1 else ''} connected"
+            pair = P_CYAN
     else:
         host, port = SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1]
         title = " SYNC: CLIENT "

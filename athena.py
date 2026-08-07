@@ -8358,6 +8358,10 @@ class AppState:
         self.footprint_bars = {}
         self.live_bars = {}
         self.qqq_market_closed = True
+        self._last_footprint_broadcast = 0.0   # see publish()'s own use of
+                                                 # this — how the recurring
+                                                 # sync push decides when to
+                                                 # include footprint_bars
 
     def publish_live_fast(self, live_bars):
         """Fast path (see _fast_publish_loop) — refreshes ONLY the live/
@@ -8426,7 +8430,17 @@ class AppState:
             self.trade_pairs = recent_trade_pairs(8)
             self.footprint_bars = bars
             self.qqq_market_closed = qqq_market_closed
-        _sync_broadcast_app_state()   # no-op on a Client / with no connected clients
+        # Full snapshot (incl. footprint_bars) only every SYNC_FOOTPRINT_
+        # PUSH_INTERVAL seconds — every OTHER publish() cycle sends
+        # everything else (balance/positions/lights/etc., what actually
+        # needs to feel real-time) without the one field that's both by
+        # far the largest and the least time-sensitive. See
+        # _sync_broadcast_app_state's own docstring for the full story.
+        now_mono = time.time()
+        include_fp = (now_mono - self._last_footprint_broadcast) >= SYNC_FOOTPRINT_PUSH_INTERVAL
+        if include_fp:
+            self._last_footprint_broadcast = now_mono
+        _sync_broadcast_app_state(include_footprint=include_fp)   # no-op on a Client / with no connected clients
 
     def snapshot(self):
         with self.lock:
@@ -8447,7 +8461,16 @@ class AppState:
         to publish() (the slow ~INTERVAL-second cycle), not publish_live_
         fast() — see apply_live_bars below for that one, and
         _sync_broadcast_live_bars's own docstring for why the two must
-        stay on separate wire message types. Called only by
+        stay on separate wire message types.
+
+        "footprint_bars" may be OMITTED from data entirely — see
+        _sync_broadcast_app_state's own docstring: publish()'s own recurring
+        ~INTERVAL-second cycle deliberately leaves it out most of the time
+        (it's the single largest field by far, up to CHART_HISTORY_BARS
+        bars per asset, and barely changes between consecutive cycles — new
+        bars close on a ~90s cadence, not every 1-3s). When it's missing,
+        keep whatever this Client already has rather than blanking the
+        chart out to empty on every single ordinary update. Called only by
         _sync_client_connect_loop — never on a Server instance."""
         live_bars = _live_bars_from_wire(data.get("live_bars"))
         with self.lock:
@@ -8461,7 +8484,8 @@ class AppState:
             self.event_log = data.get("event_log", [])
             self.closed_trades = data.get("closed_trades", [])
             self.trade_pairs = data.get("trade_pairs", [])
-            self.footprint_bars = data.get("footprint_bars", {})
+            if "footprint_bars" in data:
+                self.footprint_bars = data["footprint_bars"]
             self.live_bars = live_bars
             self.qqq_market_closed = data.get("qqq_market_closed", True)
 
@@ -8510,6 +8534,20 @@ SERVER_MODE = False   # screen, never changes at runtime — gates every trading
                        # the entire thread-startup block.
 
 SYNC_PORT_DEFAULT = 8765
+SYNC_CLIENT_STALE_TIMEOUT = 15   # seconds with zero messages received before
+                                  # the Client gives up on its current
+                                  # connection and forces a reconnect itself
+                                  # — see _sync_client_connect_loop's own
+                                  # docstring for why this can't just rely
+                                  # on the socket eventually raising an error
+SYNC_FOOTPRINT_PUSH_INTERVAL = 20   # how often AppState.publish()'s own
+                                      # recurring sync push includes the full
+                                      # footprint_bars history (by far the
+                                      # largest field) rather than just the
+                                      # small, genuinely time-sensitive
+                                      # fields — see AppState.publish's own
+                                      # use of this and _sync_broadcast_
+                                      # app_state's docstring for why
 
 SYNC_SERVER_LOCK = threading.Lock()   # SYNC_CLIENTS is a genuine multi-writer
 SYNC_CLIENTS = {}                     # structure — N per-client handler threads
@@ -8623,20 +8661,41 @@ def _sync_broadcast(payload_dict):
     except Exception as e:
         console_log(f"{DIM}Sync broadcast failed ({payload_dict.get('type', '?')}): {e}{RST}")
 
-def _sync_broadcast_app_state():
+def _sync_broadcast_app_state(include_footprint=True):
     # try/except here too, not just inside _sync_broadcast itself — this is
     # called UNGUARDED from AppState.publish(), which engine_loop() calls
     # directly from its own while-loop body with no try/except at THAT call
     # site; anything raised here (even just building the payload, before
     # _sync_broadcast is ever reached) would otherwise silently kill the
-    # trading engine's thread. The full snapshot (this one) only ever goes
-    # out from publish()'s own ~INTERVAL-second cycle plus once on a new
-    # client's initial connect — NOT from publish_live_fast's 0.25s cadence,
-    # see _sync_broadcast_live_bars below for why that split matters.
+    # trading engine's thread.
+    #
+    # include_footprint=False (publish()'s own recurring ~INTERVAL-second
+    # cycle uses this) strips footprint_bars — up to CHART_HISTORY_BARS
+    # bars per asset, each with a per-price-level dict — out of the
+    # payload entirely, cutting it from ~500KB down to a few KB. This is a
+    # second, DIFFERENT overload from _sync_broadcast_live_bars (which
+    # already handles the 0.25s fast path): even after that fix, THIS
+    # slower cycle was still sending the full 500KB snapshot every 1-3
+    # seconds, forever — user-reported and confirmed: the connection would
+    # work, go stale, reconnect, then go stale again on a fresh connection
+    # too, with zero exceptions ever logged on the Server (consistent with
+    # sends "succeeding" locally while the network path underneath — a
+    # Tailscale relay hop in particular — simply couldn't sustain a large
+    # payload repeated every couple of seconds). footprint_bars barely
+    # changes between consecutive publish() cycles anyway — new bars close
+    # on a ~90s cadence, not every 1-3s — so a Client just keeps whatever
+    # it already has (see AppState.apply_snapshot's own handling of a
+    # missing key) until the next full push, which still happens: once on
+    # initial connect (_sync_client_handler), and periodically thereafter
+    # (see AppState.publish's own cadence tracking).
     if not SERVER_MODE:
         return
     try:
-        _sync_broadcast({"type": "app_state", "data": APP_STATE.snapshot()})
+        data = APP_STATE.snapshot()
+        if not include_footprint:
+            data = dict(data)
+            data.pop("footprint_bars", None)
+        _sync_broadcast({"type": "app_state", "data": data})
     except Exception as e:
         console_log(f"{DIM}Sync app_state broadcast failed: {e}{RST}")
 
@@ -8909,7 +8968,28 @@ def _sync_client_connect_loop(host, port, stop_evt):
             SYNC_CLIENT_STATUS[0] = "connected"
             backoff = 1
             sock.settimeout(1)
+            last_msg_at = time.time()
             while not stop_evt.is_set():
+                # Application-level staleness watchdog — NOT redundant with
+                # TCP keepalive. User-reported bug, confirmed by direct
+                # diagnosis: the Server correctly detected a dead connection
+                # and dropped it (its own client count went to 0), but this
+                # Client never noticed anything was wrong — its socket just
+                # kept timing out on recv() forever (no exception, nothing
+                # for `except socket.timeout: continue` below to escalate),
+                # because a Client only ever READS on this socket; with
+                # nothing of its own being sent, there's no send() to fail
+                # and no guarantee the OS's own keepalive probes get a
+                # timely response over every real network path (a Tailscale
+                # relay hop in particular). Rather than trust the transport
+                # to eventually surface an error, give up on this
+                # connection ourselves once too long has passed with zero
+                # messages of ANY type — live_bars alone should land at
+                # least every ~1-2s under normal operation, so 15s with
+                # nothing is already a generous margin, not a hair trigger.
+                if time.time() - last_msg_at > SYNC_CLIENT_STALE_TIMEOUT:
+                    raise ConnectionError(
+                        f"no messages received in {SYNC_CLIENT_STALE_TIMEOUT}s — forcing reconnect")
                 try:
                     line = _read_line()
                 except socket.timeout:
@@ -8918,6 +8998,7 @@ def _sync_client_connect_loop(host, port, stop_evt):
                     msg = json.loads(line.decode())
                 except Exception:
                     continue
+                last_msg_at = time.time()
                 mtype = msg.get("type")
                 if mtype == "app_state":
                     APP_STATE.apply_snapshot(msg["data"])

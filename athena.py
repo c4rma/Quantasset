@@ -8644,20 +8644,50 @@ def _sync_broadcast(payload_dict):
     anything) would propagate all the way out and silently kill the
     trading engine's own thread. A sync/dashboard bug must never be able
     to stop Athena from managing real positions, so this catches
-    everything, not just OSError, and only ever logs."""
+    everything, not just OSError, and only ever logs.
+
+    BUG FIXED (user-reported: Server's client count drops to 0 within
+    seconds, with NOTHING logged on either side, while the Client itself
+    still reports "connected" for 60s+): dropping a dead client here used
+    to ONLY pop it from SYNC_CLIENTS — it never closed that client's own
+    socket, and never logged WHY. That silence was structural, not a
+    missing log line: with the socket left open, _sync_client_handler's
+    own per-client thread (a SEPARATE thread, still happily looping on
+    conn.recv()) never sees an error or EOF either, so IT never logs
+    "disconnected" — nothing anywhere ever notices. And because the socket
+    was never actually closed, the Client's own recv() calls just kept
+    timing out normally instead of getting a real EOF/RST — indistinguishable
+    from "no new data yet," which is exactly why the Client-side staleness
+    watchdog was the ONLY thing that could ever catch this (a timer, not a
+    real signal) instead of an immediate, reliable one. Now: log the
+    specific error and CLOSE the socket — that closure itself delivers a
+    proper TCP close to the Client, so its own _read_line() gets an actual
+    EOF (see _sync_client_connect_loop's own "server closed connection"
+    ConnectionError) and reconnects immediately, not up to 15s later."""
     if not SYNC_CLIENTS:
         return
     try:
         line = (json.dumps(payload_dict) + "\n").encode()
-        dead = []
+        dead = []   # (conn_id, conn, addr, error) — collected under the lock,
+                     # closed/logged after releasing it so a slow close() or
+                     # console_log() call never holds up the lock everyone
+                     # else broadcasting needs
         with SYNC_SERVER_LOCK:
             for conn_id, info in SYNC_CLIENTS.items():
                 try:
                     info["conn"].sendall(line)
-                except OSError:
-                    dead.append(conn_id)
-            for conn_id in dead:
+                except OSError as e:
+                    dead.append((conn_id, info["conn"], info.get("addr"), e))
+            for conn_id, _, _, _ in dead:
                 SYNC_CLIENTS.pop(conn_id, None)
+        for conn_id, dead_conn, addr, err in dead:
+            addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
+            console_log(f"{YLW}Sync client dropped ({payload_dict.get('type', '?')} send failed): "
+                        f"{addr_txt} — {err}{RST}")
+            try:
+                dead_conn.close()
+            except OSError:
+                pass
     except Exception as e:
         console_log(f"{DIM}Sync broadcast failed ({payload_dict.get('type', '?')}): {e}{RST}")
 

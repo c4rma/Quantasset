@@ -9733,7 +9733,18 @@ def draw_dashboard(db, snap, cols):
             regime_txt, state_txt = "n/a", "CLOSED"
         else:
             regime_txt, state_txt = (inst.get("regime") or "none").upper(), inst.get("state", "?")
-        price_txt = f"   {DIM}price {inst['price']:.2f}{RST}" if inst.get("price") is not None else ""
+        # Prefer live_price (refreshed every 0.25s by publish_live_fast/
+        # _sync_broadcast_live_bars) over the plain price field (only
+        # refreshed once per ~1-3s engine cycle) — the dashboard's own
+        # headline number should show the freshest tick available, not lag
+        # a full engine cycle behind it. True on Server AND Client alike
+        # (same shared render code, no CLIENT_MODE branch needed) — this
+        # was never actually a Client-only gap, the fast live-price pipeline
+        # existed already but nothing on-screen ever read from it.
+        display_price = inst.get("live_price")
+        if display_price is None:
+            display_price = inst.get("price")
+        price_txt = f"   {DIM}price {display_price:.2f}{RST}" if display_price is not None else ""
         bj_txt = ""
         if BLACKJACK_MODE:
             bj = BLACKJACK_STATE[asset]

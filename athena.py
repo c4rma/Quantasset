@@ -81,6 +81,7 @@ import hashlib
 import asyncio
 import threading
 import socket
+import queue
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8548,6 +8549,20 @@ SYNC_FOOTPRINT_PUSH_INTERVAL = 20   # how often AppState.publish()'s own
                                       # fields — see AppState.publish's own
                                       # use of this and _sync_broadcast_
                                       # app_state's docstring for why
+SYNC_CLIENT_CONNECT_TIMEOUT = 6   # seconds allowed for connect()+handshake
+                                    # before giving up on ONE attempt — down
+                                    # from 10s so a truly unreachable path
+                                    # (server down, network partition) gets
+                                    # retried more often rather than idling
+                                    # out a long timeout on each doomed
+                                    # attempt; still generous for a
+                                    # genuinely slow-but-working link
+SYNC_CLIENT_MAX_BACKOFF = 5   # cap on the reconnect backoff between attempts
+                                # — down from 10s, same reasoning: cycle
+                                # through more attempts during a real outage
+                                # so recovery starts sooner once the network
+                                # is actually back, at the cost of a few more
+                                # cheap failed-connect attempts meanwhile
 
 SYNC_SERVER_LOCK = threading.Lock()   # SYNC_CLIENTS is a genuine multi-writer
 SYNC_CLIENTS = {}                     # structure — N per-client handler threads
@@ -8630,66 +8645,95 @@ _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] k
 # their own data — no separate polling/timer thread anywhere in this layer,
 # every push just piggybacks on whichever thread already just recomputed
 # the thing being pushed.
+SYNC_CLIENT_QUEUE_MAXSIZE = 100   # bounded per-client outbound queue — see
+                                    # _sync_broadcast's own docstring for why
+                                    # this exists at all; if a client's own
+                                    # writer thread can't keep up, drop the
+                                    # OLDEST queued message to make room for
+                                    # the newest rather than let the queue
+                                    # grow unbounded or fall further and
+                                    # further behind real-time
+
 def _sync_broadcast(payload_dict):
-    """Send one JSON line to every currently-connected sync client —
-    best-effort: a write failure to one client (dead socket, client closed)
-    just marks that one for removal under SYNC_SERVER_LOCK, never raises
-    into the calling producer thread. This is a hard requirement, not just
-    a nicety: this function (via _sync_broadcast_app_state) is called
+    """Enqueue one JSON line for every currently-connected sync client — a
+    FAST, NEVER-BLOCKING operation (queue.put_nowait, with a bounded drop-
+    oldest fallback if a client's queue is full), never raises into the
+    calling producer thread. This is a hard requirement, not just a
+    nicety: this function (via _sync_broadcast_app_state) is called
     UNGUARDED from AppState.publish()/publish_live_fast(), which in turn
     are called directly from engine_loop()'s and _fast_publish_loop's own
     while-loop bodies with no surrounding try/except at THOSE call sites
-    either — any exception escaping here (not just a dead socket; a
-    json.dumps failure on some future unexpected payload shape, a KeyError,
-    anything) would propagate all the way out and silently kill the
-    trading engine's own thread. A sync/dashboard bug must never be able
-    to stop Athena from managing real positions, so this catches
-    everything, not just OSError, and only ever logs.
+    either.
 
-    BUG FIXED (user-reported: Server's client count drops to 0 within
-    seconds, with NOTHING logged on either side, while the Client itself
-    still reports "connected" for 60s+): dropping a dead client here used
-    to ONLY pop it from SYNC_CLIENTS — it never closed that client's own
-    socket, and never logged WHY. That silence was structural, not a
-    missing log line: with the socket left open, _sync_client_handler's
-    own per-client thread (a SEPARATE thread, still happily looping on
-    conn.recv()) never sees an error or EOF either, so IT never logs
-    "disconnected" — nothing anywhere ever notices. And because the socket
-    was never actually closed, the Client's own recv() calls just kept
-    timing out normally instead of getting a real EOF/RST — indistinguishable
-    from "no new data yet," which is exactly why the Client-side staleness
-    watchdog was the ONLY thing that could ever catch this (a timer, not a
-    real signal) instead of an immediate, reliable one. Now: log the
-    specific error and CLOSE the socket — that closure itself delivers a
-    proper TCP close to the Client, so its own _read_line() gets an actual
-    EOF (see _sync_client_connect_loop's own "server closed connection"
-    ConnectionError) and reconnects immediately, not up to 15s later."""
+    ARCHITECTURE FIXED (user-reported: a live "sendall() timed out" drop
+    even over a Tailscale connection confirmed DIRECT, not relayed — ruling
+    out the DERP-relay theory the previous fix was reasoning from): this
+    function used to call conn.sendall() ITSELF, synchronously, inline,
+    while every producer thread that broadcasts (engine_loop, _fast_
+    publish_loop, _gex_engine_loop, _status_snapshot_loop) was blocked
+    waiting for it. That meant ANY single client with a slow or briefly
+    degraded socket — direct connection or not, a real network can still
+    have transient hiccups — could stall Athena's OWN core engine threads
+    for up to the FULL socket timeout on EVERY broadcast, not just delay
+    that one client's own data. A sync/dashboard connection must never be
+    able to throttle the trading engine itself. Now: this function only
+    ever enqueues (microseconds, never blocks); a dedicated per-client
+    _sync_client_writer thread owns the actual (potentially slow)
+    sendall() call and all dead-client detection/cleanup — see its own
+    docstring. Never raises even if queueing itself fails for some
+    unexpected reason (e.g. a future non-JSON-safe payload), so a sync-
+    layer bug still can't reach the trading engine's own threads."""
     if not SYNC_CLIENTS:
         return
     try:
         line = (json.dumps(payload_dict) + "\n").encode()
-        dead = []   # (conn_id, conn, addr, error) — collected under the lock,
-                     # closed/logged after releasing it so a slow close() or
-                     # console_log() call never holds up the lock everyone
-                     # else broadcasting needs
         with SYNC_SERVER_LOCK:
-            for conn_id, info in SYNC_CLIENTS.items():
-                try:
-                    info["conn"].sendall(line)
-                except OSError as e:
-                    dead.append((conn_id, info["conn"], info.get("addr"), e))
-            for conn_id, _, _, _ in dead:
-                SYNC_CLIENTS.pop(conn_id, None)
-        for conn_id, dead_conn, addr, err in dead:
-            addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
-            console_log(f"{YLW}Sync client dropped ({payload_dict.get('type', '?')} send failed): "
-                        f"{addr_txt} — {err}{RST}")
+            queues = [info["queue"] for info in SYNC_CLIENTS.values()]
+        for q in queues:
             try:
-                dead_conn.close()
-            except OSError:
-                pass
+                q.put_nowait(line)
+            except queue.Full:
+                try:
+                    q.get_nowait()   # drop the oldest to make room for this
+                    q.put_nowait(line)   # newest one — real-time semantics,
+                except (queue.Empty, queue.Full):   # not a backlog to replay
+                    pass
     except Exception as e:
         console_log(f"{DIM}Sync broadcast failed ({payload_dict.get('type', '?')}): {e}{RST}")
+
+def _sync_client_writer(conn_id, conn, addr, q, stop_evt):
+    """Dedicated per-client thread — the ONLY thing that ever calls
+    sendall() on this client's socket. Draining a per-client queue here,
+    rather than every producer thread writing inline via _sync_broadcast,
+    means a slow/degraded connection can only ever delay ITS OWN delivery
+    — never block engine_loop/_fast_publish_loop/_gex_engine_loop/
+    _status_snapshot_loop, which now just enqueue and immediately return.
+    Owns the same "detect failure, log why, close the socket, remove from
+    SYNC_CLIENTS" responsibility _sync_broadcast used to have inline —
+    closing the socket still delivers a real TCP close to the Client so it
+    reconnects immediately rather than waiting on its own staleness
+    watchdog (see _sync_client_connect_loop)."""
+    try:
+        while not stop_evt.is_set():
+            try:
+                line = q.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                conn.sendall(line)
+            except OSError as e:
+                addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
+                console_log(f"{YLW}Sync client dropped (send failed): {addr_txt} — {e}{RST}")
+                break
+    except Exception as e:
+        console_log(f"{DIM}Sync writer thread error: {e}{RST}")
+    finally:
+        with SYNC_SERVER_LOCK:
+            SYNC_CLIENTS.pop(conn_id, None)
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 def _sync_broadcast_app_state(include_footprint=True):
     # try/except here too, not just inside _sync_broadcast itself — this is
@@ -8828,9 +8872,11 @@ def _sync_client_handler(conn, addr, stop_evt):
     then just idles reading (and discarding) whatever the client sends
     until the socket closes or stop_evt fires; the client never pushes
     state, only an occasional keepalive line, so there's nothing to
-    dispatch here. Actual state pushes to this client happen from OTHER
-    threads (the producers, via _sync_broadcast above) once this handler
-    has registered the live socket in SYNC_CLIENTS."""
+    dispatch here. Actual state pushes to this client are enqueued by
+    OTHER threads (the producers, via _sync_broadcast) and delivered by a
+    SEPARATE dedicated writer thread (_sync_client_writer, started below
+    right after registration) — this thread only ever reads, never writes,
+    on this connection."""
     conn_id = None
     try:
         _enable_tcp_keepalive(conn)
@@ -8854,16 +8900,21 @@ def _sync_client_handler(conn, addr, stop_evt):
             return   # no retry loop on this connection — see security notes
         conn.sendall((json.dumps({"type": "auth_ok"}) + "\n").encode())
 
+        q = queue.Queue(maxsize=SYNC_CLIENT_QUEUE_MAXSIZE)
         with SYNC_SERVER_LOCK:
             _sync_next_conn_id[0] += 1
             conn_id = _sync_next_conn_id[0]
-            SYNC_CLIENTS[conn_id] = {"conn": conn, "addr": addr}
+            SYNC_CLIENTS[conn_id] = {"conn": conn, "addr": addr, "queue": q}
+        threading.Thread(target=_sync_client_writer, args=(conn_id, conn, addr, q, stop_evt), daemon=True).start()
         console_log(f"{CYN}Sync client connected: {addr[0]}:{addr[1]}{RST}")
         log_event("SYSTEM", "sync_client_connected", {"addr": f"{addr[0]}:{addr[1]}"})
 
         # Send this client a full snapshot immediately on connect (rather
         # than waiting for the next producer cycle) so its own dashboard
-        # doesn't sit blank/stale for up to a full engine interval.
+        # doesn't sit blank/stale for up to a full engine interval. These
+        # just enqueue now (see _sync_broadcast) — _sync_client_writer
+        # drains them asynchronously, so this never blocks THIS thread
+        # either, even on a slow connection.
         _sync_broadcast_app_state()
         for asset in ASSETS:
             _sync_broadcast_gex_state(asset)
@@ -8874,15 +8925,15 @@ def _sync_client_handler(conn, addr, stop_evt):
         except Exception as e:
             console_log(f"{DIM}Sync data_view broadcast failed (on-connect): {e}{RST}")
 
-        # 10s, not 1s — this timeout also bounds every sendall() other
-        # threads make against this same socket (_sync_broadcast, called
-        # from the various producer threads) since a socket's timeout is
-        # per-object, not per-call. A too-tight timeout here was the actual
-        # cause of a user-reported bug: a genuinely healthy but slower/
-        # higher-latency connection couldn't always drain a full app_state
-        # payload inside 1 second, so sendall() raised socket.timeout (a
-        # subclass of OSError), which _sync_broadcast's own per-client
-        # except OSError handling correctly treats as "dead" and drops —
+        # 10s, not 1s — this timeout also bounds _sync_client_writer's own
+        # sendall() calls against this same socket (a socket's timeout is
+        # per-object, not per-call — the writer thread never sets its own).
+        # A too-tight timeout here was the actual cause of an earlier
+        # user-reported bug: a genuinely healthy but slower/higher-latency
+        # connection couldn't always drain a full app_state payload inside
+        # 1 second, so sendall() raised socket.timeout (a subclass of
+        # OSError), which the writer thread's own except OSError handling
+        # correctly treats as "dead" and drops —
         # even though the client was never actually disconnected. Splitting
         # the fast path onto its own much smaller message (see
         # _sync_broadcast_live_bars) already reduces how often a big send
@@ -8986,7 +9037,8 @@ def _sync_client_connect_loop(host, port, stop_evt):
     GEX/status threads would populate (AppState.apply_snapshot/
     _gex_apply_wire_state/_gex_apply_wire_status/_status_apply_wire_lines).
     On any failure — connection refused, auth_fail, socket reset — backs
-    off (capped exponential: 1/2/4/8/10s) and retries until stop_evt fires.
+    off (capped exponential: 1/2/4/5/5…s, see SYNC_CLIENT_MAX_BACKOFF) and
+    retries until stop_evt fires.
     This is the entire extent of Client Mode's network activity; it never
     touches a broker credential or the trading engine."""
     global SYNC_CLIENT_STATUS
@@ -9000,7 +9052,7 @@ def _sync_client_connect_loop(host, port, stop_evt):
         try:
             SYNC_CLIENT_STATUS[0] = "connecting…"
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
+            sock.settimeout(SYNC_CLIENT_CONNECT_TIMEOUT)
             sock.connect((host, port))
             _enable_tcp_keepalive(sock)
             buf = b""
@@ -9090,7 +9142,7 @@ def _sync_client_connect_loop(host, port, stop_evt):
             if not auth_failed:
                 SYNC_CLIENT_STATUS[0] = f"reconnecting in {backoff}s…"
             stop_evt.wait(backoff)
-            backoff = min(10, backoff * 2)
+            backoff = min(SYNC_CLIENT_MAX_BACKOFF, backoff * 2)
 
 def _gather_data_view_payload():
     """Server side — BOTH sim and real Data-view content (trades/events/

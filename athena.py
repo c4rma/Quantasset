@@ -81,7 +81,6 @@ import hashlib
 import asyncio
 import threading
 import socket
-import queue
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8513,6 +8512,33 @@ class AppState:
 
 APP_STATE = AppState()
 
+def _apply_wire_control_flags(data):
+    """Client side — DRY_RUN/NO_SESSION/ATHENA_ENABLED/BLACKJACK_MODE/
+    BLACKJACK_STATE are plain module globals, NOT part of AppState, but
+    draw_dashboard's own shared render code (the SAME function Server and
+    Client both call — see curses_main) reads them directly as globals —
+    e.g. `paused_tag = " [PAUSED]" if not ATHENA_ENABLED[asset] else ""`.
+    Without syncing them too, a Client's dashboard silently showed
+    whatever ITS OWN local defaults happened to be (initialized once at
+    startup, never touched again — Client Mode never runs any of the [A]/
+    [B]/[N]/[G] key handlers that mutate these on a Server) no matter what
+    the Server was actually doing. User-reported: pausing QQQ via [A] on
+    the Server never showed [PAUSED] on the Client — "statuses should be
+    shared for anyone to see." Called only by _sync_client_connect_loop,
+    once per received app_state message (every message carries a
+    "control" section — see _sync_broadcast_app_state)."""
+    global DRY_RUN, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_STATE
+    control = data.get("control")
+    if not control:
+        return
+    DRY_RUN = control.get("dry_run", DRY_RUN)
+    NO_SESSION = control.get("no_session", NO_SESSION)
+    if "athena_enabled" in control:
+        ATHENA_ENABLED = control["athena_enabled"]
+    BLACKJACK_MODE = control.get("blackjack_mode", BLACKJACK_MODE)
+    if "blackjack_state" in control:
+        BLACKJACK_STATE = control["blackjack_state"]
+
 # ── Server Mode / Client Mode (sync layer) ──────────────────────────────────
 # A Server instance is just today's athena.py, unchanged, PLUS it streams its
 # live dashboard state to any connected Clients. A Client instance is a pure
@@ -8541,14 +8567,33 @@ SYNC_CLIENT_STALE_TIMEOUT = 15   # seconds with zero messages received before
                                   # — see _sync_client_connect_loop's own
                                   # docstring for why this can't just rely
                                   # on the socket eventually raising an error
-SYNC_FOOTPRINT_PUSH_INTERVAL = 20   # how often AppState.publish()'s own
-                                      # recurring sync push includes the full
-                                      # footprint_bars history (by far the
-                                      # largest field) rather than just the
-                                      # small, genuinely time-sensitive
-                                      # fields — see AppState.publish's own
-                                      # use of this and _sync_broadcast_
-                                      # app_state's docstring for why
+SYNC_FOOTPRINT_PUSH_INTERVAL = 5   # how often AppState.publish()'s own
+                                     # recurring sync push includes the full
+                                     # footprint_bars history (by far the
+                                     # largest field) rather than just the
+                                     # small, genuinely time-sensitive
+                                     # fields — see AppState.publish's own
+                                     # use of this and _sync_broadcast_
+                                     # app_state's docstring for why.
+                                     # Down from 20s: user-reported evidence
+                                     # (even sub-1KB messages timing out on
+                                     # the SYNC_SEND_MIN_TIMEOUT floor, not
+                                     # struggling with size) points to a
+                                     # connection with short, semi-random
+                                     # "good windows," not a throughput
+                                     # problem — the full refresh only gets
+                                     # ONE chance to land per this interval
+                                     # (or once per reconnect), so a rare
+                                     # attempt window means it can keep
+                                     # missing its shot for a long stretch,
+                                     # leaving the chart stuck far in the
+                                     # past even while smaller/faster
+                                     # messages (live price ticks) keep
+                                     # getting through. More frequent
+                                     # attempts is the direct mitigation —
+                                     # no per-attempt guarantee, but a much
+                                     # shorter expected time to the next
+                                     # good window actually landing one.
 SYNC_CLIENT_CONNECT_TIMEOUT = 6   # seconds allowed for connect()+handshake
                                     # before giving up on ONE attempt — down
                                     # from 10s so a truly unreachable path
@@ -8645,17 +8690,83 @@ _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] k
 # their own data — no separate polling/timer thread anywhere in this layer,
 # every push just piggybacks on whichever thread already just recomputed
 # the thing being pushed.
-SYNC_CLIENT_QUEUE_MAXSIZE = 100   # bounded per-client outbound queue — see
-                                    # _sync_broadcast's own docstring for why
-                                    # this exists at all; if a client's own
-                                    # writer thread can't keep up, drop the
-                                    # OLDEST queued message to make room for
-                                    # the newest rather than let the queue
-                                    # grow unbounded or fall further and
-                                    # further behind real-time
-SYNC_SEND_MIN_TIMEOUT = 10       # floor, seconds — a genuinely tiny message
+class _SyncMailbox:
+    """Per-client outbound mailbox — ONE SLOT PER MESSAGE TYPE (keyed by
+    "type", or "type:asset" for the per-asset ones — gex_state/gex_status),
+    not a FIFO queue. A newer message of a given type simply OVERWRITES
+    that type's slot instead of queueing behind whatever else is pending.
+
+    BUG FIXED (user-reported: the Client's [D]ata page never loads the
+    Server's sim PnL/trading log, even though the sync connection itself
+    is healthy): the previous design was a single bounded FIFO
+    (queue.Queue(maxsize=100)) shared by every message type, with a
+    drop-OLDEST-on-full policy. live_bars fires every 0.25s — 4x/second —
+    so if the writer thread ever fell behind for any real stretch (which
+    the size-proportional send timeout, an earlier fix, explicitly allows
+    for a large payload: up to ~25s), the queue could fill entirely with
+    live_bars messages within seconds and evict whatever data_view/
+    gex_state/app_state message had been waiting — data_view is only
+    (re)broadcast every 2s, so it was disproportionately likely to be the
+    thing sitting in the queue getting evicted by a burst of a much more
+    frequent, and individually far less important, message type. A high-
+    frequency, fully-disposable stream (only the LATEST live_bars tick
+    ever matters) was crowding out a low-frequency, non-disposable one.
+    One slot per type fixes this structurally: live_bars updates only
+    ever overwrite their OWN slot — which is exactly correct, since only
+    the latest tick is ever worth sending — and can never touch any other
+    type's slot, so data_view (and everything else) always gets through
+    on the writer's very next drain, never competing for shared FIFO
+    capacity with a completely unrelated, much chattier stream."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._slots = {}   # key -> line (bytes) — at most ~7 distinct keys
+                             # ever exist (app_state, live_bars, status_lines,
+                             # data_view, gex_state:ETH/QQQ, gex_status:ETH/QQQ),
+                             # so this needs no size bound at all
+        self._event = threading.Event()
+
+    def put(self, key, line):
+        with self._lock:
+            self._slots[key] = line
+        self._event.set()
+
+    def drain(self, timeout):
+        """Blocks up to `timeout` for at least one pending message, then
+        returns ALL currently-pending (type, line) pairs at once, clearing
+        the mailbox. Returns [] on a timeout with nothing pending."""
+        if not self._event.wait(timeout):
+            return []
+        with self._lock:
+            items = list(self._slots.items())
+            self._slots.clear()
+            self._event.clear()
+        return items
+
+def _sync_key_for(payload_dict):
+    """The _SyncMailbox slot key for a given outbound payload — its own
+    "type", plus the asset for the two per-asset message types, so ETH and
+    QQQ each get their own independent gex_state/gex_status slot rather
+    than clobbering each other."""
+    key = payload_dict.get("type", "?")
+    if "asset" in payload_dict:
+        key = f"{key}:{payload_dict['asset']}"
+    return key
+
+SYNC_SEND_MIN_TIMEOUT = 5        # floor, seconds — a genuinely tiny message
                                    # (a dead/stalled connection, not a slow
-                                   # one) still fails this fast, same as before
+                                   # one) still fails this fast. Down from
+                                   # 10s: user-reported evidence — messages
+                                   # under 1KB (91B, 524B, ...) timing out
+                                   # reliably at exactly the old 10s floor —
+                                   # shows this connection's failures aren't
+                                   # a throughput problem being given not-
+                                   # quite-enough time; the link is just
+                                   # dead for stretches, and waiting out the
+                                   # full old floor before admitting that
+                                   # only delayed the reconnect attempt that
+                                   # actually fixes it. Halving the floor
+                                   # roughly halves the time-to-next-attempt
+                                   # after every failure.
 SYNC_SEND_MIN_THROUGHPUT = 20000   # bytes/sec — the assumed WORST acceptable
                                      # real throughput a send is still given
                                      # credit for; _sync_client_writer's own
@@ -8672,64 +8783,56 @@ SYNC_SEND_MIN_THROUGHPUT = 20000   # bytes/sec — the assumed WORST acceptable
                                      # not real intermittent network failures)
 
 def _sync_broadcast(payload_dict):
-    """Enqueue one JSON line for every currently-connected sync client — a
-    FAST, NEVER-BLOCKING operation (queue.put_nowait, with a bounded drop-
-    oldest fallback if a client's queue is full), never raises into the
-    calling producer thread. This is a hard requirement, not just a
-    nicety: this function (via _sync_broadcast_app_state) is called
-    UNGUARDED from AppState.publish()/publish_live_fast(), which in turn
-    are called directly from engine_loop()'s and _fast_publish_loop's own
-    while-loop bodies with no surrounding try/except at THOSE call sites
-    either.
+    """Post one message into every currently-connected sync client's own
+    mailbox — a FAST, NEVER-BLOCKING operation (a dict assignment under a
+    lock, plus setting an Event), never raises into the calling producer
+    thread. This is a hard requirement, not just a nicety: this function
+    (via _sync_broadcast_app_state) is called UNGUARDED from AppState.
+    publish()/publish_live_fast(), which in turn are called directly from
+    engine_loop()'s and _fast_publish_loop's own while-loop bodies with no
+    surrounding try/except at THOSE call sites either.
 
     ARCHITECTURE FIXED (user-reported: a live "sendall() timed out" drop
     even over a Tailscale connection confirmed DIRECT, not relayed — ruling
-    out the DERP-relay theory the previous fix was reasoning from): this
+    out the DERP-relay theory an earlier fix was reasoning from): this
     function used to call conn.sendall() ITSELF, synchronously, inline,
     while every producer thread that broadcasts (engine_loop, _fast_
     publish_loop, _gex_engine_loop, _status_snapshot_loop) was blocked
-    waiting for it. That meant ANY single client with a slow or briefly
-    degraded socket — direct connection or not, a real network can still
-    have transient hiccups — could stall Athena's OWN core engine threads
-    for up to the FULL socket timeout on EVERY broadcast, not just delay
-    that one client's own data. A sync/dashboard connection must never be
-    able to throttle the trading engine itself. Now: this function only
-    ever enqueues (microseconds, never blocks); a dedicated per-client
-    _sync_client_writer thread owns the actual (potentially slow)
-    sendall() call and all dead-client detection/cleanup — see its own
-    docstring. Never raises even if queueing itself fails for some
-    unexpected reason (e.g. a future non-JSON-safe payload), so a sync-
-    layer bug still can't reach the trading engine's own threads."""
+    waiting for it. Now: this function only ever posts to a mailbox
+    (microseconds, never blocks); a dedicated per-client _sync_client_writer
+    thread owns the actual (potentially slow) sendall() call and all
+    dead-client detection/cleanup — see its own docstring. See
+    _SyncMailbox's own docstring for why this is a coalescing mailbox (one
+    slot per message type) rather than a FIFO queue — a second, separate
+    bug that shape fixed (a rare/important message type getting crowded
+    out and evicted by a much more frequent/disposable one). Never raises
+    even if posting itself fails for some unexpected reason (e.g. a future
+    non-JSON-safe payload), so a sync-layer bug still can't reach the
+    trading engine's own threads."""
     if not SYNC_CLIENTS:
         return
     try:
         line = (json.dumps(payload_dict) + "\n").encode()
+        key = _sync_key_for(payload_dict)
         with SYNC_SERVER_LOCK:
-            queues = [info["queue"] for info in SYNC_CLIENTS.values()]
-        for q in queues:
-            try:
-                q.put_nowait(line)
-            except queue.Full:
-                try:
-                    q.get_nowait()   # drop the oldest to make room for this
-                    q.put_nowait(line)   # newest one — real-time semantics,
-                except (queue.Empty, queue.Full):   # not a backlog to replay
-                    pass
+            mailboxes = [info["mailbox"] for info in SYNC_CLIENTS.values()]
+        for mailbox in mailboxes:
+            mailbox.put(key, line)
     except Exception as e:
         console_log(f"{DIM}Sync broadcast failed ({payload_dict.get('type', '?')}): {e}{RST}")
 
-def _sync_client_writer(conn_id, conn, addr, q, stop_evt):
+def _sync_client_writer(conn_id, conn, addr, mailbox, stop_evt):
     """Dedicated per-client thread — the ONLY thing that ever calls
-    sendall() on this client's socket. Draining a per-client queue here,
+    sendall() on this client's socket. Draining a per-client mailbox here,
     rather than every producer thread writing inline via _sync_broadcast,
     means a slow/degraded connection can only ever delay ITS OWN delivery
     — never block engine_loop/_fast_publish_loop/_gex_engine_loop/
-    _status_snapshot_loop, which now just enqueue and immediately return.
-    Owns the same "detect failure, log why, close the socket, remove from
-    SYNC_CLIENTS" responsibility _sync_broadcast used to have inline —
-    closing the socket still delivers a real TCP close to the Client so it
-    reconnects immediately rather than waiting on its own staleness
-    watchdog (see _sync_client_connect_loop).
+    _status_snapshot_loop, which now just post to the mailbox and
+    immediately return. Owns the same "detect failure, log why, close the
+    socket, remove from SYNC_CLIENTS" responsibility _sync_broadcast used
+    to have inline — closing the socket still delivers a real TCP close to
+    the Client so it reconnects immediately rather than waiting on its own
+    staleness watchdog (see _sync_client_connect_loop).
 
     BUG FIXED (user-reported: connection drops on a near-EXACT ~11s
     schedule, every single reconnect, with the Server's own log showing
@@ -8740,27 +8843,27 @@ def _sync_client_writer(conn_id, conn, addr, q, stop_evt):
     snapshot plus GEX history — see _sync_client_handler) is genuinely
     large, and this connection's real sustained throughput apparently
     isn't fast enough to clear it inside the old flat 10s budget — a
-    slow-but-working link, not a dead one. Two changes together fix this:
-    (1) the timeout for each send now scales with that message's own
-    size (see SYNC_SEND_MIN_THROUGHPUT below) instead of one fixed value
-    for everything, so a large payload gets proportionally more time
-    while a tiny one (a stalled/genuinely-dead connection) still fails
-    fast; (2) _sync_client_handler's own on-connect burst no longer
+    slow-but-working link, not a dead one. Two changes together fixed
+    that: (1) the timeout for each send now scales with that message's
+    own size (see SYNC_SEND_MIN_THROUGHPUT below) instead of one fixed
+    value for everything, so a large payload gets proportionally more
+    time while a tiny one (a stalled/genuinely-dead connection) still
+    fails fast; (2) _sync_client_handler's own on-connect burst no longer
     front-loads the full snapshot at all — see its own comment."""
     try:
         while not stop_evt.is_set():
-            try:
-                line = q.get(timeout=1)
-            except queue.Empty:
-                continue
-            try:
-                conn.settimeout(max(SYNC_SEND_MIN_TIMEOUT, len(line) / SYNC_SEND_MIN_THROUGHPUT))
-                conn.sendall(line)
-            except OSError as e:
-                addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
-                console_log(f"{YLW}Sync client dropped (send failed, {len(line):,}B payload): "
-                            f"{addr_txt} — {e}{RST}")
-                break
+            items = mailbox.drain(timeout=1)
+            for _key, line in items:
+                try:
+                    conn.settimeout(max(SYNC_SEND_MIN_TIMEOUT, len(line) / SYNC_SEND_MIN_THROUGHPUT))
+                    conn.sendall(line)
+                except OSError as e:
+                    addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
+                    console_log(f"{YLW}Sync client dropped (send failed, {len(line):,}B payload): "
+                                f"{addr_txt} — {e}{RST}")
+                    return   # socket is presumed unusable — stop the whole
+                              # thread, don't keep trying the REST of this
+                              # drain batch on it too
     except Exception as e:
         console_log(f"{DIM}Sync writer thread error: {e}{RST}")
     finally:
@@ -8805,6 +8908,23 @@ def _sync_broadcast_app_state(include_footprint=True):
         if not include_footprint:
             data = dict(data)
             data.pop("footprint_bars", None)
+        # "control" — DRY_RUN/NO_SESSION/ATHENA_ENABLED/BLACKJACK_MODE/
+        # BLACKJACK_STATE are plain module globals, NOT part of AppState,
+        # but draw_dashboard's own shared render code (identical on Server
+        # and Client) reads them directly as globals — see
+        # _apply_wire_control_flags's own docstring for the user-reported
+        # bug this fixes ("[PAUSED] doesn't show on the Client"). Cheap
+        # (a handful of bools/floats plus a tiny per-asset dict), so this
+        # rides along on every app_state push, light or full alike.
+        data = dict(data) if include_footprint else data   # data is already
+                            # a fresh copy in the include_footprint=False
+                            # branch above; avoid a redundant second copy
+        data["control"] = {
+            "dry_run": DRY_RUN, "no_session": NO_SESSION,
+            "athena_enabled": dict(ATHENA_ENABLED),
+            "blackjack_mode": BLACKJACK_MODE,
+            "blackjack_state": {a: dict(s) for a, s in BLACKJACK_STATE.items()},
+        }
         _sync_broadcast({"type": "app_state", "data": data})
     except Exception as e:
         console_log(f"{DIM}Sync app_state broadcast failed: {e}{RST}")
@@ -8936,12 +9056,12 @@ def _sync_client_handler(conn, addr, stop_evt):
             return   # no retry loop on this connection — see security notes
         conn.sendall((json.dumps({"type": "auth_ok"}) + "\n").encode())
 
-        q = queue.Queue(maxsize=SYNC_CLIENT_QUEUE_MAXSIZE)
+        mailbox = _SyncMailbox()
         with SYNC_SERVER_LOCK:
             _sync_next_conn_id[0] += 1
             conn_id = _sync_next_conn_id[0]
-            SYNC_CLIENTS[conn_id] = {"conn": conn, "addr": addr, "queue": q}
-        threading.Thread(target=_sync_client_writer, args=(conn_id, conn, addr, q, stop_evt), daemon=True).start()
+            SYNC_CLIENTS[conn_id] = {"conn": conn, "addr": addr, "mailbox": mailbox}
+        threading.Thread(target=_sync_client_writer, args=(conn_id, conn, addr, mailbox, stop_evt), daemon=True).start()
         console_log(f"{CYN}Sync client connected: {addr[0]}:{addr[1]}{RST}")
         log_event("SYSTEM", "sync_client_connected", {"addr": f"{addr[0]}:{addr[1]}"})
 
@@ -9171,6 +9291,7 @@ def _sync_client_connect_loop(host, port, stop_evt):
                 mtype = msg.get("type")
                 if mtype == "app_state":
                     APP_STATE.apply_snapshot(msg["data"])
+                    _apply_wire_control_flags(msg["data"])
                 elif mtype == "live_bars":
                     APP_STATE.apply_live_bars(msg["data"])
                 elif mtype == "gex_state":

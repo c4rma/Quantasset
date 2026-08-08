@@ -8653,6 +8653,23 @@ SYNC_CLIENT_QUEUE_MAXSIZE = 100   # bounded per-client outbound queue — see
                                     # the newest rather than let the queue
                                     # grow unbounded or fall further and
                                     # further behind real-time
+SYNC_SEND_MIN_TIMEOUT = 10       # floor, seconds — a genuinely tiny message
+                                   # (a dead/stalled connection, not a slow
+                                   # one) still fails this fast, same as before
+SYNC_SEND_MIN_THROUGHPUT = 20000   # bytes/sec — the assumed WORST acceptable
+                                     # real throughput a send is still given
+                                     # credit for; _sync_client_writer's own
+                                     # per-send timeout is max(the floor
+                                     # above, payload_bytes / this) — a large
+                                     # payload gets proportionally more time
+                                     # instead of hitting one fixed cutoff
+                                     # regardless of size (the actual cause of
+                                     # a user-reported bug: reconnects failing
+                                     # on an almost-exact ~11s schedule, which
+                                     # is the signature of a fixed timeout
+                                     # being hit reliably by a large payload
+                                     # on a slow-but-genuinely-working link,
+                                     # not real intermittent network failures)
 
 def _sync_broadcast(payload_dict):
     """Enqueue one JSON line for every currently-connected sync client — a
@@ -8712,7 +8729,24 @@ def _sync_client_writer(conn_id, conn, addr, q, stop_evt):
     SYNC_CLIENTS" responsibility _sync_broadcast used to have inline —
     closing the socket still delivers a real TCP close to the Client so it
     reconnects immediately rather than waiting on its own staleness
-    watchdog (see _sync_client_connect_loop)."""
+    watchdog (see _sync_client_connect_loop).
+
+    BUG FIXED (user-reported: connection drops on a near-EXACT ~11s
+    schedule, every single reconnect, with the Server's own log showing
+    "send failed ... timed out" each time): that regularity is the
+    opposite of what a flaky network produces — it's the signature of a
+    FIXED socket timeout being hit reliably, not a real intermittent
+    break. The one-time initial burst on connect (a full account
+    snapshot plus GEX history — see _sync_client_handler) is genuinely
+    large, and this connection's real sustained throughput apparently
+    isn't fast enough to clear it inside the old flat 10s budget — a
+    slow-but-working link, not a dead one. Two changes together fix this:
+    (1) the timeout for each send now scales with that message's own
+    size (see SYNC_SEND_MIN_THROUGHPUT below) instead of one fixed value
+    for everything, so a large payload gets proportionally more time
+    while a tiny one (a stalled/genuinely-dead connection) still fails
+    fast; (2) _sync_client_handler's own on-connect burst no longer
+    front-loads the full snapshot at all — see its own comment."""
     try:
         while not stop_evt.is_set():
             try:
@@ -8720,10 +8754,12 @@ def _sync_client_writer(conn_id, conn, addr, q, stop_evt):
             except queue.Empty:
                 continue
             try:
+                conn.settimeout(max(SYNC_SEND_MIN_TIMEOUT, len(line) / SYNC_SEND_MIN_THROUGHPUT))
                 conn.sendall(line)
             except OSError as e:
                 addr_txt = f"{addr[0]}:{addr[1]}" if addr else "?"
-                console_log(f"{YLW}Sync client dropped (send failed): {addr_txt} — {e}{RST}")
+                console_log(f"{YLW}Sync client dropped (send failed, {len(line):,}B payload): "
+                            f"{addr_txt} — {e}{RST}")
                 break
     except Exception as e:
         console_log(f"{DIM}Sync writer thread error: {e}{RST}")
@@ -8909,13 +8945,32 @@ def _sync_client_handler(conn, addr, stop_evt):
         console_log(f"{CYN}Sync client connected: {addr[0]}:{addr[1]}{RST}")
         log_event("SYSTEM", "sync_client_connected", {"addr": f"{addr[0]}:{addr[1]}"})
 
-        # Send this client a full snapshot immediately on connect (rather
-        # than waiting for the next producer cycle) so its own dashboard
-        # doesn't sit blank/stale for up to a full engine interval. These
-        # just enqueue now (see _sync_broadcast) — _sync_client_writer
-        # drains them asynchronously, so this never blocks THIS thread
-        # either, even on a slow connection.
-        _sync_broadcast_app_state()
+        # Send this client a snapshot immediately on connect (rather than
+        # waiting for the next producer cycle) so its own dashboard doesn't
+        # sit blank/stale for up to a full engine interval. These just
+        # enqueue now (see _sync_broadcast) — _sync_client_writer drains
+        # them asynchronously, so this never blocks THIS thread either,
+        # even on a slow connection.
+        #
+        # include_footprint=False here deliberately — a fresh connection is
+        # exactly the WORST moment to front-load the single largest payload
+        # this app ever sends (the full ~500KB footprint history): the
+        # queue is completely empty and _sync_client_writer immediately
+        # attempts it as the very FIRST thing on a brand-new socket, before
+        # there's any evidence yet that this particular link can sustain a
+        # transfer that size. User-reported bug, root-caused: reconnects
+        # were failing on a near-exact ~11s schedule, every time — the
+        # signature of a fixed timeout being hit reliably by a large
+        # payload on a slow-but-genuinely-working connection, not real
+        # intermittent breaks (see _sync_client_writer's own docstring for
+        # the size-proportional timeout that's the other half of this fix).
+        # Balance/positions/lights — the fields that actually need to feel
+        # immediate — still arrive right away, tiny; the chart history
+        # follows within AppState.publish's own next cycle instead (reset
+        # _last_footprint_broadcast so that's soon, not up to
+        # SYNC_FOOTPRINT_PUSH_INTERVAL seconds away).
+        APP_STATE._last_footprint_broadcast = 0.0
+        _sync_broadcast_app_state(include_footprint=False)
         for asset in ASSETS:
             _sync_broadcast_gex_state(asset)
             _sync_broadcast_gex_status(asset)

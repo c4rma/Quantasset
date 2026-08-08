@@ -8602,6 +8602,14 @@ SYNC_CLIENT_CONNECT_TIMEOUT = 6   # seconds allowed for connect()+handshake
                                     # out a long timeout on each doomed
                                     # attempt; still generous for a
                                     # genuinely slow-but-working link
+SYNC_CLIENT_PROBE_TIMEOUT = 3   # connect() timeout used for every candidate
+                                  # address EXCEPT the last one being tried
+                                  # this attempt (see _sync_client_connect_
+                                  # loop) — e.g. probing a LAN address that
+                                  # isn't reachable today (remote/Tailscale-
+                                  # only) should fail fast so the fallback
+                                  # candidate gets tried promptly, not after
+                                  # the full connect timeout idles out
 SYNC_CLIENT_MAX_BACKOFF = 5   # cap on the reconnect backoff between attempts
                                 # — down from 10s, same reasoning: cycle
                                 # through more attempts during a real outage
@@ -8616,16 +8624,40 @@ SYNC_CLIENTS = {}                     # structure — N per-client handler threa
                     # unlocked (same convention STATUS_ENGINE_STATE/GEX_STATUS
                     # already use elsewhere in this file). Keyed by a simple
                     # incrementing connection id -> {"conn": socket, "addr": (ip,port)}.
-SYNC_SERVER_STATUS = ["not started"]   # "listening on 100.x.x.x:8765" / "error: ..."
-SYNC_SERVER_BIND_IP = [None]           # resolved Tailscale IP (see _get_tailscale_ip)
+SYNC_SERVER_STATUS = {}                # label -> "listening on host:port" / "error: ..." /
+                                        # "restarting listener…" / "stopped", one entry per
+                                        # address _sync_server_listen was started for (see
+                                        # SYNC_SERVER_BIND_IPS) — "LAN" and/or "TS"
+SYNC_SERVER_BIND_IPS = []              # [(label, ip), ...] this Server actually resolved
+                                        # and started a listener for. A Server now binds
+                                        # BOTH its plain LAN address (_get_lan_ip) and its
+                                        # Tailscale address (_get_tailscale_ip) — each on
+                                        # its own listener thread — instead of Tailscale
+                                        # only. Reason: a Client and Server on the SAME
+                                        # local network were paying for a VPN hop (and its
+                                        # occasional instability) on every message, for no
+                                        # benefit — the LAN path is simpler and inherently
+                                        # more reliable when it's actually reachable.
+                                        # Tailscale remains the only path when the Client
+                                        # is genuinely off-network. Still NEVER 0.0.0.0 —
+                                        # each bind is one specific host address; see
+                                        # _sync_server_listen's own docstring for why that
+                                        # still matters even for the LAN address (don't
+                                        # port-forward either one from your router).
 
 SYNC_CLIENT_STATUS = ["disconnected"]      # "connecting…" / "connected" /
                                             # "reconnecting in Ns…" / "auth failed…"
 SYNC_CLIENT_LAST_MSG_TS = [0.0]            # time.time() of the last applied push —
                                             # _startup_progress's Client-Mode branch
                                             # and the footer both read this
-SYNC_SERVER_ADDR = [None, None]            # [host, port] the user typed into
-                                            # _client_connect_screen
+SYNC_SERVER_CANDIDATES = []                # [(host, port), ...] the user typed into
+                                            # _client_connect_screen, in priority order
+                                            # (e.g. LAN address first, Tailscale address
+                                            # as fallback) — _sync_client_connect_loop
+                                            # tries each in turn on every (re)connect.
+SYNC_CLIENT_ACTIVE_ADDR = [None, None]     # [host, port] actually connected right now
+                                            # (which candidate won) — None until a
+                                            # connection succeeds at least once
 
 # [D]ata view content — unlike everything else synced (which is already
 # in-memory state the engine/GEX/status threads maintain continuously),
@@ -8752,21 +8784,24 @@ def _sync_key_for(payload_dict):
         key = f"{key}:{payload_dict['asset']}"
     return key
 
-SYNC_SEND_MIN_TIMEOUT = 5        # floor, seconds — a genuinely tiny message
-                                   # (a dead/stalled connection, not a slow
-                                   # one) still fails this fast. Down from
-                                   # 10s: user-reported evidence — messages
-                                   # under 1KB (91B, 524B, ...) timing out
-                                   # reliably at exactly the old 10s floor —
-                                   # shows this connection's failures aren't
-                                   # a throughput problem being given not-
-                                   # quite-enough time; the link is just
-                                   # dead for stretches, and waiting out the
-                                   # full old floor before admitting that
-                                   # only delayed the reconnect attempt that
-                                   # actually fixes it. Halving the floor
-                                   # roughly halves the time-to-next-attempt
-                                   # after every failure.
+SYNC_SEND_MIN_TIMEOUT = 25        # floor, seconds. Reverted back up (was 10,
+                                   # briefly dropped to 5): tiny messages
+                                   # timing out at the old floor was read as
+                                   # "the link is dead, stop waiting" — but
+                                   # it's equally consistent with transient
+                                   # packet loss/latency, where sendall() is
+                                   # blocked on TCP's own retransmit timers,
+                                   # not on anything app-level. A short floor
+                                   # can't tell those apart, and cutting it
+                                   # made the writer thread give up on links
+                                   # that would've recovered on their own —
+                                   # tearing down and rebuilding a connection
+                                   # (fresh handshake + auth + full resync)
+                                   # is strictly more disruptive than just
+                                   # waiting a bit longer on one write. This
+                                   # thread's stall never touches the trading
+                                   # engine or other clients, so there's
+                                   # little cost to being patient here.
 SYNC_SEND_MIN_THROUGHPUT = 20000   # bytes/sec — the assumed WORST acceptable
                                      # real throughput a send is still given
                                      # credit for; _sync_client_writer's own
@@ -9135,14 +9170,17 @@ def _sync_client_handler(conn, addr, stop_evt):
         except OSError:
             pass
 
-def _sync_server_listen(stop_evt):
-    """Accept-loop thread — binds ONLY to SYNC_SERVER_BIND_IP[0] (the
-    resolved Tailscale IP; curses_main never calls this thread at all if
-    that resolution failed, see its own SERVER_MODE branch) — NEVER 0.0.0.0.
-    Do not change this to bind a wildcard address: the state stream is
-    plaintext JSON after the handshake, acceptable only because it's
-    wrapped in Tailscale's own WireGuard tunnel — this port must never be
-    reachable from, or port-forwarded to, the public internet.
+def _sync_server_listen(label, host, stop_evt):
+    """Accept-loop thread for ONE specific bind address — curses_main starts
+    one of these per address in SYNC_SERVER_BIND_IPS (today: "LAN" and/or
+    "TS"; see that constant's docstring for why a Server binds both). Binds
+    ONLY the exact host address it's given — NEVER 0.0.0.0. Do not change
+    this to bind a wildcard address: the state stream is plaintext JSON
+    after the handshake, acceptable only because the two addresses this
+    is ever called with are either (a) a private LAN address, reachable
+    only to devices already on the same local network, or (b) a Tailscale
+    address, wrapped in its own WireGuard tunnel. Neither of this port's
+    listeners may ever be port-forwarded to the public internet.
 
     BUG FIXED (user-reported: "clients connected drops from 1 to 0 and
     never comes back", even with the Client itself still retrying):
@@ -9161,8 +9199,6 @@ def _sync_server_listen(stop_evt):
     accept() is logged and the loop keeps going; if the listening socket
     itself somehow needs replacing, the outer loop rebuilds it from
     scratch rather than giving up for good."""
-    global SYNC_SERVER_STATUS
-    host = SYNC_SERVER_BIND_IP[0]
     while not stop_evt.is_set():
         sock = None
         try:
@@ -9172,8 +9208,8 @@ def _sync_server_listen(stop_evt):
             sock.listen(5)
             sock.settimeout(1)
         except OSError as e:
-            SYNC_SERVER_STATUS[0] = f"error: {e}"
-            console_log(f"{RED}Sync server failed to bind {host}:{SYNC_PORT_DEFAULT} — {e}{RST}")
+            SYNC_SERVER_STATUS[label] = f"error: {e}"
+            console_log(f"{RED}Sync server ({label}) failed to bind {host}:{SYNC_PORT_DEFAULT} — {e}{RST}")
             if sock is not None:
                 try:
                     sock.close()
@@ -9182,8 +9218,8 @@ def _sync_server_listen(stop_evt):
             stop_evt.wait(5)
             continue   # retry the bind — e.g. "address already in use" right
                         # after a restart often clears up on its own shortly
-        SYNC_SERVER_STATUS[0] = f"listening on {host}:{SYNC_PORT_DEFAULT}"
-        console_log(f"{CYN}Sync server listening on {host}:{SYNC_PORT_DEFAULT}{RST}")
+        SYNC_SERVER_STATUS[label] = f"listening on {host}:{SYNC_PORT_DEFAULT}"
+        console_log(f"{CYN}Sync server ({label}) listening on {host}:{SYNC_PORT_DEFAULT}{RST}")
         try:
             while not stop_evt.is_set():
                 try:
@@ -9191,7 +9227,7 @@ def _sync_server_listen(stop_evt):
                 except socket.timeout:
                     continue
                 except OSError as e:
-                    console_log(f"{YLW}Sync accept() error (still listening): {e}{RST}")
+                    console_log(f"{YLW}Sync accept() error on {label} (still listening): {e}{RST}")
                     continue
                 threading.Thread(target=_sync_client_handler, args=(conn, addr, stop_evt), daemon=True).start()
         finally:
@@ -9200,12 +9236,12 @@ def _sync_server_listen(stop_evt):
             except OSError:
                 pass
         if not stop_evt.is_set():
-            SYNC_SERVER_STATUS[0] = "restarting listener…"
-            console_log(f"{YLW}Sync listener socket closed unexpectedly — restarting{RST}")
+            SYNC_SERVER_STATUS[label] = "restarting listener…"
+            console_log(f"{YLW}Sync listener socket ({label}) closed unexpectedly — restarting{RST}")
             stop_evt.wait(2)
-    SYNC_SERVER_STATUS[0] = "stopped"
+    SYNC_SERVER_STATUS[label] = "stopped"
 
-def _sync_client_connect_loop(host, port, stop_evt):
+def _sync_client_connect_loop(candidates, stop_evt):
     """Client Mode's ONE background thread — connects to a Server, does the
     HMAC handshake (client side), then reads newline-delimited JSON forever,
     dispatching each message into the same globals a Server's own engine/
@@ -9215,20 +9251,56 @@ def _sync_client_connect_loop(host, port, stop_evt):
     off (capped exponential: 1/2/4/5/5…s, see SYNC_CLIENT_MAX_BACKOFF) and
     retries until stop_evt fires.
     This is the entire extent of Client Mode's network activity; it never
-    touches a broker credential or the trading engine."""
+    touches a broker credential or the trading engine.
+
+    `candidates` is a list of (host, port) tried IN ORDER on every single
+    (re)connect attempt — not just the first. User request: "both,
+    depending on the day" (same LAN some days, remote/Tailscale others) —
+    rather than picking one transport, try the LAN address first (fast,
+    no VPN hop) and fall back to the Tailscale address only if that
+    fails. Every candidate but the last gets a short probe timeout
+    (SYNC_CLIENT_PROBE_TIMEOUT) so an unreachable LAN address on a
+    remote day doesn't stall the fallback for long; the LAST candidate
+    still gets the full, generous SYNC_CLIENT_CONNECT_TIMEOUT, since by
+    then it's the only path left and a slow-but-working link deserves
+    patience, not a race against a needlessly short clock. Re-probing
+    every attempt (rather than sticking with whichever one won last time)
+    means moving from home Wi-Fi back onto the same LAN self-heals onto
+    the faster path automatically, no restart needed."""
     global SYNC_CLIENT_STATUS
     backoff = 1
     while not stop_evt.is_set():
         sock = None
+        connected_addr = None
         auth_failed = False   # set on an explicit auth_fail so the bottom-of-
                                # loop reconnect message doesn't immediately
                                # stomp the more specific "check your secret"
                                # status before the user ever sees it
         try:
-            SYNC_CLIENT_STATUS[0] = "connecting…"
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(SYNC_CLIENT_CONNECT_TIMEOUT)
-            sock.connect((host, port))
+            last_err = ConnectionError("no candidate addresses configured")
+            for i, (cand_host, cand_port) in enumerate(candidates):
+                is_last = (i == len(candidates) - 1)
+                timeout = SYNC_CLIENT_CONNECT_TIMEOUT if is_last else min(SYNC_CLIENT_CONNECT_TIMEOUT, SYNC_CLIENT_PROBE_TIMEOUT)
+                SYNC_CLIENT_STATUS[0] = f"connecting… ({cand_host})"
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    sock.connect((cand_host, cand_port))
+                    connected_addr = (cand_host, cand_port)
+                    break
+                except OSError as e:
+                    last_err = e
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+            if sock is None:
+                raise last_err
+            SYNC_CLIENT_ACTIVE_ADDR[0], SYNC_CLIENT_ACTIVE_ADDR[1] = connected_addr
+            sock.settimeout(SYNC_CLIENT_CONNECT_TIMEOUT)   # full patience for the handshake —
+                                                             # connect() above already proved
+                                                             # this candidate is reachable
             _enable_tcp_keepalive(sock)
             buf = b""
 
@@ -10198,25 +10270,32 @@ def draw_sync_status_box(db, cols):
 
     if SERVER_MODE:
         title = " SYNC: SERVER "
-        ip = SYNC_SERVER_BIND_IP[0]
-        addr_line = f"{ip}:{SYNC_PORT_DEFAULT}" if ip else "no Tailscale IP found"
+        addr_line = " / ".join(f"{label} {ip}" for label, ip in SYNC_SERVER_BIND_IPS) or "no address found"
         with SYNC_SERVER_LOCK:
             n = len(SYNC_CLIENTS)
-        listener_ok = SYNC_SERVER_STATUS[0].startswith("listening on")
-        if not ip:
+        listener_ok = any(v.startswith("listening on") for v in SYNC_SERVER_STATUS.values())
+        if not SYNC_SERVER_BIND_IPS:
             status_line, pair = "not accepting clients", P_YELLOW
         elif not listener_ok:
             # Surfaces exactly the failure mode a user-reported bug hid
             # completely: "0 clients connected" used to look IDENTICAL
             # whether the listener had died outright or was just genuinely
             # idle — this branch is what makes the two distinguishable on
-            # screen instead of only in the activity log.
-            status_line, pair = SYNC_SERVER_STATUS[0], P_RED
+            # screen instead of only in the activity log. With two
+            # possible listeners now, "not ok" means NEITHER is up.
+            status_line = " / ".join(SYNC_SERVER_STATUS.values())
+            pair = P_RED
         else:
             status_line = f"{n} client{'s' if n != 1 else ''} connected"
             pair = P_CYAN
     else:
-        host, port = SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1]
+        active_host, active_port = SYNC_CLIENT_ACTIVE_ADDR[0], SYNC_CLIENT_ACTIVE_ADDR[1]
+        if active_host:
+            host, port = active_host, active_port
+        elif SYNC_SERVER_CANDIDATES:
+            host, port = SYNC_SERVER_CANDIDATES[0]
+        else:
+            host, port = None, None
         title = " SYNC: CLIENT "
         addr_line = f"{host}:{port}" if host else "no server address"
         status_line = SYNC_CLIENT_STATUS[0]
@@ -10550,6 +10629,26 @@ def _get_tailscale_ip():
     except Exception:
         return None
 
+def _get_lan_ip():
+    """Best-effort resolution of this machine's plain local-network IPv4
+    address — the address a device on the SAME Wi-Fi/router would use to
+    reach it directly, with no VPN hop at all. Opens a UDP socket
+    "connected" to a public address purely so the OS picks a route and
+    tells us which local interface/address it would use for it — no
+    packet is actually sent (UDP connect() never touches the network).
+    Returns None on any failure (e.g. no network connectivity at all).
+    Like _get_tailscale_ip, callers must NEVER fall back to binding
+    0.0.0.0 when this returns None — see _sync_server_listen's docstring."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
 def _login_screen(stdscr):
     """First screen curses_main shows, before anything else — gates BOTH
     Server and Client Mode behind one shared username/password stored in
@@ -10634,52 +10733,77 @@ def _mode_select_screen(stdscr):
 
 def _server_info_screen(stdscr):
     """Shown once, right after picking Server Mode — resolves this
-    machine's Tailscale IP (_get_tailscale_ip) and shows it plus the sync
-    port so the user can type it into a Client elsewhere. If Tailscale
-    resolution fails, Server Mode still proceeds — it just runs with no
-    listener thread (see curses_main's own SERVER_MODE branch, which is
-    the actual enforcement point for "never bind 0.0.0.0") rather than
-    ever silently falling back to a public bind address."""
-    ip = _get_tailscale_ip()
-    if ip:
-        _blocking_info_screen(stdscr, [
-            "", "SERVER MODE", "",
-            f"Clients connect to:  {ip}:{SYNC_PORT_DEFAULT}", "",
-            "Tailscale-only — this is NOT reachable from the public",
-            "internet, and must never be port-forwarded to be.", "",
-        ], color=P_CYAN)
+    machine's plain LAN address (_get_lan_ip) AND its Tailscale address
+    (_get_tailscale_ip) and shows whichever ones exist, plus the sync
+    port, so the user can type them into a Client elsewhere (comma-
+    separated — see _client_connect_screen). A Server now listens on
+    BOTH when both resolve: the LAN address lets a same-network Client
+    skip Tailscale entirely (simpler, no VPN hop, one less thing to be
+    flaky); the Tailscale address is still there for when the Client is
+    genuinely remote. If NEITHER resolves, Server Mode still proceeds —
+    it just runs with no listener thread at all (see curses_main's own
+    SERVER_MODE branch, which is the actual enforcement point for "never
+    bind 0.0.0.0") rather than ever silently falling back to a public
+    bind address."""
+    lan_ip = _get_lan_ip()
+    ts_ip = _get_tailscale_ip()
+    lines = ["", "SERVER MODE", ""]
+    if lan_ip:
+        lines.append(f"Local network:  {lan_ip}:{SYNC_PORT_DEFAULT}")
+    if ts_ip:
+        lines.append(f"Tailscale:      {ts_ip}:{SYNC_PORT_DEFAULT}")
+    if lan_ip or ts_ip:
+        lines += ["", "On a Client, enter whichever address(es) apply,",
+                   "comma-separated — the local one is tried first.", "",
+                   "Neither address is reachable from the public internet;",
+                   "never port-forward this port from your router.", ""]
+        _blocking_info_screen(stdscr, lines, color=P_CYAN)
     else:
         _blocking_info_screen(stdscr, [
-            "", "SERVER MODE — NO TAILSCALE IP FOUND", "",
-            "Couldn't resolve a Tailscale address (is `tailscale`",
-            "installed and `tailscaled` running/logged in?).", "",
+            "", "SERVER MODE — NO ADDRESS FOUND", "",
+            "Couldn't resolve a local network address or a Tailscale",
+            "address (is networking up? is `tailscale` installed and",
+            "tailscaled running/logged in?).", "",
             "Continuing WITHOUT accepting remote clients — the local",
             "trading engine and dashboard below are unaffected.", "",
         ], color=P_YELLOW)
 
-def _client_connect_screen(stdscr):
-    """Shown once, right after picking Client Mode — asks for the Server's
-    address (host[:port], port defaults to SYNC_PORT_DEFAULT if omitted).
-    Only loosely validated here (non-empty host) — actual reachability is
-    _sync_client_connect_loop's own job, which retries with backoff rather
-    than failing this screen outright. Returns (None, None) on Esc/empty
-    input — curses_main's own caller treats that as "go back to mode
-    select," not "proceed with nothing to connect to."""
-    stdscr.erase()
-    addr = _prompt_text(stdscr, ["", "CLIENT MODE", "", "Server address, e.g. 100.x.x.x or 100.x.x.x:8765", ""],
-                         prompt="Address: ")
-    if not addr:
-        return None, None
+def _parse_sync_addr(addr, default_port=SYNC_PORT_DEFAULT):
+    """host[:port] -> (host, port), defaulting port when omitted or
+    unparseable. Shared by _client_connect_screen's per-candidate parsing."""
     addr = addr.strip()
     if ":" in addr:
         host, _, port_s = addr.rpartition(":")
         try:
             port = int(port_s)
         except ValueError:
-            host, port = addr, SYNC_PORT_DEFAULT
+            host, port = addr, default_port
     else:
-        host, port = addr, SYNC_PORT_DEFAULT
-    return (host, port) if host else (None, None)
+        host, port = addr, default_port
+    return host, port
+
+def _client_connect_screen(stdscr):
+    """Shown once, right after picking Client Mode — asks for the Server's
+    address(es): one or more host[:port] entries, comma-separated, tried
+    in the order given on every (re)connect (see _sync_client_connect_
+    loop). Typical use: the LAN address first, Tailscale address as
+    fallback, e.g. "192.168.1.42, 100.x.x.x" — covers "same network most
+    days, remote some days" without picking one transport up front. Only
+    loosely validated here (non-empty host per entry) — actual
+    reachability is _sync_client_connect_loop's own job, which retries
+    with backoff rather than failing this screen outright. Returns None
+    on Esc/empty input — curses_main's own caller treats that as "go back
+    to mode select," not "proceed with nothing to connect to.\""""
+    stdscr.erase()
+    addr = _prompt_text(stdscr, ["", "CLIENT MODE", "",
+                                  "Server address(es), e.g. 192.168.1.42, 100.x.x.x:8765",
+                                  "(comma-separated — first reachable one wins)", ""],
+                         prompt="Address: ")
+    if not addr:
+        return None
+    candidates = [_parse_sync_addr(a) for a in addr.split(",") if a.strip()]
+    candidates = [(h, p) for h, p in candidates if h]
+    return candidates or None
 
 def _prompt_flatten_scope(stdscr):
     """[F] confirmation, 2026-07-28 user request: "make a pop-up with
@@ -11183,11 +11307,11 @@ def curses_main(stdscr):
             _server_info_screen(stdscr)
             break
         else:
-            host, port = _client_connect_screen(stdscr)
-            if host is None:
+            candidates = _client_connect_screen(stdscr)
+            if candidates is None:
                 continue   # Esc/empty address — back to the mode picker, not a crash
             CLIENT_MODE, SERVER_MODE = True, False
-            SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1] = host, port
+            SYNC_SERVER_CANDIDATES[:] = candidates
             break
     stdscr.erase()
 
@@ -11248,17 +11372,20 @@ def curses_main(stdscr):
         threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
 
     # Sync layer — the ONE thread Client Mode ever starts (never touches an
-    # exchange, a broker credential, or the trading engine); the listener
-    # Server Mode starts alongside its normal engine threads above.
+    # exchange, a broker credential, or the trading engine); Server Mode
+    # starts one listener thread PER resolved address (LAN and/or Tailscale)
+    # alongside its normal engine threads above.
     if CLIENT_MODE:
         threading.Thread(target=_sync_client_connect_loop,
-                          args=(SYNC_SERVER_ADDR[0], SYNC_SERVER_ADDR[1], _quit_evt),
+                          args=(SYNC_SERVER_CANDIDATES, _quit_evt),
                           daemon=True).start()
     if SERVER_MODE:
-        ip = _get_tailscale_ip()
-        if ip:
-            SYNC_SERVER_BIND_IP[0] = ip
-            threading.Thread(target=_sync_server_listen, args=(_quit_evt,), daemon=True).start()
+        for label, getter in (("LAN", _get_lan_ip), ("TS", _get_tailscale_ip)):
+            ip = getter()
+            if ip:
+                SYNC_SERVER_BIND_IPS.append((label, ip))
+                threading.Thread(target=_sync_server_listen, args=(label, ip, _quit_evt), daemon=True).start()
+        if SYNC_SERVER_BIND_IPS:
             threading.Thread(target=_sync_data_view_loop, args=(_quit_evt,), daemon=True).start()
         # else: already surfaced on _server_info_screen — Server just runs
         # with no listener, never falls back to binding 0.0.0.0.

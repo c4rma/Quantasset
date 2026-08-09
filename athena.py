@@ -5504,7 +5504,38 @@ class AthenaInstrument:
         it changes. The very first check ever (reset_day still None, e.g.
         a brand new blackjack_state.json) seeds the key WITHOUT logging a
         "reset" — there's nothing meaningful to reset from yet, and
-        loss_step is already 0 by construction."""
+        loss_step is already 0 by construction.
+
+        CRITICAL fix, 2026-08-09, user-reported (an ETH trade showed a
+        SECOND "Win (1R+$X)" progression immediately after the prior one
+        had already won — should have fully reset to plain "1R", doubly so
+        since it also crossed into a new day): the original "QQQ resets at
+        15:00 CT after open trades are flattened" wording above already
+        assumed no position could ever be open at QQQ's own reset moment
+        (QQQ has its own hardcoded 15:00 CT EOD-flatten elsewhere in this
+        file) — but ETH has no equivalent forced flatten at 19:30 CT, and
+        this function used to fire completely unconditionally regardless
+        of `self.state`. Confirmed against the real logs: a trade filled
+        2026-08-07T14:58 as "trade 2" of a win progression (label "Win
+        (1R+$16.66)") was STILL OPEN when ETH's own daily reset fired at
+        2026-08-07T19:30:00 — wiping `in_win_progression` back to False
+        mid-trade. When that same trade finally closed profitably the next
+        morning (2026-08-08T09:32), `_update_blackjack` had no memory it
+        was ever part of a progression and incorrectly treated the win as
+        brand new, starting ANOTHER win-progression state instead of the
+        expected full reset to 1R. Fixed: defer the entire check (don't
+        even compare/update the window key yet) while a position is
+        currently open for this asset — `_update_blackjack`'s own close-
+        time processing (which already correctly handles "trade 2 of a
+        win progression won -> full reset") gets to run first and clear
+        `in_win_progression` on its own terms; THEN, once state is no
+        longer IN_POSITION, this check re-fires on the very next cycle and
+        applies the (by-then-overdue) day-boundary reset normally. A
+        position that's still open at the next check is deferred again,
+        for as long as it takes — same "wait rather than corrupt in-flight
+        state" principle, not a one-shot skip."""
+        if self.state == "IN_POSITION":
+            return
         if not TZ_CT:
             return
         now = datetime.now(TZ_CT)

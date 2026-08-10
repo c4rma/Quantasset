@@ -258,6 +258,22 @@ DEFAULT_CONFIDENCE_DEADZONE = 0.20   # [C], equities only — fraction of the
 # than forced into a call/put guess (see classify_sign). 0 = old exact
 # binary split; crypto never uses this, it has real trade-side data.
 
+LIVE_QUOTE_MAX_DEVIATION = 0.01   # fetch_live_price's near-real-time quote
+# is only trusted if it's within this fraction of CBOE's own (delayed but
+# genuine) reference price — see poll_once_cboe. Confirmed live: Yahoo's
+# quote occasionally returns a stale/bad value (six real samples logged at
+# exactly $735.00 while CBOE and every neighboring poll agreed on
+# ~$720-722, a 1.8% divergence) with nothing else to catch it, since
+# fetch_live_price has no cross-check of its own. A bad value here doesn't
+# just mis-display once — it gets permanently logged into history, and
+# because the live chart recomputes each sample's bucket column from real
+# "now" every redraw, that one bad point's visibility cycles in and out of
+# the visible window as time passes, producing an intermittent-looking
+# spike that appears to "come and go" even though the bad data never
+# actually left. 1% comfortably clears normal same-window quote noise
+# (observed well under 0.1% in the same log) while catching the 1.8% bad
+# read that prompted this.
+
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -408,6 +424,33 @@ def fetch_bybit_option_trades(currency):
     above on why this is dedup-based rather than a time-range query."""
     result = _bybit_api("/v5/market/recent-trade", category="option", baseCoin=currency, limit=1000)
     return result.get("list") or []
+
+
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def fetch_live_price(symbol):
+    """Best-effort near-real-time quote via Yahoo's v8 chart 'meta' block —
+    NOT the OHLC bars, which Yahoo delays ~15m for equities same as CBOE,
+    but meta's own regularMarketPrice/regularMarketTime tick live. Same
+    fetch gex.py/charm.py/chain.py already use for exactly this reason:
+    CBOE's own "delayed_quotes" feed really is delayed (confirmed by its
+    own URL/name), so the option CHAIN data (premium, OI, greeks) stays
+    tied to CBOE's reference price for internal consistency, but the
+    DISPLAYED spot shouldn't inherit that same staleness just because it
+    happens to ride along in the same response. Returns None on any
+    failure — caller falls back to CBOE's own price rather than blocking
+    on this or leaving the display blank."""
+    try:
+        r = requests.get(YAHOO_CHART_URL.format(symbol), headers=_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
 
 
 def fetch_cboe_chain(symbol):
@@ -776,6 +819,12 @@ def _maybe_reset_for_new_day(state):
     startup) with state.lock already held. Only resets the flat/top-level
     fields — crypto's per-venue dicts are the caller's responsibility
     (see poll_once_crypto), since this function has no venue concept.
+    Equities' state.baseline (CBOE's per-contract session-volume tracking
+    — see poll_once_cboe) IS cleared here: CBOE's own volume counters
+    really do reset to 0 at a new session, so today's low readings should
+    be trusted as fresh starting points, not treated as the same-day
+    "glitch, don't trust it" case poll_once_cboe's own baseline check
+    guards against.
     Returns True if a reset just happened."""
     today = datetime.now().strftime("%m_%d_%Y")
     rolled = state.last_log_date is not None and today != state.last_log_date
@@ -786,6 +835,7 @@ def _maybe_reset_for_new_day(state):
         state.puts_cum_f = 0.0
         state.net_vol_cum = 0.0
         state.net_vol_cum_f = 0.0
+        state.baseline = {}
     state.last_log_date = today
     return rolled
 
@@ -1147,7 +1197,22 @@ def poll_once_cboe(symbol, state, min_trade_usd, confidence_deadzone):
     chain = fetch_cboe_chain(symbol)
     contracts = chain["contracts"]
     is_0dte = chain["is_0dte"]
-    spot = chain["spot"]
+    spot = chain["spot"]  # CBOE's own (delayed) reference — kept for the OTM
+    # classification below, staying consistent with what this same poll's
+    # premium/OI numbers are themselves relative to (same reasoning as
+    # gex.py's fetch_equity: GEX math stays tied to CBOE's own price).
+    live_quote = fetch_live_price(symbol)  # near-real-time for state.spot /
+    # the chart's price line — see fetch_live_price's own docstring for why
+    # this shouldn't inherit CBOE's staleness. Only trusted within
+    # LIVE_QUOTE_MAX_DEVIATION of CBOE's own (delayed but genuine)
+    # reference — see that constant's own comment for why: an unvalidated
+    # bad quote doesn't just mis-display once, it gets permanently baked
+    # into history. Falls back to CBOE's own price on a failed fetch OR
+    # an implausible one, so neither ever blanks the display.
+    if live_quote is not None and spot and abs(live_quote - spot) <= spot * LIVE_QUOTE_MAX_DEVIATION:
+        display_spot = live_quote
+    else:
+        display_spot = spot
     with state.lock:
         first_poll = not state.have_baseline
         d_calls = d_puts = d_calls_f = d_puts_f = interval_vol = d_netvol = d_netvol_f = 0.0
@@ -1155,10 +1220,27 @@ def poll_once_cboe(symbol, state, min_trade_usd, confidence_deadzone):
             key = c["key"]
             prev = state.baseline.get(key)
             cur = c["baseline_value"]
-            state.baseline[key] = cur
-            if prev is None or cur <= prev:
+            if prev is None:
+                state.baseline[key] = cur
+                continue
+            if cur <= prev:
+                # CBOE's own session volume only ever increases intraday —
+                # it resets to 0 solely at a new trading session, which is
+                # handled explicitly by _maybe_reset_for_new_day clearing
+                # state.baseline wholesale. A same-day drop here is almost
+                # certainly a transient feed glitch (a stale/corrupted
+                # snapshot), NOT a real reset — do NOT trust it as the new
+                # baseline. Confirmed live: overwriting on a bad low read
+                # used to silently corrupt the baseline, so the VERY NEXT
+                # normal poll would diff against that artificially-low
+                # value and produce one giant spurious delta, permanently
+                # baked into the cumulative total (a single-poll +$110K+
+                # premium spike from ~$1K of real activity, reproduced in
+                # a unit test). Skipping the overwrite here means the next
+                # poll retries against the last known-good baseline instead.
                 continue
             delta_contracts = cur - prev
+            state.baseline[key] = cur
             usd = delta_contracts * c["multiplier"]
             if usd <= 0:
                 continue
@@ -1181,14 +1263,14 @@ def poll_once_cboe(symbol, state, min_trade_usd, confidence_deadzone):
 
         if first_poll:
             state.have_baseline = True
-            state.spot = chain["spot"]
+            state.spot = display_spot
             day_suffix = " (new day — drift reset)" if _maybe_reset_for_new_day(state) else ""
             suffix = _maybe_reset_for_expiry(state, chain["expiry_label"])
             state.status = "baseline set — first sample next poll" + day_suffix + suffix
             state.last_poll = time.time()
         else:
             _record_sample(symbol, state, d_calls, d_puts, d_calls_f, d_puts_f, d_netvol, d_netvol_f,
-                            chain["spot"], chain["expiry_label"], interval_vol, "live")
+                            display_spot, chain["expiry_label"], interval_vol, "live")
 
 
 def poll_once(symbol, is_crypto, state, min_trade_usd, confidence_deadzone):
@@ -1630,6 +1712,7 @@ def draw(stdscr, ctrl, show_venues=False):
         history = list(state.history)
         calls_cum = state.calls_cum_f if filtered_mode else state.calls_cum
         puts_cum = state.puts_cum_f if filtered_mode else state.puts_cum
+        net_vol_cum = state.net_vol_cum_f if filtered_mode else state.net_vol_cum
         spot, status, expiry = state.spot, state.status, state.expiry_label
         last_poll = state.last_poll
         # computed while the lock is held — state.venues/venue_status are
@@ -1658,6 +1741,8 @@ def draw(stdscr, ctrl, show_venues=False):
     if view_offset > 0:
         title += f"[← {fmt_duration(view_offset * bar_interval)}] "
     safe_add(stdscr, 0, 0, title.ljust(w), cp(P_STATUS, bold=True))
+    clock_str = datetime.now(tz=CT).strftime("%H:%M:%S") + " "
+    safe_add(stdscr, 0, max(0, w - len(clock_str)), clock_str, cp(P_STATUS, bold=True))
 
     calls_str, puts_str, spot_str = fmt_money(calls_cum), fmt_money(puts_cum), fmt_price(spot)
     draw_segments(stdscr, 1, 1, [
@@ -1669,7 +1754,12 @@ def draw(stdscr, ctrl, show_venues=False):
         info = f"{venue_info}  {status}"
     else:
         info = (f"exp {expiry}  " if expiry else "") + status
-        if not is_market_open_et():
+        # background_poll_loop already sets status itself to "market closed
+        # — waiting for next session" while idling outside market hours
+        # (see BackgroundTracker) — don't prepend a second "market closed"
+        # on top of that (confirmed live: rendered as "market closed —
+        # market closed — waiting for next session" before this check).
+        if not is_market_open_et() and not status.startswith("market closed"):
             info = "market closed — " + info
     safe_add(stdscr, 1, max(0, w - len(info) - 1), info, cp(P_DIM))
 
@@ -1738,6 +1828,8 @@ def draw(stdscr, ctrl, show_venues=False):
     if pmin <= 0.0 <= pmax:
         zero_row = to_row(0.0, pmin, pmax, main_top, main_bot)
         safe_add(stdscr, zero_row, LEFT_W, "·" * plot_w, cp(P_DIM))
+        zero_lbl = fmt_axis_money(0.0)
+        safe_add(stdscr, zero_row, max(0, LEFT_W - 1 - len(zero_lbl)), zero_lbl, cp(P_DIM))
 
     # Live price line — ported from athena.py's own chart (its "live_g"/
     # live_row_y block): a dashed reference line at the CURRENT price
@@ -1775,6 +1867,11 @@ def draw(stdscr, ctrl, show_venues=False):
     plot_line(cols_puts, pmin, pmax, "●", cp(P_RED, bold=True))
     plot_line(cols_calls, pmin, pmax, "●", cp(P_GREEN, bold=True))
 
+    # Border between the premium chart and the bottom panel — the single
+    # blank row already reserved between them (main_bot+1 == vol_top-1),
+    # now drawn as a full-width divider instead of staying empty.
+    safe_add(stdscr, main_bot + 1, 0, "─" * w, cp(P_DIM))
+
     # Bottom panel — [N] toggles between two views of the same underlying
     # data, both always computed by build_columns:
     #   Net Volume (default) — cumulative signed CONTRACT count (buy -
@@ -1801,6 +1898,20 @@ def draw(stdscr, ctrl, show_venues=False):
         if nvmin <= 0.0 <= nvmax:
             zero_row_v = to_row(0.0, nvmin, nvmax, vol_top, vol_bot)
             safe_add(stdscr, zero_row_v, LEFT_W, "·" * plot_w, cp(P_DIM))
+            zero_lbl_v = fmt_axis_count(0.0)
+            safe_add(stdscr, zero_row_v, max(0, LEFT_W - 1 - len(zero_lbl_v)), zero_lbl_v, cp(P_DIM))
+
+        # Live Net Volume label — same TradingView-style dashed line +
+        # reverse-video badge as the premium panel's live price line above,
+        # tracking the CURRENT net_vol_cum (not just whatever the rightmost
+        # column happens to show — matters while scrolled back via [<-]).
+        # Drawn before plot_area's fill below, so it only shows through in
+        # gaps the fill doesn't cover — same non-destructive z-order.
+        if net_vol_cum is not None and nvmin <= net_vol_cum <= nvmax:
+            live_row_v = to_row(net_vol_cum, nvmin, nvmax, vol_top, vol_bot)
+            safe_add(stdscr, live_row_v, LEFT_W, "─" * plot_w, cp(P_YELLOW))
+            badge_v = fmt_axis_count(net_vol_cum).rjust(max(0, RIGHT_W - 1))
+            safe_add(stdscr, live_row_v, LEFT_W + plot_w + 1, badge_v, cp(P_YELLOW, bold=True) | curses.A_REVERSE)
 
         plot_area(stdscr, cols_netvol, nvmin, nvmax, vol_top, vol_bot, LEFT_W)
     else:

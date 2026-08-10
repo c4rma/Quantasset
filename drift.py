@@ -137,7 +137,11 @@ RESETS — two independent triggers, whichever fires first:
      until it wasn't: confirmed live — a long-running session's first
      sample of a new day had the exact same totals as the previous day's
      last sample, because nothing was re-checking the date once a process
-     was already up).
+     was already up). A live session running across this boundary shows it
+     on the chart too: a dim vertical line + "D" label at 00:00 CT (this
+     deployment's local time — see day_boundary_cols), so the value-cliff
+     the reset puts in the data has a visible marker instead of just
+     looking like an unexplained drop.
   2. A tracked nearest-expiry chain changes identity — "Net Drift" is flow
      within THE CHAIN currently being watched, so once that chain expires
      and the next one becomes nearest, the running total resets rather
@@ -231,7 +235,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-ET = ZoneInfo("America/New_York")
+ET = ZoneInfo("America/New_York")  # NYSE/Nasdaq's own official hours are quoted in
+# ET regardless of where this runs — used ONLY for is_market_open_et's actual
+# open/closed gating logic, never for display (see CT below for that).
+CT = ZoneInfo("America/Chicago")
 
 DERIBIT_BASE = "https://www.deribit.com/api/v2"
 OKX_BASE = "https://www.okx.com"
@@ -1360,10 +1367,12 @@ def fmt_duration(seconds):
 
 def fmt_time(ts, is_crypto):
     dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    # equities: always ET, matching the market's own convention regardless
-    # of where this is run. crypto has no exchange timezone, so show
-    # whatever clock the person watching the chart is actually on.
-    dt = dt.astimezone(ET) if not is_crypto else dt.astimezone()
+    # equities: always CT (not the market's own ET convention — a display
+    # preference, distinct from is_market_open_et's gating logic, which
+    # stays in ET since that's how NYSE/Nasdaq hours are actually defined).
+    # crypto has no exchange timezone, so show whatever clock the person
+    # watching the chart is actually on.
+    dt = dt.astimezone(CT) if not is_crypto else dt.astimezone()
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
@@ -1573,6 +1582,35 @@ def build_columns(history, x_end, bar_interval, plot_w, filtered=False):
     return ffill(cols_calls), ffill(cols_puts), ffill(cols_spot), ffill(cols_netvol), cols_vol
 
 
+def day_boundary_cols(x_end, bar_interval, plot_w):
+    """Column indices where local midnight falls inside that bucket — i.e.
+    the bucket's own local date differs from the PREVIOUS bucket's. Ported
+    from charthacker.py's "Period separator" (a dim vertical line at its
+    19:00 CT session-open boundary), but anchored to drift.py's own actual
+    reset boundary instead: 00:00 local time, the same clock
+    _maybe_reset_for_new_day fires on (00:00 CT on this deployment, since
+    the system's local timezone IS CT — see fmt_time's own CT usage).
+    Marking the SAME boundary the reset already fires on, rather than a
+    separately-chosen timezone, means the line always lines up with the
+    real value-cliff a day-reset already puts in the data (see calls_cum/
+    puts_cum/net_vol_cum zeroing in _maybe_reset_for_new_day) instead of
+    risking a line that doesn't match where the reset actually happened.
+
+    Each column's bucket only has ONE end-timestamp compared against the
+    next column's, so this catches each day transition once — correct for
+    any bar_interval that doesn't span more than a full day per bucket
+    (drift.py's bar sizes are always well under that in practice)."""
+    cols = []
+    prev_date = None
+    for i in range(plot_w):
+        ts_i = x_end - (plot_w - 1 - i) * bar_interval
+        d = datetime.fromtimestamp(ts_i).date()
+        if prev_date is not None and d != prev_date:
+            cols.append(i)
+        prev_date = d
+    return cols
+
+
 def draw(stdscr, ctrl, show_venues=False):
     with ctrl.lock:
         symbol, is_crypto, state, live = ctrl.symbol, ctrl.is_crypto, ctrl.state, ctrl.live
@@ -1649,7 +1687,22 @@ def draw(stdscr, ctrl, show_venues=False):
     vol_h = max(3, available - main_h - 1)
     main_top = top
     vol_top = main_top + main_h + 1
+    vol_bot = vol_top + vol_h - 1
     plot_w = max(1, w - LEFT_W - RIGHT_W - 1)
+
+    # Day separator — dim vertical line marking 00:00 CT (the same boundary
+    # _maybe_reset_for_new_day fires the daily reset on), spanning both
+    # panels. Same technique as charthacker.py's own "Period separator"
+    # (drawn behind the data, before any of the actual chart glyphs below,
+    # so it only shows through in the gaps) — see day_boundary_cols. Only
+    # ever appears for a live session that's been running across a
+    # midnight rollover; a single [H]-browsed historical day never spans
+    # one (each day gets its own log file).
+    for i in day_boundary_cols(x_end, bar_interval, plot_w):
+        col = LEFT_W + i
+        for rr in range(main_top + 1, vol_bot + 1):
+            safe_add(stdscr, rr, col, ":", cp(P_DIM))
+        safe_add(stdscr, main_top, col, "D", cp(P_DIM, bold=True))
 
     cols_calls, cols_puts, cols_spot, cols_netvol, cols_vol = build_columns(history, x_end, bar_interval, plot_w, filtered_mode)
 
@@ -1729,7 +1782,6 @@ def draw(stdscr, ctrl, show_venues=False):
     #     value and colored by that column's own sign, QuantData-style.
     #   Volume (the original panel) — unsigned per-bucket $ premium
     #     activity, plain green bars from the bottom up, no sign/zero-line.
-    vol_bot = vol_top + vol_h - 1
     if net_volume_mode:
         netvol_vals = [v for v in cols_netvol if v is not None] + [0.0]
         nvmin, nvmax = min(netvol_vals), max(netvol_vals)

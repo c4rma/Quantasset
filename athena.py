@@ -256,6 +256,31 @@ ASSETS = {
 LEVERAGE_BY_SYMBOL = {cfg["phemex_symbol"]: cfg["leverage"] for cfg in ASSETS.values()}
 ASSET_BY_SYMBOL = {cfg["phemex_symbol"]: name for name, cfg in ASSETS.items()}
 
+# ── Funding rate (user request 2026-08-10: "I forgot to account for funding
+# rate charges on positions") ──────────────────────────────────────────────
+# Phemex settles funding every 8 hours, at 00:00/08:00/16:00 UTC, on
+# whatever position is open AT THAT EXACT MOMENT: Funding = Position Value
+# (qty * mark price) x Funding Rate; positive rate -> longs pay shorts,
+# negative -> shorts pay longs (confirmed against Phemex's own published
+# formula). fundingRateRr on /md/v2/ticker/24hr (the same endpoint
+# fetch_last_price already polls) is the rate actually applied at the LAST
+# settlement; predFundingRateRr is the running estimate for the NEXT one,
+# not yet charged to anyone — both are plain decimals already (e.g.
+# "0.0001" = 0.01%), no /1e8 scaling like the older Ev/Er fields elsewhere
+# in Phemex's API use.
+FUNDING_TIMES_UTC_HOURS = (0, 8, 16)
+FUNDING_POLL_INTERVAL_SEC = 30   # dashboard display only needs to be this
+                                   # fresh — engine_loop's own cycle refetches
+                                   # at most this often, not every INTERVAL
+FUNDING_RATE_LOCK = threading.Lock()
+FUNDING_RATE = {}   # asset -> {"rate": float, "pred_rate": float, "ts": float}
+                     # — populated by engine_loop regardless of DRY_RUN (real
+                     # positions accrue funding too; this is display-only for
+                     # them), read by both draw_dashboard and SimAccount.
+                     # apply_funding_if_due (paper trading's own charge/credit).
+_funding_poll_ts = [0.0]   # single-item box, same convention as SYNC_CLIENT_
+                            # STATUS etc. — last time FUNDING_RATE was refreshed
+
 # ── "Blackjack" position-sizing mode ([B] toggle) ─────────────────────────────
 # Loss progression 1R,1R,2R,3R,5R (R = balance*PCT/100, the SAME "1 unit of
 # risk" the flat-PCT sizing already uses — Blackjack mode only changes HOW
@@ -4461,6 +4486,12 @@ class SimAccount:
         self.balance = default_balance
         self.positions = {}   # symbol -> {"pos_side","qty","avg_entry"}
         self.orders = {}      # clOrdID -> order dict
+        self.last_funding_ts = {}   # symbol -> unix ts of the last 00:00/08:00/
+                                     # 16:00 UTC funding boundary already charged
+                                     # to this symbol — see apply_funding_if_due.
+                                     # Persisted so a restart mid-window doesn't
+                                     # re-charge (or, worse, silently skip) funding
+                                     # that already happened.
         self._seq = 0
         self._load()
 
@@ -4471,14 +4502,15 @@ class SimAccount:
             self.balance = data.get("balance", self.balance)
             self.positions = data.get("positions", {})
             self.orders = data.get("orders", {})
+            self.last_funding_ts = data.get("last_funding_ts", {})
         except Exception:
             pass
 
     def _save(self):
         try:
             with open(SIM_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"balance": self.balance,
-                           "positions": self.positions, "orders": self.orders}, f, indent=2)
+                json.dump({"balance": self.balance, "positions": self.positions,
+                           "orders": self.orders, "last_funding_ts": self.last_funding_ts}, f, indent=2)
         except Exception:
             pass
 
@@ -4486,6 +4518,7 @@ class SimAccount:
         self.balance = balance
         self.positions = {}
         self.orders = {}
+        self.last_funding_ts = {}
         self._save()
         _archive_sim_logs()
         sim_log_event("reset", {"balance": balance})
@@ -4653,7 +4686,73 @@ class SimAccount:
                     if hit:
                         self._close(symbol, pos_side, o["qty"], price, "tp", target_type=o.get("type"))
                         self.orders.pop(oid, None)
+        self.apply_funding_if_due()
         self._save()
+
+    def apply_funding_if_due(self):
+        """Called every tick_matching() cycle (cheap unless a funding
+        boundary has actually just been crossed — one dict lookup and a
+        timestamp compare per open symbol otherwise). User-reported gap
+        2026-08-10: the sim account never charged/credited funding at
+        all, so paper P&L silently ran optimistic (or pessimistic)
+        relative to what a real Phemex position would actually see.
+
+        Mirrors Phemex's own real settlement exactly: every 8 hours, at
+        00:00/08:00/16:00 UTC, Funding = Position Value (qty x mark
+        price) x Funding Rate is charged to whoever holds a position AT
+        THAT MOMENT — longs pay shorts when the rate is positive, shorts
+        pay longs when it's negative. Expressed here as
+        `payment = -side_sign * notional * rate` (side_sign = +1 Long,
+        -1 Short): a Long with a positive rate gets a NEGATIVE payment
+        (pays), a Short gets the positive mirror (receives) — and the
+        signs flip together when the rate itself is negative. Added
+        straight to self.balance, exactly like a real account's balance
+        moves — NOT booked as a trade: no fee, doesn't touch avg_entry,
+        doesn't close/reduce the position.
+
+        Uses the latest FUNDING_RATE cache (kept fresh by engine_loop
+        regardless of DRY_RUN) and the latest live mark price as the
+        stand-in for "the rate/price AT the settlement instant" — checked
+        every ~0.5s via tick_matching, so in practice this fires within a
+        second of the real boundary, not on some slower poll that could
+        drift qty/price stale relative to the actual moment.
+
+        last_funding_ts[symbol] tracks the last boundary already charged
+        for each symbol, so a position held across MULTIPLE consecutive
+        windows (the normal case) gets charged once per window, not once
+        per tick — and a position that doesn't exist yet at a boundary
+        (opened after it) correctly waits for the NEXT one."""
+        boundary = _most_recent_funding_boundary()
+        changed = False
+        for symbol, pos in list(self.positions.items()):
+            if pos.get("qty", 0) <= 0:
+                continue
+            if self.last_funding_ts.get(symbol, 0.0) >= boundary:
+                continue   # already charged this window
+            asset = ASSET_BY_SYMBOL.get(symbol)
+            with FUNDING_RATE_LOCK:
+                info = FUNDING_RATE.get(asset)
+            if not info or info.get("rate") is None:
+                continue   # rate not fetched yet — leave last_funding_ts
+                            # alone so this window is still eligible once
+                            # engine_loop's next poll lands a real rate,
+                            # rather than silently skipping it forever
+            rate = info["rate"]
+            tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
+            mark_price = tape_bar["c"] if tape_bar is not None else pos["avg_entry"]
+            side_sign = 1.0 if pos["pos_side"] == "Long" else -1.0
+            notional = pos["qty"] * mark_price
+            payment = -side_sign * notional * rate
+            self.balance += payment
+            self.last_funding_ts[symbol] = boundary
+            sim_log_event("funding", {"symbol": symbol, "pos_side": pos["pos_side"], "qty": pos["qty"],
+                                       "mark_price": mark_price, "rate": rate, "payment": payment,
+                                       "balance": self.balance})
+            console_log(f"{pnl_color(payment)}Funding: {asset or symbol} {pos['pos_side']} "
+                        f"{fmt_money(payment)} (rate {rate * 100:+.4f}%){RST}")
+            changed = True
+        if changed:
+            self._save()
 
     async def to_account_snapshot(self):
         """totalUsedBalanceRv is real per-position margin usage — notional
@@ -4881,7 +4980,18 @@ async def fetch_resting_orders(symbol):
     same discipline as the rest of this session's real-trading hardening
     work). Returns the combined raw row list, or None if either call
     outright failed (network/auth) — an empty list is a genuine "no
-    resting orders" answer, distinct from "couldn't ask"."""
+    resting orders" answer, distinct from "couldn't ask".
+
+    BUG FIXED 2026-08-11 (found while diagnosing a user-reported "no TPs
+    showing" issue): confirmed live against a real account that the
+    'conditional'-filtered call does NOT actually restrict to only
+    conditional/stop orders on this API — it returned the exact same
+    rows as the plain call, so every order (SL included) came back
+    TWICE, and _parse_resting_orders' tp_legs ended up with duplicate
+    entries (the display's own tp_legs[:2] slice would then show the
+    same TP1 twice instead of TP1+TP2). Deduped here by orderID — the
+    one field guaranteed unique per real order — rather than trusting
+    the two calls to be genuinely disjoint."""
     try:
         active = await phemex_request('GET', '/g-orders/activeList',
                                        params={'symbol': symbol, 'currency': 'USDT'})
@@ -4890,17 +5000,24 @@ async def fetch_resting_orders(symbol):
     except Exception:
         return None
     rows = []
+    seen_order_ids = set()
     for resp in (active, cond):
         if resp and resp.get('code') == 0:
-            rows += (resp.get('data', {}).get('rows', []) or [])
+            for row in (resp.get('data', {}).get('rows', []) or []):
+                oid = row.get('orderID')
+                if oid is not None and oid in seen_order_ids:
+                    continue
+                if oid is not None:
+                    seen_order_ids.add(oid)
+                rows.append(row)
     return rows
 
 def _parse_resting_orders(rows, pos_side):
-    """Reconstructs (sl_price, tp_legs) for ONE position side from
-    Phemex's own /g-orders/activeList rows, using Athena's OWN clOrdID
-    naming convention (athena_sl_..., athena_tp{suffix}_{code}_...) to
-    classify each order precisely — far more reliable than guessing purely
-    from stopDirection/side the way copycat.py's own parsing has to
+    """Reconstructs (sl_price, sl_order_id, tp_legs) for ONE position side
+    from Phemex's own /g-orders/activeList rows, using Athena's OWN
+    clOrdID naming convention (athena_sl_..., athena_tp{suffix}_{code}_...)
+    to classify each order precisely — far more reliable than guessing
+    purely from stopDirection/side the way copycat.py's own parsing has to
     (it doesn't control clOrdID as tightly). tp_legs come back sorted by
     suffix (1, 2, ...), matching the SAME order _check_fill's own tp_legs
     list is always built in.
@@ -4913,10 +5030,18 @@ def _parse_resting_orders(rows, pos_side):
     response shapes — and from side-vs-close_side for plain (TP) orders,
     which need no stopDirection at all.
 
+    Each returned tp_leg carries its own real exchange orderID (added
+    2026-08-11 alongside sl_order_id) — lets _sync_moving_tps/
+    _apply_tp1_breakeven_lock cancel-by-ID just the ONE order that
+    actually needs to change instead of a blind cancel_all + replace-
+    everything (see _sync_moving_tps's own docstring for why that used
+    to be the only option, and why it isn't anymore).
+
     Pure function — no network I/O — same "testable without a real
     Phemex connection" discipline as _footprint_crosshair_clamp/
     _order_ok elsewhere in this file."""
     sl_price = None
+    sl_order_id = None
     tp_legs = []
     close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     for o in rows or []:
@@ -4927,6 +5052,22 @@ def _parse_resting_orders(rows, pos_side):
         o_pos_side = o.get('posSide')
         if not o_pos_side:
             stop_dir, side_o = o.get('stopDirection', ''), o.get('side', '')
+            # BUG FIXED 2026-08-11, user-reported ("in a live trade but
+            # there are no TPs" — dashboard showed SL only, both TP legs
+            # missing, even though a direct /g-orders/activeList query
+            # confirmed both were genuinely resting on Phemex the whole
+            # time): Phemex returns the literal string "UNSPECIFIED" for
+            # stopDirection on a plain (non-conditional) order, not ''/None
+            # as this code assumed — `not stop_dir` is False for a non-
+            # empty string, so the "plain Limit TP leg" fallback below
+            # never matched, o_pos_side stayed None, and every TP row got
+            # silently filtered out by the `o_pos_side != pos_side` check
+            # right after this block. The SL was unaffected (a real
+            # conditional order always carries an actual 'Rising'/'Falling'
+            # direction), which is exactly why the position looked "SL
+            # fine, TPs vanished" instead of everything vanishing.
+            if stop_dir == 'UNSPECIFIED':
+                stop_dir = ''
             if stop_dir == 'Falling' and side_o == 'Sell':
                 o_pos_side = 'Long'
             elif stop_dir == 'Rising' and side_o == 'Buy':
@@ -4944,6 +5085,7 @@ def _parse_resting_orders(rows, pos_side):
             spx = o.get('stopPxRp')
             if spx:
                 sl_price = float(spx)
+                sl_order_id = o.get('orderID')
         elif cl_id.startswith('athena_tp'):
             # athena_tp{suffix}_{code}_{ts} -> ['athena', 'tp1', 'GF', '...']
             parts = cl_id.split('_')
@@ -4955,16 +5097,40 @@ def _parse_resting_orders(rows, pos_side):
                 leg_type = _tp_type_from_code(code)
                 tp_legs.append({"level": float(price), "qty": float(qty),
                                  "type": leg_type, "tracks_gex_flip": leg_type == "GEX Flip",
-                                 "_suffix": suffix})
+                                 "order_id": o.get('orderID'), "_suffix": suffix})
     tp_legs.sort(key=lambda leg: leg["_suffix"])
     for leg in tp_legs:
         del leg["_suffix"]
-    return sl_price, tp_legs
+    return sl_price, sl_order_id, tp_legs
 
 async def cancel_all(symbol):
+    """Real mode: Phemex's DELETE /g-orders/all needs to be called TWICE
+    with different `untriggered` values to actually clear everything —
+    confirmed against Phemex's own docs: untriggered='false' cancels
+    ACTIVE orders (Athena's TP legs); untriggered='true' cancels a
+    still-resting, not-yet-triggered CONDITIONAL order (Athena's SL is
+    always one of these). The old single-call version never actually
+    touched a resting SL at all — confirmed directly against a real
+    account while diagnosing a user-reported bug ("in a live trade but
+    there are no TPs" led to a second, related report: spurious
+    "CRITICAL — stop-loss placement FAILED" / TE_STOP_LOSS_ORDER_
+    DUPLICATED errors every time a moving TP target refreshed). That
+    specific misfire is now fixed at the SOURCE — _sync_moving_tps/
+    _apply_tp1_breakeven_lock no longer call cancel_all for the SL at
+    all (see their own docstrings) — but this function's OTHER real
+    callers (_manage_position's flat-cleanup and PCVR-flip-close,
+    _flatten_now) genuinely mean "this position is going away, clear
+    EVERYTHING resting on it", and the old behavior would have silently
+    left an orphaned SL order sitting on the account indefinitely,
+    referencing a position that no longer exists. Returns ok only if
+    BOTH calls succeeded."""
     if DRY_RUN:
         return await get_sim_account().cancel_all(symbol)
-    return await phemex_request('DELETE', '/g-orders/all', params={'symbol': symbol, 'untriggered': 'false'})
+    active_result = await phemex_request('DELETE', '/g-orders/all', params={'symbol': symbol, 'untriggered': 'false'})
+    cond_result = await phemex_request('DELETE', '/g-orders/all', params={'symbol': symbol, 'untriggered': 'true'})
+    if _order_ok(active_result) and _order_ok(cond_result):
+        return {"code": 0}
+    return active_result if not _order_ok(active_result) else cond_result
 
 async def market_close(symbol, pos_side, qty, reason="flip"):
     # `reason` only matters for --dry-run's own sim_logs "closed" reason tag
@@ -5002,6 +5168,35 @@ async def fetch_last_price(symbol):
         return float(last) if last is not None else None
     except Exception:
         return None
+
+async def fetch_funding_rate(symbol):
+    """(current_rate, predicted_rate) as plain decimals (e.g. 0.0001 =
+    0.01%), read straight off the same /md/v2/ticker/24hr response
+    fetch_last_price already polls — fundingRateRr (the rate actually
+    applied at the LAST 00:00/08:00/16:00 UTC settlement) and
+    predFundingRateRr (the running estimate for the NEXT one). Returns
+    (None, None) on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            r = await client.get(f"{PHEMEX_BASE_URL}/md/v2/ticker/24hr", params={'symbol': symbol})
+        data = r.json().get('result') or r.json().get('data') or {}
+        rate = data.get('fundingRateRr')
+        pred = data.get('predFundingRateRr')
+        return (float(rate) if rate is not None else None,
+                float(pred) if pred is not None else None)
+    except Exception:
+        return None, None
+
+def _most_recent_funding_boundary(now_ts=None):
+    """The most recent 00:00/08:00/16:00 UTC funding timestamp at or before
+    `now_ts` (default: now), as a unix timestamp. Shared by SimAccount.
+    apply_funding_if_due (has a NEW boundary been crossed since we last
+    charged this symbol?) and the dashboard's own countdown-to-next display."""
+    now_ts = now_ts if now_ts is not None else time.time()
+    dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    candidates = [dt.replace(hour=h, minute=0, second=0, microsecond=0) for h in FUNDING_TIMES_UTC_HOURS]
+    candidates = [c if c <= dt else c - timedelta(days=1) for c in candidates]
+    return max(c.timestamp() for c in candidates)
 
 async def cancel_order(symbol, pos_side, order_id):
     """Cancel ONE specific resting order by its exchange-assigned orderID —
@@ -5100,6 +5295,13 @@ class AthenaInstrument:
         self._tp1_lock_done = False   # 2026-07-28 — see _apply_tp1_breakeven_lock;
                                         # reset to False on every new fill (_check_fill)
                                         # so it fires exactly once per trade's own TP1.
+        self._sl_order_id = None   # real mode only — the CURRENT resting SL's own
+                                     # exchange orderID, kept in sync alongside
+                                     # self.position["sl_order_id"] (see _place_sl_
+                                     # with_retry) — lets _apply_tp1_breakeven_lock
+                                     # cancel-by-ID instead of cancel_all, added
+                                     # 2026-08-11 alongside the same fix in
+                                     # _sync_moving_tps (see that docstring for why).
 
     async def _place_sl_with_retry(self, symbol, pos_side, sl_price, price_decimals, retries=3):
         """A resting stop-loss is the single most important order this app
@@ -5125,6 +5327,7 @@ class AthenaInstrument:
                 if self._sl_missing:
                     console_log(f"{self.asset}: {GRN}stop-loss re-established at {fmt_num(sl_price)}{RST}")
                 self._sl_missing = False
+                self._sl_order_id = (last_result.get("data") or {}).get("orderID")
                 return True
         console_log(f"{self.asset}: {RED}{BLD}CRITICAL — stop-loss placement FAILED after {retries} attempts "
                     f"({last_result}) — position has NO resting stop-loss right now{RST}")
@@ -5138,7 +5341,15 @@ class AthenaInstrument:
         risk) — so this logs loudly rather than retrying in a loop, same
         general "check the actual response, don't just catch exceptions"
         fix as _place_sl_with_retry, added while hardening the real-money
-        order path for the first time it's ever been exercised."""
+        order path for the first time it's ever been exercised.
+
+        Returns the new order's exchange orderID on success (real mode) —
+        or None on any failure, AND None for a successful sim fill (no
+        comparable id concept there). Changed from a plain True/False
+        2026-08-11 so _sync_moving_tps can cancel-by-ID just the ONE leg
+        that actually changed instead of blowing away the whole bracket —
+        no existing caller used the old boolean return value, so this is
+        a safe widening, not a breaking change."""
         try:
             result = await place_tp_leg(symbol, pos_side, qty_str, level, price_decimals, suffix, target_type)
         except Exception as e:
@@ -5148,8 +5359,8 @@ class AthenaInstrument:
                         f"({result}) — that leg is NOT resting{RST}")
             log_event(self.asset, "tp_placement_failed",
                        {"suffix": suffix, "level": level, "type": target_type, "result": result, "sim": DRY_RUN})
-            return False
-        return True
+            return None
+        return (result.get("data") or {}).get("orderID")
 
     def _realized_since_last_fill(self, symbol, pos_side):
         """Sum of already-realized 'closed' event pnl for the CURRENTLY-
@@ -5285,7 +5496,7 @@ class AthenaInstrument:
             # orders/_parse_resting_orders, added 2026-07-25 — the exact
             # gap flagged, not fixed, in the earlier real-trading hardening
             # pass) instead of leaving sl_price/tp_legs empty and guessing.
-            sl_price, tp_legs = None, []
+            sl_price, sl_order_id, tp_legs = None, None, []
             symbol = self.cfg["phemex_symbol"]
             if DRY_RUN:
                 sim_orders = get_sim_account().orders
@@ -5315,9 +5526,10 @@ class AthenaInstrument:
                 try:
                     rows = await fetch_resting_orders(symbol)
                     if rows is not None:
-                        sl_price, tp_legs = _parse_resting_orders(rows, pos_side)
+                        sl_price, sl_order_id, tp_legs = _parse_resting_orders(rows, pos_side)
                 except Exception as e:
                     console_log(f"{self.asset}: resting-order lookup failed on restart ({e}) — SL/TP display will show n/a")
+            self._sl_order_id = sl_order_id
 
             # A resurrected position with NO resting SL order found is
             # EXACTLY what _place_sl_with_retry's own _sl_missing flag
@@ -5362,7 +5574,7 @@ class AthenaInstrument:
             if DRY_RUN:
                 realized_pnl += already_realized
             self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
-                              "sl_price": sl_price, "tp_legs": tp_legs,
+                              "sl_price": sl_price, "sl_order_id": sl_order_id, "tp_legs": tp_legs,
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                               "price_decimals": pd, "qty_decimals": qd,
                               "realized_pnl": realized_pnl}
@@ -6058,14 +6270,14 @@ class AthenaInstrument:
             tp1_qty = tp1_steps * step
             tp2_qty = tp2_steps * step
             (tp1_level, tp1_t), (tp2_level, tp2_t) = valid[0], valid[1]
-            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
-            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
-            tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"]},
-                       {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": tp2_t["type"] == "GEX Flip", "type": tp2_t["type"]}]
+            tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+            tp2_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
+            tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid},
+                       {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": tp2_t["type"] == "GEX Flip", "type": tp2_t["type"], "order_id": tp2_oid}]
         elif valid:
             tp1_level, tp1_t = valid[0]
-            await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
-            tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"]}]
+            tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+            tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid}]
         else:
             tp_legs = []
             if targets:
@@ -6087,7 +6299,7 @@ class AthenaInstrument:
                                               "tp_legs": [{"level": leg["level"], "type": leg["type"]} for leg in tp_legs]})
 
         self.position = {"pos_side": p["pos_side"], "qty": qty, "orig_qty": qty, "fill_price": fill_price,
-                          "sl_price": sl_price, "tp_legs": tp_legs,
+                          "sl_price": sl_price, "sl_order_id": self._sl_order_id, "tp_legs": tp_legs,
                           # entry_day_ct (see _update_closed_pnl_today):
                           # tagged HERE, at the real fill moment, so
                           # "Closed PnL Today" attributes this trade's
@@ -6255,10 +6467,12 @@ class AthenaInstrument:
             try:
                 rows = await fetch_resting_orders(symbol)
                 if rows is not None:
-                    real_sl_price, real_tp_legs = _parse_resting_orders(rows, pos_side)
+                    real_sl_price, real_sl_order_id, real_tp_legs = _parse_resting_orders(rows, pos_side)
                     self.position["tp_legs"] = real_tp_legs
                     if real_sl_price is not None:
                         self.position["sl_price"] = real_sl_price
+                        self.position["sl_order_id"] = real_sl_order_id
+                        self._sl_order_id = real_sl_order_id
                         if self._sl_missing:
                             console_log(f"{self.asset}: {GRN}stop-loss confirmed resting at {fmt_num(real_sl_price)}{RST}")
                         self._sl_missing = False
@@ -6385,14 +6599,34 @@ class AthenaInstrument:
         A TP leg's own `type` field (set at entry — "GEX Flip", "Cluster",
         "BT", or "ST", see _check_fill/tp_legs) says which rule applies.
 
-        Full bracket refresh (cancel everything, re-place SL + all TP legs
-        at current prices) rather than a selective single-order amend/
-        cancel — Phemex's real API for editing just one resting order
-        isn't verified/wired up here, and this is simpler and doesn't risk
-        touching the wrong order; SL's own price is unchanged so
-        re-placing it is a harmless no-op. Trade-off, worth knowing: the
-        position briefly has no resting SL between the cancel and
-        re-place calls."""
+        Real mode: cancels and re-places ONLY the leg(s) that actually
+        moved, by their own exchange orderID (cancel_order) — the SL and
+        any unchanged leg are never touched. DRY_RUN keeps the older
+        full-bracket-refresh behavior (cancel_all, then re-place the SL
+        and every leg regardless of whether it moved) — SimAccount's own
+        cancel/replace is a free, instant, local dict mutation with none
+        of real trading's downsides, so there's no bug to fix there and
+        no reason to add the extra complexity.
+
+        CHANGED 2026-08-11 (two user reports at once): (1) "only modify
+        the TP that had the change" — the old code always rebuilt the
+        WHOLE bracket even when e.g. only the GEX-Flip-tracking leg
+        moved and the other leg was untouched. (2) repeated spurious
+        "CRITICAL — stop-loss placement FAILED" / TE_STOP_LOSS_ORDER_
+        DUPLICATED (code 11084) alarms, confirmed by direct inspection
+        of the real account: cancel_all's `untriggered=false` only
+        cancels ACTIVE orders — a still-resting, not-yet-triggered
+        conditional stop (exactly what Athena's own SL always is) is
+        NEVER actually cancelled by it (see cancel_all's own docstring).
+        So every single time this function fired, it cancelled the TWO
+        TP legs, left the SL genuinely untouched, then tried to place a
+        BRAND NEW SL on top of the one that was there the whole time —
+        Phemex correctly rejected it as a duplicate, and the position's
+        SL was never actually at risk despite the alarming log line. The
+        real fix here is the SAME one that fixes (1): stop touching the
+        SL from this function at all — there was never a reason to
+        "refresh" it in the first place, since its price never changes
+        here."""
         tp_legs = self.position.get("tp_legs") or []
         if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST") for leg in tp_legs):
             return
@@ -6447,10 +6681,12 @@ class AthenaInstrument:
             new_cluster_levels = [k for k, _tier in clusters]
 
         new_legs = []
-        changed = False
         cluster_rank = 0   # which cluster-tracking leg, in tp_legs' own order, we're on
         for leg in tp_legs:
             level = leg["level"]
+            leg_changed = False   # per-LEG now (was a single function-wide `changed`
+                                    # shared by every leg) — see this function's own
+                                    # docstring for why that mattered
             # Same guard as the initial placement (_check_fill) — if the
             # refreshed target has drifted close enough to the fill price
             # that it would land within R of it (or past it), skip this
@@ -6461,7 +6697,7 @@ class AthenaInstrument:
                 if _safe(new_gex_level):
                     self._tp_skip_warned.pop("gex", None)
                     if abs(level - new_gex_level) > 0.005:
-                        level, changed = new_gex_level, True
+                        level, leg_changed = new_gex_level, True
                 else:
                     # Log-spam fix, 2026-07-25 (user-reported: "TP refresh
                     # is getting skipped constantly") — this branch is
@@ -6488,7 +6724,7 @@ class AthenaInstrument:
                     if _safe(new_cluster_level):
                         self._tp_skip_warned.pop(warn_key, None)
                         if abs(level - new_cluster_level) > 0.005:
-                            level, changed = new_cluster_level, True
+                            level, leg_changed = new_cluster_level, True
                     else:
                         if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_cluster_level) > 0.01:
                             console_log(f"{self.asset}: {YLW}Cluster (rank {cluster_rank}) too close to fill "
@@ -6504,44 +6740,70 @@ class AthenaInstrument:
                 if _safe(new_bt_st_level):
                     self._tp_skip_warned.pop(warn_key, None)
                     if abs(level - new_bt_st_level) > 0.005:
-                        level, changed = new_bt_st_level, True
+                        level, leg_changed = new_bt_st_level, True
                 else:
                     if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_bt_st_level) > 0.01:
                         console_log(f"{self.asset}: {YLW}{leg['type']} too close to fill (${fmt_num(new_bt_st_level)}) — TP refresh skipped this cycle{RST}")
                         self._tp_skip_warned[warn_key] = new_bt_st_level
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
-                              "type": leg.get("type", "?")})
+                              "type": leg.get("type", "?"),
+                              "order_id": leg.get("order_id"),   # carried over as-is unless this
+                              "_changed": leg_changed})          # leg is actually replaced below
 
-        if not changed:
+        if not any(leg["_changed"] for leg in new_legs):
             return
 
         pd = self.position.get("price_decimals", 2)
         qd = self.position.get("qty_decimals", 2)
-        try:
-            cancel_result = await cancel_all(symbol)
-        except Exception as e:
-            console_log(f"{self.asset}: TP refresh — cancel failed ({e})")
-            return
-        if not _order_ok(cancel_result):
-            # Hardening fix, 2026-07-25: same "check the response, not just
-            # exceptions" gap as the flip-close path — a failed cancel here
-            # must abort the refresh rather than proceeding to re-place SL/
-            # TP on top of whatever's still resting (duplicate orders), and
-            # since nothing was cancelled the ORIGINAL SL/TP are presumably
-            # still in place, so this is a safe abort, not a naked position.
-            console_log(f"{self.asset}: {RED}TP refresh — cancel failed ({cancel_result}), aborting this cycle's refresh{RST}")
-            log_event(self.asset, "tp_refresh_cancel_failed", {"result": cancel_result})
-            return
-        # The cancel above just pulled the SL too — every attempt to
-        # re-place it here is genuinely load-bearing (see _place_sl_with_
-        # retry's own docstring: a naked real position is the worst
-        # failure mode in this whole app), not just a formality.
-        sl_price = self.position.get("sl_price")
-        if sl_price is not None:
-            await self._place_sl_with_retry(symbol, pos_side, sl_price, pd)
-        for i, leg in enumerate(new_legs, start=1):
-            await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+
+        if DRY_RUN:
+            # Unchanged from before — see this function's own docstring for
+            # why DRY_RUN keeps the simpler full-bracket-refresh behavior.
+            try:
+                cancel_result = await cancel_all(symbol)
+            except Exception as e:
+                console_log(f"{self.asset}: TP refresh — cancel failed ({e})")
+                return
+            if not _order_ok(cancel_result):
+                console_log(f"{self.asset}: {RED}TP refresh — cancel failed ({cancel_result}), aborting this cycle's refresh{RST}")
+                log_event(self.asset, "tp_refresh_cancel_failed", {"result": cancel_result})
+                return
+            sl_price = self.position.get("sl_price")
+            if sl_price is not None:
+                await self._place_sl_with_retry(symbol, pos_side, sl_price, pd)
+            for i, leg in enumerate(new_legs, start=1):
+                await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+        else:
+            # Real mode — selective per-leg cancel+replace, SL never touched
+            # at all. See this function's own docstring for the full story.
+            for i, leg in enumerate(new_legs, start=1):
+                if not leg["_changed"]:
+                    continue   # untouched — same order_id, same resting order, no API calls
+                old_leg = tp_legs[i - 1]   # new_legs was built by iterating tp_legs in
+                                            # order, so index i-1 is this leg's own prior state
+                old_order_id = old_leg.get("order_id")
+                if old_order_id:
+                    try:
+                        cancel_result = await cancel_order(symbol, pos_side, old_order_id)
+                    except Exception as e:
+                        cancel_result = {"code": -1, "msg": str(e)}
+                    if not _order_ok(cancel_result):
+                        # Same "abort to the safe state" philosophy as the old
+                        # cancel_all-failed branch — the old order is presumably
+                        # STILL resting (cancel didn't take), so placing a new
+                        # one now would create a genuine duplicate. Leave this
+                        # leg exactly as it was rather than risk that.
+                        console_log(f"{self.asset}: {YLW}TP{i} cancel failed before refresh "
+                                    f"({cancel_result}) — leaving it resting at its old level{RST}")
+                        new_legs[i - 1] = old_leg
+                        continue
+                new_oid = await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+                leg["order_id"] = new_oid   # None on failure — _place_tp_leg_checked
+                                              # already logged the loud "NOT resting" warning
+
+        for leg in new_legs:
+            leg.pop("_changed", None)
         self.position["tp_legs"] = new_legs
         console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
         log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
@@ -6604,11 +6866,20 @@ class AthenaInstrument:
         tp1_qty relative to orig_qty, leaving little room), the existing
         SL is left untouched rather than loosening protection.
 
-        Same full-bracket-refresh mechanism _sync_moving_tps already uses
-        (cancel everything, re-place SL at the new price + every remaining
-        TP leg unchanged) — same brief no-resting-SL window between cancel
-        and re-place, same accepted trade-off, for the same reason (no
-        verified single-order amend endpoint wired up here)."""
+        Real mode: cancels and re-places ONLY the SL, by its own exchange
+        orderID (cancel_order) — the still-correct, unchanged TP legs are
+        never touched at all. DRY_RUN keeps the older full-bracket-refresh
+        behavior (cancel_all, then re-place the SL AND every TP leg even
+        though they didn't change) — see _sync_moving_tps's own docstring
+        for why DRY_RUN doesn't need the same fix (SimAccount's cancel/
+        replace is free and instant, no real-exchange downside). Changed
+        2026-08-11 alongside that same fix, same root cause: real mode's
+        cancel_all here never actually cancelled the TP legs' own
+        conditional-vs-active nuance the OTHER way — the two TP legs are
+        genuinely re-placed here with NO reason to be, pure waste, though
+        unlike _sync_moving_tps this specific call site never actually
+        misfired into a duplicate-SL error (the SL price genuinely IS
+        changing here, so re-placing it was never a duplicate)."""
         entry = self.position["fill_price"]
         rem_qty = self.position["qty"]
         if rem_qty <= 0:
@@ -6635,18 +6906,38 @@ class AthenaInstrument:
         pd = self.position.get("price_decimals", 2)
         qd = self.position.get("qty_decimals", 2)
         tp_legs = self.position.get("tp_legs") or []
-        try:
-            cancel_result = await cancel_all(symbol)
-        except Exception as e:
-            console_log(f"{self.asset}: TP1 breakeven-lock — cancel failed ({e})")
-            return
-        if not _order_ok(cancel_result):
-            console_log(f"{self.asset}: {RED}TP1 breakeven-lock — cancel failed ({cancel_result}), aborting{RST}")
-            log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
-            return
-        await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
-        for i, leg in enumerate(tp_legs, start=1):
-            await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+
+        if DRY_RUN:
+            # Unchanged from before — see this function's own docstring.
+            try:
+                cancel_result = await cancel_all(symbol)
+            except Exception as e:
+                console_log(f"{self.asset}: TP1 breakeven-lock — cancel failed ({e})")
+                return
+            if not _order_ok(cancel_result):
+                console_log(f"{self.asset}: {RED}TP1 breakeven-lock — cancel failed ({cancel_result}), aborting{RST}")
+                log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
+                return
+            await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
+            for i, leg in enumerate(tp_legs, start=1):
+                await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+        else:
+            # Real mode — cancel+replace ONLY the SL, by its own orderID.
+            # The TP legs are never touched: nothing about them changed,
+            # so there's no reason to cancel and re-place them at all.
+            old_sl_order_id = self.position.get("sl_order_id")
+            if old_sl_order_id:
+                try:
+                    cancel_result = await cancel_order(symbol, pos_side, old_sl_order_id)
+                except Exception as e:
+                    cancel_result = {"code": -1, "msg": str(e)}
+                if not _order_ok(cancel_result):
+                    console_log(f"{self.asset}: {RED}TP1 breakeven-lock — SL cancel failed ({cancel_result}), aborting{RST}")
+                    log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
+                    return
+            await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
+            self.position["sl_order_id"] = self._sl_order_id
+
         self.position["sl_price"] = new_sl
         console_log(f"{self.asset}: {GRN}{BLD}TP1 hit — SL locked to guarantee "
                     f"{fmt_money(target_total_net)} net profit (SL -> {fmt_num(new_sl)}){RST}")
@@ -10173,6 +10464,26 @@ async def engine_loop():
 
         qqq_market_closed = bool((snapshot.get("qqq") or {}).get("market_closed")) if snapshot else True
         APP_STATE.publish(instruments, age, acc, live_prices, qqq_market_closed)
+
+        # Funding rate — refreshed on its own throttle (FUNDING_POLL_INTERVAL_SEC),
+        # not every INTERVAL cycle; the dashboard display doesn't need it that
+        # fresh, and Phemex's own predicted rate itself only moves gradually
+        # over each 8h window. Runs regardless of DRY_RUN — a REAL position
+        # accrues funding too, so this cache is shown either way; only
+        # SimAccount.apply_funding_if_due (paper trading's own charge/credit,
+        # called from tick_matching) is DRY_RUN-only, since Phemex itself
+        # already settles funding on the real account with no help from Athena.
+        if time.time() - _funding_poll_ts[0] >= FUNDING_POLL_INTERVAL_SEC:
+            _funding_poll_ts[0] = time.time()
+            for inst in instruments:
+                try:
+                    rate, pred = await fetch_funding_rate(inst.cfg["phemex_symbol"])
+                except Exception:
+                    rate, pred = None, None
+                if rate is not None:
+                    with FUNDING_RATE_LOCK:
+                        FUNDING_RATE[inst.asset] = {"rate": rate, "pred_rate": pred, "ts": time.time()}
+
         await _fast_match_wait(INTERVAL)
 
     log_event("SYSTEM", "shutdown", {})
@@ -10341,6 +10652,20 @@ def draw_dashboard(db, snap, cols):
         if display_price is None:
             display_price = inst.get("price")
         price_txt = f"   {DIM}price {display_price:.2f}{RST}" if display_price is not None else ""
+        # Funding rate (user request 2026-08-10) — the rate ACTUALLY applied
+        # at the last 00:00/08:00/16:00 UTC settlement, plus a countdown to
+        # the next one. Shown for every asset regardless of DRY_RUN/mode —
+        # market data, not tied to whether Athena itself holds a position —
+        # see FUNDING_RATE's own module-level docstring for the fetch/cache.
+        funding_txt = ""
+        with FUNDING_RATE_LOCK:
+            finfo = FUNDING_RATE.get(asset)
+        if finfo and finfo.get("rate") is not None:
+            rate = finfo["rate"]
+            remaining = max(0.0, _most_recent_funding_boundary() + 8 * 3600 - time.time())
+            hh, mm = int(remaining // 3600), int((remaining % 3600) // 60)
+            funding_txt = (f"   {DIM}funding {RST}{pnl_color(rate)}{rate * 100:+.4f}%{RST}"
+                           f"{DIM} (next {hh}h{mm:02d}m){RST}")
         bj_txt = ""
         if BLACKJACK_MODE:
             bj = BLACKJACK_STATE[asset]
@@ -10348,7 +10673,7 @@ def draw_dashboard(db, snap, cols):
                 bj_txt = f"   {DIM}BJ: win progression ({fmt_num(bj['win_step_back'], 0)}R + ${bj['win_profit_dollars']:,.2f}){RST}"
             else:
                 bj_txt = f"   {DIM}BJ: {fmt_num(BLACKJACK_STEPS[bj['loss_step']], 0)}R{RST}"
-        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bj_txt}")
+        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{funding_txt}{bj_txt}")
         y += 1
         detail = "  " + "  ".join(
             (GRN if lights.get(n) else RED) + n + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")

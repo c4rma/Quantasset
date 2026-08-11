@@ -5267,6 +5267,1036 @@ async def _test_phemex_order_roundtrip(phemex_symbol):
     except Exception as e:
         return False, f"{phemex_symbol}: {e}"
 
+# ── Net Drift (Premium) — ported from drift.py ─────────────────────────────
+# Cumulative net options-premium flow (calls vs. puts) against live price,
+# tracked continuously for BOTH assets — ETH (crypto, aggregated across
+# Deribit+OKX+Bybit trade tapes) and QQQ (CBOE snapshot-diffing + Yahoo live
+# quote) — the same always-on tracking drift.py itself already built for
+# exactly this pair (its own BG_SYMBOLS), just collapsed onto Athena's
+# existing "always track ETH+QQQ, nothing else" model instead of drift.py's
+# own Controller/BackgroundTracker/[S]-switch-to-any-symbol machinery —
+# Athena never needs a third, arbitrary symbol the way the standalone tool
+# does, so that whole layer of indirection isn't needed here (see
+# _drift_engine_loop's own docstring). Reachable as the 4th stop in the [M]
+# mode cycle (Trading -> GEX -> Status -> Net Drift -> Trading).
+#
+# Data/math ported essentially verbatim from drift.py — same formulas, same
+# per-venue quirks already verified live there (OKX's (instId, tradeId)
+# dedup key, since tradeId alone collides across instruments; Bybit's
+# confirmed geo-block, left wired up rather than removed, since it costs one
+# fast-failing request/poll and would "just work" from an unblocked network;
+# CBOE's same-day volume-drop guard against a corrupted baseline). Every name
+# below is _drift_/DRIFT_-prefixed, matching this file's own established
+# per-module self-containment convention — GEX_/STATUS_ each already keep
+# their own separate Deribit/Yahoo/CBOE fetchers rather than sharing one
+# (see GEX_DERIBIT_BASE_URL/STATUS_YAHOO_CHART_URL) — this mirrors that
+# exact pattern from the GEX (Phase 2), Status (Phase 3), CharHacker
+# (Phase 3b) merges already done in this file, not a new convention.
+
+DRIFT_DERIBIT_BASE = "https://www.deribit.com/api/v2"
+DRIFT_OKX_BASE = "https://www.okx.com"
+DRIFT_BYBIT_BASE = "https://api.bybit.com"
+DRIFT_CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+DRIFT_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_DRIFT_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+DRIFT_ASSETS = ("ETH", "QQQ")             # Athena's own fixed pair — drift.py's own BG_SYMBOLS
+DRIFT_IS_CRYPTO = {"ETH": True, "QQQ": False}
+DRIFT_CRYPTO_CCY = {"ETH": "ETH"}          # Deribit/OKX/Bybit currency code per crypto asset
+
+DRIFT_DEFAULT_INTERVAL = 15         # [I] — how often each asset polls for new data
+DRIFT_MIN_INTERVAL = 5
+DRIFT_DEFAULT_BAR_INTERVAL = 60     # [B] — chart bucket size, independent of poll cadence
+DRIFT_MIN_BAR_INTERVAL = 5
+DRIFT_DEFAULT_MIN_TRADE_USD = 100.0        # [T] — see _drift_poll_venue_deribit etc.
+DRIFT_DEFAULT_CONFIDENCE_DEADZONE = 0.20   # [C] — equities (QQQ) only, see _drift_classify_sign
+DRIFT_LIVE_QUOTE_MAX_DEVIATION = 0.01   # _drift_fetch_live_price's near-real-time quote is only
+                                          # trusted within this fraction of CBOE's own (delayed
+                                          # but genuine) reference price — see _drift_poll_once_cboe.
+                                          # Ported verbatim: ~drift.py confirmed live a bad Yahoo
+                                          # quote (six samples at exactly $735.00 while CBOE and
+                                          # every neighboring poll agreed on ~$720-722) gets
+                                          # permanently baked into history with nothing else to
+                                          # catch it, since fetch_live_price has no cross-check of
+                                          # its own — 1% comfortably clears normal quote noise
+                                          # while catching that 1.8% bad read.
+
+DRIFT_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "drift_logs")   # own top-level folder, same
+                                                                 # "each merged subsystem gets
+                                                                 # its own log root" convention
+                                                                 # as logs/status_logs/sim_logs
+
+DRIFT_CRYPTO_VENUES = ("deribit", "okx", "bybit")
+DRIFT_VENUE_ABBREV = {"deribit": "D", "okx": "OKX", "bybit": "Bybit"}
+
+
+# ── Net Drift data fetchers ─────────────────────────────────────────────────
+def _drift_deribit_api(path, **params):
+    r = requests.get(DRIFT_DERIBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def _drift_fetch_deribit_nearest_expiry(currency):
+    """Nearest non-expired expiry's instrument set for ETH. Returns
+    ({instrument_name, ...}, expiry_label)."""
+    instruments = _drift_deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+    target_exp = min((e for e in by_exp if e > now_ms), default=None)
+    if not target_exp:
+        raise RuntimeError(f"no active {currency} option expiry found")
+    instrument_set = {ins["instrument_name"] for ins in by_exp[target_exp]}
+    expiry_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d %b %Y")
+    return instrument_set, expiry_label
+
+def _drift_fetch_deribit_index(currency):
+    result = _drift_deribit_api("/public/get_index_price", index_name=f"{currency.lower()}_usd")
+    return result.get("index_price")
+
+def _drift_fetch_deribit_trades(currency, start_ms, end_ms, instrument_set):
+    """Every real option trade print between start_ms/end_ms (exclusive of
+    anything already seen — callers pass start_ms = last poll's end_ms),
+    filtered to `instrument_set` (the nearest-expiry contracts). Ground-truth
+    taker direction straight from Deribit. Paginates via has_more/sorting=asc."""
+    trades = []
+    cursor = start_ms
+    for _ in range(20):   # hard cap on pagination rounds — safety net, not expected to hit
+        result = _drift_deribit_api(
+            "/public/get_last_trades_by_currency_and_time",
+            currency=currency, kind="option", start_timestamp=cursor, end_timestamp=end_ms,
+            count=1000, include_old="true", sorting="asc",
+        )
+        batch = result.get("trades") or []
+        trades.extend(t for t in batch if t.get("instrument_name") in instrument_set)
+        if not result.get("has_more") or not batch:
+            break
+        cursor = batch[-1]["timestamp"] + 1
+    return trades
+
+def _drift_okx_api(path, **params):
+    r = requests.get(DRIFT_OKX_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") not in ("0", 0):
+        raise RuntimeError(j.get("msg") or f"OKX error {j.get('code')}")
+    return j.get("data") or []
+
+def _drift_fetch_okx_nearest_expiry(currency):
+    """Returns (instrument_set, ct_val, ct_mult, expiry_label). ct_val/ct_mult
+    are OKX's own notional-value fields — usd_premium = px * ct_val * ct_mult * sz * idxPx."""
+    instruments = _drift_okx_api("/api/v5/public/instruments", instType="OPTION", uly=f"{currency}-USD")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        exp_ms = int(ins["expTime"])
+        if exp_ms > now_ms:
+            by_exp.setdefault(exp_ms, []).append(ins)
+    if not by_exp:
+        raise RuntimeError(f"no active OKX {currency} option expiry found")
+    target_exp = min(by_exp)
+    chain_ins = by_exp[target_exp]
+    instrument_set = {ins["instId"] for ins in chain_ins}
+    ct_val = float(chain_ins[0]["ctVal"])
+    ct_mult = float(chain_ins[0]["ctMult"])
+    expiry_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d %b %Y")
+    return instrument_set, ct_val, ct_mult, expiry_label
+
+def _drift_fetch_okx_option_trades(currency):
+    """Fixed ~100-most-recent-trades snapshot across the whole currency
+    family — no time-range query exists, so callers dedup against
+    previously-seen (instId, tradeId) pairs rather than windowing by time."""
+    return _drift_okx_api("/api/v5/public/option-trades", instFamily=f"{currency}-USD")
+
+def _drift_bybit_api(path, **params):
+    r = requests.get(DRIFT_BYBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("retCode") != 0:
+        raise RuntimeError(j.get("retMsg") or f"Bybit error {j.get('retCode')}")
+    return j.get("result") or {}
+
+def _drift_fetch_bybit_nearest_expiry(currency):
+    result = _drift_bybit_api("/v5/market/instruments-info", category="option", baseCoin=currency, limit=1000)
+    instruments = result.get("list") or []
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        if ins.get("status") != "Trading":
+            continue
+        exp_ms = int(ins["deliveryTime"])
+        if exp_ms > now_ms:
+            by_exp.setdefault(exp_ms, []).append(ins)
+    if not by_exp:
+        raise RuntimeError(f"no active Bybit {currency} option expiry found")
+    target_exp = min(by_exp)
+    instrument_set = {ins["symbol"] for ins in by_exp[target_exp]}
+    expiry_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d %b %Y")
+    return instrument_set, expiry_label
+
+def _drift_fetch_bybit_option_trades(currency):
+    """Fixed most-recent-trades snapshot (up to 1000) — same dedup-not-window
+    shape/limitation as OKX. Bybit options are USDC-settled, so price is
+    already ~USD, no index-price multiply needed."""
+    result = _drift_bybit_api("/v5/market/recent-trade", category="option", baseCoin=currency, limit=1000)
+    return result.get("list") or []
+
+def _drift_fetch_live_price(symbol):
+    """Best-effort near-real-time quote via Yahoo's v8 chart 'meta' block —
+    NOT the OHLC bars (Yahoo delays those ~15m for equities same as CBOE).
+    Returns None on any failure — caller falls back to CBOE's own price."""
+    try:
+        r = requests.get(DRIFT_YAHOO_CHART_URL.format(symbol), headers=_DRIFT_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
+
+def _drift_fetch_cboe_chain(symbol):
+    """Nearest expiry (today if listed, else the closest future date) via
+    CBOE's delayed-quotes feed. Returns {"contracts": [...], "spot": float,
+    "expiry_label": str, "is_0dte": bool}."""
+    r = requests.get(DRIFT_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    payload = r.json().get("data") or {}
+    if not payload:
+        raise RuntimeError(f"empty CBOE response for {symbol}")
+    spot = payload.get("current_price")
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in payload.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        exp = name[-15:-9]
+        by_exp.setdefault(exp, []).append(o)
+    if not by_exp:
+        raise RuntimeError(f"no options found for {symbol}")
+    if today in by_exp:
+        target_exp = today
+    else:
+        future = sorted(e for e in by_exp if e >= today)
+        target_exp = future[0] if future else min(by_exp)
+
+    contracts = []
+    for o in by_exp[target_exp]:
+        name = o["option"]
+        otype = "call" if name[-9] == "C" else "put"
+        last = float(o.get("last_trade_price") or 0.0)
+        vol = float(o.get("volume") or 0.0)
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            strike = None
+        contracts.append({
+            "key": name, "otype": otype, "strike": strike,
+            "bid": float(o.get("bid") or 0.0), "ask": float(o.get("ask") or 0.0),
+            "last": last, "baseline_value": vol, "multiplier": last * 100.0,
+        })
+    expiry_label = f"20{target_exp[:2]}-{target_exp[2:4]}-{target_exp[4:6]}"
+    # is_0dte: did we actually get TODAY's listing, or fall back to the next
+    # future date because today has none? [F] filtered mode's 0DTE filter
+    # means NOT accepting that fallback — see _drift_poll_once_cboe.
+    return {"contracts": contracts, "spot": spot, "expiry_label": expiry_label,
+            "is_0dte": target_exp == today}
+
+
+# ── Net Drift classification/math ───────────────────────────────────────────
+def _drift_midpoint(bid, ask):
+    bid = bid or 0.0
+    ask = ask or 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    if ask > 0:
+        return ask
+    if bid > 0:
+        return bid
+    return None
+
+def _drift_parse_strike_otype(dashed_name):
+    """Deribit/OKX/Bybit instrument identifiers all end in
+    ...-<STRIKE>-<C|P> — confirmed identical convention across all three."""
+    parts = dashed_name.rsplit("-", 2)
+    return float(parts[-2]), ("call" if parts[-1] == "C" else "put")
+
+def _drift_is_otm(otype, strike, spot):
+    """[F] filtered mode's OTM filter: call OTM means strike > spot, put OTM
+    means strike < spot; at-the-money and anything unclassifiable is excluded."""
+    if strike is None or spot is None:
+        return False
+    return strike > spot if otype == "call" else strike < spot
+
+def _drift_classify_sign(last, bid, ask, deadzone_frac):
+    """+1/-1 aggressor-proxy classification (nearer ask = buy, nearer bid =
+    sell), with a "deadzone" around the midpoint — a print landing within
+    deadzone_frac of the bid-ask spread (centered on mid) is unclassified
+    (0.0) rather than forced into calls/puts on a coin-flip guess. Equities
+    (QQQ) only — crypto (ETH) has real trade-side data and never calls this."""
+    mid = _drift_midpoint(bid, ask)
+    if not last or mid is None:
+        return 0.0
+    if bid and ask and ask > bid:
+        spread = ask - bid
+        if abs(last - mid) < spread * deadzone_frac / 2.0:
+            return 0.0
+    return 1.0 if last >= mid else -1.0
+
+def _drift_is_market_open_et(now=None):
+    now = now or datetime.now(tz=TZ_ET)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
+# ── Net Drift persistence — drift_logs/YYYY/MM/DD/drift_<ASSET>_MM_DD_YYYY.jsonl
+def _drift_date_folder(date_str):
+    """Ported verbatim from drift.py's own _date_folder — same MM_DD_YYYY
+    split GEX's own _gex_date_folder already uses."""
+    mm, dd, yyyy = date_str.split("_")
+    folder = os.path.join(DRIFT_LOG_DIR_BASE, yyyy, mm, dd)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _drift_log_path(asset, date_str):
+    return os.path.join(_drift_date_folder(date_str), f"drift_{asset}_{date_str}.jsonl")
+
+def _drift_append_log(asset, sample):
+    try:
+        with open(_drift_log_path(asset, datetime.now().strftime("%m_%d_%Y")), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.fromtimestamp(sample["ts"]).isoformat(),
+                "calls": sample["calls"], "puts": sample["puts"],
+                "spot": sample["spot"], "vol": sample["vol"],
+                "expiry": sample.get("expiry"),
+                "venues": sample.get("venues"),
+                "calls_f": sample.get("calls_f"), "puts_f": sample.get("puts_f"),
+                "net_vol": sample.get("net_vol"), "net_vol_f": sample.get("net_vol_f"),
+            }) + "\n")
+    except Exception:
+        pass
+
+def _drift_load_log(asset, date_str):
+    path = _drift_log_path(asset, date_str)
+    samples = []
+    if not os.path.exists(path):
+        return samples
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                samples.append({
+                    "ts": datetime.fromisoformat(d["ts"]).timestamp(),
+                    "calls": d["calls"], "puts": d["puts"],
+                    "spot": d["spot"], "vol": d["vol"],
+                    "expiry": d.get("expiry"), "venues": d.get("venues"),
+                    "calls_f": d.get("calls_f", 0.0), "puts_f": d.get("puts_f", 0.0),
+                    "net_vol": d.get("net_vol", 0.0), "net_vol_f": d.get("net_vol_f", 0.0),
+                })
+            except Exception:
+                continue
+    return samples
+
+
+# ── Net Drift live state ────────────────────────────────────────────────────
+def _drift_new_venue():
+    return {
+        "calls_cum": 0.0, "puts_cum": 0.0,
+        "calls_cum_f": 0.0, "puts_cum_f": 0.0,
+        "net_vol_cum": 0.0, "net_vol_cum_f": 0.0,
+        "expiry_label": None, "cursor": None,
+    }
+
+class _DriftState:
+    """One per Athena asset (ETH, QQQ) — mirrors drift.py's own State class
+    1:1. Unlike drift.py, there's no separate "live_state vs displayed state"
+    split here: Athena's engine threads (_drift_engine_loop) ALWAYS poll into
+    this same object for as long as the process runs — [H] historical
+    browsing (UI-side) loads a SEPARATE read-only _DriftState snapshot for
+    display without ever touching this one, same non-interference drift.py's
+    own view_historical already guarantees."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.history = []
+        self.calls_cum = 0.0
+        self.puts_cum = 0.0
+        self.calls_cum_f = 0.0
+        self.puts_cum_f = 0.0
+        self.net_vol_cum = 0.0
+        self.net_vol_cum_f = 0.0
+        self.baseline = {}          # QQQ (CBOE) only: contract key -> last-seen volume
+        self.expiry_label = None    # QQQ only — ETH tracks expiry per-venue instead
+        self.venues = {name: _drift_new_venue() for name in DRIFT_CRYPTO_VENUES}   # ETH only
+        self.venue_status = {}      # ETH only
+        self.have_baseline = False
+        self.spot = None
+        self.status = "starting…"
+        self.last_poll = 0.0
+        self.last_log_date = None   # "MM_DD_YYYY"
+
+DRIFT_STATE = {asset: _DriftState() for asset in DRIFT_ASSETS}
+DRIFT_READY = {asset: threading.Event() for asset in DRIFT_ASSETS}   # set on each
+                    # asset's first completed poll cycle — mirrors _ch_ready,
+                    # read only by the loading screen (_startup_progress)
+DRIFT_INTERVAL = {asset: DRIFT_DEFAULT_INTERVAL for asset in DRIFT_ASSETS}                    # [I]
+DRIFT_MIN_TRADE_USD = {asset: DRIFT_DEFAULT_MIN_TRADE_USD for asset in DRIFT_ASSETS}           # [T]
+DRIFT_CONFIDENCE_DEADZONE = {asset: DRIFT_DEFAULT_CONFIDENCE_DEADZONE for asset in DRIFT_ASSETS}  # [C], QQQ only
+DRIFT_REFRESH_EVENT = {asset: threading.Event() for asset in DRIFT_ASSETS}   # [R] refresh-now
+DRIFT_NEXT_POLL_TS = {asset: time.time() for asset in DRIFT_ASSETS}          # for the UI countdown
+
+
+def _drift_seed_state_from_samples(state, samples, is_crypto):
+    """Shared by _drift_seed_today (live resume) and the [H] historical
+    loader: populates state from the last of a list of previously-logged
+    samples. For ETH, restores each venue's own sub-totals from the
+    sample's "venues" breakdown when present; older logs with no "venues"
+    key attribute the whole total to Deribit. Only Deribit's cursor is
+    seeded from the resume point (a real ms timestamp it can backfill
+    from) — OKX/Bybit have no time-range query to seed, their next poll
+    just re-baselines from a fresh snapshot."""
+    if not samples:
+        return
+    state.history = samples
+    last = samples[-1]
+    state.last_log_date = datetime.fromtimestamp(last["ts"]).strftime("%m_%d_%Y")
+    state.spot = last["spot"]
+    state.calls_cum = last["calls"]
+    state.puts_cum = last["puts"]
+    state.calls_cum_f = last.get("calls_f", 0.0)
+    state.puts_cum_f = last.get("puts_f", 0.0)
+    state.net_vol_cum = last.get("net_vol", 0.0)
+    state.net_vol_cum_f = last.get("net_vol_f", 0.0)
+    if is_crypto:
+        breakdown = last.get("venues")
+        if breakdown:
+            for name, v in breakdown.items():
+                if name in state.venues:
+                    state.venues[name]["calls_cum"] = v.get("calls", 0.0)
+                    state.venues[name]["puts_cum"] = v.get("puts", 0.0)
+                    state.venues[name]["calls_cum_f"] = v.get("calls_f", 0.0)
+                    state.venues[name]["puts_cum_f"] = v.get("puts_f", 0.0)
+                    state.venues[name]["net_vol_cum"] = v.get("net_vol", 0.0)
+                    state.venues[name]["net_vol_cum_f"] = v.get("net_vol_f", 0.0)
+                    state.venues[name]["expiry_label"] = v.get("expiry")
+        else:
+            state.venues["deribit"]["calls_cum"] = last["calls"]
+            state.venues["deribit"]["puts_cum"] = last["puts"]
+            state.venues["deribit"]["calls_cum_f"] = last.get("calls_f", 0.0)
+            state.venues["deribit"]["puts_cum_f"] = last.get("puts_f", 0.0)
+            state.venues["deribit"]["net_vol_cum"] = last.get("net_vol", 0.0)
+            state.venues["deribit"]["net_vol_cum_f"] = last.get("net_vol_f", 0.0)
+            state.venues["deribit"]["expiry_label"] = last.get("expiry")
+        state.venues["deribit"]["cursor"] = int(last["ts"] * 1000)
+    else:
+        state.expiry_label = last.get("expiry")
+
+def _drift_seed_today(state, asset, is_crypto):
+    date_str = datetime.now().strftime("%m_%d_%Y")
+    samples = _drift_load_log(asset, date_str)
+    _drift_seed_state_from_samples(state, samples, is_crypto)
+
+def _drift_maybe_reset_for_new_day(state):
+    """Calendar-day reset — must be called EVERY poll (not just at startup),
+    with state.lock already held. Only resets flat/top-level fields — ETH's
+    per-venue dicts are the caller's own responsibility (see
+    _drift_poll_once_crypto). Returns True if a reset just happened."""
+    today = datetime.now().strftime("%m_%d_%Y")
+    rolled = state.last_log_date is not None and today != state.last_log_date
+    if rolled:
+        state.calls_cum = 0.0
+        state.puts_cum = 0.0
+        state.calls_cum_f = 0.0
+        state.puts_cum_f = 0.0
+        state.net_vol_cum = 0.0
+        state.net_vol_cum_f = 0.0
+        state.baseline = {}
+    state.last_log_date = today
+    return rolled
+
+def _drift_maybe_reset_for_expiry(state, expiry_label):
+    """Resets the running totals whenever the tracked nearest-expiry chain
+    itself changes, so continuing the same running total never silently
+    blends two unrelated chains' flow into one number. Must be called with
+    state.lock already held. Returns a status suffix describing what happened."""
+    rolled = state.expiry_label is not None and expiry_label != state.expiry_label
+    old = state.expiry_label
+    if rolled:
+        state.calls_cum = 0.0
+        state.puts_cum = 0.0
+        state.calls_cum_f = 0.0
+        state.puts_cum_f = 0.0
+        state.net_vol_cum = 0.0
+        state.net_vol_cum_f = 0.0
+    state.expiry_label = expiry_label
+    return f" (expiry rolled {old} -> {expiry_label} — drift reset)" if rolled else ""
+
+def _drift_record_sample(asset, state, d_calls, d_puts, d_calls_f, d_puts_f, d_netvol, d_netvol_f,
+                          spot, expiry_label, interval_vol, live_status):
+    day_suffix = " (new day — drift reset)" if _drift_maybe_reset_for_new_day(state) else ""
+    suffix = day_suffix + _drift_maybe_reset_for_expiry(state, expiry_label)
+    state.calls_cum += d_calls
+    state.puts_cum += d_puts
+    state.calls_cum_f += d_calls_f
+    state.puts_cum_f += d_puts_f
+    state.net_vol_cum += d_netvol
+    state.net_vol_cum_f += d_netvol_f
+    sample = {"ts": time.time(), "calls": state.calls_cum, "puts": state.puts_cum,
+              "calls_f": state.calls_cum_f, "puts_f": state.puts_cum_f,
+              "net_vol": state.net_vol_cum, "net_vol_f": state.net_vol_cum_f,
+              "spot": spot, "vol": interval_vol, "expiry": expiry_label}
+    state.history.append(sample)
+    _drift_append_log(asset, sample)
+    state.have_baseline = True
+    state.spot = spot
+    state.status = live_status + suffix
+    state.last_poll = time.time()
+
+
+# ── Net Drift venue pollers (ETH) ────────────────────────────────────────────
+def _drift_empty_venue_result(cursor, expiry_label, rolled):
+    return {"d_calls": 0.0, "d_puts": 0.0, "d_calls_f": 0.0, "d_puts_f": 0.0,
+            "d_netvol": 0.0, "d_netvol_f": 0.0, "interval_vol": 0.0,
+            "cursor": cursor, "expiry_label": expiry_label, "rolled": rolled}
+
+def _drift_poll_venue_deribit(asset, cursor_prev, expiry_prev, min_trade_usd, fallback_spot):
+    """Pure function — reads the venue's prior cursor/expiry as plain
+    arguments and returns its contribution without touching shared state,
+    so all three venues can run concurrently. True historical range query
+    — cursor_prev being an earlier timestamp naturally backfills that gap."""
+    currency = DRIFT_CRYPTO_CCY[asset]
+    now_ms = int(time.time() * 1000)
+    first_poll = cursor_prev is None
+    instrument_set, expiry_label = _drift_fetch_deribit_nearest_expiry(currency)
+    rolled = expiry_prev is not None and expiry_label != expiry_prev
+    if first_poll:
+        return _drift_empty_venue_result(now_ms, expiry_label, rolled)
+    trades = _drift_fetch_deribit_trades(currency, cursor_prev, now_ms, instrument_set)
+    d_calls = d_puts = d_calls_f = d_puts_f = interval_vol = d_netvol = d_netvol_f = 0.0
+    for t in trades:
+        contracts = float(t["amount"])
+        trade_spot = float(t["index_price"])
+        usd = float(t["price"]) * contracts * trade_spot
+        if usd < min_trade_usd:
+            continue
+        sign = 1.0 if t.get("direction") == "buy" else -1.0
+        strike, otype = _drift_parse_strike_otype(t["instrument_name"])
+        otm = _drift_is_otm(otype, strike, trade_spot)
+        interval_vol += usd
+        d_netvol += sign * contracts
+        if otm:
+            d_netvol_f += sign * contracts
+        if otype == "call":
+            d_calls += usd * sign
+            if otm:
+                d_calls_f += usd * sign
+        else:
+            d_puts += usd * sign
+            if otm:
+                d_puts_f += usd * sign
+    return {"d_calls": d_calls, "d_puts": d_puts, "d_calls_f": d_calls_f, "d_puts_f": d_puts_f,
+            "d_netvol": d_netvol, "d_netvol_f": d_netvol_f, "interval_vol": interval_vol,
+            "cursor": now_ms, "expiry_label": expiry_label, "rolled": rolled}
+
+def _drift_poll_venue_okx(asset, cursor_prev, expiry_prev, min_trade_usd, fallback_spot):
+    """cursor_prev/new cursor are sets of already-seen (instId, tradeId)
+    pairs — no time-range query exists, so unlike Deribit this can only
+    dedup against the current recent-trades snapshot, never backfill a gap
+    wider than that. Keyed on (instId, tradeId), NOT tradeId alone —
+    confirmed live that OKX's tradeId is scoped per-instrument, not globally
+    unique across the whole option-trades response."""
+    currency = DRIFT_CRYPTO_CCY[asset]
+    instrument_set, ct_val, ct_mult, expiry_label = _drift_fetch_okx_nearest_expiry(currency)
+    rolled = expiry_prev is not None and expiry_label != expiry_prev
+    batch = _drift_fetch_okx_option_trades(currency)
+    new_cursor = {(t.get("instId"), t.get("tradeId")) for t in batch}
+    if cursor_prev is None:
+        return _drift_empty_venue_result(new_cursor, expiry_label, rolled)
+    d_calls = d_puts = d_calls_f = d_puts_f = interval_vol = d_netvol = d_netvol_f = 0.0
+    for t in batch:
+        key = (t.get("instId"), t.get("tradeId"))
+        if t.get("tradeId") is None or key in cursor_prev or t.get("instId") not in instrument_set:
+            continue
+        contracts = float(t["sz"])
+        trade_spot = float(t["idxPx"])
+        usd = float(t["px"]) * ct_val * ct_mult * contracts * trade_spot
+        if usd < min_trade_usd:
+            continue
+        sign = 1.0 if t.get("side") == "buy" else -1.0
+        strike, otype = _drift_parse_strike_otype(t["instId"])
+        otm = _drift_is_otm(otype, strike, trade_spot)
+        interval_vol += usd
+        d_netvol += sign * contracts
+        if otm:
+            d_netvol_f += sign * contracts
+        if otype == "call":
+            d_calls += usd * sign
+            if otm:
+                d_calls_f += usd * sign
+        else:
+            d_puts += usd * sign
+            if otm:
+                d_puts_f += usd * sign
+    return {"d_calls": d_calls, "d_puts": d_puts, "d_calls_f": d_calls_f, "d_puts_f": d_puts_f,
+            "d_netvol": d_netvol, "d_netvol_f": d_netvol_f, "interval_vol": interval_vol,
+            "cursor": new_cursor, "expiry_label": expiry_label, "rolled": rolled}
+
+def _drift_poll_venue_bybit(asset, cursor_prev, expiry_prev, min_trade_usd, fallback_spot):
+    """Same shape/limitation as OKX. Bybit options are USDC-settled, so
+    price is already ~USD — no index-price multiply needed. UNVERIFIED
+    against a live response (api.bybit.com geo-blocks the environment this
+    was built in — confirmed a CloudFront country block, not fixable
+    client-side) — dedups on (symbol, execId) defensively. Per-trade index
+    price (iP, for OTM classification) is also docs-only/unverified — falls
+    back to the poll's own fetched spot (fallback_spot) when a trade record
+    doesn't carry it. A venue erroring here just contributes $0 for that
+    poll (see _drift_poll_once_crypto's own per-venue try/except) — this is
+    the EXPECTED steady state in a blocked region, not a bug; the aggregate
+    stays correct on Deribit+OKX alone."""
+    currency = DRIFT_CRYPTO_CCY[asset]
+    instrument_set, expiry_label = _drift_fetch_bybit_nearest_expiry(currency)
+    rolled = expiry_prev is not None and expiry_label != expiry_prev
+    batch = _drift_fetch_bybit_option_trades(currency)
+    new_cursor = {(t.get("symbol"), t.get("execId")) for t in batch}
+    if cursor_prev is None:
+        return _drift_empty_venue_result(new_cursor, expiry_label, rolled)
+    d_calls = d_puts = d_calls_f = d_puts_f = interval_vol = d_netvol = d_netvol_f = 0.0
+    for t in batch:
+        key = (t.get("symbol"), t.get("execId"))
+        if t.get("execId") is None or key in cursor_prev or t.get("symbol") not in instrument_set:
+            continue
+        contracts = float(t["size"])
+        usd = float(t["price"]) * contracts
+        if usd < min_trade_usd:
+            continue
+        sign = 1.0 if t.get("side") == "Buy" else -1.0
+        strike, otype = _drift_parse_strike_otype(t["symbol"])
+        trade_spot = float(t["iP"]) if t.get("iP") else fallback_spot
+        otm = _drift_is_otm(otype, strike, trade_spot)
+        interval_vol += usd
+        d_netvol += sign * contracts
+        if otm:
+            d_netvol_f += sign * contracts
+        if otype == "call":
+            d_calls += usd * sign
+            if otm:
+                d_calls_f += usd * sign
+        else:
+            d_puts += usd * sign
+            if otm:
+                d_puts_f += usd * sign
+    return {"d_calls": d_calls, "d_puts": d_puts, "d_calls_f": d_calls_f, "d_puts_f": d_puts_f,
+            "d_netvol": d_netvol, "d_netvol_f": d_netvol_f, "interval_vol": interval_vol,
+            "cursor": new_cursor, "expiry_label": expiry_label, "rolled": rolled}
+
+DRIFT_VENUE_POLLERS = {
+    "deribit": _drift_poll_venue_deribit,
+    "okx": _drift_poll_venue_okx,
+    "bybit": _drift_poll_venue_bybit,
+}
+
+def _drift_sync_totals(state):
+    """Aggregate totals are always recomputed fresh from the per-venue
+    sub-totals rather than maintained redundantly — no way for the
+    displayed total to drift out of sync with its parts."""
+    state.calls_cum = sum(v["calls_cum"] for v in state.venues.values())
+    state.puts_cum = sum(v["puts_cum"] for v in state.venues.values())
+    state.calls_cum_f = sum(v["calls_cum_f"] for v in state.venues.values())
+    state.puts_cum_f = sum(v["puts_cum_f"] for v in state.venues.values())
+    state.net_vol_cum = sum(v["net_vol_cum"] for v in state.venues.values())
+    state.net_vol_cum_f = sum(v["net_vol_cum_f"] for v in state.venues.values())
+
+def _drift_poll_once_crypto(asset, state, min_trade_usd):
+    """Fans out to all three venues in parallel, each isolated by its own
+    try/except — one venue erroring contributes $0 that interval and is
+    reflected in state.venue_status, never stops the other two or crashes
+    the poll."""
+    with state.lock:
+        first_poll = not state.have_baseline
+        prior = {name: (state.venues[name]["cursor"], state.venues[name]["expiry_label"])
+                  for name in DRIFT_VENUE_POLLERS}
+        prior_spot = state.spot
+
+    spot = None
+    errors = {}
+    try:
+        spot = _drift_fetch_deribit_index(DRIFT_CRYPTO_CCY[asset])
+    except Exception as e:
+        errors["spot"] = str(e)
+    fallback_spot = spot if spot is not None else prior_spot
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(DRIFT_VENUE_POLLERS)) as ex:
+        futs = {ex.submit(fn, asset, *prior[name], min_trade_usd, fallback_spot): name
+                for name, fn in DRIFT_VENUE_POLLERS.items()}
+        for fut, name in futs.items():
+            try:
+                results[name] = fut.result()
+            except Exception as e:
+                errors[name] = str(e)
+
+    with state.lock:
+        day_rolled = _drift_maybe_reset_for_new_day(state)
+        if day_rolled:
+            for v in state.venues.values():
+                v["calls_cum"] = 0.0
+                v["puts_cum"] = 0.0
+                v["calls_cum_f"] = 0.0
+                v["puts_cum_f"] = 0.0
+                v["net_vol_cum"] = 0.0
+                v["net_vol_cum_f"] = 0.0
+
+        interval_vol = 0.0
+        for name in DRIFT_VENUE_POLLERS:
+            if name not in results:
+                continue
+            r = results[name]
+            venue = state.venues[name]
+            if r["rolled"]:
+                venue["calls_cum"] = 0.0
+                venue["puts_cum"] = 0.0
+                venue["calls_cum_f"] = 0.0
+                venue["puts_cum_f"] = 0.0
+                venue["net_vol_cum"] = 0.0
+                venue["net_vol_cum_f"] = 0.0
+            venue["calls_cum"] += r["d_calls"]
+            venue["puts_cum"] += r["d_puts"]
+            venue["calls_cum_f"] += r["d_calls_f"]
+            venue["puts_cum_f"] += r["d_puts_f"]
+            venue["net_vol_cum"] += r["d_netvol"]
+            venue["net_vol_cum_f"] += r["d_netvol_f"]
+            venue["expiry_label"] = r["expiry_label"]
+            venue["cursor"] = r["cursor"]
+            interval_vol += r["interval_vol"]
+        _drift_sync_totals(state)
+        state.venue_status = {name: ("live" if name not in errors else f"error: {errors[name]}")
+                               for name in DRIFT_VENUE_POLLERS}
+        new_spot = spot if spot is not None else state.spot
+        day_suffix = " (new day — drift reset)" if day_rolled else ""
+
+        if first_poll:
+            state.have_baseline = True
+            state.spot = new_spot
+            state.status = "baseline set — first sample next poll" + day_suffix
+            state.last_poll = time.time()
+        else:
+            sample = {
+                "ts": time.time(), "calls": state.calls_cum, "puts": state.puts_cum,
+                "calls_f": state.calls_cum_f, "puts_f": state.puts_cum_f,
+                "net_vol": state.net_vol_cum, "net_vol_f": state.net_vol_cum_f,
+                "spot": new_spot, "vol": interval_vol,
+                "venues": {name: {"calls": v["calls_cum"], "puts": v["puts_cum"],
+                                   "calls_f": v["calls_cum_f"], "puts_f": v["puts_cum_f"],
+                                   "net_vol": v["net_vol_cum"], "net_vol_f": v["net_vol_cum_f"],
+                                   "expiry": v["expiry_label"]}
+                           for name, v in state.venues.items()},
+            }
+            state.history.append(sample)
+            _drift_append_log(asset, sample)
+            state.spot = new_spot
+            state.status = "live" + day_suffix
+            state.last_poll = time.time()
+
+def _drift_poll_once_cboe(asset, state, min_trade_usd, confidence_deadzone):
+    """Snapshot-diff aggressor-proxy path (QQQ). min_trade_usd here filters
+    a whole POLL INTERVAL's aggregate volume delta for a contract, not a
+    single trade's size — CBOE has no per-trade granularity. [F] filtered
+    mode here is BOTH real filters (unlike ETH, where 0DTE is a no-op):
+    is_0dte gates the whole poll's filtered contribution to zero on days
+    the chain fetch had to fall back off today's date; OTM is checked per
+    contract using this poll's one chain spot."""
+    chain = _drift_fetch_cboe_chain(asset)
+    contracts = chain["contracts"]
+    is_0dte = chain["is_0dte"]
+    spot = chain["spot"]
+    live_quote = _drift_fetch_live_price(asset)
+    if live_quote is not None and spot and abs(live_quote - spot) <= spot * DRIFT_LIVE_QUOTE_MAX_DEVIATION:
+        display_spot = live_quote
+    else:
+        display_spot = spot
+    with state.lock:
+        first_poll = not state.have_baseline
+        d_calls = d_puts = d_calls_f = d_puts_f = interval_vol = d_netvol = d_netvol_f = 0.0
+        for c in contracts:
+            key = c["key"]
+            prev = state.baseline.get(key)
+            cur = c["baseline_value"]
+            if prev is None:
+                state.baseline[key] = cur
+                continue
+            if cur <= prev:
+                # CBOE's own session volume only ever increases intraday — a
+                # same-day drop is almost certainly a transient feed glitch,
+                # not a real reset (that's handled explicitly by
+                # _drift_maybe_reset_for_new_day clearing state.baseline
+                # wholesale). Do NOT trust it as the new baseline — skipping
+                # the overwrite means the next poll retries against the last
+                # known-good baseline instead of baking in one giant
+                # spurious delta.
+                continue
+            delta_contracts = cur - prev
+            state.baseline[key] = cur
+            usd = delta_contracts * c["multiplier"]
+            if usd <= 0:
+                continue
+            if usd < min_trade_usd:
+                continue
+            sign = _drift_classify_sign(c["last"], c["bid"], c["ask"], confidence_deadzone)
+            interval_vol += usd
+            d_netvol += sign * delta_contracts
+            otm = is_0dte and _drift_is_otm(c["otype"], c["strike"], spot)
+            if otm:
+                d_netvol_f += sign * delta_contracts
+            if c["otype"] == "call":
+                d_calls += usd * sign
+                if otm:
+                    d_calls_f += usd * sign
+            else:
+                d_puts += usd * sign
+                if otm:
+                    d_puts_f += usd * sign
+
+        if first_poll:
+            state.have_baseline = True
+            state.spot = display_spot
+            day_suffix = " (new day — drift reset)" if _drift_maybe_reset_for_new_day(state) else ""
+            suffix = _drift_maybe_reset_for_expiry(state, chain["expiry_label"])
+            state.status = "baseline set — first sample next poll" + day_suffix + suffix
+            state.last_poll = time.time()
+        else:
+            _drift_record_sample(asset, state, d_calls, d_puts, d_calls_f, d_puts_f, d_netvol, d_netvol_f,
+                                  display_spot, chain["expiry_label"], interval_vol, "live")
+
+def _drift_poll_once(asset, is_crypto, state, min_trade_usd, confidence_deadzone):
+    if is_crypto:
+        _drift_poll_once_crypto(asset, state, min_trade_usd)
+    else:
+        _drift_poll_once_cboe(asset, state, min_trade_usd, confidence_deadzone)
+
+
+# ── Net Drift formatting — all _drift_-prefixed, athena.py already has its
+# OWN fmt_money/fmt_price with different (full-precision $) formatting for
+# the trading dashboard; drift.py's own abbreviated $1.2K/$1.2M style is a
+# distinct, deliberately different convention for this chart specifically. ──
+def _drift_fmt_money(v, decimals=2):
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000:
+        return f"{sign}${v / 1_000_000:.{decimals}f}M"
+    if v >= 1000:
+        return f"{sign}${v / 1000:.{decimals}f}K"
+    return f"{sign}${v:.{decimals}f}"
+
+def _drift_fmt_axis_money(v):
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000:
+        return f"{sign}${v / 1_000_000:.1f}M"
+    if v >= 1000:
+        return f"{sign}${v / 1000:.0f}K"
+    return f"{sign}${v:.0f}"
+
+def _drift_fmt_axis_count(v):
+    """Net Volume panel's axis — CONTRACT count, not $, so no '$' prefix."""
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000:
+        return f"{sign}{v / 1_000_000:.1f}M"
+    if v >= 1000:
+        return f"{sign}{v / 1000:.0f}K"
+    return f"{sign}{v:.0f}"
+
+def _drift_fmt_price(p):
+    if p is None:
+        return "—"
+    return f"${p:,.2f}" if p >= 1 else f"${p:.5f}"
+
+def _drift_fmt_duration(seconds):
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+def _drift_fmt_time(ts, is_crypto):
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt = dt.astimezone(TZ_CT) if not is_crypto else dt.astimezone()
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+def _drift_short_expiry(expiry_label):
+    if not expiry_label:
+        return "—"
+    parts = expiry_label.split()
+    return parts[0] + parts[1] if len(parts) >= 2 else expiry_label
+
+def _drift_fmt_venue_line(state):
+    """Compact per-venue health/expiry readout, e.g. 'D:09Aug✓ OKX:09Aug✓
+    Bybit:✗' — visible at a glance if a venue has silently stopped
+    contributing to the aggregate."""
+    parts = []
+    for name in DRIFT_CRYPTO_VENUES:
+        v = state.venues[name]
+        status = state.venue_status.get(name, "")
+        mark = "✓" if status == "live" else ("✗" if status else "…")
+        parts.append(f"{DRIFT_VENUE_ABBREV[name]}:{_drift_short_expiry(v['expiry_label'])}{mark}")
+    return " ".join(parts)
+
+def _drift_fmt_venue_breakdown(state, filtered_mode=False):
+    """[V] toggle's extra line: each venue's own calls/puts sub-total."""
+    calls_key = "calls_cum_f" if filtered_mode else "calls_cum"
+    puts_key = "puts_cum_f" if filtered_mode else "puts_cum"
+    parts = []
+    for name in DRIFT_CRYPTO_VENUES:
+        v = state.venues[name]
+        parts.append(f"{DRIFT_VENUE_ABBREV[name]} {_drift_fmt_money(v[calls_key])}/{_drift_fmt_money(v[puts_key])}")
+    return "   ".join(parts)
+
+
+# ── Net Drift chart math (pure — no curses dependency) ──────────────────────
+def _drift_chart_x_end(history, live, view_offset, bar_interval):
+    """Right edge of the chart's fixed bar_interval-wide window, shifted
+    back by view_offset bars. Returns (x_end, clamped_view_offset). Ported
+    verbatim from drift.py's own chart_x_end — same charthacker.py-style
+    pan/scroll scheme already used elsewhere in this file."""
+    anchor = time.time() if live else (history[-1]["ts"] if history else time.time())
+    if history:
+        max_offset = max(0, int((anchor - history[0]["ts"]) // bar_interval))
+    else:
+        max_offset = 0
+    clamped = max(0, min(max_offset, view_offset))
+    return anchor - clamped * bar_interval, clamped
+
+def _drift_to_row(v, vmin, vmax, row_top, row_bot):
+    if vmax == vmin:
+        vmax = vmin + 1e-9
+    frac = (v - vmin) / (vmax - vmin)
+    frac = min(1.0, max(0.0, frac))
+    r = row_top + int(round((1 - frac) * (row_bot - row_top)))
+    return max(row_top, min(row_bot, r))
+
+def _drift_build_columns(history, x_end, bar_interval, plot_w, filtered=False):
+    """Each column is a FIXED bar_interval-second bucket. Multiple samples
+    landing in the same bucket keep the LAST one (calls/puts/spot/net_vol
+    are all cumulative running totals — a step chart). Also returns
+    cols_vol — unsigned per-bucket $ premium activity (SUMMED per bucket,
+    not step-charted, since it's interval activity, not a running total).
+    filtered ([F]) pulls the "_f"-suffixed fields instead — spot is never
+    filtered, same either way."""
+    calls_key = "calls_f" if filtered else "calls"
+    puts_key = "puts_f" if filtered else "puts"
+    netvol_key = "net_vol_f" if filtered else "net_vol"
+    cols_calls = [None] * plot_w
+    cols_puts = [None] * plot_w
+    cols_spot = [None] * plot_w
+    cols_netvol = [None] * plot_w
+    cols_vol = [0.0] * plot_w
+    for s in history:
+        c = plot_w - 1 - int((x_end - s["ts"]) // bar_interval)
+        if c < 0 or c >= plot_w:
+            continue
+        cols_calls[c] = s[calls_key]
+        cols_puts[c] = s[puts_key]
+        cols_spot[c] = s["spot"]
+        cols_netvol[c] = s.get(netvol_key, 0.0)
+        cols_vol[c] += s.get("vol") or 0.0
+
+    def ffill(col):
+        last = None
+        for i in range(len(col)):
+            if col[i] is None:
+                col[i] = last
+            else:
+                last = col[i]
+        return col
+
+    return ffill(cols_calls), ffill(cols_puts), ffill(cols_spot), ffill(cols_netvol), cols_vol
+
+def _drift_day_boundary_cols(x_end, bar_interval, plot_w):
+    """Column indices where local midnight falls inside that bucket — the
+    same boundary _drift_maybe_reset_for_new_day fires the daily reset on,
+    so the marker always lines up with the real value-cliff a day-reset
+    puts in the data."""
+    cols = []
+    prev_date = None
+    for i in range(plot_w):
+        ts_i = x_end - (plot_w - 1 - i) * bar_interval
+        d = datetime.fromtimestamp(ts_i).date()
+        if prev_date is not None and d != prev_date:
+            cols.append(i)
+        prev_date = d
+    return cols
+
+
+# ── Net Drift engine ─────────────────────────────────────────────────────────
+def _drift_engine_loop(asset, stop_evt):
+    """Always-on background engine for ONE Athena asset (ETH or QQQ) — see
+    this section's own header comment for why this collapses drift.py's
+    Controller/BackgroundTracker/[S]-switch-to-any-symbol machinery down to
+    just two of these, one per asset, both started unconditionally at
+    startup (same shape as _gex_engine_loop's own per-asset thread) instead
+    of drift.py's own single-focused-symbol-plus-two-background-trackers
+    model — Athena never needs a third, arbitrary symbol. QQQ only actually
+    polls during _drift_is_market_open_et(); ETH has no such gate, crypto
+    trades 24/7 — same split drift.py's own background_poll_loop already
+    used for this exact pair. Seeds today's already-logged samples on
+    startup (_drift_seed_today) so a restart resumes mid-day instead of
+    losing the running total, same "seed from today's own log" behavior
+    every other engine in this file already has for its own subsystem."""
+    is_crypto = DRIFT_IS_CRYPTO[asset]
+    state = DRIFT_STATE[asset]
+    try:
+        _drift_seed_today(state, asset, is_crypto)
+    except Exception:
+        pass
+    while not stop_evt.is_set():
+        if not is_crypto and not _drift_is_market_open_et():
+            with state.lock:
+                state.status = "market closed — waiting for next session"
+            DRIFT_NEXT_POLL_TS[asset] = time.time() + 60
+            DRIFT_READY[asset].set()   # "engine started, correctly idling outside market
+                                        # hours" still counts as ready for the loading screen
+            DRIFT_REFRESH_EVENT[asset].wait(timeout=60)
+            DRIFT_REFRESH_EVENT[asset].clear()
+            continue
+        try:
+            _drift_poll_once(asset, is_crypto, state, DRIFT_MIN_TRADE_USD[asset], DRIFT_CONFIDENCE_DEADZONE[asset])
+        except Exception as e:
+            with state.lock:
+                state.status = f"error: {e}"
+        DRIFT_READY[asset].set()
+        DRIFT_NEXT_POLL_TS[asset] = time.time() + DRIFT_INTERVAL[asset]
+        DRIFT_REFRESH_EVENT[asset].wait(timeout=DRIFT_INTERVAL[asset])
+        DRIFT_REFRESH_EVENT[asset].clear()
+
+DRIFT_HIST_STATE = {}   # asset -> _DriftState snapshot loaded via [H], absent
+                          # until first used for that asset
+
+def _drift_load_historical(asset, date_str):
+    """[H]: load a past day's log for `asset` into a standalone read-only
+    snapshot. Does NOT touch DRIFT_STATE[asset] — the background engine
+    thread keeps tracking the live session the whole time regardless, so
+    [H] again with today's date (or Esc/[M] to leave the mode entirely)
+    snaps straight back to an up-to-date chart with nothing to resume."""
+    is_crypto = DRIFT_IS_CRYPTO[asset]
+    samples = _drift_load_log(asset, date_str)
+    hist_state = _DriftState()
+    hist_state.have_baseline = True
+    if samples:
+        _drift_seed_state_from_samples(hist_state, samples, is_crypto)
+        hist_state.status = f"historical — {date_str}"
+    else:
+        hist_state.status = f"no log found for {date_str}"
+    DRIFT_HIST_STATE[asset] = hist_state
+
 # ── Per-instrument state machine ──────────────────────────────────────────────
 class AthenaInstrument:
     def __init__(self, asset):
@@ -5877,41 +6907,96 @@ class AthenaInstrument:
                 log_event(self.asset, "daily_loss_limit_hit", {"blocked_regime": dl["blocked_regime"]})
         _save_daily_loss_state()
 
-    def _update_closed_pnl_today(self, gross_pnl, entry_price, exit_price, exit_qty):
-        """Books this trade's realized NET pnl (fees deducted) into
+    def _update_closed_pnl_today(self, net_amount):
+        """Books an ALREADY-NET (fees fully included) dollar amount into
         today's 'Closed PnL Today' bucket, attributed to the CT calendar
         day this trade was ENTERED on (self.position's own
-        "entry_day_ct", tagged at fill time in _check_fill) rather than
-        whatever day it happens to close on. 2026-07-30 user request,
+        "entry_day_ct", tagged at fill time). 2026-07-30 user request,
         then clarified same day: "'Closed PnL Today' is supposed to be
-        the total Net PnL of all trades opened in the same day" — this
-        must be true NET pnl (fees subtracted), not the gross figure
-        `_update_blackjack`/`_update_daily_loss_limit` use for their own
-        (unrelated, unchanged) progression decisions. Fee is approximated
-        the same way real mode's pnl itself already is (no fill-history
-        API, no per-leg breakdown once a position is fully flat) —
-        `orig_qty` (the ORIGINAL full entry size, before any partial
-        exits) on the entry leg, `exit_qty`/`exit_price` (this call's own
-        final leg) on the exit leg — via `fee_for_leg` (this asset's own
-        user-configurable fee model), same per-leg convention
-        `scan_all_trades_detailed`'s own exact fee column already uses.
-        Called from every close site (the "position flat" branch of
-        _manage_position, the PCVR-flip-close branch, and _flatten_now)
-        — self.position must still be set when this runs (read
-        entry_day_ct/orig_qty BEFORE the caller clears it)."""
-        if gross_pnl is None or not TZ_CT:
+        the total Net PnL of all trades opened in the same day."
+
+        REWRITTEN 2026-08-11, user-reported ("TP1 hit... realized profit
+        of +$1.53... 'Closed PnL Today' does not reflect this"). Two bugs
+        traced back to this function's old design (it took a raw pnl
+        figure and recomputed fees itself via orig_qty/exit_qty):
+        (1) its caller (_trade_net_pnl) already returned a fully NET
+        figure for DRY_RUN (a straight balance diff) — this function then
+        subtracted the SAME entry+exit fees a SECOND time, confirmed
+        empirically to under-book by exactly one entry-fee-plus-exit-fee
+        per trade; (2) it was only ever called once, at the trade's FINAL
+        close, so a partial TP fill's already-realized, already-booked-
+        nowhere profit sat invisible until the rest of the position
+        closed too — which for real mode (see _trade_net_pnl's own old
+        docstring) wasn't even computed correctly at that point either.
+
+        Now takes the exact net to book and does nothing else — no fee
+        math of its own, so it can't double-count one. Called via
+        _book_closed_pnl_delta from BOTH the partial-fill-detection site
+        AND every final-close site, once per REALIZED LEG rather than
+        once per trade, so a TP1 fill's own profit shows up the moment
+        it happens instead of waiting on whatever closes the trade
+        later."""
+        if net_amount is None or not TZ_CT:
             return
         entry_day_ct = (self.position or {}).get("entry_day_ct")
         if entry_day_ct is None:
             return
-        net_pnl = gross_pnl
-        if entry_price and exit_price and exit_qty:
-            orig_qty = (self.position or {}).get("orig_qty") or exit_qty
-            fee = fee_for_leg(self.asset, orig_qty, entry_price) + fee_for_leg(self.asset, exit_qty, exit_price)
-            net_pnl = gross_pnl - fee
         bucket = CLOSED_PNL_STATE["sim" if DRY_RUN else "real"]
-        bucket[entry_day_ct] = bucket.get(entry_day_ct, 0.0) + net_pnl
+        bucket[entry_day_ct] = bucket.get(entry_day_ct, 0.0) + net_amount
         _save_closed_pnl_state()
+
+    def _book_closed_pnl_delta(self):
+        """Books whatever portion of self.position["realized_pnl"] hasn't
+        been attributed to today's Closed PnL bucket yet, tracking how
+        much has already been booked via self.position["closed_pnl_
+        booked"] — so this can be called at EVERY realized leg of a
+        trade (a partial TP fill, then again at the eventual final
+        close) without ever double-booking the portion booked earlier.
+        realized_pnl already starts at -entry_fee the moment a position
+        is created and grows by each leg's own (gross - that leg's own
+        exit fee) as legs close — see the partial-fill-detection block
+        and _finalize_and_book_pnl below, the only two places that ever
+        touch it — so the FIRST call for a trade naturally books the
+        entry fee along with whatever that first leg made, and every
+        later call only ever books that NEXT leg's own net on top."""
+        realized = self.position.get("realized_pnl", 0.0) if self.position else None
+        if realized is None:
+            return
+        already_booked = self.position.get("closed_pnl_booked", 0.0)
+        self._update_closed_pnl_today(realized - already_booked)
+        self.position["closed_pnl_booked"] = realized
+
+    def _finalize_and_book_pnl(self, exit_price, exit_qty, pos_side):
+        """Called once, right before self.position is cleared, at EVERY
+        full-close site (the "position flat" branch of _manage_position,
+        the PCVR-flip-close branch, and _flatten_now) — adds this FINAL
+        leg's own net (gross minus its own exit fee) to self.position
+        ["realized_pnl"], the same running total the partial-fill-
+        detection block above already maintains, so by the time this
+        returns it holds the TRUE, complete net for the WHOLE trade
+        (entry fee once, every leg's own net, no approximation needed —
+        this replaces the old _trade_net_pnl, which for real mode just
+        used this final leg's raw gross with no fee accounting and no
+        credit for any earlier partial fill at all). Books whatever's
+        newly added via _book_closed_pnl_delta, then returns the
+        finalized total for _update_blackjack/_update_daily_loss_limit's
+        own use (a genuinely per-TRADE, not per-leg, decision — unlike
+        Closed PnL Today, those still only care about the trade's final
+        combined outcome).
+
+        Real mode has no fill-history API (documented gap elsewhere in
+        this file) — exit_price here is the best available approximation
+        (the live price at the moment Athena performed or discovered the
+        close), not a certain, exact fill; DRY_RUN's own sim_logs already
+        gave the entry/partial legs exact prices, and this is only ever
+        approximate for the LAST leg, same as before."""
+        entry = self.position.get("fill_price")
+        if entry is not None and exit_price is not None and exit_qty:
+            leg_gross = (exit_price - entry) * exit_qty if pos_side == "Long" else (entry - exit_price) * exit_qty
+            leg_fee = fee_for_leg(self.asset, exit_qty, exit_price)
+            self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
+        self._book_closed_pnl_delta()
+        return self.position.get("realized_pnl")
 
     def _clear_daily_loss_block(self, reason):
         dl = DAILY_LOSS_STATE[self.asset]
@@ -6405,10 +7490,24 @@ class AthenaInstrument:
             log_event(self.asset, "position_closed", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "reason": reason, "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
+            net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
+            if DRY_RUN:
+                # Blackjack/Daily-Loss-Limit keep using the OLD, separately-
+                # proven authoritative source for DRY_RUN specifically (a
+                # straight SimAccount.balance diff, or _realized_since_
+                # last_fill as its own already-hardened fallback) — cross-
+                # checked against _finalize_and_book_pnl's own realized_pnl
+                # bookkeeping above in testing (the two agree exactly, same
+                # underlying fee_for_leg formula), but there's no reason to
+                # retire a battle-tested independent source for a decision
+                # that shapes future position sizing when keeping it costs
+                # nothing. Real mode has no such independent source at all
+                # (Phemex's own balance reflects everything, not just this
+                # trade) — realized_pnl-based net_pnl is a genuine fix
+                # there, not just a parallel option.
+                net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
-            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -6511,6 +7610,14 @@ class AthenaInstrument:
                 leg_fee = fee_for_leg(self.asset, tp1_qty, tp1_price)
                 leg_gross = (tp1_price - entry) * tp1_qty if pos_side == "Long" else (entry - tp1_price) * tp1_qty
                 self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
+                # Book THIS leg's own realized net into today's Closed PnL
+                # bucket right now, not deferred until the whole trade
+                # eventually closes — see _book_closed_pnl_delta's own
+                # docstring (2026-08-11 user-reported gap: a TP1 fill's
+                # already-realized profit was invisible in Closed PnL
+                # Today until — and even then, incorrectly — the REST of
+                # the position also closed).
+                self._book_closed_pnl_delta()
                 await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
             self._tp1_lock_done = True
 
@@ -6552,7 +7659,7 @@ class AthenaInstrument:
             log_event(self.asset, "pcvr_flip_close", {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
+            net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
             # 2026-07-29 user clarification (correcting an earlier, wrong
             # reading of this same rule): "a PCVR flip closes the trade,
             # but the loss/win progression rules still apply based on the
@@ -6570,7 +7677,6 @@ class AthenaInstrument:
             # asset the ladder is already sitting at 1R.
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
-            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -6687,6 +7793,16 @@ class AthenaInstrument:
             leg_changed = False   # per-LEG now (was a single function-wide `changed`
                                     # shared by every leg) — see this function's own
                                     # docstring for why that mattered
+            tracked = False    # did this leg actually get freshly evaluated this cycle
+                                 # at all (has a moving-target type AND fresh data was
+                                 # available to compare against)? Drives last_synced_ts.
+            pinned = False      # evaluated, but the fresh target was unsafe/unavailable,
+                                 # so the resting order was deliberately left as-is —
+                                 # user-requested 2026-08-11: surfaced on the dashboard
+                                 # so "hasn't moved" is visibly explained (rate-limited
+                                 # by the upstream GEX/status refresh cadence vs.
+                                 # genuinely pinned for safety) instead of looking
+                                 # identical to "nothing is checking this at all."
             # Same guard as the initial placement (_check_fill) — if the
             # refreshed target has drifted close enough to the fill price
             # that it would land within R of it (or past it), skip this
@@ -6694,11 +7810,13 @@ class AthenaInstrument:
             # retry once it moves back to a safe distance, rather than
             # ever placing an unsafe level.
             if leg.get("tracks_gex_flip") and new_gex_level is not None:
+                tracked = True
                 if _safe(new_gex_level):
                     self._tp_skip_warned.pop("gex", None)
                     if abs(level - new_gex_level) > 0.005:
                         level, leg_changed = new_gex_level, True
                 else:
+                    pinned = True
                     # Log-spam fix, 2026-07-25 (user-reported: "TP refresh
                     # is getting skipped constantly") — this branch is
                     # re-evaluated every engine cycle (as fast as 2s) for
@@ -6720,28 +7838,34 @@ class AthenaInstrument:
                 # the single nearest cluster, which was the bug.
                 warn_key = f"cluster{cluster_rank}"
                 if cluster_rank < len(new_cluster_levels):
+                    tracked = True
                     new_cluster_level = new_cluster_levels[cluster_rank]
                     if _safe(new_cluster_level):
                         self._tp_skip_warned.pop(warn_key, None)
                         if abs(level - new_cluster_level) > 0.005:
                             level, leg_changed = new_cluster_level, True
                     else:
+                        pinned = True
                         if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_cluster_level) > 0.01:
                             console_log(f"{self.asset}: {YLW}Cluster (rank {cluster_rank}) too close to fill "
                                         f"(${fmt_num(new_cluster_level)}) — TP refresh skipped this cycle{RST}")
                             self._tp_skip_warned[warn_key] = new_cluster_level
-                # else: fewer qualifying clusters exist now than this leg's
-                # own rank needs — leave it resting at its last-known level
-                # rather than guessing; same "don't place an unverified
-                # level" caution the R-distance guard above already uses.
+                else:
+                    # Fewer qualifying clusters exist now than this leg's own
+                    # rank needs — leave it resting at its last-known level
+                    # rather than guessing; same "don't place an unverified
+                    # level" caution the R-distance guard above already uses.
+                    pinned = True
                 cluster_rank += 1
             elif leg.get("type") in ("BT", "ST") and new_bt_st_level is not None:
+                tracked = True
                 warn_key = leg["type"]
                 if _safe(new_bt_st_level):
                     self._tp_skip_warned.pop(warn_key, None)
                     if abs(level - new_bt_st_level) > 0.005:
                         level, leg_changed = new_bt_st_level, True
                 else:
+                    pinned = True
                     if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_bt_st_level) > 0.01:
                         console_log(f"{self.asset}: {YLW}{leg['type']} too close to fill (${fmt_num(new_bt_st_level)}) — TP refresh skipped this cycle{RST}")
                         self._tp_skip_warned[warn_key] = new_bt_st_level
@@ -6749,9 +7873,22 @@ class AthenaInstrument:
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?"),
                               "order_id": leg.get("order_id"),   # carried over as-is unless this
-                              "_changed": leg_changed})          # leg is actually replaced below
+                              "pinned": pinned,                  # leg is actually replaced below
+                              "last_synced_ts": time.time() if tracked else leg.get("last_synced_ts"),
+                              "_changed": leg_changed})
 
-        if not any(leg["_changed"] for leg in new_legs):
+        # Always persist the fresh per-leg last_synced_ts/pinned state, even
+        # on a cycle where nothing actually needs to change on the exchange
+        # — the OLD early-return-before-persisting here meant a no-op cycle
+        # (the common case) never updated last_synced_ts at all, so "synced
+        # Xs ago" would have been stuck at whenever something last CHANGED,
+        # not whenever it was last CHECKED — silently wrong the moment a
+        # leg legitimately goes several cycles without needing a move.
+        any_changed = any(leg["_changed"] for leg in new_legs)
+        if not any_changed:
+            for leg in new_legs:
+                leg.pop("_changed", None)
+            self.position["tp_legs"] = new_legs
             return
 
         pd = self.position.get("price_decimals", 2)
@@ -6810,61 +7947,61 @@ class AthenaInstrument:
 
     async def _apply_tp1_breakeven_lock(self, symbol, pos_side, tp1_price, tp1_qty):
         """2026-07-28 user request: "once TP1 is achieved, adjust the SL to
-        what would equate to 1 point of net profit (accounting for fees as
-        well). If price doesn't make it to TP2 and retraces all the way
-        back to entry, this protects the account from unnecessary drawdown
-        and guarantees a 1 point net profit, even after fees." Called
-        exactly once per trade, right after _manage_position detects the
-        position went from full size to a smaller-but-still-open size (the
-        only way that happens in this app is a TP leg filling — SL always
-        closes the FULL remaining size, never partially).
+        what would equate to 1 point of net profit... this protects the
+        account from unnecessary drawdown and guarantees a 1 point net
+        profit, even after fees." Called exactly once per trade, right
+        after _manage_position detects the position went from full size to
+        a smaller-but-still-open size (the only way that happens in this
+        app is a TP leg filling — SL always closes the FULL remaining
+        size, never partially).
 
-        "1 point" here means $1.00 of net profit per unit of the ORIGINAL
-        entry quantity (orig_qty) — e.g. a 2.0 qty entry guarantees $2.00
-        total, matching how R-multiples/position sizing already scale with
-        qty elsewhere in this file, not a flat $1 regardless of size.
+        RESCOPED 2026-08-11, user-reported: the original version guaranteed
+        $1/unit net across the WHOLE trade (TP1's already-banked gain used
+        as a cushion for the remainder, which could — and for the user's
+        own real position, did — end up with new_sl BELOW entry). That
+        total was mathematically exact (verified against the real
+        numbers), but it means a whipsaw after the lock can give back real,
+        already-open profit on the remaining leg specifically, which is
+        exactly the "unnecessary drawdown" this feature exists to prevent
+        — a correct total doesn't help if it's funded by giving back gains
+        on the piece still open. Now the remaining leg is guaranteed
+        $1.00/unit of net profit ENTIRELY ON ITS OWN, with no credit taken
+        for whatever TP1 already banked — a second, independent layer of
+        locked-in profit stacked on top of TP1's, not blended with it.
 
-        Derivation (Long case; Short is the mirror image) — let R_target =
-        orig_qty * $1.00 be the required TOTAL combined net profit across
-        BOTH legs (the already-closed TP1 leg and this remaining leg once
-        IT closes too, at the new SL), with this asset's own fee model
-        (`fee_for_leg`, 2026-07-31 user-configurable per asset) applied to
-        every leg's own fill (entry once for the whole position, TP1's
-        exit, and this new SL's own future exit):
+        "1 point" means $1.00 of net profit per unit of the REMAINING
+        quantity (rem_qty) now — was per unit of ORIGINAL quantity under
+        the old whole-trade framing; the two only coincide when rem_qty
+        happens to equal orig_qty (i.e. no TP1 has fired yet, where this
+        function never runs anyway).
 
-            entry_fee = fee_for_leg(asset, orig_qty, entry)
-            tp1_fee   = fee_for_leg(asset, tp1_qty, tp1_price)
-            tp1_gross = (tp1_price - entry) * tp1_qty              [Long]
-            needed_remaining_net = R_target - tp1_gross + entry_fee + tp1_fee
+        Derivation (Long case; Short is the mirror image) — the remaining
+        leg's OWN net must cover $1.00/unit AND its own pro-rated share of
+        the entry fee (fee_for_leg is exactly linear in qty — see its own
+        docstring — so `fee_for_leg(asset, rem_qty, entry)` IS that share,
+        no separate pro-rating math needed):
 
-        Solving for `new_sl` (the remaining leg's own future exit price)
-        depends on whether THIS asset's fee model depends on that unknown
-        price at all — ETH's %-of-notional fee does (the exit fee is
-        itself a function of new_sl), so it requires isolating new_sl via
-        division by `(1 -/+ FEE_ETH_PCT)`:
+            target_remaining_net = rem_qty * 1.00
+            entry_fee_share      = fee_for_leg(asset, rem_qty, entry)
+            needed_remaining_net = target_remaining_net + entry_fee_share
 
-            new_sl = (entry + needed_remaining_net / rem_qty) / (1 - FEE_ETH_PCT)   [Long]
-            new_sl = (entry - needed_remaining_net / rem_qty) / (1 + FEE_ETH_PCT)   [Short]
+        tp1_price/tp1_qty are no longer inputs to the calculation at all
+        (kept as parameters only because the caller already has them handy
+        for logging context — see the trigger site) — this leg's guarantee
+        no longer depends in any way on what TP1 did.
 
-        QQQ's flat $/unit fee does NOT depend on new_sl at all (it's the
-        same `FEE_QQQ_PER_UNIT * rem_qty` regardless of what price the
-        remainder eventually exits at), so it solves directly/linearly
-        instead — see `_new_sl_for_target_net`'s own docstring for the
-        parallel QQQ derivation.
-
-        Solving for new_sl this way (rather than just "entry + $1 worth of
-        points") is what makes the guarantee EXACT net of all 3 fee legs,
-        not just entry+exit on the remainder alone — verified algebraically
-        by expanding the full net-PnL equation and isolating new_sl, cross-
-        checked against hand-computed examples in this session's own test
-        suite (test_tp1_breakeven_lock_20260728.py, updated 2026-07-31 for
-        the asset-aware fee model).
+        Solving for `new_sl` from `needed_remaining_net` is unchanged —
+        see `_new_sl_for_target_net`'s own docstring for the per-asset
+        algebra (ETH's %-of-notional exit fee needs isolating via division;
+        QQQ's flat $/unit fee doesn't).
 
         Safety guard: only ever tightens the SL (moves it in the
         protective direction) — if the computed level would actually be
-        WORSE than the current resting SL (can happen with a very small
-        tp1_qty relative to orig_qty, leaving little room), the existing
-        SL is left untouched rather than loosening protection.
+        WORSE than the current resting SL, the existing SL is left
+        untouched rather than loosening protection. Under the new,
+        stricter formula this guard should rarely if ever trigger (the
+        new target no longer depends on how big TP1's own gain was, so it
+        can't come out looser just because TP1 undershot).
 
         Real mode: cancels and re-places ONLY the SL, by its own exchange
         orderID (cancel_order) — the still-correct, unchanged TP legs are
@@ -6872,29 +8009,31 @@ class AthenaInstrument:
         behavior (cancel_all, then re-place the SL AND every TP leg even
         though they didn't change) — see _sync_moving_tps's own docstring
         for why DRY_RUN doesn't need the same fix (SimAccount's cancel/
-        replace is free and instant, no real-exchange downside). Changed
-        2026-08-11 alongside that same fix, same root cause: real mode's
-        cancel_all here never actually cancelled the TP legs' own
-        conditional-vs-active nuance the OTHER way — the two TP legs are
-        genuinely re-placed here with NO reason to be, pure waste, though
-        unlike _sync_moving_tps this specific call site never actually
-        misfired into a duplicate-SL error (the SL price genuinely IS
-        changing here, so re-placing it was never a duplicate)."""
+        replace is free and instant, no real-exchange downside)."""
         entry = self.position["fill_price"]
         rem_qty = self.position["qty"]
         if rem_qty <= 0:
             return
-        orig_qty = self.position.get("orig_qty") or (tp1_qty + rem_qty)
-        entry_fee = fee_for_leg(self.asset, orig_qty, entry)
-        tp1_fee = fee_for_leg(self.asset, tp1_qty, tp1_price)
-        target_total_net = orig_qty * 1.00
+        target_remaining_net = rem_qty * 1.00
+        entry_fee_share = fee_for_leg(self.asset, rem_qty, entry)
+        needed_remaining_net = target_remaining_net + entry_fee_share
+        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
+
+        # Round in whichever direction can only ever HELP the guarantee, not
+        # undershoot it — plain string-format rounding (round-half-to-even)
+        # has no notion of "which way is safe" and can quietly land a hair
+        # under the promised $1.00/unit. Long: round UP (a higher SL is more
+        # protective AND yields a bigger net if it triggers there); Short:
+        # round DOWN. price_step derived from price_decimals the same way
+        # _check_fill's own qty step already does it (`10 ** -decimals`).
+        pd = self.position.get("price_decimals", 2)
+        qd = self.position.get("qty_decimals", 2)
+        price_step = 10 ** (-pd) if pd else 1.0
         if pos_side == "Long":
-            tp1_gross = (tp1_price - entry) * tp1_qty
-            needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
+            new_sl = math.ceil(new_sl_raw / price_step - 1e-9) * price_step
         else:
-            tp1_gross = (entry - tp1_price) * tp1_qty
-            needed_remaining_net = target_total_net - tp1_gross + entry_fee + tp1_fee
-        new_sl = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
+            new_sl = math.floor(new_sl_raw / price_step + 1e-9) * price_step
+        new_sl = round(new_sl, pd)
 
         cur_sl = self.position.get("sl_price")
         if cur_sl is not None:
@@ -6903,8 +8042,6 @@ class AthenaInstrument:
             if pos_side == "Short" and new_sl >= cur_sl:
                 return
 
-        pd = self.position.get("price_decimals", 2)
-        qd = self.position.get("qty_decimals", 2)
         tp_legs = self.position.get("tp_legs") or []
 
         if DRY_RUN:
@@ -6939,10 +8076,12 @@ class AthenaInstrument:
             self.position["sl_order_id"] = self._sl_order_id
 
         self.position["sl_price"] = new_sl
-        console_log(f"{self.asset}: {GRN}{BLD}TP1 hit — SL locked to guarantee "
-                    f"{fmt_money(target_total_net)} net profit (SL -> {fmt_num(new_sl)}){RST}")
-        log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price,
-                                                        "tp1_qty": tp1_qty, "target_total_net": target_total_net})
+        console_log(f"{self.asset}: {GRN}{BLD}TP1 hit — remaining {fmt_num(rem_qty, 2)} locked to "
+                    f"guarantee {fmt_money(target_remaining_net)} net profit ON ITS OWN, "
+                    f"independent of TP1's own {fmt_money((tp1_price - entry) * tp1_qty if pos_side == 'Long' else (entry - tp1_price) * tp1_qty)} "
+                    f"gross gain (SL -> {fmt_num(new_sl)}){RST}")
+        log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price, "tp1_qty": tp1_qty,
+                                                        "rem_qty": rem_qty, "target_remaining_net": target_remaining_net})
 
     async def _flatten_now(self, reason):
         """Force-flat regardless of state/regime — cancels any resting
@@ -7009,10 +8148,24 @@ class AthenaInstrument:
             log_event(self.asset, event_name, {"pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                 "sim": DRY_RUN})
-            net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
+            net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
+            if DRY_RUN:
+                # Blackjack/Daily-Loss-Limit keep using the OLD, separately-
+                # proven authoritative source for DRY_RUN specifically (a
+                # straight SimAccount.balance diff, or _realized_since_
+                # last_fill as its own already-hardened fallback) — cross-
+                # checked against _finalize_and_book_pnl's own realized_pnl
+                # bookkeeping above in testing (the two agree exactly, same
+                # underlying fee_for_leg formula), but there's no reason to
+                # retire a battle-tested independent source for a decision
+                # that shapes future position sizing when keeping it costs
+                # nothing. Real mode has no such independent source at all
+                # (Phemex's own balance reflects everything, not just this
+                # trade) — realized_pnl-based net_pnl is a genuine fix
+                # there, not just a parallel option.
+                net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
-            self._update_closed_pnl_today(net_pnl, entry, exit_price, qty)
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
@@ -9083,6 +10236,22 @@ CLIENT_BLOCKED_KEYS = {ord("r"), ord("R"), ord("f"), ord("F"), ord("n"), ord("N"
                         ord("g"), ord("G")}
 
 _quit_evt = threading.Event()
+_last_cycle_ts = [None]   # engine_loop's own wall-clock timestamp from the END
+                           # of its previous iteration — see CYCLE_GAP_WARN_SEC
+CYCLE_GAP_WARN_SEC = 30   # user-reported 2026-08-11: a laptop sleep/suspend (or
+                           # a hard freeze) doesn't kill this process, it just
+                           # pauses EVERY thread for however long the machine was
+                           # out — engine_loop's own cycle is normally 1-3s
+                           # (INTERVAL) with sub-second matching steps in between,
+                           # so a gap this large can only mean the whole process
+                           # was suspended, not normal jitter. Confirmed against
+                           # a real case: no fresh "startup" SYSTEM event (the
+                           # process was never actually relaunched) but a ~4-hour
+                           # hole in the footprint chart's own bar timestamps —
+                           # nothing was actively monitoring the real position
+                           # for that entire window, which needs to be loud and
+                           # unambiguous in the log, not something that has to be
+                           # reconstructed after the fact from chart gaps.
 _backfill_ready = {a: threading.Event() for a in ASSETS}   # set by _backfill_then_feeds
                     # once this asset's REST backfill attempt has finished (success
                     # OR failure — either way there's nothing further to wait on).
@@ -10389,6 +11558,22 @@ async def engine_loop():
         await inst.reconcile_startup()
 
     while not _quit_evt.is_set():
+        now = time.time()
+        if _last_cycle_ts[0] is not None:
+            gap = now - _last_cycle_ts[0]
+            if gap > CYCLE_GAP_WARN_SEC:
+                gh, rem = divmod(int(gap), 3600)
+                gm, gs = divmod(rem, 60)
+                gap_txt = f"{gh}h{gm:02d}m{gs:02d}s" if gh else f"{gm}m{gs:02d}s"
+                console_log(f"{RED}{BLD}Resumed after a {gap_txt} gap since the last cycle{RST} — "
+                            f"{YLW}the machine likely slept or lost power; NOTHING was actively "
+                            f"monitoring your position(s) during that time (resting SL/TP orders on "
+                            f"Phemex itself were still live throughout — this only affects Athena's "
+                            f"own checks). Verify your real position/orders directly on Phemex before "
+                            f"trusting anything below.{RST}")
+                log_event("SYSTEM", "cycle_gap_detected", {"gap_seconds": gap})
+        _last_cycle_ts[0] = now
+
         snapshot = read_last_status_snapshot()
         if snapshot:
             try:
@@ -10751,8 +11936,27 @@ def draw_dashboard(db, snap, cols):
                 # them.
                 dist_tag = f"{GRN}[{fmt_num(abs(live_for_tp - leg['level']))} away]{RST} " \
                            if live_for_tp is not None else ""
+                # Sync-age/pinned tag — user request 2026-08-11: a leg that
+                # hasn't moved in a while looked identical whether it was
+                # (a) genuinely rate-limited by its upstream GEX/status
+                # engine's own refresh cadence (GEX Flip only recomputes
+                # every GEX_REFRESH_SEC=60s; BT/ST every ~30s — see
+                # _sync_moving_tps's own docstring), (b) deliberately
+                # PINNED at its last safe level because the fresh target
+                # drifted too close to/past the fill price, or (c) actually
+                # stuck. last_synced_ts is refreshed every cycle this leg
+                # gets checked at all (see _sync_moving_tps), whether or
+                # not its level actually changed, so "synced Ns ago" alone
+                # already rules out (c) — it can only ever show a genuinely
+                # recent number if the check is really still running.
+                sync_tag = ""
+                last_synced = leg.get("last_synced_ts")
+                if last_synced is not None:
+                    age = time.time() - last_synced
+                    sync_tag = f" {YLW}[PINNED — too close]{RST}" if leg.get("pinned") \
+                               else f" {DIM}[synced {age:.0f}s ago]{RST}"
                 parts.append(f"{DIM}TP{i} ({RST}{GRN}{leg.get('type', '?')}{RST}{DIM}){RST} "
-                             f"{fmt_num(leg['qty'], 2)} @ {fmt_num(leg['level'])} {dist_tag}{gex_tag}")
+                             f"{fmt_num(leg['qty'], 2)} @ {fmt_num(leg['level'])} {dist_tag}{gex_tag}{sync_tag}")
             db.puts_ansi(y, 0, "       " + "    ".join(parts))
         y += 2   # blank row separates this instrument block from the next one
 
@@ -11659,7 +12863,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
     if not lines:
         msg = "Waiting for first status snapshot…"
         db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg[:w], P_CYAN)
-        hint = " q=quit  Esc=dashboard  M=next(Trading) "
+        hint = " q=quit  Esc=dashboard  M=next(Drift) "
         db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
         return 0
 
@@ -11669,9 +12873,263 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
         db.puts_ansi(y0 + i, x0, line[:w])
 
     scroll_tag = f"  [{scroll + 1}-{min(total, scroll + visible_rows)} of {total}]" if total > visible_rows else ""
-    hint = f" q=quit  Esc=dashboard  M=next(Trading)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
+    hint = f" q=quit  Esc=dashboard  M=next(Drift)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
     db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
     return scroll
+
+def _drift_segments(db, row, col, segments):
+    """db.puts()-based equivalent of drift.py's own draw_segments — writes a
+    sequence of (text, pair, attrs) pieces left to right, returning the
+    final column (unused here, kept for parity)."""
+    cx = col
+    for text, pair, attrs in segments:
+        db.puts(row, cx, text, pair, attrs)
+        cx += len(text)
+    return cx
+
+def _drift_plot_area(db, cols, vmin, vmax, row_top, row_bot, left_x):
+    """Cumulative-signed area fill for the Net Volume panel — green above
+    zero, red below, filled solid from the zero row (or the nearest panel
+    edge, if zero itself isn't in [vmin, vmax]) to each column's own row."""
+    zero_row = _drift_to_row(0.0, vmin, vmax, row_top, row_bot) if vmin <= 0.0 <= vmax else None
+    for i, v in enumerate(cols):
+        if v is None:
+            continue
+        r = _drift_to_row(v, vmin, vmax, row_top, row_bot)
+        pair = P_GREEN if v >= 0 else P_RED
+        anchor = zero_row if zero_row is not None else (row_bot if v >= 0 else row_top)
+        r0, r1 = sorted((anchor, r))
+        for rr in range(r0, r1 + 1):
+            db.puts(rr, left_x + i, "█", pair, curses.A_DIM)
+
+def draw_drift(db, asset, y0, y1, x0, x1, ui):
+    """Net Drift (Premium) — ported from drift.py's own draw(), adapted from
+    raw stdscr/safe_add calls to Athena's DoubleBuffer db.puts/puts_ansi API
+    (same adaptation draw_gex_map/draw_status_screen already went through
+    for their own merges). `asset` is whichever of ETH/QQQ is currently
+    focused (chart_focus, resolved by the caller exactly like gex_mode's own
+    gex_asset) — there is no drift.py-style [S]-switch-to-any-symbol here,
+    see this section's own header comment for why. `ui` carries the mutable
+    display state curses_main owns as plain locals (mirrors gex_ui's own
+    dict-in convention): live/view_date/view_offset/bar_interval/
+    filtered_mode/net_volume_mode/show_venues. Returns the clamped
+    view_offset so the caller's own local stays in sync with what was
+    actually drawn (same convention draw_status_screen's own scroll return
+    already uses)."""
+    is_crypto = DRIFT_IS_CRYPTO[asset]
+    live = ui["live"]
+    state = DRIFT_STATE[asset] if live else (DRIFT_HIST_STATE.get(asset) or DRIFT_STATE[asset])
+    view_date = ui["view_date"]
+    bar_interval = ui["bar_interval"]
+    raw_view_offset = ui["view_offset"]
+    filtered_mode = ui["filtered_mode"]
+    net_volume_mode = ui["net_volume_mode"]
+    show_venues = ui["show_venues"]
+    interval = DRIFT_INTERVAL[asset]
+    next_poll_ts = DRIFT_NEXT_POLL_TS[asset]
+    min_trade_usd = DRIFT_MIN_TRADE_USD[asset]
+    confidence_deadzone = DRIFT_CONFIDENCE_DEADZONE[asset]
+
+    with state.lock:
+        history = list(state.history)
+        calls_cum = state.calls_cum_f if filtered_mode else state.calls_cum
+        puts_cum = state.puts_cum_f if filtered_mode else state.puts_cum
+        net_vol_cum = state.net_vol_cum_f if filtered_mode else state.net_vol_cum
+        spot, status, expiry = state.spot, state.status, state.expiry_label
+        last_poll = state.last_poll
+        venue_info = _drift_fmt_venue_line(state) if is_crypto else None
+        venue_breakdown = _drift_fmt_venue_breakdown(state, filtered_mode) if (is_crypto and show_venues) else None
+
+    x_end, view_offset = _drift_chart_x_end(history, live, raw_view_offset, bar_interval)
+
+    h, w = y1 - y0, x1 - x0
+    if h < 14 or w < 50:
+        db.puts(y0, x0, "terminal too small — resize"[:w], P_YELLOW)
+        return view_offset
+
+    title = f" Net Drift (Premium) — {asset} "
+    if filtered_mode:
+        title += "(filtered — OTM only) "
+    if not live:
+        title += f"(historical — {view_date}) "
+    if view_offset > 0:
+        title += f"[← {_drift_fmt_duration(view_offset * bar_interval)}] "
+    db.puts(y0, x0, title.ljust(w)[:w], P_STATUS, curses.A_BOLD)
+    clock_str = datetime.now(tz=TZ_CT).strftime("%H:%M:%S") + " "
+    db.puts(y0, x0 + max(0, w - len(clock_str)), clock_str, P_STATUS, curses.A_BOLD)
+
+    calls_str, puts_str, spot_str = _drift_fmt_money(calls_cum), _drift_fmt_money(puts_cum), _drift_fmt_price(spot)
+    _drift_segments(db, y0 + 1, x0 + 1, [
+        ("● ", P_GREEN, curses.A_BOLD), (f"Calls ({calls_str})   ", P_DEFAULT, 0),
+        ("● ", P_RED, curses.A_BOLD), (f"Puts ({puts_str})   ", P_DEFAULT, 0),
+        ("● ", P_BLUE, curses.A_BOLD), (f"{asset} ({spot_str})", P_DEFAULT, 0),
+    ])
+    if is_crypto:
+        info = f"{venue_info}  {status}"
+    else:
+        info = (f"exp {expiry}  " if expiry else "") + status
+        if not _drift_is_market_open_et() and not status.startswith("market closed"):
+            info = "market closed — " + info
+    db.puts(y0 + 1, x0 + max(0, w - len(info) - 1), info, P_DIM)
+
+    LEFT_W, RIGHT_W = 8, 10
+    FOOTER_ROWS, TIME_ROWS = 1, 1
+    top = y0 + 3
+    if venue_breakdown is not None:
+        db.puts(y0 + 2, x0 + 1, venue_breakdown, P_DIM)
+        top = y0 + 4
+    available = h - (top - y0) - FOOTER_ROWS - TIME_ROWS
+    if available < 8:
+        return view_offset
+    main_h = max(5, int(available * 0.68))
+    vol_h = max(3, available - main_h - 1)
+    main_top = top
+    vol_top = main_top + main_h + 1
+    vol_bot = vol_top + vol_h - 1
+    plot_w = max(1, w - LEFT_W - RIGHT_W - 1)
+
+    for i in _drift_day_boundary_cols(x_end, bar_interval, plot_w):
+        col = x0 + LEFT_W + i
+        for rr in range(main_top + 1, vol_bot + 1):
+            db.puts(rr, col, ":", P_DIM)
+        db.puts(main_top, col, "D", P_DIM, curses.A_BOLD)
+
+    cols_calls, cols_puts, cols_spot, cols_netvol, cols_vol = _drift_build_columns(
+        history, x_end, bar_interval, plot_w, filtered_mode)
+
+    prem_vals = [v for v in cols_calls + cols_puts if v is not None] + [0.0]
+    pmin, pmax = min(prem_vals), max(prem_vals)
+    if pmin == pmax:
+        pmin, pmax = pmin - 1, pmax + 1
+    pad = (pmax - pmin) * 0.08
+    pmin, pmax = pmin - pad, pmax + pad
+
+    price_vals = [v for v in cols_spot if v is not None]
+    if price_vals:
+        smin, smax = min(price_vals), max(price_vals)
+        if smin == smax:
+            smin, smax = smin - 1, smax + 1
+        spad = (smax - smin) * 0.10
+        smin, smax = smin - spad, smax + spad
+    else:
+        smin, smax = 0.0, 1.0
+
+    main_bot = main_top + main_h - 1
+    N_TICKS = max(2, min(6, main_h // 2))
+    for k in range(N_TICKS):
+        row = main_top + int(k * (main_h - 1) / max(1, N_TICKS - 1))
+        frac = (row - main_top) / max(1, main_h - 1)
+        pval = pmax - frac * (pmax - pmin)
+        sval = smax - frac * (smax - smin)
+        lbl = _drift_fmt_axis_money(pval)
+        db.puts(row, x0 + max(0, LEFT_W - 1 - len(lbl)), lbl, P_DIM)
+        rlbl = _drift_fmt_price(sval)
+        db.puts(row, x0 + LEFT_W + plot_w + 1, rlbl, P_DIM)
+
+    if pmin <= 0.0 <= pmax:
+        zero_row = _drift_to_row(0.0, pmin, pmax, main_top, main_bot)
+        db.puts(zero_row, x0 + LEFT_W, "·" * plot_w, P_DIM)
+        zero_lbl = _drift_fmt_axis_money(0.0)
+        db.puts(zero_row, x0 + max(0, LEFT_W - 1 - len(zero_lbl)), zero_lbl, P_DIM)
+
+    # Live price line — dashed reference line at the CURRENT price (state.spot,
+    # not just whatever the rightmost column shows — matters while scrolled
+    # back), plus a solid reverse-video price-axis badge, TradingView-style.
+    if spot is not None and price_vals and smin <= spot <= smax:
+        live_row = _drift_to_row(spot, smin, smax, main_top, main_bot)
+        db.puts(live_row, x0 + LEFT_W, "─" * plot_w, P_YELLOW)
+        badge = _drift_fmt_price(spot).rjust(max(0, RIGHT_W - 1))
+        db.puts(live_row, x0 + LEFT_W + plot_w + 1, badge, P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+
+    def _plot_line(cols, vmin, vmax, glyph, pair, attrs):
+        prev_row = None
+        for i, v in enumerate(cols):
+            if v is None:
+                prev_row = None
+                continue
+            r = _drift_to_row(v, vmin, vmax, main_top, main_bot)
+            if prev_row is not None:
+                r0, r1 = sorted((prev_row, r))
+                for rr in range(r0, r1 + 1):
+                    db.puts(rr, x0 + LEFT_W + i, "│", pair, attrs)
+            db.puts(r, x0 + LEFT_W + i, glyph, pair, attrs)
+            prev_row = r
+
+    _plot_line(cols_spot, smin, smax, "●", P_BLUE, curses.A_BOLD)
+    _plot_line(cols_puts, pmin, pmax, "●", P_RED, curses.A_BOLD)
+    _plot_line(cols_calls, pmin, pmax, "●", P_GREEN, curses.A_BOLD)
+
+    db.puts(main_bot + 1, x0, "─" * w, P_DIM)
+    panel_title = " Net Volume " if net_volume_mode else " Volume "
+    db.puts(main_bot + 1, x0 + LEFT_W, panel_title, P_DEFAULT, curses.A_BOLD)
+
+    if net_volume_mode:
+        netvol_vals = [v for v in cols_netvol if v is not None] + [0.0]
+        nvmin, nvmax = min(netvol_vals), max(netvol_vals)
+        if nvmin == nvmax:
+            nvmin, nvmax = nvmin - 1, nvmax + 1
+        nvpad = (nvmax - nvmin) * 0.08
+        nvmin, nvmax = nvmin - nvpad, nvmax + nvpad
+
+        N_VOL_TICKS = max(2, min(4, vol_h // 2))
+        for k in range(N_VOL_TICKS):
+            row = vol_top + int(k * (vol_h - 1) / max(1, N_VOL_TICKS - 1))
+            frac = (row - vol_top) / max(1, vol_h - 1)
+            nval = nvmax - frac * (nvmax - nvmin)
+            lbl = _drift_fmt_axis_count(nval)
+            db.puts(row, x0 + max(0, LEFT_W - 1 - len(lbl)), lbl, P_DIM)
+
+        if nvmin <= 0.0 <= nvmax:
+            zero_row_v = _drift_to_row(0.0, nvmin, nvmax, vol_top, vol_bot)
+            db.puts(zero_row_v, x0 + LEFT_W, "·" * plot_w, P_DIM)
+            zero_lbl_v = _drift_fmt_axis_count(0.0)
+            db.puts(zero_row_v, x0 + max(0, LEFT_W - 1 - len(zero_lbl_v)), zero_lbl_v, P_DIM)
+
+        if net_vol_cum is not None and nvmin <= net_vol_cum <= nvmax:
+            live_row_v = _drift_to_row(net_vol_cum, nvmin, nvmax, vol_top, vol_bot)
+            db.puts(live_row_v, x0 + LEFT_W, "─" * plot_w, P_YELLOW)
+            badge_v = _drift_fmt_axis_count(net_vol_cum).rjust(max(0, RIGHT_W - 1))
+            db.puts(live_row_v, x0 + LEFT_W + plot_w + 1, badge_v, P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+
+        _drift_plot_area(db, cols_netvol, nvmin, nvmax, vol_top, vol_bot, x0 + LEFT_W)
+    else:
+        max_vol = max(cols_vol) if cols_vol else 0.0
+        db.puts(vol_top, x0 + max(0, LEFT_W - 1 - len(_drift_fmt_axis_money(max_vol))), _drift_fmt_axis_money(max_vol), P_DIM)
+        db.puts(vol_bot, x0 + max(0, LEFT_W - 2), "$0", P_DIM)
+        for i, v in enumerate(cols_vol):
+            if max_vol <= 0 or not v:
+                continue
+            bar_h = max(1, int(round(v / max_vol * vol_h)))
+            for rr in range(vol_bot, vol_bot - bar_h, -1):
+                db.puts(rr, x0 + LEFT_W + i, "█", P_GREEN, curses.A_DIM)
+
+    time_row = vol_bot + 1
+    n_time_labels = max(2, plot_w // 14)
+    for k in range(n_time_labels):
+        i = int(k * (plot_w - 1) / max(1, n_time_labels - 1))
+        ts = x_end - (plot_w - 1 - i) * bar_interval
+        lbl = _drift_fmt_time(ts, is_crypto)
+        cx = x0 + LEFT_W + max(0, i - len(lbl) // 2)
+        db.puts(time_row, cx, lbl, P_DIM)
+
+    last_str = datetime.fromtimestamp(last_poll).strftime("%H:%M:%S") if last_poll else "—"
+    if view_offset > 0:
+        countdown = f"scrolled -{_drift_fmt_duration(view_offset * bar_interval)} — [→]/[L] to live"
+    elif live:
+        countdown = f"next refresh in {max(0, int(round(next_poll_ts - time.time())))}s"
+    else:
+        countdown = "live tracking continues in background"
+    v_hint = "   [V] venues" if is_crypto else "   [C] deadzone"
+    min_str = f"min ${min_trade_usd:g}"
+    dz_str = f"   dz {confidence_deadzone * 100:g}%" if not is_crypto else ""
+    filt_str = "   FILTERED (OTM)" if filtered_mode else ""
+    vol_str = "   bottom: Net Vol" if net_volume_mode else "   bottom: Volume"
+    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint} "
+              f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
+              f"poll {interval}s   {_drift_fmt_duration(bar_interval)} bars   {min_str}{dz_str}{filt_str}{vol_str}    "
+              f"{countdown}    last update {last_str} ")
+    db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
+    return view_offset
 
 # ── Startup loading screen ───────────────────────────────────────────────────
 # Shown by curses_main from the moment its startup threads are launched until
@@ -11772,6 +13230,8 @@ def _startup_progress():
     steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
     for asset in ASSETS:
         steps.append((f"{asset} chart engine", _ch_ready[asset].is_set()))
+    for asset in DRIFT_ASSETS:
+        steps.append((f"{asset} Net Drift engine", DRIFT_READY[asset].is_set()))
     if not DRY_RUN:
         # Only shown at all on a live launch — a DRY_RUN/paper session never
         # starts _phemex_preflight_thread (see curses_main's own thread-
@@ -11973,6 +13433,14 @@ def curses_main(stdscr):
         threading.Thread(target=_ch_engine_thread_eth, args=(_quit_evt,), daemon=True).start()
         threading.Thread(target=_ch_engine_thread_qqq, args=(_quit_evt,), daemon=True).start()
         threading.Thread(target=_ch_export_loop, args=(_quit_evt,), daemon=True).start()
+        # Net Drift engine — ported from drift.py, one always-on thread per
+        # asset (both ETH and QQQ tracked continuously regardless of which
+        # [M] mode is currently displayed, same as GEX/Status/CH above) —
+        # see _drift_engine_loop's own docstring for why this is two simple
+        # per-asset threads rather than a port of drift.py's own Controller/
+        # BackgroundTracker split.
+        for _drift_asset in DRIFT_ASSETS:
+            threading.Thread(target=_drift_engine_loop, args=(_drift_asset, _quit_evt), daemon=True).start()
 
     # Sync layer — the ONE thread Client Mode ever starts (never touches an
     # exchange, a broker credential, or the trading engine); Server Mode
@@ -12060,6 +13528,27 @@ def curses_main(stdscr):
     status_mode = False   # full-screen Status mode (Phase 3c) — the [M]
                             # cycle's next stop after GEX; see gex_mode above
     status_scroll = 0
+    drift_mode = False   # full-screen Net Drift (Premium) mode, ported from
+                          # drift.py — the NEW last stop in the [M] cycle:
+                          # Trading -> GEX -> Status -> Net Drift -> Trading
+                          # (see status_mode's own key dispatch below, which
+                          # now continues here instead of exiting straight
+                          # to Trading).
+    drift_live = {"ETH": True, "QQQ": True}         # [H] per-asset live/historical
+    drift_view_date = {"ETH": None, "QQQ": None}     # per-asset — which date [H] is browsing
+    drift_view_offset = {"ETH": 0, "QQQ": 0}         # per-asset pan/scroll — deliberately
+                          # per-asset (unlike drift.py's own single ctrl.view_offset, which
+                          # resets on [S]-switch) so Tab-switching ETH<->QQQ preserves each
+                          # asset's own scroll position, matching the SAME per-asset state
+                          # preservation gex_mode's own gex_live_follow/gex_view_end_idx/etc.
+                          # already established for Tab-switching in THIS file.
+    drift_bar_interval = DRIFT_DEFAULT_BAR_INTERVAL   # [B] — shared across both assets,
+                          # matches drift.py's own ctrl.bar_interval (not per-symbol there either)
+    drift_filtered_mode = True      # [F] — shared display toggle, matches ctrl.filtered_mode;
+                                      # defaults ON per user request (2026-08-11)
+    drift_net_volume_mode = True    # [N] — shared display toggle, matches ctrl.net_volume_mode
+    drift_show_venues = False       # [V] — shared display toggle, matches drift.py's own
+                                      # curses_main-local show_venues
     dashboard_hidden = False   # [H] — gives the chart the ENTIRE terminal,
                                # same row budget footprint.py's own
                                # full-screen view uses, for when even the
@@ -12176,6 +13665,17 @@ def curses_main(stdscr):
             # separate Athena footer is drawn underneath (see the footer
             # dispatch below).
             status_scroll = draw_status_screen(db, 0, rows, 0, cols, status_scroll)
+        elif drift_mode:
+            # Full screen, same convention as gex_mode/status_mode above —
+            # draw_drift draws its own hint row at the very last line, so no
+            # separate Athena footer is drawn underneath (see the footer
+            # dispatch below).
+            drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            drift_ui = {"live": drift_live[drift_asset], "view_date": drift_view_date[drift_asset],
+                        "view_offset": drift_view_offset[drift_asset], "bar_interval": drift_bar_interval,
+                        "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
+                        "show_venues": drift_show_venues}
+            drift_view_offset[drift_asset] = draw_drift(db, drift_asset, 0, rows, 0, cols, drift_ui)
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
@@ -12247,6 +13747,9 @@ def curses_main(stdscr):
         elif status_mode:
             pass   # draw_status_screen already drew its own hint row —
                    # same reasoning as gex_mode above.
+        elif drift_mode:
+            pass   # draw_drift already drew its own hint row — same
+                   # reasoning as gex_mode/status_mode above.
         else:
             # [Tab] hint placed right after the scroll hint it's directly
             # related to (not appended at the very end) — the footer is
@@ -12262,7 +13765,7 @@ def curses_main(stdscr):
                 # shorter footer instead of interleaving "not available"
                 # markers into the same dense f-string.
                 footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Status"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Status/Drift"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             else:
                 risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
@@ -12271,7 +13774,7 @@ def curses_main(stdscr):
                 fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
                 footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                           f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status"
+                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status/Drift"
                           + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                           + "  [F]latten"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
@@ -12314,15 +13817,17 @@ def curses_main(stdscr):
 
         if status_mode:
             # Scrollable full-screen text, not a chart with pan state, so
-            # the key set is smaller than gex_mode's. Phase 4: [M] and Esc
-            # both land back on Trading here — Status is the LAST stop in
-            # the Trading -> GEX -> Status -> Trading cycle, so "next" and
-            # "exit" coincide at this one stop (see the gex_mode block
-            # below for where they diverge).
+            # the key set is smaller than gex_mode's. [M] continues the
+            # Trading -> GEX -> Status -> Net Drift -> Trading cycle on to
+            # Net Drift; Esc is still the fast "back to Trading" escape
+            # hatch from any mode (same split gex_mode's own block uses).
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
-            elif key in (ord("m"), ord("M"), 27):
+            elif key == 27:
                 status_mode = False
+            elif key in (ord("m"), ord("M")):
+                status_mode = False
+                drift_mode = True
             elif key == curses.KEY_UP:
                 status_scroll = max(0, status_scroll - 1)
             elif key == curses.KEY_DOWN:
@@ -12417,6 +13922,102 @@ def curses_main(stdscr):
             elif key == ord("}"):
                 gex_vert_follow[gex_asset] = False
                 gex_vert_center_idx[gex_asset] = 0
+            continue
+
+        if drift_mode:
+            # Ported from drift.py's own curses_main key dispatch, remapped
+            # per the approved plan: [M] is taken globally (next mode, same
+            # as gex_mode/status_mode above — Net Drift is the LAST stop, so
+            # it wraps back to Trading), drift.py's own [M] (min trade $
+            # threshold) moves to [T]; drift.py's [S] (switch to an
+            # arbitrary symbol) is dropped entirely since Athena only ever
+            # tracks ETH/QQQ — Tab switches focus between them instead,
+            # matching gex_mode's own convention; drift.py's Esc (snap to
+            # live) moves to [L], freeing Esc for the same cross-mode "back
+            # to Trading" convention every other full-screen mode uses.
+            drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                drift_mode = False
+            elif key in (ord("m"), ord("M")):
+                drift_mode = False
+            elif key == 9:   # Tab — switch asset focus, same convention as gex_mode
+                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key in (ord("l"), ord("L")):   # snap back to the live edge
+                drift_live[drift_asset] = True
+                drift_view_date[drift_asset] = None
+                drift_view_offset[drift_asset] = 0
+                DRIFT_HIST_STATE.pop(drift_asset, None)
+            elif key in (ord("h"), ord("H")):
+                raw = _prompt_text(stdscr, [f"{drift_asset} — date to browse MM_DD_YYYY, or 'live' to return"],
+                                    prompt="> ")
+                db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
+                if raw is not None:
+                    low = raw.strip().lower()
+                    if low in ("", "live", "l"):
+                        if raw.strip():   # non-empty "live"/"l" — blank Enter is a no-op cancel
+                            drift_live[drift_asset] = True
+                            drift_view_date[drift_asset] = None
+                            drift_view_offset[drift_asset] = 0
+                            DRIFT_HIST_STATE.pop(drift_asset, None)
+                    else:
+                        _drift_load_historical(drift_asset, raw.strip())
+                        drift_view_date[drift_asset] = raw.strip()
+                        drift_live[drift_asset] = False
+                        drift_view_offset[drift_asset] = 0
+            elif key in (ord("i"), ord("I")):
+                new_interval = _prompt_number(stdscr, f"{drift_asset} poll interval in seconds, min "
+                                               f"{DRIFT_MIN_INTERVAL} (current {DRIFT_INTERVAL[drift_asset]}): ",
+                                               default=DRIFT_INTERVAL[drift_asset])
+                db.prev = None
+                DRIFT_INTERVAL[drift_asset] = max(DRIFT_MIN_INTERVAL, int(new_interval))
+            elif key in (ord("b"), ord("B")):
+                new_bar = _prompt_number(stdscr, f"Bar interval in seconds, min {DRIFT_MIN_BAR_INTERVAL} "
+                                          f"(current {drift_bar_interval}): ", default=drift_bar_interval)
+                db.prev = None
+                drift_bar_interval = max(DRIFT_MIN_BAR_INTERVAL, int(new_bar))
+            elif key in (ord("t"), ord("T")):
+                new_min = _prompt_number(stdscr, f"{drift_asset} min trade size in $ (current "
+                                          f"${DRIFT_MIN_TRADE_USD[drift_asset]:,.0f}): ",
+                                          default=DRIFT_MIN_TRADE_USD[drift_asset])
+                db.prev = None
+                DRIFT_MIN_TRADE_USD[drift_asset] = max(0.0, new_min)
+            elif key in (ord("c"), ord("C")):
+                new_dz = _prompt_number(stdscr, f"{drift_asset} confidence deadzone in $ (current "
+                                         f"${DRIFT_CONFIDENCE_DEADZONE[drift_asset]:,.2f}): ",
+                                         default=DRIFT_CONFIDENCE_DEADZONE[drift_asset])
+                db.prev = None
+                DRIFT_CONFIDENCE_DEADZONE[drift_asset] = max(0.0, new_dz)
+            elif key in (ord("f"), ord("F")):
+                drift_filtered_mode = not drift_filtered_mode
+            elif key in (ord("n"), ord("N")):
+                drift_net_volume_mode = not drift_net_volume_mode
+            elif key in (ord("v"), ord("V")):
+                drift_show_venues = not drift_show_venues
+            elif key in (ord("r"), ord("R")):
+                DRIFT_NEXT_POLL_TS[drift_asset] = 0.0
+            elif key == curses.KEY_LEFT:
+                drift_live[drift_asset] = False
+                drift_view_offset[drift_asset] += 1
+            elif key == curses.KEY_RIGHT:
+                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 1)
+                if drift_view_offset[drift_asset] == 0:
+                    drift_live[drift_asset] = True
+            elif key == curses.KEY_SLEFT:
+                drift_live[drift_asset] = False
+                drift_view_offset[drift_asset] += 10
+            elif key == curses.KEY_SRIGHT:
+                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 10)
+                if drift_view_offset[drift_asset] == 0:
+                    drift_live[drift_asset] = True
+            elif key == curses.KEY_PPAGE:
+                drift_live[drift_asset] = False
+                drift_view_offset[drift_asset] += 50
+            elif key == curses.KEY_NPAGE:
+                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 50)
+                if drift_view_offset[drift_asset] == 0:
+                    drift_live[drift_asset] = True
             continue
 
         if data_view:

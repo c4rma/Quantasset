@@ -5003,6 +5003,75 @@ async def fetch_last_price(symbol):
     except Exception:
         return None
 
+async def cancel_order(symbol, pos_side, order_id):
+    """Cancel ONE specific resting order by its exchange-assigned orderID —
+    unlike cancel_all, this never touches any other order the account
+    might have resting on this symbol. Currently only used by the
+    trade-execution pre-flight check below (_test_phemex_order_roundtrip)
+    — not wired into any live trading logic path, so it doesn't change
+    the behavior of anything that was already working."""
+    if DRY_RUN:
+        return {"code": 0}   # SimAccount has no matching concept of a single
+                              # resting order id — the pre-flight check only
+                              # ever runs when NOT DRY_RUN (see its own call
+                              # sites), so this is just a harmless no-op
+    return await phemex_request('DELETE', '/g-orders/cancel',
+                                 params={'orderID': order_id, 'symbol': symbol, 'posSide': pos_side})
+
+async def _test_phemex_order_roundtrip(phemex_symbol):
+    """Real-money pre-flight check, added on explicit user request ("make
+    sure trade execution works" before going live) — places the smallest
+    possible resting limit order and immediately cancels it, proving the
+    API key/secret can actually sign, place, AND cancel a real order
+    end-to-end. Catches a bad/expired key, a read-only-permission key, a
+    symbol-level trading restriction, or a Phemex-side outage BEFORE
+    Athena would otherwise discover any of that on its first real entry,
+    with money on the line.
+
+    Two independent safeguards against the test order ever actually
+    filling: (1) timeInForce=PostOnly — Phemex rejects the order outright
+    rather than executing it as taker if it would cross the book; (2) on
+    top of that, the price is deliberately 50% below the current market
+    anyway, so even a stale/wrong reference price can't put it near the
+    real book. Order size is exactly one qty_step — the smallest this
+    symbol allows — as one more layer of belt-and-suspenders on top of
+    both of the above, not because either one is expected to fail.
+
+    Returns (ok, message)."""
+    try:
+        price = await fetch_last_price(phemex_symbol)
+        if not price or price <= 0:
+            return False, f"{phemex_symbol}: couldn't fetch a reference price"
+        qty_step, price_step = await fetch_contract_spec(phemex_symbol)
+        qty_step = qty_step or 0.001
+        price_step = price_step or 0.01
+        price_decimals = _decimals_for_step(price_step)
+        qty_decimals = _decimals_for_step(qty_step)
+        test_price = floor_to_step(price * 0.5, price_step)
+        price_str = f"{test_price:.{price_decimals}f}"
+        qty_str = f"{qty_step:.{qty_decimals}f}"
+
+        params = {
+            'symbol': phemex_symbol, 'clOrdID': f'athena_selftest_{int(time.time() * 1000)}',
+            'side': 'Buy', 'posSide': 'Long', 'orderQtyRq': qty_str,
+            'ordType': 'Limit', 'priceRp': price_str,
+            'reduceOnly': 'false', 'timeInForce': 'PostOnly',
+        }
+        create_result = await phemex_request('PUT', '/g-orders/create', params=params)
+        if not _order_ok(create_result):
+            return False, f"{phemex_symbol}: order placement failed — {create_result}"
+        order_id = (create_result.get('data') or {}).get('orderID')
+        if not order_id:
+            return False, f"{phemex_symbol}: order accepted but no orderID in response — {create_result}"
+
+        cancel_result = await cancel_order(phemex_symbol, 'Long', order_id)
+        if not _order_ok(cancel_result):
+            return False, (f"{phemex_symbol}: TEST ORDER PLACED (id={order_id}) BUT CANCEL "
+                            f"FAILED — check your Phemex account manually. {cancel_result}")
+        return True, f"{phemex_symbol}: order create+cancel round-trip OK"
+    except Exception as e:
+        return False, f"{phemex_symbol}: {e}"
+
 # ── Per-instrument state machine ──────────────────────────────────────────────
 class AthenaInstrument:
     def __init__(self, asset):
@@ -8637,8 +8706,8 @@ SYNC_CLIENT_PROBE_TIMEOUT = 3   # connect() timeout used for every candidate
                                   # address EXCEPT the last one being tried
                                   # this attempt (see _sync_client_connect_
                                   # loop) — e.g. probing a LAN address that
-                                  # isn't reachable today (remote/Tailscale-
-                                  # only) should fail fast so the fallback
+                                  # isn't reachable today (remote/VPN-only
+                                  # day) should fail fast so the fallback
                                   # candidate gets tried promptly, not after
                                   # the full connect timeout idles out
 SYNC_CLIENT_MAX_BACKOFF = 5   # cap on the reconnect backoff between attempts
@@ -8658,23 +8727,29 @@ SYNC_CLIENTS = {}                     # structure — N per-client handler threa
 SYNC_SERVER_STATUS = {}                # label -> "listening on host:port" / "error: ..." /
                                         # "restarting listener…" / "stopped", one entry per
                                         # address _sync_server_listen was started for (see
-                                        # SYNC_SERVER_BIND_IPS) — "LAN" and/or "TS"
+                                        # SYNC_SERVER_BIND_IPS) — "LAN" and/or "VPN"
 SYNC_SERVER_BIND_IPS = []              # [(label, ip), ...] this Server actually resolved
                                         # and started a listener for. A Server now binds
                                         # BOTH its plain LAN address (_get_lan_ip) and its
-                                        # Tailscale address (_get_tailscale_ip) — each on
-                                        # its own listener thread — instead of Tailscale
-                                        # only. Reason: a Client and Server on the SAME
-                                        # local network were paying for a VPN hop (and its
-                                        # occasional instability) on every message, for no
-                                        # benefit — the LAN path is simpler and inherently
-                                        # more reliable when it's actually reachable.
-                                        # Tailscale remains the only path when the Client
-                                        # is genuinely off-network. Still NEVER 0.0.0.0 —
+                                        # self-hosted WireGuard address (_get_vpn_ip, read
+                                        # from ATHENA_VPN_IP in .env) — each on its own
+                                        # listener thread. Reason: a Client and Server on
+                                        # the SAME local network were paying for a VPN hop
+                                        # (and its occasional instability) on every
+                                        # message, for no benefit — the LAN path is
+                                        # simpler and inherently more reliable when it's
+                                        # actually reachable. The VPN address remains the
+                                        # only path when the Client is genuinely
+                                        # off-network. (Previously used Tailscale for this
+                                        # leg — dropped per explicit user request after
+                                        # repeated instability; a self-hosted WireGuard
+                                        # tunnel has no third-party coordination service
+                                        # or relay involved at all.) Still NEVER 0.0.0.0 —
                                         # each bind is one specific host address; see
                                         # _sync_server_listen's own docstring for why that
                                         # still matters even for the LAN address (don't
-                                        # port-forward either one from your router).
+                                        # port-forward either one from your router beyond
+                                        # WireGuard's own UDP port).
 
 SYNC_CLIENT_STATUS = ["disconnected"]      # "connecting…" / "connected" /
                                             # "reconnecting in Ns…" / "auth failed…"
@@ -8683,8 +8758,8 @@ SYNC_CLIENT_LAST_MSG_TS = [0.0]            # time.time() of the last applied pus
                                             # and the footer both read this
 SYNC_SERVER_CANDIDATES = []                # [(host, port), ...] the user typed into
                                             # _client_connect_screen, in priority order
-                                            # (e.g. LAN address first, Tailscale address
-                                            # as fallback) — _sync_client_connect_loop
+                                            # (e.g. LAN address first, VPN address as
+                                            # fallback) — _sync_client_connect_loop
                                             # tries each in turn on every (re)connect.
 SYNC_CLIENT_ACTIVE_ADDR = [None, None]     # [host, port] actually connected right now
                                             # (which candidate won) — None until a
@@ -8729,6 +8804,15 @@ _ch_ready = {a: threading.Event() for a in ASSETS}   # set by _ch_engine_thread_
                     # _ch_engine_thread_qqq once this asset's one-shot _ch_bootstrap
                     # REST seed has returned — same "loading screen only" purpose as
                     # _backfill_ready above.
+
+_phemex_preflight_done = threading.Event()   # set once _phemex_preflight_thread has
+                    # finished (pass OR fail) — only started at all when NOT DRY_RUN
+                    # (see curses_main's own thread-startup block); a DRY_RUN launch
+                    # never touches the real Phemex order-entry endpoint at all, so
+                    # there's nothing here for it to test.
+_phemex_preflight_ok  = [True]    # single-item box, same convention as SYNC_CLIENT_
+_phemex_preflight_msg = [""]      # STATUS etc. — read by the loading screen and by
+                                    # the dashboard's own top-of-session warning line
 _reset_sim_evt = threading.Event()   # [R] (armed+confirmed) sets this; engine_loop
                                       # is the only thing that ever mutates SimAccount,
                                       # so the actual reset() call happens there, not
@@ -9055,6 +9139,55 @@ _sync_next_conn_id = [0]   # mutable single-item box, same convention as
                             # _profile_mode_idx above — only the listener
                             # thread ever increments this
 
+# ── Handshake brute-force lockout ──────────────────────────────────────────
+# Defense in depth, added when the sync port started being reachable through
+# a self-hosted WireGuard tunnel with a port forwarded on the router (see
+# _get_vpn_ip) rather than only Tailscale's own coordinated network. The
+# HMAC handshake itself is already unguessable (32-byte nonce + SHA-256,
+# constant-time compare) — this isn't closing a crack in that, it's making
+# repeated attempts from one source expensive even in principle, and giving
+# a signal in the log if anyone's actually probing the port at all.
+SYNC_AUTH_LOCK          = threading.Lock()
+SYNC_AUTH_FAILURES      = {}     # ip -> [timestamps of recent failed attempts]
+SYNC_AUTH_BANNED_UNTIL  = {}     # ip -> unix ts this ip is locked out until
+SYNC_AUTH_MAX_ATTEMPTS  = 5      # failed attempts allowed inside the window...
+SYNC_AUTH_WINDOW_SEC    = 300    # ...5 minutes...
+SYNC_AUTH_BAN_SEC       = 900    # ...before a 15-minute lockout on that IP
+
+def _sync_auth_is_banned(ip):
+    """Checked BEFORE even sending the HMAC challenge — a banned IP gets no
+    response at all, not even an auth_fail, so there's nothing for it to
+    learn from continuing to knock."""
+    with SYNC_AUTH_LOCK:
+        until = SYNC_AUTH_BANNED_UNTIL.get(ip)
+        if until is None:
+            return False
+        if time.time() < until:
+            return True
+        del SYNC_AUTH_BANNED_UNTIL[ip]   # ban expired — let it try again
+        return False
+
+def _sync_auth_record_failure(ip):
+    """Returns True the moment this call is what pushed `ip` over the
+    threshold and triggered a fresh ban (so the caller logs it once, not
+    on every subsequent rejected attempt)."""
+    now = time.time()
+    with SYNC_AUTH_LOCK:
+        attempts = [t for t in SYNC_AUTH_FAILURES.get(ip, []) if now - t < SYNC_AUTH_WINDOW_SEC]
+        attempts.append(now)
+        if len(attempts) >= SYNC_AUTH_MAX_ATTEMPTS:
+            SYNC_AUTH_BANNED_UNTIL[ip] = now + SYNC_AUTH_BAN_SEC
+            SYNC_AUTH_FAILURES.pop(ip, None)
+            return True
+        SYNC_AUTH_FAILURES[ip] = attempts
+        return False
+
+def _sync_auth_record_success(ip):
+    """A good handshake clears any failure history for that IP — a stale
+    laptop reconnecting after a typo'd secret shouldn't stay flagged."""
+    with SYNC_AUTH_LOCK:
+        SYNC_AUTH_FAILURES.pop(ip, None)
+
 def _enable_tcp_keepalive(sock):
     """Best-effort TCP keepalive on both ends of a sync connection —
     without it, a genuinely dead link (network drop, laptop sleep/wake, a
@@ -9100,7 +9233,12 @@ def _sync_client_handler(conn, addr, stop_evt):
     right after registration) — this thread only ever reads, never writes,
     on this connection."""
     conn_id = None
+    ip = addr[0]
     try:
+        if _sync_auth_is_banned(ip):
+            # No challenge, no auth_fail, nothing — just close. See
+            # SYNC_AUTH_* docstrings above for the lockout policy.
+            return
         _enable_tcp_keepalive(conn)
         conn.settimeout(10)
         nonce = os.urandom(32).hex()
@@ -9118,8 +9256,14 @@ def _sync_client_handler(conn, addr, stop_evt):
             return
         expected = hmac.new(SYNC_SECRET.encode(), nonce.encode(), hashlib.sha256).hexdigest()
         if msg.get("type") != "auth" or not hmac.compare_digest(str(msg.get("response", "")), expected):
+            just_banned = _sync_auth_record_failure(ip)
             conn.sendall((json.dumps({"type": "auth_fail"}) + "\n").encode())
+            if just_banned:
+                console_log(f"{RED}Sync: {ip} locked out for {SYNC_AUTH_BAN_SEC}s "
+                            f"after {SYNC_AUTH_MAX_ATTEMPTS} failed auth attempts{RST}")
+                log_event("SYSTEM", "sync_auth_lockout", {"ip": ip})
             return   # no retry loop on this connection — see security notes
+        _sync_auth_record_success(ip)
         conn.sendall((json.dumps({"type": "auth_ok"}) + "\n").encode())
 
         mailbox = _SyncMailbox()
@@ -9204,14 +9348,16 @@ def _sync_client_handler(conn, addr, stop_evt):
 def _sync_server_listen(label, host, stop_evt):
     """Accept-loop thread for ONE specific bind address — curses_main starts
     one of these per address in SYNC_SERVER_BIND_IPS (today: "LAN" and/or
-    "TS"; see that constant's docstring for why a Server binds both). Binds
+    "VPN"; see that constant's docstring for why a Server binds both). Binds
     ONLY the exact host address it's given — NEVER 0.0.0.0. Do not change
     this to bind a wildcard address: the state stream is plaintext JSON
     after the handshake, acceptable only because the two addresses this
     is ever called with are either (a) a private LAN address, reachable
-    only to devices already on the same local network, or (b) a Tailscale
-    address, wrapped in its own WireGuard tunnel. Neither of this port's
-    listeners may ever be port-forwarded to the public internet.
+    only to devices already on the same local network, or (b) this
+    machine's self-hosted WireGuard interface address, reachable only to
+    the other WireGuard peer. Neither of this port's listeners may ever
+    be port-forwarded to the public internet — only WireGuard's own UDP
+    port (configured outside this file, at the OS/router level) should be.
 
     BUG FIXED (user-reported: "clients connected drops from 1 to 0 and
     never comes back", even with the Client itself still retrying):
@@ -9286,9 +9432,9 @@ def _sync_client_connect_loop(candidates, stop_evt):
 
     `candidates` is a list of (host, port) tried IN ORDER on every single
     (re)connect attempt — not just the first. User request: "both,
-    depending on the day" (same LAN some days, remote/Tailscale others) —
+    depending on the day" (same LAN some days, remote/VPN others) —
     rather than picking one transport, try the LAN address first (fast,
-    no VPN hop) and fall back to the Tailscale address only if that
+    no VPN hop) and fall back to the WireGuard address only if that
     fails. Every candidate but the last gets a short probe timeout
     (SYNC_CLIENT_PROBE_TIMEOUT) so an unreachable LAN address on a
     remote day doesn't stall the fallback for long; the LAST candidate
@@ -10034,6 +10180,50 @@ async def engine_loop():
 def _run_engine():
     asyncio.run(engine_loop())
 
+def _phemex_preflight_thread():
+    """One-shot background thread — curses_main starts this only when NOT
+    DRY_RUN (launched live from the CLI, no --dry-run; see its own
+    thread-startup block). Runs _test_phemex_order_roundtrip for every
+    asset before the dashboard is even up, so a bad/expired key or a
+    Phemex-side outage shows up as an explicit, loud loading-screen
+    failure instead of silently waiting to be discovered on Athena's
+    first real entry attempt.
+
+    Deliberately advisory, not a hard gate, at this call site — unlike
+    _go_live's own use of the same test (see there), which DOES refuse
+    to switch to live on failure. Two reasons that's the right split:
+    (1) ATHENA_ENABLED already starts False for every asset on a live
+    CLI launch (see its own module-level comment) — nothing could fire
+    a real trade before the user manually presses [A] regardless, so
+    there's no actual exposure window here to close; (2) this runs
+    against real network calls with no bound on how long a genuine
+    outage takes to time out, and the loading screen's own existing
+    LOADING_MAX_WAIT_SEC exists for internal subsystems coming up, not
+    for that — blocking dashboard entry on it would trade a real,
+    already-mitigated risk for a manufactured availability problem."""
+    global _phemex_preflight_ok, _phemex_preflight_msg
+    async def _run_all():
+        ok_all = True
+        msgs = []
+        for cfg in ASSETS.values():
+            ok, msg = await _test_phemex_order_roundtrip(cfg["phemex_symbol"])
+            ok_all = ok_all and ok
+            msgs.append(msg)
+            if ok:
+                console_log(f"{GRN}Phemex pre-flight OK — {msg}{RST}")
+            else:
+                console_log(f"{RED}{BLD}Phemex pre-flight FAILED — {msg}{RST}")
+            log_event("SYSTEM", "phemex_preflight", {"ok": ok, "detail": msg})
+        return ok_all, msgs
+    try:
+        ok_all, msgs = asyncio.run(_run_all())
+    except Exception as e:
+        ok_all, msgs = False, [f"pre-flight crashed: {e}"]
+        console_log(f"{RED}{BLD}Phemex pre-flight crashed: {e}{RST}")
+    _phemex_preflight_ok[0] = ok_all
+    _phemex_preflight_msg[0] = "; ".join(msgs)
+    _phemex_preflight_done.set()
+
 def _fast_publish_loop(stop_evt):
     """Refreshes ONLY the live/forming-bar chart data at a fast, fixed
     cadence — independent of engine_loop's slower --interval cycle (which
@@ -10073,6 +10263,19 @@ def draw_dashboard(db, snap, cols):
     y += 1
     db.puts(y, 0, "─" * min(cols, BOX_W), P_DIM)
     y += 1
+
+    # Persistent banner (not just a scroll-away console_log line) — a failed
+    # Phemex order create+cancel pre-flight (see _phemex_preflight_thread)
+    # means real trade execution may not actually work on this account
+    # (bad/expired key, read-only permissions, symbol restriction, outage).
+    # ATHENA_ENABLED already starts False for every asset on a live launch,
+    # so nothing could have fired before the user saw this, but it needs to
+    # stay visible — not just log once and scroll off — until they either
+    # fix it or consciously enable trading anyway.
+    if not DRY_RUN and _phemex_preflight_done.is_set() and not _phemex_preflight_ok[0]:
+        db.puts_ansi(y, 0, f"{RED}{BLD}⚠ PHEMEX TRADE-EXECUTION TEST FAILED{RST}{DIM} — "
+                           f"{_phemex_preflight_msg[0]}{RST}")
+        y += 1
 
     op, cpnl = snap["open_pnl"], snap["closed_pnl"]
     bal_tag = "SIM" if DRY_RUN else "Phemex"
@@ -10643,22 +10846,20 @@ def _blocking_info_screen(stdscr, box_lines, color=None, wait_for_key=True):
         finally:
             stdscr.nodelay(True)
 
-def _get_tailscale_ip():
-    """Best-effort resolution of this machine's Tailscale IPv4 address, via
-    the `tailscale` CLI itself (authoritative — reads the daemon's own
-    state, not a network-interface guess that could pick up the wrong
-    adapter). Returns None on any failure (binary not on PATH, tailscaled
-    not running/not logged in, timeout) — callers must NEVER fall back to
-    binding 0.0.0.0 when this returns None; see _sync_server_listen's own
-    docstring for why."""
-    import subprocess
-    try:
-        result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                                 text=True, timeout=3)
-        out = result.stdout.strip()
-        return out.splitlines()[0].strip() if out else None
-    except Exception:
-        return None
+def _get_vpn_ip():
+    """This machine's self-hosted WireGuard interface address, if
+    configured — read from ATHENA_VPN_IP in .env, NOT auto-detected.
+    (Previously this shelled out to the `tailscale` CLI to resolve a
+    Tailscale IP; dropped per explicit user request after repeated
+    connection instability — see SYNC_SERVER_BIND_IPS's docstring.)
+    There's no reliable cross-platform equivalent of `tailscale ip` for a
+    plain wg-quick interface — its address is whatever you assigned it
+    in the WireGuard config in the first place, so it's simplest and
+    most honest to just have the user put that same value in .env once,
+    rather than trying to parse `wg show`/`ip addr` output per-platform.
+    Returns None if unset — callers must NEVER fall back to binding
+    0.0.0.0 in that case; see _sync_server_listen's own docstring for why."""
+    return os.environ.get('ATHENA_VPN_IP', '').strip() or None
 
 def _get_lan_ip():
     """Best-effort resolution of this machine's plain local-network IPv4
@@ -10668,8 +10869,8 @@ def _get_lan_ip():
     tells us which local interface/address it would use for it — no
     packet is actually sent (UDP connect() never touches the network).
     Returns None on any failure (e.g. no network connectivity at all).
-    Like _get_tailscale_ip, callers must NEVER fall back to binding
-    0.0.0.0 when this returns None — see _sync_server_listen's docstring."""
+    Like _get_vpn_ip, callers must NEVER fall back to binding 0.0.0.0
+    when this returns None — see _sync_server_listen's docstring."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -10764,26 +10965,26 @@ def _mode_select_screen(stdscr):
 
 def _server_info_screen(stdscr):
     """Shown once, right after picking Server Mode — resolves this
-    machine's plain LAN address (_get_lan_ip) AND its Tailscale address
-    (_get_tailscale_ip) and shows whichever ones exist, plus the sync
-    port, so the user can type them into a Client elsewhere (comma-
-    separated — see _client_connect_screen). A Server now listens on
-    BOTH when both resolve: the LAN address lets a same-network Client
-    skip Tailscale entirely (simpler, no VPN hop, one less thing to be
-    flaky); the Tailscale address is still there for when the Client is
-    genuinely remote. If NEITHER resolves, Server Mode still proceeds —
-    it just runs with no listener thread at all (see curses_main's own
-    SERVER_MODE branch, which is the actual enforcement point for "never
-    bind 0.0.0.0") rather than ever silently falling back to a public
-    bind address."""
+    machine's plain LAN address (_get_lan_ip) AND its self-hosted
+    WireGuard address (_get_vpn_ip, from ATHENA_VPN_IP in .env) and shows
+    whichever ones exist, plus the sync port, so the user can type them
+    into a Client elsewhere (comma-separated — see _client_connect_
+    screen). A Server now listens on BOTH when both resolve: the LAN
+    address lets a same-network Client skip the VPN entirely (simpler,
+    no VPN hop, one less thing to be flaky); the WireGuard address is
+    still there for when the Client is genuinely remote. If NEITHER
+    resolves, Server Mode still proceeds — it just runs with no listener
+    thread at all (see curses_main's own SERVER_MODE branch, which is
+    the actual enforcement point for "never bind 0.0.0.0") rather than
+    ever silently falling back to a public bind address."""
     lan_ip = _get_lan_ip()
-    ts_ip = _get_tailscale_ip()
+    vpn_ip = _get_vpn_ip()
     lines = ["", "SERVER MODE", ""]
     if lan_ip:
         lines.append(f"Local network:  {lan_ip}:{SYNC_PORT_DEFAULT}")
-    if ts_ip:
-        lines.append(f"Tailscale:      {ts_ip}:{SYNC_PORT_DEFAULT}")
-    if lan_ip or ts_ip:
+    if vpn_ip:
+        lines.append(f"WireGuard VPN:  {vpn_ip}:{SYNC_PORT_DEFAULT}")
+    if lan_ip or vpn_ip:
         lines += ["", "On a Client, enter whichever address(es) apply,",
                    "comma-separated — the local one is tried first.", "",
                    "Neither address is reachable from the public internet;",
@@ -10792,9 +10993,9 @@ def _server_info_screen(stdscr):
     else:
         _blocking_info_screen(stdscr, [
             "", "SERVER MODE — NO ADDRESS FOUND", "",
-            "Couldn't resolve a local network address or a Tailscale",
-            "address (is networking up? is `tailscale` installed and",
-            "tailscaled running/logged in?).", "",
+            "Couldn't resolve a local network address, and ATHENA_VPN_IP",
+            "isn't set in .env (set it to this machine's WireGuard",
+            "interface address once WireGuard is configured).", "",
             "Continuing WITHOUT accepting remote clients — the local",
             "trading engine and dashboard below are unaffected.", "",
         ], color=P_YELLOW)
@@ -10817,8 +11018,8 @@ def _client_connect_screen(stdscr):
     """Shown once, right after picking Client Mode — asks for the Server's
     address(es): one or more host[:port] entries, comma-separated, tried
     in the order given on every (re)connect (see _sync_client_connect_
-    loop). Typical use: the LAN address first, Tailscale address as
-    fallback, e.g. "192.168.1.42, 100.x.x.x" — covers "same network most
+    loop). Typical use: the LAN address first, WireGuard VPN address as
+    fallback, e.g. "192.168.1.42, 10.13.13.2" — covers "same network most
     days, remote some days" without picking one transport up front. Only
     loosely validated here (non-empty host per entry) — actual
     reachability is _sync_client_connect_loop's own job, which retries
@@ -10922,7 +11123,17 @@ def _go_live(stdscr):
     Refuses outright if PHEMEX_API_KEY/PHEMEX_API_SECRET aren't set —
     going live with no credentials would just fail on the very first real
     order anyway; better to catch it here with a clear message than let
-    the user find out via a failed entry."""
+    the user find out via a failed entry.
+
+    ALSO refuses if the trade-execution pre-flight (_test_phemex_order_
+    roundtrip — a real order create+cancel round-trip) fails, run right
+    here after the user types LIVE but before DRY_RUN actually flips.
+    Unlike the same check's OTHER call site (_phemex_preflight_thread, at
+    startup — advisory only, doesn't block boot), this one's a hard gate:
+    this is the one deliberate, already-heavily-confirmed moment the user
+    is choosing to go live, so it's exactly the right place to also prove
+    trading actually works before committing to it, not just that keys
+    are present."""
     global DRY_RUN
     if not DRY_RUN:
         console_log(f"{YLW}Already on the live Phemex account{RST}")
@@ -10968,6 +11179,31 @@ def _go_live(stdscr):
     if not confirmed:
         console_log(f"{DIM}Switch to live account cancelled{RST}")
         return
+
+    _blocking_info_screen(stdscr, ["", "Testing Phemex trade execution…", "",
+                                    "Placing and cancelling a small test order —",
+                                    "this takes a few seconds.", ""],
+                           color=P_CYAN, wait_for_key=False)
+    ok_all, fail_msgs = True, []
+    for cfg in ASSETS.values():
+        ok, msg = asyncio.run(_test_phemex_order_roundtrip(cfg["phemex_symbol"]))
+        ok_all = ok_all and ok
+        if ok:
+            console_log(f"{GRN}Phemex pre-flight OK — {msg}{RST}")
+        else:
+            fail_msgs.append(msg)
+            console_log(f"{RED}{BLD}Phemex pre-flight FAILED — {msg}{RST}")
+        log_event("SYSTEM", "phemex_preflight", {"ok": ok, "detail": msg, "trigger": "go_live"})
+    if not ok_all:
+        _blocking_info_screen(stdscr, ["", "CANNOT SWITCH TO LIVE", "",
+                                        "The trade-execution test failed:", ""]
+                                       + fail_msgs + ["",
+                                        "Staying on the paper (SIM) account.", ""],
+                               color=P_RED)
+        return
+    _phemex_preflight_ok[0] = True
+    _phemex_preflight_msg[0] = ""
+    _phemex_preflight_done.set()
 
     DRY_RUN = False
     for a in ASSETS:
@@ -11211,6 +11447,11 @@ def _startup_progress():
     steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
     for asset in ASSETS:
         steps.append((f"{asset} chart engine", _ch_ready[asset].is_set()))
+    if not DRY_RUN:
+        # Only shown at all on a live launch — a DRY_RUN/paper session never
+        # starts _phemex_preflight_thread (see curses_main's own thread-
+        # startup block), so there'd be nothing real for this line to mean.
+        steps.append(("Phemex trade-execution test", _phemex_preflight_done.is_set()))
     return steps
 
 LOADING_GAP = 2   # blank rows between each of the loading screen's own
@@ -11348,6 +11589,12 @@ def curses_main(stdscr):
 
     if not CLIENT_MODE:
         threading.Thread(target=_run_engine, daemon=True).start()
+        if not DRY_RUN:
+            threading.Thread(target=_phemex_preflight_thread, daemon=True).start()
+        else:
+            _phemex_preflight_done.set()   # nothing to test — don't make the
+                                             # loading screen wait on a step
+                                             # that will never run
         for asset in ASSETS:
             feed_starters = []
             # QQQ's live tape prefers Athena's own dedicated Alpaca account
@@ -11404,14 +11651,14 @@ def curses_main(stdscr):
 
     # Sync layer — the ONE thread Client Mode ever starts (never touches an
     # exchange, a broker credential, or the trading engine); Server Mode
-    # starts one listener thread PER resolved address (LAN and/or Tailscale)
+    # starts one listener thread PER resolved address (LAN and/or VPN)
     # alongside its normal engine threads above.
     if CLIENT_MODE:
         threading.Thread(target=_sync_client_connect_loop,
                           args=(SYNC_SERVER_CANDIDATES, _quit_evt),
                           daemon=True).start()
     if SERVER_MODE:
-        for label, getter in (("LAN", _get_lan_ip), ("TS", _get_tailscale_ip)):
+        for label, getter in (("LAN", _get_lan_ip), ("VPN", _get_vpn_ip)):
             ip = getter()
             if ip:
                 SYNC_SERVER_BIND_IPS.append((label, ip))

@@ -1869,8 +1869,12 @@ def draw(stdscr, ctrl, show_venues=False):
 
     # Border between the premium chart and the bottom panel — the single
     # blank row already reserved between them (main_bot+1 == vol_top-1),
-    # now drawn as a full-width divider instead of staying empty.
+    # now drawn as a full-width divider instead of staying empty. The
+    # panel's own title ([N] toggles which of the two it is) is embedded
+    # directly in the divider rather than costing its own row.
     safe_add(stdscr, main_bot + 1, 0, "─" * w, cp(P_DIM))
+    panel_title = " Net Volume " if net_volume_mode else " Volume "
+    safe_add(stdscr, main_bot + 1, LEFT_W, panel_title, cp(P_DEFAULT, bold=True))
 
     # Bottom panel — [N] toggles between two views of the same underlying
     # data, both always computed by build_columns:

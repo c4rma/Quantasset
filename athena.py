@@ -234,7 +234,7 @@ GEX_EXPORT_MAX_AGE       = 120   # matches status.py's GEX_STATUS_EXPORT_MAX_AGE
 # with no fill, process_cycle's PENDING_FILL branch cancels it outright
 # and returns to WATCHING (a fresh confirmation is required to try again,
 # rather than re-entering on the same now-stale bar pair).
-ENTRY_ORDER_EXPIRY_BARS  = 4
+ENTRY_ORDER_EXPIRY_BARS  = 10
 
 VALUE_AREA_FRACTION = 0.70
 
@@ -6151,7 +6151,9 @@ def _drift_fmt_venue_line(state):
     return " ".join(parts)
 
 def _drift_fmt_venue_breakdown(state, filtered_mode=False):
-    """[V] toggle's extra line: each venue's own calls/puts sub-total."""
+    """Extra line, always shown for crypto: each venue's own calls/puts
+    sub-total (2026-08-12: used to be behind a [V] toggle, removed per
+    user request — always on now wherever it applies, see draw_drift)."""
     calls_key = "calls_cum_f" if filtered_mode else "calls_cum"
     puts_key = "puts_cum_f" if filtered_mode else "puts_cum"
     parts = []
@@ -6296,6 +6298,491 @@ def _drift_load_historical(asset, date_str):
     else:
         hist_state.status = f"no log found for {date_str}"
     DRIFT_HIST_STATE[asset] = hist_state
+
+# ── Volatility Drift — ported from vol-drift.py ─────────────────────────────
+# Realized volatility (ARV, measured directly from price action) plotted
+# against at-the-money implied volatility (read from the nearest-ATM
+# option), fixed 1-minute buckets — a DIFFERENT axis from Net Drift above
+# (that tracks $ premium flow into calls vs puts, a directional/sentiment
+# signal; this compares two measures of the SAME thing, one observed after
+# the fact, one priced in ahead of it). Same standalone-merge template as
+# every other [M] mode in this file. ETH is Deribit-ONLY here (unlike Net
+# Drift's 3-venue aggregate) — IV isn't additive across venues the way $
+# premium is, averaging three venues' own ATM IV quotes wouldn't produce a
+# more "true" implied vol, just a blend of three venues' own quoting
+# conventions; see vol-drift.py's own module docstring METHODOLOGY section
+# for the full rationale. No reset logic (ARV/IV are point-in-time
+# snapshots recomputed every poll, not running totals — nothing to zero at
+# midnight or on an expiry roll) and no filtered/net-volume modes (no
+# notion of "a trade" to filter, no contract-count total to toggle).
+VOLDRIFT_DERIBIT_BASE = "https://www.deribit.com/api/v2"
+VOLDRIFT_CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+VOLDRIFT_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_VOLDRIFT_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+VOLDRIFT_ASSETS = ("ETH", "QQQ")             # Athena's own fixed pair — vol-drift.py's own BG_SYMBOLS
+VOLDRIFT_IS_CRYPTO = {"ETH": True, "QQQ": False}
+
+VOLDRIFT_DEFAULT_INTERVAL = 15         # [I] — how often each asset polls for a new price sample + ATM IV read
+VOLDRIFT_MIN_INTERVAL = 5
+VOLDRIFT_DEFAULT_BAR_INTERVAL = 60     # [B] — the vendor's own documented "1-minute buckets"
+VOLDRIFT_MIN_BAR_INTERVAL = 5
+
+VOLDRIFT_DEFAULT_RV_WINDOW = 1800      # [W] — 30m trailing window for the realized-vol calc
+VOLDRIFT_MIN_RV_WINDOW = 300           # 5m floor — anything shorter is mostly noise
+VOLDRIFT_MIN_RV_SAMPLES = 5            # below this many points in the window, don't trust it
+VOLDRIFT_MIN_RV_SPAN = 60              # below this many real seconds covered, don't trust it
+
+VOLDRIFT_SECONDS_PER_YEAR_CRYPTO = 365 * 24 * 3600
+VOLDRIFT_SECONDS_PER_YEAR_EQUITY = 252 * 23400   # 252 trading days * 6.5h session
+
+VOLDRIFT_DEFAULT_DIVERGENCE_DEADZONE = 3.0   # [D] — percentage points around 0 counted "neutral"
+VOLDRIFT_MIN_DIVERGENCE_DEADZONE = 0.0
+
+VOLDRIFT_NEAR_EXPIRY_HOURS = 6.0   # below this many hours to the tracked expiry, flag near_expiry —
+# near-expiry ATM IV reads can run structurally wide/elevated for reasons unrelated to a real
+# realized/implied disconnect (thin OI at the exact nearest strike, pin/gamma effects close to expiry).
+
+VOLDRIFT_LIVE_QUOTE_MAX_DEVIATION = 0.01   # same purpose as DRIFT_LIVE_QUOTE_MAX_DEVIATION —
+# Yahoo's near-real-time quote is only trusted within 1% of CBOE's own (delayed but genuine) reference.
+
+VOLDRIFT_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "voldrift_logs")   # own top-level folder,
+                                                                       # same convention as drift_logs/
+
+# ── Volatility Drift data fetchers ──────────────────────────────────────────
+def _voldrift_deribit_api(path, **params):
+    r = requests.get(VOLDRIFT_DERIBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def _voldrift_fetch_deribit_nearest_expiry(currency):
+    """Nearest non-expired expiry's instrument set for ETH. Returns
+    (instrument_set, expiry_label, expiry_ts) — expiry_ts (epoch seconds) is
+    the addition over Net Drift's own version, used for dte_hours/near_expiry."""
+    instruments = _voldrift_deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+    target_exp = min((e for e in by_exp if e > now_ms), default=None)
+    if not target_exp:
+        raise RuntimeError(f"no active {currency} option expiry found")
+    instrument_set = {ins["instrument_name"] for ins in by_exp[target_exp]}
+    expiry_label = datetime.fromtimestamp(target_exp / 1000, tz=timezone.utc).strftime("%d %b %Y")
+    return instrument_set, expiry_label, target_exp / 1000.0
+
+def _voldrift_fetch_deribit_index(currency):
+    result = _voldrift_deribit_api("/public/get_index_price", index_name=f"{currency.lower()}_usd")
+    return result.get("index_price")
+
+def _voldrift_fetch_deribit_book_summary(currency):
+    """Whole option chain's mark_iv in ONE call — confirmed live:
+    /public/get_book_summary_by_currency?currency=ETH&kind=option returns
+    every listed instrument with its own mark_iv field already computed by
+    Deribit, no per-instrument ticker fetch needed."""
+    return _voldrift_deribit_api("/public/get_book_summary_by_currency", currency=currency, kind="option")
+
+def _voldrift_parse_strike_otype(dashed_name):
+    parts = dashed_name.rsplit("-", 2)
+    return float(parts[-2]), ("call" if parts[-1] == "C" else "put")
+
+def _voldrift_pick_atm_iv(candidates, spot):
+    """candidates: [(strike, iv), ...] for one option type. Returns the
+    closest-to-spot strike's iv, skipping a zero (Deribit/CBOE both report
+    exactly 0.0 for a contract with no live/recent quote to price off — not
+    a real 0% vol reading) in favor of the next-nearest strike. Tries up to
+    5 nearest strikes before giving up."""
+    ranked = sorted(candidates, key=lambda x: abs(x[0] - spot))
+    for strike, iv in ranked[:5]:
+        if iv and iv > 0:
+            return iv
+    return None
+
+def _voldrift_compute_atm_iv_deribit(summary, instrument_set, spot):
+    calls, puts = [], []
+    for s in summary:
+        name = s.get("instrument_name")
+        if name not in instrument_set:
+            continue
+        strike, otype = _voldrift_parse_strike_otype(name)
+        iv = s.get("mark_iv") or 0.0
+        (calls if otype == "call" else puts).append((strike, iv))
+    call_iv = _voldrift_pick_atm_iv(calls, spot)
+    put_iv = _voldrift_pick_atm_iv(puts, spot)
+    ivs = [v for v in (call_iv, put_iv) if v is not None]
+    return sum(ivs) / len(ivs) if ivs else None
+
+def _voldrift_fetch_live_price(symbol):
+    try:
+        r = requests.get(VOLDRIFT_YAHOO_CHART_URL.format(symbol), headers=_VOLDRIFT_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
+
+def _voldrift_fetch_cboe_chain_iv(symbol):
+    """Nearest expiry (today if 0DTE-listed, else next future date) for an
+    equity/ETF ticker via CBOE's delayed-quotes feed, extended (vs. Net
+    Drift's own CBOE fetcher) to also carry each contract's own "iv" field
+    (confirmed live in the raw payload, decimal, e.g. 0.099 for a QQQ 0DTE
+    near-ATM strike — converted to percentage points the same way
+    chain.py's fetch_all_equity already does: iv * 100.0) and expiry_ts
+    (equity options stop trading at 16:00 ET on their expiry date — CBOE's
+    payload has no explicit expiry-time field like Deribit's
+    expiration_timestamp, so this is the standard close-time convention
+    status.py/gex.py already treat as end-of-session)."""
+    r = requests.get(VOLDRIFT_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    payload = r.json().get("data") or {}
+    if not payload:
+        raise RuntimeError(f"empty CBOE response for {symbol}")
+    spot = payload.get("current_price")
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in payload.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        exp = name[-15:-9]
+        by_exp.setdefault(exp, []).append(o)
+    if not by_exp:
+        raise RuntimeError(f"no options found for {symbol}")
+    if today in by_exp:
+        target_exp = today
+    else:
+        future = sorted(e for e in by_exp if e >= today)
+        target_exp = future[0] if future else min(by_exp)
+
+    contracts = []
+    for o in by_exp[target_exp]:
+        name = o["option"]
+        otype = "call" if name[-9] == "C" else "put"
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            strike = None
+        contracts.append({"otype": otype, "strike": strike, "iv": (o.get("iv") or 0.0) * 100.0})
+    expiry_label = f"20{target_exp[:2]}-{target_exp[2:4]}-{target_exp[4:6]}"
+    exp_date = datetime.strptime(target_exp, "%y%m%d")
+    expiry_dt = datetime(exp_date.year, exp_date.month, exp_date.day, 16, 0, tzinfo=TZ_ET)
+    return {"contracts": contracts, "spot": spot, "expiry_label": expiry_label,
+            "expiry_ts": expiry_dt.timestamp()}
+
+def _voldrift_compute_atm_iv_cboe(chain):
+    spot = chain["spot"]
+    if spot is None:
+        return None
+    calls = [(c["strike"], c["iv"]) for c in chain["contracts"] if c["otype"] == "call" and c["strike"] is not None]
+    puts = [(c["strike"], c["iv"]) for c in chain["contracts"] if c["otype"] == "put" and c["strike"] is not None]
+    call_iv = _voldrift_pick_atm_iv(calls, spot)
+    put_iv = _voldrift_pick_atm_iv(puts, spot)
+    ivs = [v for v in (call_iv, put_iv) if v is not None]
+    return sum(ivs) / len(ivs) if ivs else None
+
+# ── Volatility Drift math ────────────────────────────────────────────────────
+def _voldrift_compute_realized_vol(price_buf, is_crypto):
+    """price_buf: [(ts, price), ...] oldest→newest, already trimmed to the
+    trailing rv_window. Sum-of-squared-log-returns, annualized by the
+    elapsed wall-clock span actually covered (not by assuming evenly-spaced
+    samples — --interval polling can jitter on a slow/retried response, so
+    annualizing by ACTUAL elapsed seconds between the oldest and newest
+    sample avoids overstating vol just because samples happened to land
+    closer together than usual):
+        variance_rate = sum(log(p[i]/p[i-1])**2) / elapsed_seconds
+        ARV (annualized, %) = sqrt(variance_rate * seconds_per_year) * 100
+    Returns None (not enough signal to trust yet) below
+    VOLDRIFT_MIN_RV_SAMPLES points or VOLDRIFT_MIN_RV_SPAN seconds of real
+    elapsed time — an early-window read with 2 samples 15s apart would
+    otherwise produce a wildly noisy, meaningless annualized figure."""
+    if len(price_buf) < VOLDRIFT_MIN_RV_SAMPLES:
+        return None
+    elapsed = price_buf[-1][0] - price_buf[0][0]
+    if elapsed < VOLDRIFT_MIN_RV_SPAN:
+        return None
+    sq_sum = 0.0
+    for (_, p0), (_, p1) in zip(price_buf, price_buf[1:]):
+        if p0 and p1 and p0 > 0 and p1 > 0:
+            r = math.log(p1 / p0)
+            sq_sum += r * r
+    seconds_per_year = VOLDRIFT_SECONDS_PER_YEAR_CRYPTO if is_crypto else VOLDRIFT_SECONDS_PER_YEAR_EQUITY
+    variance_annual = (sq_sum / elapsed) * seconds_per_year
+    return math.sqrt(max(0.0, variance_annual)) * 100.0
+
+def _voldrift_classify_divergence(delta, deadzone):
+    """delta = ARV - IV (None if either side isn't available yet). A plain
+    deadzone around zero, same simplicity level as Net Drift's own
+    confidence-deadzone — a single band already prevents a print sitting
+    near 0 from flipping the classification on ordinary poll-to-poll noise."""
+    if delta is None:
+        return None
+    if delta > deadzone:
+        return "expansion"
+    if delta < -deadzone:
+        return "compression"
+    return "neutral"
+
+def _voldrift_update_divergence_state(state, delta, deadzone, now):
+    """Mutates state.divergence_state/divergence_since IN PLACE — call with
+    state.lock already held. Only updates when a real classification is
+    available AND it differs from the current one, so a momentary gap in
+    ARV doesn't reset the "since" clock on data that was never actually a
+    real state change."""
+    new_state = _voldrift_classify_divergence(delta, deadzone)
+    if new_state is not None and new_state != state.divergence_state:
+        state.divergence_state = new_state
+        state.divergence_since = now
+
+def _voldrift_is_market_open_et():
+    """Own copy, dependency-free — same reasoning _drift_is_market_open_et
+    already documents (not coupled to the Status engine's own snapshot health)."""
+    now = datetime.now(tz=TZ_ET)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+# ── Volatility Drift persistence — voldrift_logs/YYYY/MM/DD/voldrift_<ASSET>_MM_DD_YYYY.jsonl
+def _voldrift_date_folder(date_str):
+    mm, dd, yyyy = date_str.split("_")
+    folder = os.path.join(VOLDRIFT_LOG_DIR_BASE, yyyy, mm, dd)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _voldrift_log_path(asset, date_str):
+    return os.path.join(_voldrift_date_folder(date_str), f"voldrift_{asset}_{date_str}.jsonl")
+
+def _voldrift_append_log(asset, sample):
+    try:
+        with open(_voldrift_log_path(asset, datetime.now().strftime("%m_%d_%Y")), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.fromtimestamp(sample["ts"]).isoformat(),
+                "arv": sample["arv"], "iv": sample["iv"],
+                "spot": sample["spot"], "expiry": sample.get("expiry"),
+                "state": sample.get("state"),
+                "dte_hours": sample.get("dte_hours"),
+                "near_expiry": sample.get("near_expiry"),
+            }) + "\n")
+    except Exception:
+        pass
+
+def _voldrift_load_log(asset, date_str):
+    path = _voldrift_log_path(asset, date_str)
+    samples = []
+    if not os.path.exists(path):
+        return samples
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                samples.append({
+                    "ts": datetime.fromisoformat(d["ts"]).timestamp(),
+                    "arv": d.get("arv"), "iv": d.get("iv"),
+                    "spot": d.get("spot"), "expiry": d.get("expiry"),
+                    "state": d.get("state"),
+                    "dte_hours": d.get("dte_hours"),
+                    "near_expiry": d.get("near_expiry", False),
+                })
+            except Exception:
+                continue
+    return samples
+
+# ── Volatility Drift status export (for any third-party consumer) — same
+# atomic tmp-then-os.replace pattern gex_export_status_snapshot already
+# uses, same "port everything, including the standalone export" precedent
+# that merge already set (status_<ASSET>_gex.json is still written even
+# after GEX moved into Athena itself).
+def _voldrift_export_status_snapshot(asset, arv, iv, spot, divergence_state, divergence_since,
+                                      dte_hours, near_expiry, status):
+    try:
+        payload = {
+            "asset": asset, "updated_at": time.time(),
+            "spot": spot, "arv": arv, "iv": iv,
+            "delta": (arv - iv) if (arv is not None and iv is not None) else None,
+            "state": divergence_state, "state_since": divergence_since,
+            "dte_hours": dte_hours, "near_expiry": near_expiry, "status": status,
+        }
+        path = os.path.join(SCRIPT_DIR, f"status_{asset}_voldrift.json")
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+
+# ── Volatility Drift live state ─────────────────────────────────────────────
+class _VolDriftState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.history = []       # [{"ts","arv","iv","spot","expiry","state","dte_hours","near_expiry"}, ...]
+        self.price_buf = []     # [(ts, price), ...] trailing rv_window, for _voldrift_compute_realized_vol
+        self.expiry_label = None
+        self.spot = None
+        self.arv = None
+        self.iv = None
+        self.divergence_state = None    # "expansion"/"compression"/"neutral"/None
+        self.divergence_since = None    # epoch seconds the CURRENT state started
+        self.dte_hours = None
+        self.near_expiry = False
+        self.status = "starting…"
+        self.last_poll = 0.0
+
+VOLDRIFT_STATE = {asset: _VolDriftState() for asset in VOLDRIFT_ASSETS}
+VOLDRIFT_READY = {asset: threading.Event() for asset in VOLDRIFT_ASSETS}   # set on each asset's
+                                                                              # first completed poll,
+                                                                              # for the loading screen
+VOLDRIFT_INTERVAL = {asset: VOLDRIFT_DEFAULT_INTERVAL for asset in VOLDRIFT_ASSETS}                          # [I]
+VOLDRIFT_RV_WINDOW = {asset: VOLDRIFT_DEFAULT_RV_WINDOW for asset in VOLDRIFT_ASSETS}                        # [W]
+VOLDRIFT_DIVERGENCE_DEADZONE = {asset: VOLDRIFT_DEFAULT_DIVERGENCE_DEADZONE for asset in VOLDRIFT_ASSETS}    # [D]
+VOLDRIFT_REFRESH_EVENT = {asset: threading.Event() for asset in VOLDRIFT_ASSETS}   # [R] refresh-now
+VOLDRIFT_NEXT_POLL_TS = {asset: time.time() for asset in VOLDRIFT_ASSETS}          # for the UI countdown
+
+def _voldrift_seed_today(state, asset):
+    date_str = datetime.now().strftime("%m_%d_%Y")
+    samples = _voldrift_load_log(asset, date_str)
+    if not samples:
+        return
+    state.history = samples
+    last = samples[-1]
+    state.spot, state.arv, state.iv = last["spot"], last["arv"], last["iv"]
+    state.expiry_label = last.get("expiry")
+    state.divergence_state = last.get("state")
+    state.dte_hours = last.get("dte_hours")
+    state.near_expiry = last.get("near_expiry", False)
+    # divergence_since/price_buf NOT reseeded from the log — same "cosmetic
+    # only, never overcounts" trade-off vol-drift.py's own seed_today already
+    # documents (divergence duration briefly undercounts across a restart;
+    # ARV briefly stays at its last logged value, ffilled, until fresh polls
+    # rebuild the rolling window).
+
+def _voldrift_poll_once_crypto(asset, state, rv_window, deadzone):
+    currency = asset   # ETH
+    instrument_set, expiry_label, expiry_ts = _voldrift_fetch_deribit_nearest_expiry(currency)
+    spot = _voldrift_fetch_deribit_index(currency)
+    if spot is None:
+        raise RuntimeError("no Deribit index price")
+    summary = _voldrift_fetch_deribit_book_summary(currency)
+    iv = _voldrift_compute_atm_iv_deribit(summary, instrument_set, spot)
+    now = time.time()
+    dte_hours = max(0.0, (expiry_ts - now) / 3600.0)
+    near_expiry = dte_hours <= VOLDRIFT_NEAR_EXPIRY_HOURS
+    with state.lock:
+        state.price_buf.append((now, spot))
+        cutoff = now - rv_window
+        state.price_buf = [(t, p) for (t, p) in state.price_buf if t >= cutoff]
+        arv = _voldrift_compute_realized_vol(state.price_buf, is_crypto=True)
+        delta = (arv - iv) if (arv is not None and iv is not None) else None
+        _voldrift_update_divergence_state(state, delta, deadzone, now)
+        sample = {"ts": now, "arv": arv, "iv": iv, "spot": spot, "expiry": expiry_label,
+                  "state": state.divergence_state, "dte_hours": dte_hours, "near_expiry": near_expiry}
+        state.history.append(sample)
+        _voldrift_append_log(asset, sample)
+        state.spot, state.arv, state.iv = spot, arv, iv
+        state.expiry_label = expiry_label
+        state.dte_hours, state.near_expiry = dte_hours, near_expiry
+        state.status = "live"
+        state.last_poll = now
+        export_args = (asset, arv, iv, spot, state.divergence_state, state.divergence_since,
+                       dte_hours, near_expiry, state.status)
+    _voldrift_export_status_snapshot(*export_args)
+
+def _voldrift_poll_once_cboe(asset, state, rv_window, deadzone):
+    chain = _voldrift_fetch_cboe_chain_iv(asset)
+    spot = chain["spot"]
+    iv = _voldrift_compute_atm_iv_cboe(chain)
+    live_quote = _voldrift_fetch_live_price(asset)
+    if live_quote is not None and spot and abs(live_quote - spot) <= spot * VOLDRIFT_LIVE_QUOTE_MAX_DEVIATION:
+        display_spot = live_quote
+    else:
+        display_spot = spot
+    now = time.time()
+    dte_hours = max(0.0, (chain["expiry_ts"] - now) / 3600.0)
+    near_expiry = dte_hours <= VOLDRIFT_NEAR_EXPIRY_HOURS
+    with state.lock:
+        state.price_buf.append((now, display_spot))
+        cutoff = now - rv_window
+        state.price_buf = [(t, p) for (t, p) in state.price_buf if t >= cutoff]
+        arv = _voldrift_compute_realized_vol(state.price_buf, is_crypto=False)
+        delta = (arv - iv) if (arv is not None and iv is not None) else None
+        _voldrift_update_divergence_state(state, delta, deadzone, now)
+        sample = {"ts": now, "arv": arv, "iv": iv, "spot": display_spot, "expiry": chain["expiry_label"],
+                  "state": state.divergence_state, "dte_hours": dte_hours, "near_expiry": near_expiry}
+        state.history.append(sample)
+        _voldrift_append_log(asset, sample)
+        state.spot, state.arv, state.iv = display_spot, arv, iv
+        state.expiry_label = chain["expiry_label"]
+        state.dte_hours, state.near_expiry = dte_hours, near_expiry
+        status = "live"
+        if not _voldrift_is_market_open_et():
+            status = "market closed — " + status
+        state.status = status
+        state.last_poll = now
+        export_args = (asset, arv, iv, display_spot, state.divergence_state, state.divergence_since,
+                       dte_hours, near_expiry, state.status)
+    _voldrift_export_status_snapshot(*export_args)
+
+def _voldrift_poll_once(asset, is_crypto, state, rv_window, deadzone):
+    if is_crypto:
+        _voldrift_poll_once_crypto(asset, state, rv_window, deadzone)
+    else:
+        _voldrift_poll_once_cboe(asset, state, rv_window, deadzone)
+
+# ── Volatility Drift engine — one always-on thread per asset, matching
+# _drift_engine_loop/_gex_engine_loop's own per-asset-thread shape (see this
+# section's own header comment for why this collapses vol-drift.py's own
+# Controller/BackgroundTracker split into just this).
+def _voldrift_engine_loop(asset, stop_evt):
+    is_crypto = VOLDRIFT_IS_CRYPTO[asset]
+    state = VOLDRIFT_STATE[asset]
+    _voldrift_seed_today(state, asset)
+    while not stop_evt.is_set():
+        if not is_crypto and not _voldrift_is_market_open_et():
+            with state.lock:
+                state.status = "market closed — waiting for next session"
+            VOLDRIFT_NEXT_POLL_TS[asset] = time.time() + 60
+            VOLDRIFT_READY[asset].set()   # "engine started, correctly idling outside market
+                                            # hours" still counts as ready for the loading screen
+            VOLDRIFT_REFRESH_EVENT[asset].wait(timeout=60)
+            VOLDRIFT_REFRESH_EVENT[asset].clear()
+            continue
+        try:
+            _voldrift_poll_once(asset, is_crypto, state, VOLDRIFT_RV_WINDOW[asset], VOLDRIFT_DIVERGENCE_DEADZONE[asset])
+        except Exception as e:
+            with state.lock:
+                state.status = f"error: {e}"
+        VOLDRIFT_READY[asset].set()
+        VOLDRIFT_NEXT_POLL_TS[asset] = time.time() + VOLDRIFT_INTERVAL[asset]
+        VOLDRIFT_REFRESH_EVENT[asset].wait(timeout=VOLDRIFT_INTERVAL[asset])
+        VOLDRIFT_REFRESH_EVENT[asset].clear()
+
+VOLDRIFT_HIST_STATE = {}   # asset -> _VolDriftState snapshot loaded via [H], absent until first used
+
+def _voldrift_load_historical(asset, date_str):
+    """[H]: load a past day's log for `asset` into a standalone read-only
+    snapshot. Does NOT touch VOLDRIFT_STATE[asset] — the background engine
+    thread keeps tracking the live session the whole time regardless."""
+    samples = _voldrift_load_log(asset, date_str)
+    hist_state = _VolDriftState()
+    if samples:
+        hist_state.history = samples
+        last = samples[-1]
+        hist_state.spot, hist_state.arv, hist_state.iv = last["spot"], last["arv"], last["iv"]
+        hist_state.expiry_label = last.get("expiry")
+        hist_state.divergence_state = last.get("state")
+        hist_state.dte_hours = last.get("dte_hours")
+        hist_state.near_expiry = last.get("near_expiry", False)
+        hist_state.status = f"historical — {date_str}"
+    else:
+        hist_state.status = f"no log found for {date_str}"
+    VOLDRIFT_HIST_STATE[asset] = hist_state
 
 # ── Per-instrument state machine ──────────────────────────────────────────────
 class AthenaInstrument:
@@ -7240,6 +7727,15 @@ class AthenaInstrument:
         self.pending = {"pos_side": pos_side, "qty": qty, "qty_decimals": qty_decimals,
                          "price_decimals": price_decimals, "targets": targets_full, "regime": regime,
                          "order_type": order_type, "entry_price": entry_price if order_type == "limit" else live_price,
+                         # 2026-08-11 (real-mode detailed trade table):
+                         # sequence_label used to be dropped after being
+                         # passed to place_entry() — DRY_RUN's own
+                         # SimAccount order dict re-surfaces it separately
+                         # for sim_logs, but real mode had nowhere left to
+                         # read it back from by the time _check_fill logs
+                         # the entry. Threaded through here so the real
+                         # trade log's SEQUENCE column isn't blank.
+                         "sequence_label": sequence_label,
                          # 2026-07-27 user request: a resting LIMIT entry
                          # shouldn't wait forever for price to revert to
                          # the confirming bar's own VAH/VAL — see
@@ -7363,10 +7859,30 @@ class AthenaInstrument:
             tp1_level, tp1_t = valid[0]
             tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
             tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid}]
+        elif candidates:
+            # 2026-08-12 user-reported (a real ETH long: BT $1900.00 and
+            # Cluster $1900.00 both missed the $1900.24 full-R cutoff by
+            # just $0.24, GEX Flip missed by $5.89 — every candidate got
+            # dropped, leaving the position with NO TP at all, SL only).
+            # Explicit user choice over leaving it naked: fall back to
+            # whichever dropped candidate came CLOSEST to clearing the R
+            # filter (max distance from fill_price among the dropped set
+            # — the "least invalid" one, i.e. giving up the least reward)
+            # and use it as a single TP leg, full qty — same shape as the
+            # `elif valid:` branch above, just sourced from `candidates`
+            # instead of `valid`. Tagged "tp_fallback_used" in the log so
+            # it's distinguishable from a normal in-bounds placement.
+            fallback_level, fallback_t = max(candidates, key=lambda lt: abs(lt[0] - fill_price))
+            fallback_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", fallback_level,
+                                                              p["price_decimals"], "1", fallback_t["type"])
+            tp_legs = [{"level": fallback_level, "qty": qty, "tracks_gex_flip": fallback_t["type"] == "GEX Flip",
+                        "type": fallback_t["type"], "order_id": fallback_oid}]
+            console_log(f"{self.asset}: {YLW}no target cleared the full-R filter — using nearest anyway "
+                        f"({fallback_t['type']} {fmt_num(fallback_level)}){RST}")
+            log_event(self.asset, "tp_fallback_used", {"fill_price": fill_price, "R": R,
+                                                         "level": fallback_level, "type": fallback_t["type"]})
         else:
             tp_legs = []
-            if targets:
-                console_log(f"{self.asset}: {YLW}no valid TP target — position has SL only{RST}")
         tp_desc = [leg["level"] for leg in tp_legs]
 
         # 2026-07-28 user request: the trades table's TP1/TP1 TYPE/TP2/TP2
@@ -7377,8 +7893,11 @@ class AthenaInstrument:
         # ONLY place the planned tp_legs — level + type — are known, right
         # when they're computed/placed) so scan_all_trades_detailed can
         # show the ORIGINAL planned target for every trade regardless of
-        # outcome, not just the ones that got hit. DRY_RUN/sim_logs only,
-        # same existing scope as the rest of that table.
+        # outcome, not just the ones that got hit. DRY_RUN/sim_logs only —
+        # real mode's own planned tp_legs get folded directly into the
+        # "filled" log_event below instead of a separate event, since both
+        # are already known at this exact point for real trades too (see
+        # that log_event's own comment).
         if DRY_RUN and tp_legs:
             sim_log_event("tp_targets_set", {"symbol": symbol, "pos_side": p["pos_side"],
                                               "tp_legs": [{"level": leg["level"], "type": leg["type"]} for leg in tp_legs]})
@@ -7406,7 +7925,21 @@ class AthenaInstrument:
         self.state = "IN_POSITION"
         tag = " (sim)" if DRY_RUN else ""
         console_log(f"{self.asset}: filled{tag} @ {fill_price} — SL {sl_price}, TP {tp_desc}")
-        log_event(self.asset, "filled", {"fill_price": fill_price, "qty": qty, "sl": sl_price, "tp": tp_desc, "sim": DRY_RUN})
+        # 2026-08-11 (real-mode detailed trade table): pos_side/order_type/
+        # sequence_label/tp_legs added so scan_real_trades_detailed can
+        # reconstruct a full entry row for real trades the same way
+        # sim_logs' own richer "filled" event already lets
+        # scan_all_trades_detailed do for DRY_RUN — every one of these
+        # values is already sitting right here at fill time, no new
+        # Phemex call needed. tp_legs carries only level/qty/type (not the
+        # order_id) — the SAME planned-target shape DRY_RUN's separate
+        # tp_targets_set event uses, so _tp_slot works unchanged for both.
+        log_event(self.asset, "filled", {"symbol": symbol, "fill_price": fill_price, "qty": qty, "sl": sl_price, "tp": tp_desc,
+                                          "pos_side": p["pos_side"], "order_type": p.get("order_type"),
+                                          "sequence_label": p.get("sequence_label"),
+                                          "tp_legs": [{"level": leg["level"], "qty": leg["qty"], "type": leg["type"]}
+                                                      for leg in tp_legs],
+                                          "sim": DRY_RUN})
 
     def _infer_close_reason(self, pos_side, exit_price):
         """REAL mode only (see _manage_position's own 'position flat' branch
@@ -7417,28 +7950,38 @@ class AthenaInstrument:
         as exit_price itself being an approximation). Uses the last-known
         resting SL price / TP leg levels from `self.position` (still set at
         call time — cleared by the caller right after) and picks whichever
-        is closest to the polled exit_price, within a tolerance scaled off
-        this asset's own SL distance (R) to absorb normal poll-lag slippage
-        without conflating a genuinely different level. Returns "SL", "TP",
-        or "MANUAL" (neither resting level was close — most likely closed
-        outside Athena entirely, e.g. manually on the exchange UI) — never
-        raises, never returns None (falls back to "MANUAL" if the position
-        had no sl_price/tp_legs recorded at all, e.g. after a restart before
-        reconciliation ran)."""
+        is closest to the polled exit_price, within a tolerance. Returns
+        "SL", "TP", or "MANUAL" (neither resting level was close — most
+        likely closed outside Athena entirely, e.g. manually on the
+        exchange UI) — never raises, never returns None (falls back to
+        "MANUAL" if the position had no sl_price/tp_legs recorded at all,
+        e.g. after a restart before reconciliation ran).
+
+        2026-08-11 fix, user-reported (a real SL hit — entry 1878.90, SL
+        1868.90, exit 1865.32 — showed as "MANUAL"): the tolerance used to
+        be a single `R * 0.20` applied to BOTH candidates. TP is a resting
+        LIMIT order — it fills at (never past) its own level, so a tight
+        tolerance was always correct there. SL is a STOP order, which CAN
+        slip well past its own trigger price on a fast move — the case
+        above slipped $3.58 on a $10 R, more than the old $2 tolerance
+        allowed, so a genuine SL hit fell through to "MANUAL". SL's own
+        tolerance is now the FULL R distance (generous enough to absorb
+        real stop slippage) while TP keeps the original tight tolerance
+        (limit fills have no reason to need more)."""
         if exit_price is None:
             return "MANUAL"
         R = self.cfg["sl"]
-        tol = max(R * 0.20, 0.01)
         sl_price = self.position.get("sl_price")
         candidates = []
         if sl_price is not None:
-            candidates.append(("SL", abs(exit_price - sl_price)))
+            candidates.append(("SL", abs(exit_price - sl_price), R))
+        tp_tol = max(R * 0.20, 0.01)
         for leg in (self.position.get("tp_legs") or []):
-            candidates.append(("TP", abs(exit_price - leg["level"])))
+            candidates.append(("TP", abs(exit_price - leg["level"]), tp_tol))
         if not candidates:
             return "MANUAL"
-        best_label, best_dist = min(candidates, key=lambda c: c[1])
-        return best_label if best_dist <= tol else "MANUAL"
+        best_label, best_dist, best_tol = min(candidates, key=lambda c: c[1])
+        return best_label if best_dist <= best_tol else "MANUAL"
 
     async def _manage_position(self, regime):
         symbol = self.cfg["phemex_symbol"]
@@ -7487,9 +8030,19 @@ class AthenaInstrument:
             # under heavy slippage, which is why it's tagged "(approx)" in
             # the dashboard rather than presented as certain.
             reason = self._infer_close_reason(pos_side, exit_price) if not DRY_RUN else None
-            log_event(self.asset, "position_closed", {"pos_side": pos_side, "qty": qty, "entry": entry,
+            # 2026-08-11 (real-mode detailed trade table): symbol/type/
+            # price_exact added so scan_real_trades_detailed can correlate
+            # this final leg and (when reason=="TP") show which target it
+            # was — looked up from self.position's own tp_legs BEFORE it's
+            # cleared a few lines below. price_exact is always False here —
+            # this is the one leg whose price is a live-price-at-detection
+            # approximation, same documented gap as `reason` itself.
+            log_event(self.asset, "position_closed", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
-                                                        "reason": reason, "sim": DRY_RUN})
+                                                        "reason": reason,
+                                                        "type": (self.position["tp_legs"][0]["type"]
+                                                                 if (reason == "TP" and self.position.get("tp_legs")) else None),
+                                                        "price_exact": False, "sim": DRY_RUN})
             net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
             if DRY_RUN:
                 # Blackjack/Daily-Loss-Limit keep using the OLD, separately-
@@ -7618,6 +8171,22 @@ class AthenaInstrument:
                 # Today until — and even then, incorrectly — the REST of
                 # the position also closed).
                 self._book_closed_pnl_delta()
+                if not DRY_RUN:
+                    # 2026-08-11 (real-mode detailed trade table): DRY_RUN
+                    # already gets this leg's own exact fill logged
+                    # separately, straight from SimAccount's own order-
+                    # matching (sim_log_event("closed", ...)) — this event
+                    # is real-mode only, so scan_real_trades_detailed never
+                    # sees a duplicate. price_exact=True: tp1_price above is
+                    # the TP order's own resting limit level, not a live-
+                    # price approximation — a maker limit order fills AT
+                    # (never worse than) its own resting price, so this is
+                    # the real fill price for all practical purposes, same
+                    # confidence DRY_RUN's own exact sim_logs price has.
+                    log_event(self.asset, "leg_closed", {"pos_side": pos_side, "qty": tp1_qty, "price": tp1_price,
+                                                          "pnl": leg_gross,
+                                                          "type": old_tp_legs[0].get("type") if old_tp_legs else None,
+                                                          "price_exact": True})
                 await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
             self._tp1_lock_done = True
 
@@ -7656,8 +8225,15 @@ class AthenaInstrument:
             pnl_approx = None
             if exit_price is not None and entry:
                 pnl_approx = (exit_price - entry) * qty if pos_side == "Long" else (entry - exit_price) * qty
-            log_event(self.asset, "pcvr_flip_close", {"pos_side": pos_side, "qty": qty, "entry": entry,
+            # 2026-08-11 (real-mode detailed trade table): symbol/reason/
+            # type/price_exact added — same shape position_closed now logs.
+            # reason is "FLIP" outright (not inferred — Athena itself chose
+            # to close this, not a bracket order), type is always None (a
+            # flip is never a TP hit), price_exact is always False (same
+            # live-price-at-detection approximation as every forced close).
+            log_event(self.asset, "pcvr_flip_close", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
+                                                        "reason": "FLIP", "type": None, "price_exact": False,
                                                         "sim": DRY_RUN})
             net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
             # 2026-07-29 user clarification (correcting an earlier, wrong
@@ -8145,8 +8721,17 @@ class AthenaInstrument:
             pnl_approx = None
             if exit_price is not None and entry and qty:
                 pnl_approx = (exit_price - entry) * qty if pos_side == "Long" else (entry - exit_price) * qty
-            log_event(self.asset, event_name, {"pos_side": pos_side, "qty": qty, "entry": entry,
+            # 2026-08-11 (real-mode detailed trade table): symbol/reason/
+            # type/price_exact added — same shape position_closed/
+            # pcvr_flip_close now log. reason is this function's own
+            # `reason` param uppercased ("EOD"/"MANUAL"/"ENTRY_BLACKOUT"/
+            # "STALE_ENTRY") — Athena itself chose to close this, not a
+            # bracket order, so nothing needs inferring. type is always
+            # None (never a TP hit); price_exact is always False (same
+            # live-price-at-detection approximation as every forced close).
+            log_event(self.asset, event_name, {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
+                                                "reason": reason.upper(), "type": None, "price_exact": False,
                                                 "sim": DRY_RUN})
             net_pnl = self._finalize_and_book_pnl(exit_price, qty, pos_side)
             if DRY_RUN:
@@ -8248,7 +8833,8 @@ def recent_closed_trades(n=5):
                 d = json.loads(line)
                 if DRY_RUN and d.get("event") == "closed":
                     rows.append(d)
-                elif (not DRY_RUN and d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten")
+                elif (not DRY_RUN and d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten",
+                                                           "entry_blackout_flatten", "stale_entry_flatten")
                       and (d.get("detail") or {}).get("sim") is False):
                     rows.append(d)
     except Exception:
@@ -8290,7 +8876,8 @@ def recent_trade_pairs(n=6):
                                "exit_ts": d.get("ts"), "exit_price": d.get("price"),
                                "reason": d.get("reason", "close")})
     else:
-        reason_by_event = {"pcvr_flip_close": "flip", "eod_flatten": "eod", "manual_flatten": "manual"}
+        reason_by_event = {"pcvr_flip_close": "flip", "eod_flatten": "eod", "manual_flatten": "manual",
+                           "entry_blackout_flatten": "entry_blackout", "stale_entry_flatten": "stale_entry"}
         for d in rows:
             ev, asset = d.get("event"), d.get("asset")
             det = d.get("detail") or {}
@@ -8299,7 +8886,8 @@ def recent_trade_pairs(n=6):
                             # any --dry-run-era event mixed into today's athena_logs file
             if ev == "filled":
                 last_fill[asset] = (d.get("ts"), det.get("fill_price"))
-            elif ev in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
+            elif ev in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten",
+                        "entry_blackout_flatten", "stale_entry_flatten"):
                 fill = last_fill.get(asset)
                 # "position_closed" fires when Athena's own poll discovers a
                 # bracket order already filled on the exchange (or the
@@ -8353,7 +8941,8 @@ def scan_all_trade_events(source):
                     if source == "sim":
                         if d.get("event") == "closed" and d.get("pnl") is not None:
                             events.append({"ts": d.get("ts"), "pnl": d.get("pnl")})
-                    elif d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten"):
+                    elif d.get("event") in ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten",
+                                             "entry_blackout_flatten", "stale_entry_flatten"):
                         detail = d.get("detail") or {}
                         if detail.get("sim") is not False:
                             continue
@@ -8525,13 +9114,116 @@ def _trade_worst_adverse_dollars(asset, pos_side, entry_price, entry_qty, exits,
             continue
     return worst_dollars
 
+def _tp_slot(planned_tp_legs, tp_exits, idx):
+    # 2026-07-28: show the ORIGINAL planned target (level + type) for
+    # this TP slot even if it was never actually hit (a trade that
+    # closed via SL alone still HAD configured TP targets) — only
+    # falls back to nothing if this slot was never configured at all
+    # (a single-target trade has no TP2 slot, say). An actually-hit
+    # leg (in tp_exits) always takes priority over the merely-planned
+    # one, since it carries the real fill price/pnl.
+    if idx < len(tp_exits):
+        x = tp_exits[idx]
+        return {"price": x["price"], "type": x.get("type"), "hit": True}
+    if idx < len(planned_tp_legs):
+        leg = planned_tp_legs[idx]
+        return {"price": leg.get("level"), "type": leg.get("type"), "hit": False}
+    return None
+
+def _build_trade_rows(closed_trades, running_balance):
+    """Shared per-trade aggregation — factored out 2026-08-11 (real-mode
+    detailed trade table) from what used to be scan_all_trades_detailed's
+    own inline loop. Both scan_all_trades_detailed (sim) and
+    scan_real_trades_detailed (real) now build the same `closed_trades`
+    input shape (symbol/pos_side/entry_ts/entry_price/qty/
+    entry_order_type/sequence_label/planned_tp_legs/exits) from their own
+    differently-shaped log events first — everything past that point (fees
+    via fee_for_leg, gross/net PnL, R:R, TP1/TP2 attribution via _tp_slot,
+    DD via _trade_worst_adverse_dollars, running balance) is 100%
+    source-agnostic and was previously duplicated.
+
+    `running_balance`: starting balance to walk forward from (sim's own
+    most-recent "reset" event, or SIM_DEFAULT_BALANCE) — pass None for real
+    mode, which has no equivalent "reset" starting-balance concept; every
+    row's own `balance`/`dd_pct` come back None then (renders as "—").
+
+    REASON gets " (approx)" appended whenever ANY exit in the trade was
+    marked `price_exact: False` — real mode's one genuinely-approximated
+    leg (SL, TP2, or a lone TP1 hit in full; see the "leg_closed" vs
+    position_closed/pcvr_flip_close/*_flatten event docstrings). Sim's own
+    exits never carry that key at all, so this never fires for DRY_RUN
+    trades."""
+    out = []
+    for t in closed_trades:
+        exits = t["exits"]
+        if not exits:
+            continue
+        entry_qty, entry_price = t["qty"], t["entry_price"]
+        # asset resolved first — fee_for_leg's own model (%-of-notional for
+        # ETH, flat $/unit for QQQ) is asset-specific, unlike the old flat
+        # PHEMEX_FEE_RATE this replaced.
+        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
+        entry_fee = fee_for_leg(asset, entry_qty, entry_price)
+        exit_qty_total = sum(x["qty"] for x in exits)
+        exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
+        gross_pnl = sum(x["pnl"] for x in exits)
+        exit_fees = sum(fee_for_leg(asset, x["qty"], x["price"]) for x in exits)
+        total_fees = entry_fee + exit_fees
+        net_pnl = gross_pnl - total_fees
+        # trade_risk = qty * sl_distance (THIS asset's own fixed SL
+        # distance — $10 ETH / $0.75 QQQ), not a flat *10 — that was
+        # ETH-specific and would understate QQQ's real R by ~13x, same
+        # underlying mixup _check_confirmation's entry sizing itself had.
+        sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
+        r_dollars = entry_qty * sl_distance
+        rr = (net_pnl / r_dollars) if r_dollars else None
+        reasons = []
+        for x in exits:
+            r = (x.get("reason") or "close").upper()
+            if r not in reasons:
+                reasons.append(r)
+        approx = any(x.get("price_exact") is False for x in exits)
+        reason_str = "+".join(reasons) + (" (approx)" if approx else "")
+        tp_exits = [x for x in exits if x.get("reason") == "tp"]
+        planned_tp_legs = t.get("planned_tp_legs") or []
+        worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
+                                                      exits, t["entry_ts"], exits[-1]["ts"])
+        dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
+        if running_balance is not None:
+            # balance_after: a TRUE running total, NOT exits[-1]'s own
+            # persisted "balance" field — that field is frozen at whatever
+            # SimAccount's balance-tracking logic was AT THE TIME this
+            # trade closed, so old trades from before the 2026-07-31
+            # fee-deduction fix would otherwise show their old, wrong
+            # balance forever.
+            balance_before = running_balance
+            running_balance += net_pnl
+            balance_after = running_balance
+            dd_pct = (dd / balance_before * 100.0) if balance_before else None
+        else:
+            balance_after = None
+            dd_pct = None
+        out.append({
+            "symbol": t["symbol"], "asset": asset or t["symbol"],
+            "pos_side": t["pos_side"], "qty": entry_qty,
+            "entry_ts": t["entry_ts"], "entry_price": entry_price,
+            "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
+            "reason": reason_str,
+            "tp1": _tp_slot(planned_tp_legs, tp_exits, 0),
+            "tp2": _tp_slot(planned_tp_legs, tp_exits, 1),
+            "r_dollars": r_dollars, "fees": total_fees,
+            "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
+            "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
+            "sequence": t.get("sequence_label") or "—",
+        })
+    return out
+
 def scan_all_trades_detailed():
     """Full per-trade records (entry+every closing leg+fees+duration+R:R),
-    reconstructed from ALL sim_logs across every day — DRY_RUN only. Real
-    mode's athena_logs has no order_type or per-leg granularity recorded
-    (see _manage_position's own documented gap: no "list my resting
-    orders" Phemex call wired up), so a real-mode version of this would be
-    almost entirely blank/approximate — not built.
+    reconstructed from ALL sim_logs across every day — DRY_RUN. See
+    scan_real_trades_detailed for the real-mode counterpart (2026-08-11) —
+    same row shape, same downstream aggregation (_build_trade_rows), a
+    differently-shaped set of source events.
 
     Correlation: a 'filled' event starts a new trade for its (symbol,
     pos_side); every subsequent 'closed' event for that same key belongs to
@@ -8553,7 +9245,25 @@ def scan_all_trades_detailed():
     Fees: per-asset, via fee_for_leg() — ETH is 0.06% of notional
     (qty * price) per leg, QQQ is a flat $/unit per leg — applied to the
     entry leg and every exit leg alike, no maker/taker distinction.
-    User-configurable live via [E] (session-only, not persisted)."""
+    User-configurable live via [E] (session-only, not persisted).
+
+    2026-07-25 (now REVERTED 2026-07-29): a partial-fill trade (e.g. TP1
+    filled, TP2 still resting) used to be surfaced as its own "OPEN"-tagged
+    row here, before the position was actually fully closed. 2026-07-29
+    explicit user instruction, reversing that: "For a trade to be
+    considered 'closed', all of its relevant orders must be closed (all
+    TPs and/or SL). In the trading log, only input the trade data once all
+    of its relevant orders are closed... This is also the point at which
+    the next win/loss progression sequence decision is made." A
+    still-partially-open trade's net pnl/DD/R:R aren't final, so surfacing
+    it as a row read as premature — removed. The win/loss progression
+    decision itself was NEVER driven from this table —
+    `_update_blackjack` is only ever called once the exchange/sim position
+    is confirmed fully flat, so that half of the user's instruction was
+    already correctly in place. A bare, untouched open position (no exits
+    realized yet) was never shown here either way — the dashboard's own
+    Position/Pending line covers that; this table's job is closed trade
+    HISTORY only."""
     pattern = os.path.join(SIM_LOG_DIR_BASE, "**", "*.jsonl")
     rows = []
     for path in glob.glob(pattern, recursive=True):
@@ -8618,110 +9328,131 @@ def scan_all_trades_detailed():
             if sum(x["qty"] for x in t["exits"]) >= t["qty"] - 1e-9:
                 closed_trades.append(open_trades.pop(key))
 
-    def _tp_slot(planned_tp_legs, tp_exits, idx):
-        # 2026-07-28: show the ORIGINAL planned target (level + type) for
-        # this TP slot even if it was never actually hit (a trade that
-        # closed via SL alone still HAD configured TP targets) — only
-        # falls back to nothing if this slot was never configured at all
-        # (a single-target trade has no TP2 slot, say). An actually-hit
-        # leg (in tp_exits) always takes priority over the merely-planned
-        # one, since it carries the real fill price/pnl.
-        if idx < len(tp_exits):
-            x = tp_exits[idx]
-            return {"price": x["price"], "type": x.get("type"), "hit": True}
-        if idx < len(planned_tp_legs):
-            leg = planned_tp_legs[idx]
-            return {"price": leg.get("level"), "type": leg.get("type"), "hit": False}
-        return None
-
-    out = []
-    for t in closed_trades:
-        exits = t["exits"]
-        if not exits:
-            continue
-        entry_qty, entry_price = t["qty"], t["entry_price"]
-        # asset resolved first — fee_for_leg's own model (%-of-notional for
-        # ETH, flat $/unit for QQQ) is asset-specific, unlike the old flat
-        # PHEMEX_FEE_RATE this replaced.
-        asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
-        entry_fee = fee_for_leg(asset, entry_qty, entry_price)
-        exit_qty_total = sum(x["qty"] for x in exits)
-        exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
-        gross_pnl = sum(x["pnl"] for x in exits)
-        exit_fees = sum(fee_for_leg(asset, x["qty"], x["price"]) for x in exits)
-        total_fees = entry_fee + exit_fees
-        net_pnl = gross_pnl - total_fees
-        # trade_risk = qty * sl_distance (THIS asset's own fixed SL
-        # distance — $10 ETH / $0.75 QQQ), not a flat *10 — that was
-        # ETH-specific and would understate QQQ's real R by ~13x, same
-        # underlying mixup _check_confirmation's entry sizing itself had.
-        sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
-        r_dollars = entry_qty * sl_distance
-        rr = (net_pnl / r_dollars) if r_dollars else None
-        reasons = []
-        for x in exits:
-            r = (x.get("reason") or "close").upper()
-            if r not in reasons:
-                reasons.append(r)
-        tp_exits = [x for x in exits if x.get("reason") == "tp"]
-        planned_tp_legs = t.get("planned_tp_legs") or []
-        worst_adverse = _trade_worst_adverse_dollars(asset, t["pos_side"], entry_price, entry_qty,
-                                                      exits, t["entry_ts"], exits[-1]["ts"])
-        dd = worst_adverse if worst_adverse is not None else max(0.0, -net_pnl)
-        # balance_after: a TRUE running total (see the reset_balance/
-        # running_balance setup above), NOT exits[-1]'s own persisted
-        # "balance" field — that field is frozen at whatever
-        # SimAccount's balance-tracking logic was AT THE TIME this trade
-        # closed, so old trades from before the 2026-07-31 fee-deduction
-        # fix would otherwise show their old, wrong balance forever.
-        balance_before = running_balance
-        running_balance += net_pnl
-        balance_after = running_balance
-        dd_pct = (dd / balance_before * 100.0) if balance_before else None
-        out.append({
-            "symbol": t["symbol"], "asset": asset or t["symbol"],
-            "pos_side": t["pos_side"], "qty": entry_qty,
-            "entry_ts": t["entry_ts"], "entry_price": entry_price,
-            "exit_ts": exits[-1]["ts"], "exit_price": exit_price_avg,
-            "reason": "+".join(reasons),
-            "tp1": _tp_slot(planned_tp_legs, tp_exits, 0),
-            "tp2": _tp_slot(planned_tp_legs, tp_exits, 1),
-            "r_dollars": r_dollars, "fees": total_fees,
-            "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
-            "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
-            "sequence": t.get("sequence_label") or "—",
-        })
-
-    # 2026-07-25 (now REVERTED 2026-07-29, see below): a partial-fill
-    # trade (e.g. TP1 filled, TP2 still resting) used to be surfaced as
-    # its own "OPEN"-tagged row here, before the position was actually
-    # fully closed.
-    #
-    # 2026-07-29 explicit user instruction, reversing that: "For a trade
-    # to be considered 'closed', all of its relevant orders must be
-    # closed (all TPs and/or SL). In the trading log, only input the
-    # trade data once all of its relevant orders are closed... This is
-    # also the point at which the next win/loss progression sequence
-    # decision is made." A still-partially-open trade's net pnl/DD/R:R
-    # aren't final (the still-open remainder can still move for or
-    # against it before its own exit fires), so surfacing it as a row
-    # read as premature, not-yet-real trade data — removed. This also
-    # restores this function's own original documented scope from its
-    # top-level docstring ("A trade still open at the end of the log...
-    # is dropped — this table is CLOSED trades only"), which the OPEN-row
-    # addition had quietly broken for partially-open trades specifically.
-    # The win/loss progression decision itself was NEVER driven from this
-    # table — `_update_blackjack` is only ever called once the exchange/
-    # sim position is confirmed fully flat (`_manage_position`'s own
-    # "position flat" branch, the PCVR-flip-close branch, and
-    # `_flatten_now` — all three check the ACTUAL remaining position
-    # size, not this reporting table), so that half of the user's
-    # instruction was already correctly in place and needed no change.
-    # A bare, untouched open position (no exits realized yet) was never
-    # shown here either way — the dashboard's own Position/Pending line
-    # covers that; this table's job is closed trade HISTORY only.
-
+    out = _build_trade_rows(closed_trades, running_balance)
     out.sort(key=lambda t: t["exit_ts"] or "")
+    return out
+
+def scan_real_trades_detailed(current_balance=None):
+    """Real-mode counterpart to scan_all_trades_detailed (2026-08-11) —
+    reconstructed from athena_logs' own "filled"/"leg_closed"/<final-close>
+    events, which now carry the same per-leg granularity sim_logs always
+    has (see _check_fill/_manage_position's own 2026-08-11 comments for
+    exactly where each field is captured — no new Phemex call anywhere in
+    this path, every value was already computed in-memory by the live
+    trading engine at the moment it happened).
+
+    `current_balance` (2026-08-11, user-reported: the BALANCE column was
+    always "—" for real trades): real mode has no "reset" event to walk
+    FORWARD from the way sim does (see _build_trade_rows), but it DOES have
+    one concrete anchor sim doesn't — Phemex's own current account balance
+    is directly queryable. Callers pass that in (already-cached, e.g.
+    APP_STATE.snapshot()["balance"] — this function makes no Phemex call of
+    its own) and this walks BACKWARD from it through `out` in reverse
+    chronological order, subtracting each trade's own net_pnl to recover
+    what the balance was right after each earlier trade. Left as None
+    (renders "—") when the caller has no balance handy. Approximate the
+    further back it goes — any account activity Athena doesn't track
+    (funding accruals between trades, manual account touches) isn't
+    undone, same category of imprecision as every other real-mode number
+    in this table, just compounding across trades instead of isolated to
+    one.
+
+    Forward-only, by design (not a bug): a real trade that closed BEFORE
+    this logging existed has no "filled"/"leg_closed" event to correlate
+    from and is silently skipped here — it still counts in the summary
+    stats above the table (scan_all_trade_events, untouched), just not in
+    this detailed breakdown. There is no attempt to backfill historical
+    real trades from Phemex's own fill-history endpoints (orderList/
+    tradingList) — investigated and rejected as too fragile for real-money
+    reconstruction (truncated clOrdId, undocumented codes).
+
+    Correlation key is (asset, pos_side), not (symbol, pos_side) —
+    log_event's own row always carries `asset` (ETH/QQQ) at the TOP level
+    (unlike sim_log_event's flat row, where symbol/pos_side sit at the top
+    level too), and Athena only ever holds one open REAL position per
+    asset at a time, the same "exact in practice, not a heuristic"
+    ordering guarantee scan_all_trades_detailed's own (symbol, pos_side)
+    key relies on for sim.
+
+    Every real trade has AT MOST one "leg_closed" (TP1, exact — the TP
+    order's own resting limit level) followed by exactly one final-close
+    event (SL/TP2/lone-TP1-in-full/flip/eod/manual/blackout/stale-entry —
+    approximate, live-price-at-detection) — Athena's own bracket design
+    never allows more than two legs total, so no defensive qty-sum check
+    beyond what _build_trade_rows already inherited from sim is needed."""
+    pattern = os.path.join(ATHENA_LOG_DIR_BASE, "**", "*.jsonl")
+    rows = []
+    for path in glob.glob(pattern, recursive=True):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+        except Exception:
+            continue
+    rows.sort(key=lambda d: d.get("ts") or "")
+
+    FINAL_CLOSE_EVENTS = ("position_closed", "pcvr_flip_close", "eod_flatten", "manual_flatten",
+                          "entry_blackout_flatten", "stale_entry_flatten")
+
+    open_trades = {}
+    closed_trades = []
+    for d in rows:
+        ev = d.get("event")
+        det = d.get("detail") or {}
+        # Same guard scan_all_trade_events/recent_closed_trades already use
+        # — today's athena_logs file can still contain events from an
+        # earlier --dry-run run the same day (log_event writes there
+        # regardless of mode).
+        if ev in ("filled",) + FINAL_CLOSE_EVENTS and det.get("sim") is not False:
+            continue
+        key = (d.get("asset"), det.get("pos_side"))
+        if ev == "filled":
+            if key in open_trades:
+                closed_trades.append(open_trades.pop(key))   # defensive — see scan_all_trades_detailed's docstring
+            # "symbol" is one of today's new fields — a "filled" event
+            # logged before 2026-08-11 won't have it. Falls back to the
+            # asset's own known phemex_symbol (deterministic, always
+            # resolvable from d["asset"]) rather than leaving it None,
+            # which would otherwise crash _build_trade_rows' fee_for_leg/
+            # ASSETS[asset] lookups downstream the moment a pre-existing
+            # real trade (single-leg ones correlate and display fine even
+            # without today's richer fields) gets scanned.
+            symbol = det.get("symbol") or (ASSETS.get(d.get("asset")) or {}).get("phemex_symbol")
+            open_trades[key] = {
+                "symbol": symbol, "pos_side": det.get("pos_side"),
+                "entry_ts": d.get("ts"), "entry_price": det.get("fill_price"),
+                "qty": det.get("qty"), "entry_order_type": det.get("order_type"),
+                "sequence_label": det.get("sequence_label"),
+                "planned_tp_legs": det.get("tp_legs") or [],
+                "exits": [],
+            }
+        elif ev == "leg_closed" and key in open_trades:
+            open_trades[key]["exits"].append({"ts": d.get("ts"), "price": det.get("price"), "qty": det.get("qty"),
+                                               "reason": "tp", "pnl": det.get("pnl"), "type": det.get("type"),
+                                               "price_exact": True})
+        elif ev in FINAL_CLOSE_EVENTS and key in open_trades:
+            t = open_trades[key]
+            # lower()'d to match sim's own reason vocabulary ("tp"/"sl"/
+            # "manual"/"flip"/"eod"/...) — _build_trade_rows' tp_exits
+            # filter checks the RAW value against "tp" exactly (it
+            # separately upper()s everything for DISPLAY), so a stored
+            # "TP" here would silently fail to match and both TP slots
+            # would show as never-hit even when this leg plainly was one.
+            t["exits"].append({"ts": d.get("ts"), "price": det.get("exit_approx"), "qty": det.get("qty"),
+                                "reason": (det.get("reason") or "MANUAL").lower(), "pnl": det.get("pnl_approx"),
+                                "type": det.get("type"), "price_exact": False})
+            if sum(x["qty"] for x in t["exits"]) >= t["qty"] - 1e-9:
+                closed_trades.append(open_trades.pop(key))
+
+    out = _build_trade_rows(closed_trades, None)
+    out.sort(key=lambda t: t["exit_ts"] or "")
+    if current_balance is not None and out:
+        running = current_balance
+        for t in reversed(out):
+            t["balance"] = running
+            running -= t["net_pnl"]
     return out
 
 def compute_trade_stats(events, source="sim"):
@@ -8984,10 +9715,14 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
             P_CYAN, curses.A_BOLD)
     y += 1
 
-    if source != "sim":
-        db.puts(y, 0, "Detailed trade table is DRY_RUN/--dry-run only — real mode's "
-                      "athena_logs has no order-type/TP-leg data to build it from.", P_DIM)
-        return 0, 0
+    # 2026-08-11: real mode used to bail out here entirely ("Detailed trade
+    # table is DRY_RUN/--dry-run only") — athena_logs now carries the same
+    # per-leg granularity sim_logs always has (see scan_real_trades_
+    # detailed's own docstring), so this function no longer needs to know
+    # or care which source `trades` came from; only the title above still
+    # branches on it. A real trade closed BEFORE this logging existed just
+    # won't be in `trades` at all — same as any other day with zero closed
+    # trades, handled by the "no closed trades yet" branch below.
 
     hscroll = max(0, min(hscroll, len(TRADES_TABLE_COLS) - 1))
     visible_cols = TRADES_TABLE_COLS[hscroll:]
@@ -11036,14 +11771,23 @@ def _gather_data_view_payload():
     [S]witch-source independently, same as it always could locally. Real
     disk I/O (scan_all_trades_detailed/scan_all_trade_events) — only ever
     called when there's actually at least one client to send it to (see
-    _sync_data_view_loop and _sync_client_handler's on-connect push)."""
+    _sync_data_view_loop and _sync_client_handler's on-connect push).
+
+    "real": "trades" used to be hardcoded [] — a leftover from before
+    scan_real_trades_detailed existed (2026-08-11); a Client's own [D]ata
+    view real table was silently empty even after the Server's own local
+    one started showing real trades. Wired up the same way, with
+    APP_STATE's own already-cached balance (no extra Phemex call) for the
+    BALANCE column's backward walk — see scan_real_trades_detailed's own
+    docstring."""
     sim_trades = scan_all_trades_detailed()
     sim_events = [{"ts": t["exit_ts"], "pnl": t["net_pnl"]} for t in sim_trades]
     real_events = scan_all_trade_events("real")
+    real_trades = scan_real_trades_detailed(APP_STATE.snapshot().get("balance"))
     return {"type": "data_view",
             "sim": {"trades": sim_trades, "events": sim_events,
                     "stats": compute_trade_stats(sim_events, source="sim")},
-            "real": {"trades": [], "events": real_events,
+            "real": {"trades": real_trades, "events": real_events,
                      "stats": compute_trade_stats(real_events, source="real")}}
 
 def _data_view_apply_wire(msg):
@@ -12863,7 +13607,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
     if not lines:
         msg = "Waiting for first status snapshot…"
         db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg[:w], P_CYAN)
-        hint = " q=quit  Esc=dashboard  M=next(Drift) "
+        hint = " q=quit  Esc=dashboard  M=next(Trading) "
         db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
         return 0
 
@@ -12873,7 +13617,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
         db.puts_ansi(y0 + i, x0, line[:w])
 
     scroll_tag = f"  [{scroll + 1}-{min(total, scroll + visible_rows)} of {total}]" if total > visible_rows else ""
-    hint = f" q=quit  Esc=dashboard  M=next(Drift)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
+    hint = f" q=quit  Esc=dashboard  M=next(Trading)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
     db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
     return scroll
 
@@ -12912,7 +13656,7 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     see this section's own header comment for why. `ui` carries the mutable
     display state curses_main owns as plain locals (mirrors gex_ui's own
     dict-in convention): live/view_date/view_offset/bar_interval/
-    filtered_mode/net_volume_mode/show_venues. Returns the clamped
+    filtered_mode/net_volume_mode. Returns the clamped
     view_offset so the caller's own local stays in sync with what was
     actually drawn (same convention draw_status_screen's own scroll return
     already uses)."""
@@ -12924,7 +13668,6 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     raw_view_offset = ui["view_offset"]
     filtered_mode = ui["filtered_mode"]
     net_volume_mode = ui["net_volume_mode"]
-    show_venues = ui["show_venues"]
     interval = DRIFT_INTERVAL[asset]
     next_poll_ts = DRIFT_NEXT_POLL_TS[asset]
     min_trade_usd = DRIFT_MIN_TRADE_USD[asset]
@@ -12938,7 +13681,10 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         spot, status, expiry = state.spot, state.status, state.expiry_label
         last_poll = state.last_poll
         venue_info = _drift_fmt_venue_line(state) if is_crypto else None
-        venue_breakdown = _drift_fmt_venue_breakdown(state, filtered_mode) if (is_crypto and show_venues) else None
+        # 2026-08-12 user request: no [V] toggle — the venue breakdown is
+        # always shown wherever it applies (crypto only; QQQ has no
+        # per-venue data to break down, same CBOE-only source it's always had).
+        venue_breakdown = _drift_fmt_venue_breakdown(state, filtered_mode) if is_crypto else None
 
     x_end, view_offset = _drift_chart_x_end(history, live, raw_view_offset, bar_interval)
 
@@ -13119,7 +13865,8 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         countdown = f"next refresh in {max(0, int(round(next_poll_ts - time.time())))}s"
     else:
         countdown = "live tracking continues in background"
-    v_hint = "   [V] venues" if is_crypto else "   [C] deadzone"
+    v_hint = "" if is_crypto else "   [C] deadzone"   # no [V] hint needed —
+                                                        # venue breakdown is always on now
     min_str = f"min ${min_trade_usd:g}"
     dz_str = f"   dz {confidence_deadzone * 100:g}%" if not is_crypto else ""
     filt_str = "   FILTERED (OTM)" if filtered_mode else ""
@@ -13127,6 +13874,346 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint} "
               f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
               f"poll {interval}s   {_drift_fmt_duration(bar_interval)} bars   {min_str}{dz_str}{filt_str}{vol_str}    "
+              f"{countdown}    last update {last_str} ")
+    db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
+    return view_offset
+
+# ── Volatility Drift chart math (pure — no curses dependency) ──────────────
+def _voldrift_fmt_pct(v, decimals=1):
+    return f"{v:.{decimals}f}%" if v is not None else "—"
+
+def _voldrift_fmt_price(p):
+    if p is None:
+        return "—"
+    return f"${p:,.2f}" if p >= 1 else f"${p:.5f}"
+
+def _voldrift_fmt_duration(seconds):
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+def _voldrift_fmt_elapsed(seconds):
+    """Human-readable elapsed time for arbitrary (non-round) second counts —
+    e.g. how long the current divergence state has been sustained. Unlike
+    _voldrift_fmt_duration (exact multiples of 60/3600 only), always renders
+    something legible regardless of the exact value."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+def _voldrift_fmt_time(ts, is_crypto):
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt = dt.astimezone(TZ_CT) if not is_crypto else dt.astimezone()
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+def _voldrift_chart_x_end(history, live, view_offset, bar_interval):
+    anchor = time.time() if live else (history[-1]["ts"] if history else time.time())
+    if history:
+        max_offset = max(0, int((anchor - history[0]["ts"]) // bar_interval))
+    else:
+        max_offset = 0
+    clamped = max(0, min(max_offset, view_offset))
+    return anchor - clamped * bar_interval, clamped
+
+def _voldrift_build_columns(history, x_end, bar_interval, plot_w):
+    """Each column is a fixed bar_interval-second bucket, last-sample-wins
+    (step chart) — ARV/IV are point-in-time reads, not running totals, but
+    "last in the bucket" is still the right choice: the freshest read
+    available for that minute."""
+    cols_arv = [None] * plot_w
+    cols_iv = [None] * plot_w
+    cols_spot = [None] * plot_w
+    cols_state = [None] * plot_w
+    for s in history:
+        c = plot_w - 1 - int((x_end - s["ts"]) // bar_interval)
+        if c < 0 or c >= plot_w:
+            continue
+        cols_arv[c] = s["arv"]
+        cols_iv[c] = s["iv"]
+        cols_spot[c] = s["spot"]
+        cols_state[c] = s.get("state")
+
+    def ffill(col):
+        last = None
+        for i in range(len(col)):
+            if col[i] is None:
+                col[i] = last
+            else:
+                last = col[i]
+        return col
+
+    return ffill(cols_arv), ffill(cols_iv), ffill(cols_spot), ffill(cols_state)
+
+def _voldrift_day_boundary_cols(x_end, bar_interval, plot_w):
+    cols = []
+    prev_date = None
+    for i in range(plot_w):
+        ts_i = x_end - (plot_w - 1 - i) * bar_interval
+        d = datetime.fromtimestamp(ts_i).date()
+        if prev_date is not None and d != prev_date:
+            cols.append(i)
+        prev_date = d
+    return cols
+
+def _voldrift_expiry_boundary_cols(history, x_end, bar_interval, plot_w):
+    """Column indices where the TRACKED nearest-expiry identity changed
+    between consecutive samples — Deribit/CBOE rolled to a new contract
+    mid-session. Distinct from day_boundary_cols (a fixed clock time) —
+    this is data-driven. Important for reading the chart: ARV/IV are read
+    off a DIFFERENT underlying option contract past this point, so a jump
+    right at the marker reflects a change in what's being measured, not
+    necessarily a real vol event."""
+    cols = []
+    prev_expiry = None
+    for s in history:
+        expiry = s.get("expiry")
+        if prev_expiry is not None and expiry != prev_expiry:
+            c = plot_w - 1 - int((x_end - s["ts"]) // bar_interval)
+            if 0 <= c < plot_w:
+                cols.append(c)
+        prev_expiry = expiry
+    return cols
+
+def _voldrift_to_row(v, vmin, vmax, row_top, row_bot):
+    if vmax == vmin:
+        vmax = vmin + 1e-9
+    frac = (v - vmin) / (vmax - vmin)
+    frac = min(1.0, max(0.0, frac))
+    r = row_top + int(round((1 - frac) * (row_bot - row_top)))
+    return max(row_top, min(row_bot, r))
+
+def _voldrift_segments(db, row, col, segments):
+    cx = col
+    for text, pair, attrs in segments:
+        db.puts(row, cx, text, pair, attrs)
+        cx += len(text)
+    return cx
+
+def _voldrift_plot_divergence_fill(db, cols_arv, cols_iv, vmin, vmax, row_top, row_bot, left_x):
+    """The chart's core signal, made visible directly: shades the gap
+    between ARV and IV in each column, green when ARV is above IV (realized
+    outrunning implied — expansion) and red when IV is above ARV (implied
+    running rich relative to what's actually happening — compression/pin
+    read). Drawn BEFORE the plotted lines so the lines stay crisp on top."""
+    for i in range(len(cols_arv)):
+        a, iv = cols_arv[i], cols_iv[i]
+        if a is None or iv is None:
+            continue
+        r_a = _voldrift_to_row(a, vmin, vmax, row_top, row_bot)
+        r_iv = _voldrift_to_row(iv, vmin, vmax, row_top, row_bot)
+        if r_a == r_iv:
+            continue
+        pair = P_GREEN if a >= iv else P_RED
+        r0, r1 = sorted((r_a, r_iv))
+        for rr in range(r0 + 1, r1):
+            db.puts(rr, left_x + i, "▒", pair, curses.A_DIM)
+
+def draw_voldrift(db, asset, y0, y1, x0, x1, ui):
+    """Volatility Drift — ported from vol-drift.py's own draw(), adapted from
+    raw stdscr/safe_add calls to Athena's DoubleBuffer db.puts/puts_ansi API,
+    same adaptation draw_drift/draw_gex_map already went through. `asset` is
+    whichever of ETH/QQQ is currently focused (chart_focus, resolved by the
+    caller exactly like drift_mode's own drift_asset) — no vol-drift.py-style
+    [S]-switch-to-any-symbol here, see this section's own header comment for
+    why. `ui` carries live/view_date/view_offset (per-asset, caller-owned)
+    and bar_interval (shared across assets, matching drift_bar_interval's own
+    precedent) — interval/rv_window/deadzone are read straight off this
+    asset's own VOLDRIFT_* module dicts, same convention draw_drift already
+    uses for DRIFT_INTERVAL/etc. Returns the clamped view_offset."""
+    is_crypto = VOLDRIFT_IS_CRYPTO[asset]
+    live = ui["live"]
+    state = VOLDRIFT_STATE[asset] if live else (VOLDRIFT_HIST_STATE.get(asset) or VOLDRIFT_STATE[asset])
+    view_date = ui["view_date"]
+    bar_interval = ui["bar_interval"]
+    raw_view_offset = ui["view_offset"]
+    interval = VOLDRIFT_INTERVAL[asset]
+    next_poll_ts = VOLDRIFT_NEXT_POLL_TS[asset]
+    rv_window = VOLDRIFT_RV_WINDOW[asset]
+    deadzone = VOLDRIFT_DIVERGENCE_DEADZONE[asset]
+
+    with state.lock:
+        history = list(state.history)
+        arv, iv, spot, status, expiry = state.arv, state.iv, state.spot, state.status, state.expiry_label
+        divergence_state, divergence_since = state.divergence_state, state.divergence_since
+        dte_hours, near_expiry = state.dte_hours, state.near_expiry
+        last_poll = state.last_poll
+
+    x_end, view_offset = _voldrift_chart_x_end(history, live, raw_view_offset, bar_interval)
+
+    h, w = y1 - y0, x1 - x0
+    if h < 12 or w < 50:
+        db.puts(y0, x0, "terminal too small — resize"[:w], P_YELLOW)
+        return view_offset
+
+    title = f" Volatility Drift — {asset} "
+    if not live:
+        title += f"(historical — {view_date}) "
+    if view_offset > 0:
+        title += f"[← {_voldrift_fmt_duration(view_offset * bar_interval)}] "
+    db.puts(y0, x0, title.ljust(w)[:w], P_STATUS, curses.A_BOLD)
+    clock_str = datetime.now(tz=TZ_CT).strftime("%H:%M:%S") + " "
+    db.puts(y0, x0 + max(0, w - len(clock_str)), clock_str, P_STATUS, curses.A_BOLD)
+
+    spread_str = ""
+    if arv is not None and iv is not None:
+        d = arv - iv
+        spread_str = f"   Δ {'+' if d >= 0 else ''}{d:.1f}"
+    if divergence_state:
+        dur = _voldrift_fmt_elapsed(time.time() - divergence_since) if divergence_since else "—"
+        spread_str += f"   {divergence_state.upper()} {dur}"
+    near_expiry_str = ""
+    if near_expiry and dte_hours is not None:
+        near_expiry_str = f"   ⚠ {dte_hours:.1f}h to expiry"
+    _voldrift_segments(db, y0 + 1, x0 + 1, [
+        ("● ", P_GREEN, curses.A_BOLD), (f"ARV ({_voldrift_fmt_pct(arv)})   ", P_DEFAULT, 0),
+        ("● ", P_CYAN, curses.A_BOLD), (f"ATM IV ({_voldrift_fmt_pct(iv)})   ", P_DEFAULT, 0),
+        ("● ", P_BLUE, curses.A_BOLD), (f"{asset} ({_voldrift_fmt_price(spot)})", P_DEFAULT, 0),
+    ])
+    info = (f"exp {expiry}  " if expiry else "") + status + spread_str + near_expiry_str
+    if not is_crypto and not _voldrift_is_market_open_et() and not status.startswith("market closed"):
+        info = "market closed — " + info
+    db.puts(y0 + 1, x0 + max(0, w - len(info) - 1), info, P_YELLOW if near_expiry else P_DIM)
+
+    LEFT_W, RIGHT_W = 8, 10
+    FOOTER_ROWS, TIME_ROWS, DIVIDER_ROWS, REGIME_ROWS = 1, 1, 1, 1
+    top = y0 + 3
+    available = h - (top - y0) - FOOTER_ROWS - TIME_ROWS - DIVIDER_ROWS - REGIME_ROWS
+    if available < 5:
+        return view_offset
+    main_top = top
+    main_bot = main_top + available - 1
+    divider_row = main_bot + 1
+    regime_row = divider_row + 1
+    time_row = regime_row + 1
+    plot_w = max(1, w - LEFT_W - RIGHT_W - 1)
+
+    for i in _voldrift_day_boundary_cols(x_end, bar_interval, plot_w):
+        col = x0 + LEFT_W + i
+        for rr in range(main_top, regime_row + 1):
+            db.puts(rr, col, ":", P_DIM)
+        db.puts(main_top, col, "D", P_DIM, curses.A_BOLD)
+
+    # Expiry-rollover marker — distinct glyph/color from the day-boundary
+    # one above so the two aren't confused: this one means "measuring a
+    # DIFFERENT option contract past this point," not just "a new calendar
+    # day." See _voldrift_expiry_boundary_cols's own docstring.
+    for i in _voldrift_expiry_boundary_cols(history, x_end, bar_interval, plot_w):
+        col = x0 + LEFT_W + i
+        for rr in range(main_top, regime_row + 1):
+            db.puts(rr, col, "¦", P_YELLOW, curses.A_DIM)
+        db.puts(main_top, col, "E", P_YELLOW, curses.A_BOLD)
+
+    cols_arv, cols_iv, cols_spot, cols_state = _voldrift_build_columns(history, x_end, bar_interval, plot_w)
+
+    vol_vals = [v for v in cols_arv + cols_iv if v is not None]
+    if vol_vals:
+        vmin, vmax = min(vol_vals), max(0.0, max(vol_vals))
+        vmin = min(vmin, 0.0)
+        if vmin == vmax:
+            vmin, vmax = vmin - 1, vmax + 1
+        pad = (vmax - vmin) * 0.08
+        vmin, vmax = max(0.0, vmin - pad), vmax + pad
+    else:
+        vmin, vmax = 0.0, 100.0
+
+    price_vals = [v for v in cols_spot if v is not None]
+    if price_vals:
+        smin, smax = min(price_vals), max(price_vals)
+        if smin == smax:
+            smin, smax = smin - 1, smax + 1
+        spad = (smax - smin) * 0.10
+        smin, smax = smin - spad, smax + spad
+    else:
+        smin, smax = 0.0, 1.0
+
+    N_TICKS = max(2, min(6, available // 2))
+    for k in range(N_TICKS):
+        row = main_top + int(k * (available - 1) / max(1, N_TICKS - 1))
+        frac = (row - main_top) / max(1, available - 1)
+        val = vmax - frac * (vmax - vmin)
+        lbl = _voldrift_fmt_pct(val, 0)
+        db.puts(row, x0 + max(0, LEFT_W - 1 - len(lbl)), lbl, P_DIM)
+        sval = smax - frac * (smax - smin)
+        rlbl = _voldrift_fmt_price(sval)
+        db.puts(row, x0 + LEFT_W + plot_w + 1, rlbl, P_DIM)
+
+    _voldrift_plot_divergence_fill(db, cols_arv, cols_iv, vmin, vmax, main_top, main_bot, x0 + LEFT_W)
+
+    # Live-value reference lines, TradingView-style — same technique
+    # draw_drift's own live price/net-vol badges already use.
+    if spot is not None and price_vals and smin <= spot <= smax:
+        live_row = _voldrift_to_row(spot, smin, smax, main_top, main_bot)
+        db.puts(live_row, x0 + LEFT_W, "─" * plot_w, P_YELLOW)
+        badge = _voldrift_fmt_price(spot).rjust(max(0, RIGHT_W - 1))
+        db.puts(live_row, x0 + LEFT_W + plot_w + 1, badge, P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+    if arv is not None and vmin <= arv <= vmax:
+        live_row = _voldrift_to_row(arv, vmin, vmax, main_top, main_bot)
+        db.puts(live_row, x0 + LEFT_W, "─" * plot_w, P_GREEN, curses.A_DIM)
+    if iv is not None and vmin <= iv <= vmax:
+        live_row = _voldrift_to_row(iv, vmin, vmax, main_top, main_bot)
+        db.puts(live_row, x0 + LEFT_W, "─" * plot_w, P_CYAN, curses.A_DIM)
+
+    def _plot_line(cols, vmin_, vmax_, glyph, pair, attrs):
+        prev_row = None
+        for i, v in enumerate(cols):
+            if v is None:
+                prev_row = None
+                continue
+            r = _voldrift_to_row(v, vmin_, vmax_, main_top, main_bot)
+            if prev_row is not None:
+                r0, r1 = sorted((prev_row, r))
+                for rr in range(r0, r1 + 1):
+                    db.puts(rr, x0 + LEFT_W + i, "│", pair, attrs)
+            db.puts(r, x0 + LEFT_W + i, glyph, pair, attrs)
+            prev_row = r
+
+    _plot_line(cols_spot, smin, smax, "●", P_BLUE, curses.A_BOLD)
+    _plot_line(cols_iv, vmin, vmax, "●", P_CYAN, curses.A_BOLD)
+    _plot_line(cols_arv, vmin, vmax, "●", P_GREEN, curses.A_BOLD)
+
+    # Regime panel — the debounced expansion/compression/neutral state
+    # plotted as a colored strip, one block per column, instead of making
+    # the reader infer it from the shaded gap above.
+    db.puts(divider_row, x0, "─" * w, P_DIM)
+    _voldrift_segments(db, divider_row, x0 + LEFT_W, [
+        (" Regime ", P_DEFAULT, curses.A_BOLD),
+        ("█ ", P_GREEN, curses.A_BOLD), ("expansion  ", P_DIM, 0),
+        ("█ ", P_RED, curses.A_BOLD), ("compression  ", P_DIM, 0),
+        ("█ ", P_DIM, 0), ("neutral", P_DIM, 0),
+    ])
+    regime_pair = {"expansion": P_GREEN, "compression": P_RED, "neutral": P_DIM}
+    regime_attrs = {"expansion": curses.A_BOLD, "compression": curses.A_BOLD, "neutral": 0}
+    for i, st in enumerate(cols_state):
+        if st is None:
+            continue
+        db.puts(regime_row, x0 + LEFT_W + i, "█", regime_pair.get(st, P_DIM), regime_attrs.get(st, 0))
+
+    n_time_labels = max(2, plot_w // 14)
+    for k in range(n_time_labels):
+        i = int(k * (plot_w - 1) / max(1, n_time_labels - 1))
+        ts = x_end - (plot_w - 1 - i) * bar_interval
+        lbl = _voldrift_fmt_time(ts, is_crypto)
+        cx = x0 + LEFT_W + max(0, i - len(lbl) // 2)
+        db.puts(time_row, cx, lbl, P_DIM)
+
+    last_str = datetime.fromtimestamp(last_poll).strftime("%H:%M:%S") if last_poll else "—"
+    if view_offset > 0:
+        countdown = f"scrolled -{_voldrift_fmt_duration(view_offset * bar_interval)} — [→]/[L] to live"
+    elif live:
+        countdown = f"next refresh in {max(0, int(round(next_poll_ts - time.time())))}s"
+    else:
+        countdown = "live tracking continues in background"
+    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [W]rvWindow [D]eadzone "
+              f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
+              f"poll {interval}s   {_voldrift_fmt_duration(bar_interval)} bars   "
+              f"rv window {_voldrift_fmt_duration(rv_window)}   deadzone {deadzone:g}pt    "
               f"{countdown}    last update {last_str} ")
     db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
     return view_offset
@@ -13222,16 +14309,23 @@ def _startup_progress():
     if CLIENT_MODE:
         return [("Connecting to server", SYNC_CLIENT_STATUS[0] == "connected"),
                 ("Received first snapshot", SYNC_CLIENT_LAST_MSG_TS[0] > 0.0)]
+    # 2026-08-12 user request: one consolidated line per subsystem (both
+    # assets' own readiness ANDed together) instead of a separate ETH/QQQ
+    # line each — the per-asset granularity was never actually load-bearing
+    # here (this whole function only ever feeds a splash screen, not a
+    # real diagnostic), and by the time Net Drift/Volatility Drift's own
+    # lines were added tonight, 13 individual rows was pushing the loading
+    # screen's own bust-art/wordmark fallback logic (draw_loading_screen)
+    # into unnecessarily dropping the sword-and-shield art on a normal
+    # ~60-row terminal. 8 consolidated rows comfortably fits the full
+    # bust+wordmark combo again.
     steps = [("Trading engine", bool(APP_STATE.snapshot()["instruments"]))]
-    for asset in ASSETS:
-        steps.append((f"{asset} order-flow backfill", _backfill_ready[asset].is_set()))
-    for asset in ASSETS:
-        steps.append((f"{asset} GEX engine", GEX_STATUS.get(asset) not in (None, "connecting…")))
+    steps.append(("Order-flow backfills", all(_backfill_ready[a].is_set() for a in ASSETS)))
+    steps.append(("GEX engines", all(GEX_STATUS.get(a) not in (None, "connecting…") for a in ASSETS)))
     steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
-    for asset in ASSETS:
-        steps.append((f"{asset} chart engine", _ch_ready[asset].is_set()))
-    for asset in DRIFT_ASSETS:
-        steps.append((f"{asset} Net Drift engine", DRIFT_READY[asset].is_set()))
+    steps.append(("Chart engines", all(_ch_ready[a].is_set() for a in ASSETS)))
+    steps.append(("Net Drift engines", all(DRIFT_READY[a].is_set() for a in DRIFT_ASSETS)))
+    steps.append(("Volatility Drift engines", all(VOLDRIFT_READY[a].is_set() for a in VOLDRIFT_ASSETS)))
     if not DRY_RUN:
         # Only shown at all on a live launch — a DRY_RUN/paper session never
         # starts _phemex_preflight_thread (see curses_main's own thread-
@@ -13293,6 +14387,22 @@ def draw_loading_screen(db, rows, cols, steps, tick):
         if g is not None:
             show_bust = show_word = True
             gap = g
+        else:
+            # 2026-08-12 user-reported (sword-and-shield bust missing on a
+            # 61-row terminal): bust+full-wordmark didn't fit even at
+            # gap=0 — Net Drift's and Volatility Drift's checklist lines
+            # (4 more rows total) pushed content_h exactly 1 row past
+            # avail. The old fallback here dropped the ENTIRE 40-row bust
+            # to save that single row — try bust + the compact
+            # "A T H E N A" title line (word_h - 1 rows cheaper) BEFORE
+            # giving up on the bust art entirely; the checklist/rendering
+            # code below already handles show_bust=True/show_word=False
+            # correctly (falls to the compact title), this was purely a
+            # missing intermediate rung in the degradation ladder.
+            g2 = _loading_best_gap(True, False, bust_h, word_h, total_n, avail)
+            if g2 is not None:
+                show_bust = True
+                gap = g2
     if not show_bust and cols >= word_w + 2:
         g = _loading_best_gap(False, True, bust_h, word_h, total_n, avail)
         if g is not None:
@@ -13441,6 +14551,10 @@ def curses_main(stdscr):
         # BackgroundTracker split.
         for _drift_asset in DRIFT_ASSETS:
             threading.Thread(target=_drift_engine_loop, args=(_drift_asset, _quit_evt), daemon=True).start()
+        # Volatility Drift engine — ported from vol-drift.py, same always-on
+        # per-asset-thread shape as Net Drift's own above.
+        for _voldrift_asset in VOLDRIFT_ASSETS:
+            threading.Thread(target=_voldrift_engine_loop, args=(_voldrift_asset, _quit_evt), daemon=True).start()
 
     # Sync layer — the ONE thread Client Mode ever starts (never touches an
     # exchange, a broker credential, or the trading engine); Server Mode
@@ -13529,11 +14643,12 @@ def curses_main(stdscr):
                             # cycle's next stop after GEX; see gex_mode above
     status_scroll = 0
     drift_mode = False   # full-screen Net Drift (Premium) mode, ported from
-                          # drift.py — the NEW last stop in the [M] cycle:
-                          # Trading -> GEX -> Status -> Net Drift -> Trading
-                          # (see status_mode's own key dispatch below, which
-                          # now continues here instead of exiting straight
-                          # to Trading).
+                          # drift.py — 2026-08-12: the cycle was reordered to
+                          # Trading -> GEX -> Net Drift -> Volatility Drift ->
+                          # Status -> Trading (Volatility Drift inserted
+                          # between this and Status; see voldrift_mode below
+                          # and each mode's own [M] key-dispatch branch for
+                          # where the cycle actually advances).
     drift_live = {"ETH": True, "QQQ": True}         # [H] per-asset live/historical
     drift_view_date = {"ETH": None, "QQQ": None}     # per-asset — which date [H] is browsing
     drift_view_offset = {"ETH": 0, "QQQ": 0}         # per-asset pan/scroll — deliberately
@@ -13547,8 +14662,20 @@ def curses_main(stdscr):
     drift_filtered_mode = True      # [F] — shared display toggle, matches ctrl.filtered_mode;
                                       # defaults ON per user request (2026-08-11)
     drift_net_volume_mode = True    # [N] — shared display toggle, matches ctrl.net_volume_mode
-    drift_show_venues = False       # [V] — shared display toggle, matches drift.py's own
-                                      # curses_main-local show_venues
+                                      # (2026-08-12: the old [V] venue-breakdown toggle was
+                                      # removed entirely per user request — the breakdown is
+                                      # now always shown wherever it applies, see draw_drift)
+    voldrift_mode = False   # full-screen Volatility Drift mode, ported from
+                             # vol-drift.py (2026-08-12) — sits between Net
+                             # Drift and Status in the [M] cycle (see
+                             # drift_mode's own comment above for the full
+                             # cycle order).
+    voldrift_live = {"ETH": True, "QQQ": True}
+    voldrift_view_date = {"ETH": None, "QQQ": None}
+    voldrift_view_offset = {"ETH": 0, "QQQ": 0}   # per-asset, same Tab-switch-preserving
+                             # reasoning as drift_view_offset above
+    voldrift_bar_interval = VOLDRIFT_DEFAULT_BAR_INTERVAL   # [B] — shared across both assets,
+                             # matches vol-drift.py's own ctrl.bar_interval
     dashboard_hidden = False   # [H] — gives the chart the ENTIRE terminal,
                                # same row budget footprint.py's own
                                # full-screen view uses, for when even the
@@ -13634,7 +14761,14 @@ def curses_main(stdscr):
             # documented approximate-pnl gap as everywhere else in real
             # mode), still sourced from scan_all_trade_events as before.
             if trades_cache.get("source") != data_source or now_mono - trades_cache["ts"] > 2.0:
-                trades = scan_all_trades_detailed() if data_source == "sim" else []
+                # 2026-08-11: real mode used to always be [] here (no
+                # detailed per-trade data existed yet) — now sourced from
+                # scan_real_trades_detailed, the real-mode counterpart to
+                # scan_all_trades_detailed (see its own docstring). Still
+                # forward-only: a real trade closed before that logging
+                # shipped simply won't appear.
+                trades = (scan_all_trades_detailed() if data_source == "sim"
+                          else scan_real_trades_detailed(snap.get("balance")))
                 trades_cache = {"source": data_source, "ts": now_mono, "trades": trades}
             if data_cache["source"] != data_source or now_mono - data_cache["ts"] > 2.0:
                 if data_source == "sim":
@@ -13673,9 +14807,16 @@ def curses_main(stdscr):
             drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             drift_ui = {"live": drift_live[drift_asset], "view_date": drift_view_date[drift_asset],
                         "view_offset": drift_view_offset[drift_asset], "bar_interval": drift_bar_interval,
-                        "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
-                        "show_venues": drift_show_venues}
+                        "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode}
             drift_view_offset[drift_asset] = draw_drift(db, drift_asset, 0, rows, 0, cols, drift_ui)
+        elif voldrift_mode:
+            # Full screen, same convention as drift_mode above — draw_voldrift
+            # draws its own hint row at the very last line, so no separate
+            # Athena footer is drawn underneath (see the footer dispatch below).
+            voldrift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            voldrift_ui = {"live": voldrift_live[voldrift_asset], "view_date": voldrift_view_date[voldrift_asset],
+                           "view_offset": voldrift_view_offset[voldrift_asset], "bar_interval": voldrift_bar_interval}
+            voldrift_view_offset[voldrift_asset] = draw_voldrift(db, voldrift_asset, 0, rows, 0, cols, voldrift_ui)
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
@@ -13750,6 +14891,9 @@ def curses_main(stdscr):
         elif drift_mode:
             pass   # draw_drift already drew its own hint row — same
                    # reasoning as gex_mode/status_mode above.
+        elif voldrift_mode:
+            pass   # draw_voldrift already drew its own hint row — same
+                   # reasoning as drift_mode above.
         else:
             # [Tab] hint placed right after the scroll hint it's directly
             # related to (not appended at the very end) — the footer is
@@ -13765,7 +14909,7 @@ def curses_main(stdscr):
                 # shorter footer instead of interleaving "not available"
                 # markers into the same dense f-string.
                 footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Status/Drift"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Status"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             else:
                 risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
@@ -13774,7 +14918,7 @@ def curses_main(stdscr):
                 fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
                 footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                           f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Status/Drift"
+                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Status"
                           + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                           + "  [F]latten"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
@@ -13817,17 +14961,16 @@ def curses_main(stdscr):
 
         if status_mode:
             # Scrollable full-screen text, not a chart with pan state, so
-            # the key set is smaller than gex_mode's. [M] continues the
-            # Trading -> GEX -> Status -> Net Drift -> Trading cycle on to
-            # Net Drift; Esc is still the fast "back to Trading" escape
-            # hatch from any mode (same split gex_mode's own block uses).
+            # the key set is smaller than gex_mode's. 2026-08-12: Status is
+            # the LAST stop again in the reordered Trading -> GEX -> Net
+            # Drift -> Volatility Drift -> Status -> Trading cycle (Net
+            # Drift used to be the last stop before Volatility Drift was
+            # inserted ahead of Status) — [M] and Esc both land back on
+            # Trading here, same as before Net Drift was appended.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
-            elif key == 27:
+            elif key in (ord("m"), ord("M"), 27):
                 status_mode = False
-            elif key in (ord("m"), ord("M")):
-                status_mode = False
-                drift_mode = True
             elif key == curses.KEY_UP:
                 status_scroll = max(0, status_scroll - 1)
             elif key == curses.KEY_DOWN:
@@ -13850,11 +14993,11 @@ def curses_main(stdscr):
             # data_view/activity_log_open already use ([mode-key] or Esc
             # = back out). z/Z/End alone still does gex.py's own reset.
             #
-            # Phase 4: [M] no longer means "exit" here — it means "next
-            # mode" in the Trading -> GEX -> Status -> Trading cycle, so
-            # from GEX it moves on to Status instead of leaving to Trading.
-            # Esc remains the fast "back to Trading" escape hatch from any
-            # mode, unchanged.
+            # [M] means "next mode" in the Trading -> GEX -> Net Drift ->
+            # Volatility Drift -> Status -> Trading cycle (2026-08-12: GEX
+            # now leads to Net Drift, not Status — Volatility Drift was
+            # inserted between them). Esc remains the fast "back to
+            # Trading" escape hatch from any mode, unchanged.
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
@@ -13862,8 +15005,7 @@ def curses_main(stdscr):
                 gex_mode = False
             elif key in (ord("m"), ord("M")):
                 gex_mode = False
-                status_mode = True
-                status_scroll = 0
+                drift_mode = True
             elif key in (ord("g"), ord("G")):
                 gex_by_strike = not gex_by_strike
             elif key in (ord("n"), ord("N")) and gex_by_strike:
@@ -13926,15 +15068,17 @@ def curses_main(stdscr):
 
         if drift_mode:
             # Ported from drift.py's own curses_main key dispatch, remapped
-            # per the approved plan: [M] is taken globally (next mode, same
-            # as gex_mode/status_mode above — Net Drift is the LAST stop, so
-            # it wraps back to Trading), drift.py's own [M] (min trade $
-            # threshold) moves to [T]; drift.py's [S] (switch to an
-            # arbitrary symbol) is dropped entirely since Athena only ever
-            # tracks ETH/QQQ — Tab switches focus between them instead,
-            # matching gex_mode's own convention; drift.py's Esc (snap to
-            # live) moves to [L], freeing Esc for the same cross-mode "back
-            # to Trading" convention every other full-screen mode uses.
+            # per the approved plan: [M] is taken globally (next mode — same
+            # as gex_mode/status_mode above; 2026-08-12: Net Drift now leads
+            # to Volatility Drift instead of wrapping to Trading, since
+            # Volatility Drift was inserted right after it in the cycle),
+            # drift.py's own [M] (min trade $ threshold) moves to [T];
+            # drift.py's [S] (switch to an arbitrary symbol) is dropped
+            # entirely since Athena only ever tracks ETH/QQQ — Tab switches
+            # focus between them instead, matching gex_mode's own
+            # convention; drift.py's Esc (snap to live) moves to [L],
+            # freeing Esc for the same cross-mode "back to Trading"
+            # convention every other full-screen mode uses.
             drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
@@ -13942,6 +15086,7 @@ def curses_main(stdscr):
                 drift_mode = False
             elif key in (ord("m"), ord("M")):
                 drift_mode = False
+                voldrift_mode = True
             elif key == 9:   # Tab — switch asset focus, same convention as gex_mode
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("l"), ord("L")):   # snap back to the live edge
@@ -13993,8 +15138,6 @@ def curses_main(stdscr):
                 drift_filtered_mode = not drift_filtered_mode
             elif key in (ord("n"), ord("N")):
                 drift_net_volume_mode = not drift_net_volume_mode
-            elif key in (ord("v"), ord("V")):
-                drift_show_venues = not drift_show_venues
             elif key in (ord("r"), ord("R")):
                 DRIFT_NEXT_POLL_TS[drift_asset] = 0.0
             elif key == curses.KEY_LEFT:
@@ -14004,20 +15147,117 @@ def curses_main(stdscr):
                 drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 1)
                 if drift_view_offset[drift_asset] == 0:
                     drift_live[drift_asset] = True
-            elif key == curses.KEY_SLEFT:
+            elif key in (curses.KEY_SLEFT, ord("[")):
+                # [2026-08-12 user-reported gap] '[' is drift.py's own
+                # bracket-key alias for the same 10-bar step Shift+Left
+                # gives — a fallback for terminals where Shift+Arrow
+                # doesn't register as KEY_SLEFT (a common curses
+                # portability issue, exactly why drift.py provided it).
                 drift_live[drift_asset] = False
                 drift_view_offset[drift_asset] += 10
-            elif key == curses.KEY_SRIGHT:
+            elif key in (curses.KEY_SRIGHT, ord("]")):
                 drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 10)
                 if drift_view_offset[drift_asset] == 0:
                     drift_live[drift_asset] = True
-            elif key == curses.KEY_PPAGE:
+            elif key in (curses.KEY_PPAGE, ord("{")):
+                # '{' is drift.py's own bracket-key alias for the 50-bar
+                # step (there, Ctrl+Left's raw terminal-dependent codes;
+                # here, KEY_PPAGE already covers that same big-step role).
                 drift_live[drift_asset] = False
                 drift_view_offset[drift_asset] += 50
-            elif key == curses.KEY_NPAGE:
+            elif key in (curses.KEY_NPAGE, ord("}")):
                 drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 50)
                 if drift_view_offset[drift_asset] == 0:
                     drift_live[drift_asset] = True
+            continue
+
+        if voldrift_mode:
+            # Ported from vol-drift.py's own curses_main key dispatch, same
+            # remap reasoning as drift_mode above: [M] continues the cycle
+            # (Volatility Drift -> Status); vol-drift.py's [S] (switch to an
+            # arbitrary symbol) is dropped, Tab switches ETH/QQQ focus
+            # instead; vol-drift.py's Esc (snap to live) moves to [L], Esc
+            # here leaves the mode, matching every other full-screen mode.
+            voldrift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                voldrift_mode = False
+            elif key in (ord("m"), ord("M")):
+                voldrift_mode = False
+                status_mode = True
+                status_scroll = 0
+            elif key == 9:   # Tab — switch asset focus, same convention as drift_mode
+                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key in (ord("l"), ord("L")):   # snap back to the live edge
+                voldrift_live[voldrift_asset] = True
+                voldrift_view_date[voldrift_asset] = None
+                voldrift_view_offset[voldrift_asset] = 0
+                VOLDRIFT_HIST_STATE.pop(voldrift_asset, None)
+            elif key in (ord("h"), ord("H")):
+                raw = _prompt_text(stdscr, [f"{voldrift_asset} — date to browse MM_DD_YYYY, or 'live' to return"],
+                                    prompt="> ")
+                db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
+                if raw is not None:
+                    low = raw.strip().lower()
+                    if low in ("", "live", "l"):
+                        if raw.strip():   # non-empty "live"/"l" — blank Enter is a no-op cancel
+                            voldrift_live[voldrift_asset] = True
+                            voldrift_view_date[voldrift_asset] = None
+                            voldrift_view_offset[voldrift_asset] = 0
+                            VOLDRIFT_HIST_STATE.pop(voldrift_asset, None)
+                    else:
+                        _voldrift_load_historical(voldrift_asset, raw.strip())
+                        voldrift_view_date[voldrift_asset] = raw.strip()
+                        voldrift_live[voldrift_asset] = False
+                        voldrift_view_offset[voldrift_asset] = 0
+            elif key in (ord("i"), ord("I")):
+                new_interval = _prompt_number(stdscr, f"{voldrift_asset} poll interval in seconds, min "
+                                               f"{VOLDRIFT_MIN_INTERVAL} (current {VOLDRIFT_INTERVAL[voldrift_asset]}): ",
+                                               default=VOLDRIFT_INTERVAL[voldrift_asset])
+                db.prev = None
+                VOLDRIFT_INTERVAL[voldrift_asset] = max(VOLDRIFT_MIN_INTERVAL, int(new_interval))
+            elif key in (ord("b"), ord("B")):
+                new_bar = _prompt_number(stdscr, f"Bar interval in seconds, min {VOLDRIFT_MIN_BAR_INTERVAL} "
+                                          f"(current {voldrift_bar_interval}): ", default=voldrift_bar_interval)
+                db.prev = None
+                voldrift_bar_interval = max(VOLDRIFT_MIN_BAR_INTERVAL, int(new_bar))
+            elif key in (ord("w"), ord("W")):
+                new_rv = _prompt_number(stdscr, f"{voldrift_asset} realized-vol window in seconds, min "
+                                         f"{VOLDRIFT_MIN_RV_WINDOW} (current {VOLDRIFT_RV_WINDOW[voldrift_asset]}): ",
+                                         default=VOLDRIFT_RV_WINDOW[voldrift_asset])
+                db.prev = None
+                VOLDRIFT_RV_WINDOW[voldrift_asset] = max(VOLDRIFT_MIN_RV_WINDOW, int(new_rv))
+            elif key in (ord("d"), ord("D")):
+                new_dz = _prompt_number(stdscr, f"{voldrift_asset} divergence deadzone in percentage points, "
+                                         f"min {VOLDRIFT_MIN_DIVERGENCE_DEADZONE:g} (current "
+                                         f"{VOLDRIFT_DIVERGENCE_DEADZONE[voldrift_asset]:g}): ",
+                                         default=VOLDRIFT_DIVERGENCE_DEADZONE[voldrift_asset])
+                db.prev = None
+                VOLDRIFT_DIVERGENCE_DEADZONE[voldrift_asset] = max(VOLDRIFT_MIN_DIVERGENCE_DEADZONE, new_dz)
+            elif key in (ord("r"), ord("R")):
+                VOLDRIFT_NEXT_POLL_TS[voldrift_asset] = 0.0
+            elif key == curses.KEY_LEFT:
+                voldrift_live[voldrift_asset] = False
+                voldrift_view_offset[voldrift_asset] += 1
+            elif key == curses.KEY_RIGHT:
+                voldrift_view_offset[voldrift_asset] = max(0, voldrift_view_offset[voldrift_asset] - 1)
+                if voldrift_view_offset[voldrift_asset] == 0:
+                    voldrift_live[voldrift_asset] = True
+            elif key in (curses.KEY_SLEFT, ord("[")):
+                voldrift_live[voldrift_asset] = False
+                voldrift_view_offset[voldrift_asset] += 10
+            elif key in (curses.KEY_SRIGHT, ord("]")):
+                voldrift_view_offset[voldrift_asset] = max(0, voldrift_view_offset[voldrift_asset] - 10)
+                if voldrift_view_offset[voldrift_asset] == 0:
+                    voldrift_live[voldrift_asset] = True
+            elif key in (curses.KEY_PPAGE, ord("{")):
+                voldrift_live[voldrift_asset] = False
+                voldrift_view_offset[voldrift_asset] += 50
+            elif key in (curses.KEY_NPAGE, ord("}")):
+                voldrift_view_offset[voldrift_asset] = max(0, voldrift_view_offset[voldrift_asset] - 50)
+                if voldrift_view_offset[voldrift_asset] == 0:
+                    voldrift_live[voldrift_asset] = True
             continue
 
         if data_view:

@@ -5024,11 +5024,14 @@ def _parse_resting_orders(rows, pos_side):
 
     posSide filtering: uses the order's own posSide field when Phemex
     echoes it back (should be, since every Athena order sets it
-    explicitly); falls back to inferring it from stopDirection/side for
-    conditional (SL) orders — copycat.py's own documented fallback,
-    "Phemex doesn't return posSide on conditional orders" in some
-    response shapes — and from side-vs-close_side for plain (TP) orders,
-    which need no stopDirection at all.
+    explicitly); falls back to `side` ALONE when it's missing — closing a
+    Long always Sells, closing a Short always Buys, in Hedged mode, for
+    both SL and TP orders alike, so side unconditionally determines which
+    position any closing order belongs to (2026-08-13: this used to branch
+    on stopDirection+side together, a leftover from trying to also
+    distinguish SL from take-profit-via-stop semantics that this function
+    never actually needs — see the fix comment inline below for the real
+    bug that caused).
 
     Each returned tp_leg carries its own real exchange orderID (added
     2026-08-11 alongside sl_order_id) — lets _sync_moving_tps/
@@ -5043,7 +5046,6 @@ def _parse_resting_orders(rows, pos_side):
     sl_price = None
     sl_order_id = None
     tp_legs = []
-    close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     for o in rows or []:
         cl_id = o.get('clOrdID') or ''
         if not cl_id.startswith('athena_'):
@@ -5051,33 +5053,32 @@ def _parse_resting_orders(rows, pos_side):
 
         o_pos_side = o.get('posSide')
         if not o_pos_side:
-            stop_dir, side_o = o.get('stopDirection', ''), o.get('side', '')
-            # BUG FIXED 2026-08-11, user-reported ("in a live trade but
-            # there are no TPs" — dashboard showed SL only, both TP legs
-            # missing, even though a direct /g-orders/activeList query
-            # confirmed both were genuinely resting on Phemex the whole
-            # time): Phemex returns the literal string "UNSPECIFIED" for
-            # stopDirection on a plain (non-conditional) order, not ''/None
-            # as this code assumed — `not stop_dir` is False for a non-
-            # empty string, so the "plain Limit TP leg" fallback below
-            # never matched, o_pos_side stayed None, and every TP row got
-            # silently filtered out by the `o_pos_side != pos_side` check
-            # right after this block. The SL was unaffected (a real
-            # conditional order always carries an actual 'Rising'/'Falling'
-            # direction), which is exactly why the position looked "SL
-            # fine, TPs vanished" instead of everything vanishing.
-            if stop_dir == 'UNSPECIFIED':
-                stop_dir = ''
-            if stop_dir == 'Falling' and side_o == 'Sell':
+            # BUG FIXED 2026-08-13, user-reported (a real Short position's
+            # SL was genuinely resting on Phemex the ENTIRE time — confirmed
+            # live via a direct /g-orders/activeList query: side='Buy',
+            # stopDirection='Rising', posSide missing from the response —
+            # but the OLD code here branched on stopDirection+side TOGETHER
+            # (trying to also distinguish an SL from a take-profit-via-stop
+            # order, a distinction this function never actually needs, since
+            # it only ever looks for `athena_sl_`-prefixed rows), and that
+            # 4-way branching mapped 'Rising'+'Buy' to 'Long' instead of
+            # 'Short'. So _parse_resting_orders(rows, "Short") always came
+            # back with sl_price=None; _manage_position's per-cycle
+            # reconciliation believed the SL was missing and retried
+            # placing a new one every cycle, which Phemex correctly
+            # rejected every single time (TE_STOP_LOSS_ORDER_DUPLICATED,
+            # code 11084) since one was already genuinely resting — a real
+            # error logged on repeat, forever, over a position that was
+            # fully protected the entire time. `side` ALONE fully
+            # determines which position a closing order belongs to in
+            # Hedged mode, for both SL and TP orders alike: closing a Long
+            # always Sells, closing a Short always Buys — no need to also
+            # look at stopDirection here at all.
+            side_o = o.get('side', '')
+            if side_o == 'Sell':
                 o_pos_side = 'Long'
-            elif stop_dir == 'Rising' and side_o == 'Buy':
-                o_pos_side = 'Long'
-            elif stop_dir == 'Rising' and side_o == 'Sell':
+            elif side_o == 'Buy':
                 o_pos_side = 'Short'
-            elif stop_dir == 'Falling' and side_o == 'Buy':
-                o_pos_side = 'Short'
-            elif not stop_dir and side_o == close_side:
-                o_pos_side = pos_side   # plain Limit TP leg, no stopDirection at all
         if o_pos_side != pos_side:
             continue
 

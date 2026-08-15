@@ -70,6 +70,7 @@
 import sys
 import os
 import re
+import csv
 import glob
 import json
 import shutil
@@ -6188,18 +6189,30 @@ def _drift_to_row(v, vmin, vmax, row_top, row_bot):
 
 def _drift_build_columns(history, x_end, bar_interval, plot_w, filtered=False):
     """Each column is a FIXED bar_interval-second bucket. Multiple samples
-    landing in the same bucket keep the LAST one (calls/puts/spot/net_vol
-    are all cumulative running totals — a step chart). Also returns
-    cols_vol — unsigned per-bucket $ premium activity (SUMMED per bucket,
-    not step-charted, since it's interval activity, not a running total).
-    filtered ([F]) pulls the "_f"-suffixed fields instead — spot is never
-    filtered, same either way."""
+    landing in the same bucket keep the LAST one for calls/puts/spot/
+    net_vol (all cumulative running totals — a step chart; spot's last
+    value is that bucket's Close). Also returns cols_vol — unsigned
+    per-bucket $ premium activity (SUMMED per bucket, not step-charted,
+    since it's interval activity, not a running total). filtered ([F])
+    pulls the "_f"-suffixed fields instead — spot is never filtered,
+    same either way.
+
+    2026-08-15 user-requested crosshair feature: also returns cols_open/
+    cols_high/cols_low — the bucket's own first/max/min spot samples,
+    giving each column real OHLC (not just the Close every other series
+    here already had). A bucket with NO samples at all had no new price
+    action, so its O/H/L/C all carry forward from the previous bucket's
+    Close (flat) — exactly what the plotted spot-price line already shows
+    through that gap."""
     calls_key = "calls_f" if filtered else "calls"
     puts_key = "puts_f" if filtered else "puts"
     netvol_key = "net_vol_f" if filtered else "net_vol"
     cols_calls = [None] * plot_w
     cols_puts = [None] * plot_w
     cols_spot = [None] * plot_w
+    cols_open = [None] * plot_w
+    cols_high = [None] * plot_w
+    cols_low = [None] * plot_w
     cols_netvol = [None] * plot_w
     cols_vol = [0.0] * plot_w
     for s in history:
@@ -6208,7 +6221,13 @@ def _drift_build_columns(history, x_end, bar_interval, plot_w, filtered=False):
             continue
         cols_calls[c] = s[calls_key]
         cols_puts[c] = s[puts_key]
-        cols_spot[c] = s["spot"]
+        spot_val = s["spot"]
+        if spot_val is not None:
+            cols_spot[c] = spot_val
+            if cols_open[c] is None:
+                cols_open[c] = spot_val
+            cols_high[c] = spot_val if cols_high[c] is None else max(cols_high[c], spot_val)
+            cols_low[c]  = spot_val if cols_low[c]  is None else min(cols_low[c],  spot_val)
         cols_netvol[c] = s.get(netvol_key, 0.0)
         cols_vol[c] += s.get("vol") or 0.0
 
@@ -6221,7 +6240,48 @@ def _drift_build_columns(history, x_end, bar_interval, plot_w, filtered=False):
                 last = col[i]
         return col
 
-    return ffill(cols_calls), ffill(cols_puts), ffill(cols_spot), ffill(cols_netvol), cols_vol
+    cols_calls  = ffill(cols_calls)
+    cols_puts   = ffill(cols_puts)
+    cols_netvol = ffill(cols_netvol)
+    cols_spot   = ffill(cols_spot)
+
+    prev_close = None
+    for i in range(plot_w):
+        if cols_open[i] is None:
+            cols_open[i] = prev_close
+            cols_high[i] = prev_close
+            cols_low[i]  = prev_close
+        prev_close = cols_spot[i] if cols_spot[i] is not None else prev_close
+
+    return cols_calls, cols_puts, cols_spot, cols_open, cols_high, cols_low, cols_netvol, cols_vol
+
+# Left/right gutter widths — module constants (not draw_drift locals) so the
+# curses_main key handler can compute the SAME plot_w estimate draw_drift
+# itself uses, for crosshair pan-at-edge clamping (mirrors how the footprint
+# panel's own key handler reuses CHART_AXIS_W/CHART_COL_W directly).
+DRIFT_LEFT_W  = 8
+DRIFT_RIGHT_W = 10
+
+def _drift_crosshair_clamp(crosshair_idx, view_offset, plot_w):
+    """[X] crosshair — crosshair_idx moves within the visible plot_w-wide
+    window (0 = rightmost/live-most visible column); when a move would push
+    it past either edge, the WINDOW itself pans (view_offset, the same
+    variable [<-]/[->] panning already uses) instead, pinning crosshair_idx
+    at that edge — same idea as the footprint charts' own
+    _footprint_crosshair_clamp. Handles ANY overflow amount, not just a
+    single column (2026-08-15: crosshair movement was merged into the same
+    [<-]/[->]/['/']/[{/}] keys panning already uses, at their own existing
+    1/10/50-column steps, so a 10- or 50-column move can overshoot the
+    window in one call). The upper bound on view_offset is left to
+    _drift_chart_x_end's own existing clamp on the next draw call (same
+    lazy-clamp convention plain panning already relies on here)."""
+    if crosshair_idx >= plot_w:
+        view_offset += crosshair_idx - (plot_w - 1)
+        crosshair_idx = plot_w - 1
+    elif crosshair_idx < 0:
+        view_offset = max(0, view_offset + crosshair_idx)
+        crosshair_idx = 0
+    return crosshair_idx, view_offset
 
 def _drift_day_boundary_cols(x_end, bar_interval, plot_w):
     """Column indices where local midnight falls inside that bucket — the
@@ -7208,8 +7268,24 @@ class AthenaInstrument:
             # during the window regardless of when the order was placed.
             await self._check_fill()
             if self.state == "PENDING_FILL":
+                pending_side = self.pending["pos_side"]
+                # BUG FIXED 2026-08-13, user-reported (a resting Long limit
+                # entry sat untouched after PCVR flipped to short — stayed
+                # there for the full ENTRY_ORDER_EXPIRY_BARS window,
+                # available to fill against a regime it no longer agreed
+                # with): this branch already covers blackout/staleness, but
+                # never the regime itself — that emergency-close only
+                # existed for an ALREADY-FILLED IN_POSITION trade (see
+                # _manage_position's own `flipped` check above), not a
+                # still-pending one. Same flip condition, same "cancel
+                # rather than let it fill wrong" reasoning, just one state
+                # earlier in the lifecycle.
+                pending_flipped = ((pending_side == "Long" and regime == "short")
+                                    or (pending_side == "Short" and regime == "long"))
                 if _in_entry_blackout():
                     await self._flatten_now("entry_blackout")
+                elif pending_flipped:
+                    await self._flatten_now("regime_flip")
                 elif self._entry_order_stale():
                     await self._flatten_now("stale_entry")
             return
@@ -8670,17 +8746,26 @@ class AthenaInstrument:
         19:00-19:30 CT blackout starts, see process_cycle's own PENDING_FILL
         branch), and `reason="stale_entry"` (2026-07-27 — cancels a
         LIMIT entry that's sat unfilled for ENTRY_ORDER_EXPIRY_BARS bars,
-        see _entry_order_stale). Mirrors the PCVR-flip-close branch of
+        see _entry_order_stale), and `reason="regime_flip"` (2026-08-13,
+        user-reported: a pending LIMIT entry sat resting in the WRONG
+        direction — e.g. a still-unfilled Long while PCVR had already
+        flipped to short — for as long as ENTRY_ORDER_EXPIRY_BARS allowed,
+        since process_cycle's own PENDING_FILL branch only ever checked
+        blackout/staleness, never the current regime; _manage_position's
+        own "flipped" emergency-close only covers an ALREADY-FILLED
+        IN_POSITION trade, never a still-pending one — see process_cycle's
+        own PENDING_FILL branch for the new check). Mirrors the PCVR-flip-close branch of
         _manage_position above (same approximate-exit/PnL caveat for real
         trades — see that method's own comment). Event names stay distinct
         per reason ("eod_flatten"/"manual_flatten"/"entry_blackout_flatten"/
-        "stale_entry_flatten") — same one-event-name-per-cause convention
+        "stale_entry_flatten"/"regime_flip_flatten") — same one-event-name-per-cause convention
         "pcvr_flip_close" already established, so the trades table/
         blotter/chart markers can tell them apart."""
         symbol = self.cfg["phemex_symbol"]
         label = ("15:00 CT — flattening for EOD" if reason == "eod"
                  else "19:00-19:30 CT entry blackout — cancelling pending order" if reason == "entry_blackout"
                  else "entry order stale — cancelling unfilled pending order" if reason == "stale_entry"
+                 else "regime flipped — cancelling stale-direction pending order" if reason == "regime_flip"
                  else "manual Flatten All")
         console_log(f"{self.asset}: {YLW}{label}{RST}")
         event_name = f"{reason}_flatten"
@@ -9456,7 +9541,7 @@ def scan_real_trades_detailed(current_balance=None):
             running -= t["net_pnl"]
     return out
 
-def compute_trade_stats(events, source="sim"):
+def compute_trade_stats(events, source="sim", current_balance=None):
     pnls = [e["pnl"] for e in events]
     n = len(pnls)
     wins = [p for p in pnls if p > 0]
@@ -9495,8 +9580,21 @@ def compute_trade_stats(events, source="sim"):
     peak = 0.0
     max_dd = 0.0
     max_dd_pct = None
-    if source == "sim" and n:
-        starting_balance = get_sim_account().balance - total_pnl
+    # 2026-08-14 user-reported (Max Drawdown showed no percentage at all in
+    # real mode's own Data view, not even "n/a" — just the bare dollar
+    # figure): real mode used to have no running-balance anchor wired up
+    # at all here. AppState's own `balance` field (the live Phemex account
+    # balance, already read every cycle for the dashboard's ACCOUNT line)
+    # gives the exact same "current balance minus this epoch's own total
+    # PnL" anchor sim's own branch already uses below — callers now pass
+    # it in as `current_balance` (already-cached, no extra Phemex call
+    # here), same backward-derivation scan_real_trades_detailed's own
+    # BALANCE column already relies on. Falls back to the old "n/a"
+    # behavior if a caller has none handy yet (e.g. before the first
+    # publish cycle completes).
+    have_balance_anchor = (source == "sim") or (current_balance is not None)
+    if have_balance_anchor and n:
+        starting_balance = (get_sim_account().balance if source == "sim" else current_balance) - total_pnl
         peak_equity = starting_balance
         max_dd_pct = 0.0
         for p in pnls:
@@ -11789,7 +11887,8 @@ def _gather_data_view_payload():
             "sim": {"trades": sim_trades, "events": sim_events,
                     "stats": compute_trade_stats(sim_events, source="sim")},
             "real": {"trades": real_trades, "events": real_events,
-                     "stats": compute_trade_stats(real_events, source="real")}}
+                     "stats": compute_trade_stats(real_events, source="real",
+                                                   current_balance=APP_STATE.snapshot().get("balance"))}}
 
 def _data_view_apply_wire(msg):
     """Client side — overwrites SYNC_DATA_VIEW wholesale from a received
@@ -13657,10 +13756,18 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     see this section's own header comment for why. `ui` carries the mutable
     display state curses_main owns as plain locals (mirrors gex_ui's own
     dict-in convention): live/view_date/view_offset/bar_interval/
-    filtered_mode/net_volume_mode. Returns the clamped
+    filtered_mode/net_volume_mode/crosshair_idx. Returns the clamped
     view_offset so the caller's own local stays in sync with what was
     actually drawn (same convention draw_status_screen's own scroll return
-    already uses)."""
+    already uses).
+
+    crosshair_idx (2026-08-15, user-requested) — None when the [X]
+    crosshair is off, else "columns back from the right edge of the
+    CURRENT view" (0 = rightmost), same convention as the footprint
+    panel's own crosshair_bar_idx. Draws a vertical line through the
+    selected column and replaces the info line's live-status text with
+    that column's O/H/L/C plus whichever of Net Volume/Volume the bottom
+    panel is currently showing."""
     is_crypto = DRIFT_IS_CRYPTO[asset]
     live = ui["live"]
     state = DRIFT_STATE[asset] if live else (DRIFT_HIST_STATE.get(asset) or DRIFT_STATE[asset])
@@ -13669,6 +13776,7 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     raw_view_offset = ui["view_offset"]
     filtered_mode = ui["filtered_mode"]
     net_volume_mode = ui["net_volume_mode"]
+    crosshair_idx = ui.get("crosshair_idx")
     interval = DRIFT_INTERVAL[asset]
     next_poll_ts = DRIFT_NEXT_POLL_TS[asset]
     min_trade_usd = DRIFT_MIN_TRADE_USD[asset]
@@ -13694,6 +13802,19 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         db.puts(y0, x0, "terminal too small — resize"[:w], P_YELLOW)
         return view_offset
 
+    LEFT_W, RIGHT_W = DRIFT_LEFT_W, DRIFT_RIGHT_W
+    plot_w = max(1, w - LEFT_W - RIGHT_W - 1)
+    cols_calls, cols_puts, cols_spot, cols_open, cols_high, cols_low, cols_netvol, cols_vol = _drift_build_columns(
+        history, x_end, bar_interval, plot_w, filtered_mode)
+
+    # [X] crosshair — resolve the selected column's index into cols_* (0 =
+    # oldest visible column, plot_w-1 = rightmost/live-most, matching every
+    # other array here) from crosshair_idx's "columns back from the right
+    # edge" convention.
+    ch_col = None
+    if crosshair_idx is not None and 0 <= crosshair_idx < plot_w:
+        ch_col = plot_w - 1 - crosshair_idx
+
     title = f" Net Drift (Premium) — {asset} "
     if filtered_mode:
         title += "(filtered — OTM only) "
@@ -13711,15 +13832,30 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         ("● ", P_RED, curses.A_BOLD), (f"Puts ({puts_str})   ", P_DEFAULT, 0),
         ("● ", P_BLUE, curses.A_BOLD), (f"{asset} ({spot_str})", P_DEFAULT, 0),
     ])
-    if is_crypto:
+    if ch_col is not None:
+        # Crosshair active — the info line becomes the selected column's own
+        # readout (O/H/L/C plus whichever of Net Volume/Volume the bottom
+        # panel currently shows) instead of the live connection status,
+        # which is secondary while the user is deliberately inspecting a
+        # specific bar (toggling [X] off restores the normal status text).
+        ch_ts = x_end - (plot_w - 1 - ch_col) * bar_interval
+        ch_o, ch_h, ch_l, ch_c = cols_open[ch_col], cols_high[ch_col], cols_low[ch_col], cols_spot[ch_col]
+        if net_volume_mode:
+            nv = cols_netvol[ch_col]
+            nv_tag = f"NetVol:{_drift_fmt_axis_count(nv)}" if nv is not None else "NetVol:—"
+        else:
+            nv_tag = f"Vol:{_drift_fmt_axis_money(cols_vol[ch_col])}"
+        fp = lambda v: _drift_fmt_price(v) if v is not None else "—"
+        info = (f"✛ {_drift_fmt_time(ch_ts, is_crypto)}  "
+                f"O:{fp(ch_o)} H:{fp(ch_h)} L:{fp(ch_l)} C:{fp(ch_c)}  {nv_tag}")
+    elif is_crypto:
         info = f"{venue_info}  {status}"
     else:
         info = (f"exp {expiry}  " if expiry else "") + status
         if not _drift_is_market_open_et() and not status.startswith("market closed"):
             info = "market closed — " + info
-    db.puts(y0 + 1, x0 + max(0, w - len(info) - 1), info, P_DIM)
+    db.puts(y0 + 1, x0 + max(0, w - len(info) - 1), info, P_YELLOW if ch_col is not None else P_DIM)
 
-    LEFT_W, RIGHT_W = 8, 10
     FOOTER_ROWS, TIME_ROWS = 1, 1
     top = y0 + 3
     if venue_breakdown is not None:
@@ -13733,16 +13869,12 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     main_top = top
     vol_top = main_top + main_h + 1
     vol_bot = vol_top + vol_h - 1
-    plot_w = max(1, w - LEFT_W - RIGHT_W - 1)
 
     for i in _drift_day_boundary_cols(x_end, bar_interval, plot_w):
         col = x0 + LEFT_W + i
         for rr in range(main_top + 1, vol_bot + 1):
             db.puts(rr, col, ":", P_DIM)
         db.puts(main_top, col, "D", P_DIM, curses.A_BOLD)
-
-    cols_calls, cols_puts, cols_spot, cols_netvol, cols_vol = _drift_build_columns(
-        history, x_end, bar_interval, plot_w, filtered_mode)
 
     prem_vals = [v for v in cols_calls + cols_puts if v is not None] + [0.0]
     pmin, pmax = min(prem_vals), max(prem_vals)
@@ -13850,6 +13982,15 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
             for rr in range(vol_bot, vol_bot - bar_h, -1):
                 db.puts(rr, x0 + LEFT_W + i, "█", P_GREEN, curses.A_DIM)
 
+    # [X] crosshair vertical line — spans both panels, drawn only into
+    # still-blank cells so it never overwrites a plotted point/bar (same
+    # non-destructive technique the footprint charts' own crosshair uses).
+    if ch_col is not None:
+        cx_line = x0 + LEFT_W + ch_col
+        for rr in range(main_top, vol_bot + 1):
+            if db.buf[rr][cx_line][0] == " ":
+                db.put(rr, cx_line, CROSSHAIR_LINE_CH, P_CYAN)
+
     time_row = vol_bot + 1
     n_time_labels = max(2, plot_w // 14)
     for k in range(n_time_labels):
@@ -13858,6 +13999,13 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         lbl = _drift_fmt_time(ts, is_crypto)
         cx = x0 + LEFT_W + max(0, i - len(lbl) // 2)
         db.puts(time_row, cx, lbl, P_DIM)
+    if ch_col is not None:
+        # Dedicated, highlighted time label AT the crosshair's own column —
+        # drawn after the regular sparse labels so it's never hidden by one
+        # landing nearby, same "own label wins" convention footprint uses.
+        ch_lbl = _drift_fmt_time(x_end - (plot_w - 1 - ch_col) * bar_interval, is_crypto)
+        db.puts(time_row, x0 + LEFT_W + max(0, ch_col - len(ch_lbl) // 2),
+                ch_lbl, P_CYAN, curses.A_BOLD | curses.A_REVERSE)
 
     last_str = datetime.fromtimestamp(last_poll).strftime("%H:%M:%S") if last_poll else "—"
     if view_offset > 0:
@@ -13872,7 +14020,8 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     dz_str = f"   dz {confidence_deadzone * 100:g}%" if not is_crypto else ""
     filt_str = "   FILTERED (OTM)" if filtered_mode else ""
     vol_str = "   bottom: Net Vol" if net_volume_mode else "   bottom: Volume"
-    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint} "
+    ch_hint = " [X]:crosshair-ON" if ch_col is not None else " [X]:crosshair"
+    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint}{ch_hint} "
               f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
               f"poll {interval}s   {_drift_fmt_duration(bar_interval)} bars   {min_str}{dz_str}{filt_str}{vol_str}    "
               f"{countdown}    last update {last_str} ")
@@ -14219,6 +14368,1456 @@ def draw_voldrift(db, asset, y0, y1, x0, x1, ui):
     db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
     return view_offset
 
+# ── Markets — ported from charthacker.py's own "Macro Mode" (draw_global) ──
+# Normalized %-change comparison chart across 8 cross-asset instruments for
+# today (00:00-now CT). On-demand only (per user's explicit answer this
+# session): the fetch thread starts when markets_mode is entered and stops
+# when it's left, matching exactly how charthacker.py's own global_mode
+# toggle already starts/stops its own refresh loop — no always-on background
+# load against Phemex/Kraken/Yahoo the way Net Drift/Volatility Drift have.
+MARKETS_ASSETS = [
+    ("BTC",    "BTCUSDT",     "XBT/USD",  "BTC-USD",   P_YELLOW),
+    ("ETH",    "ETHUSDT",     "ETH/USD",  "ETH-USD",   P_CYAN),
+    ("XAUUSD", "XAUUSDT",     "XAU/USD",  "GC=F",      P_MAGENTA),
+    ("USDJPY", "uUSDJPYUSDT", None,       "JPY=X",     P_BLUE),
+    ("USOIL",  "XTIUSDT",     None,       "CL=F",      P_RED),
+    ("SPX500", "SP500USDT",   None,       "^GSPC",     P_GREEN),
+    ("NAS100", "NAS100USDT",  None,       "^NDX",      P_DEFAULT),
+    ("DXY",    "uDXYUSDT",    None,       "DX-Y.NYB",  P_DIM),
+]
+MARKETS_PHEMEX_URL  = "https://api.phemex.com/exchange/public/md/v2/kline/last"
+MARKETS_KRAKEN_URL  = "https://api.kraken.com/0/public/OHLC"
+MARKETS_YAHOO_URL   = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_MARKETS_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+MARKETS_REFRESH_SECS = 30
+
+def _markets_fetch_phemex(symbol, resolution=60, limit=1440):
+    """Verbatim port of charthacker.py's fetch_global_asset_phemex — public
+    (unsigned) kline endpoint, same convention fetch_status_phemex_session_
+    candles already uses elsewhere in this file. Returns [(ts, close), ...]
+    oldest-first, or [] on any failure/unsupported symbol."""
+    try:
+        r = requests.get(MARKETS_PHEMEX_URL, params={
+            "symbol": symbol, "resolution": resolution, "limit": limit,
+        }, timeout=10)
+        data = r.json()
+        if data.get("code", -1) != 0:
+            return []
+        rows = (data.get("data") or {}).get("rows") or []
+        if not rows:
+            return []
+        return [(int(row[0]), float(row[5])) for row in reversed(rows)]
+    except Exception:
+        return []
+
+def _markets_fetch_kraken(pair, interval=1, limit=1440):
+    """Verbatim port of charthacker.py's fetch_global_asset_kraken."""
+    try:
+        r = requests.get(MARKETS_KRAKEN_URL, params={"pair": pair, "interval": interval}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            return []
+        result = data.get("result", {})
+        rows = next((v for k, v in result.items() if k != "last"), [])
+        return [(row[0], float(row[4])) for row in rows[-limit:]]
+    except Exception:
+        return []
+
+def _markets_fetch_yahoo(symbol, resolution=60, limit=1440):
+    """Verbatim port of charthacker.py's fetch_global_asset_yahoo."""
+    if resolution <= 60:
+        interval, yrange = "1m", "1d"
+    elif resolution <= 300:
+        interval, yrange = "5m", "5d"
+    elif resolution <= 900:
+        interval, yrange = "15m", "5d"
+    elif resolution <= 3600:
+        interval, yrange = "1h", "1mo"
+    elif resolution <= 14400:
+        interval, yrange = "1h", "3mo"
+    else:
+        interval, yrange = "1d", "1y"
+    try:
+        r = requests.get(MARKETS_YAHOO_URL.format(symbol), headers=_MARKETS_YAHOO_HEADERS,
+                          params={"interval": interval, "range": yrange}, timeout=12)
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return []
+        chart = result[0]
+        ts_raw = chart.get("timestamp", [])
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        if not ts_raw or not closes:
+            return []
+        pairs = [(int(ts), float(cl)) for ts, cl in zip(ts_raw, closes) if cl is not None and cl > 0]
+        return pairs[-limit:]
+    except Exception:
+        return []
+
+MARKETS_LOCK = threading.Lock()
+MARKETS_DATA = {}          # label -> [close, ...] aligned to MARKETS_TS
+MARKETS_TS = []            # shared timestamp axis
+MARKETS_LOADING = [False]
+MARKETS_NEXT_REFRESH = [0.0]
+MARKETS_ERROR = [""]
+
+def _load_markets_data(initial, stop_evt):
+    """Port of charthacker.py's load_global_data — fetch today's data (00:00
+    CT-anchored, same as the source) for all MARKETS_ASSETS in parallel,
+    Phemex -> Kraken -> Yahoo fallback chain per asset, aligned onto a
+    shared timestamp axis."""
+    now = datetime.now()
+    today_start_ts = int(datetime(now.year, now.month, now.day, 0, 0, 0).timestamp())
+
+    if initial:
+        with MARKETS_LOCK:
+            MARKETS_LOADING[0] = True
+            MARKETS_ERROR[0] = "Markets: fetching all assets..."
+
+    def _fetch_one(asset):
+        label, phemex_sym, kraken_pair, yahoo_sym, _color = asset
+        if stop_evt.is_set():
+            return label, []
+        data = []
+        if phemex_sym:
+            data = _markets_fetch_phemex(phemex_sym)
+        if not data and kraken_pair:
+            data = _markets_fetch_kraken(kraken_pair)
+        if not data and yahoo_sym:
+            data = _markets_fetch_yahoo(yahoo_sym)
+        return label, [(ts, cl) for ts, cl in data if ts >= today_start_ts]
+
+    raw, errors = {}, []
+    with ThreadPoolExecutor(max_workers=len(MARKETS_ASSETS)) as ex:
+        futures = {ex.submit(_fetch_one, a): a[0] for a in MARKETS_ASSETS}
+        for fut in as_completed(futures):
+            label, data = fut.result()
+            if data:
+                raw[label] = data
+            else:
+                errors.append(label)
+
+    if stop_evt.is_set():
+        return
+
+    if not raw:
+        with MARKETS_LOCK:
+            MARKETS_LOADING[0] = False
+            MARKETS_ERROR[0] = "Markets: no data — check connection"
+        return
+
+    ref_pairs = max(raw.values(), key=len)
+    all_ts = sorted(set(ts for ts, _ in ref_pairs))
+    aligned = {}
+    for label, pairs in raw.items():
+        d = dict(pairs)
+        last, closes = 0.0, []
+        for ts in all_ts:
+            if ts in d and d[ts] > 0:
+                last = d[ts]
+            closes.append(last)
+        aligned[label] = closes
+
+    msg = f"Markets: {len(raw)}/{len(MARKETS_ASSETS)} assets" + (f"  skip:{','.join(errors)}" if errors else "")
+    with MARKETS_LOCK:
+        # Slice-assignment mutates the module-level list in place — a plain
+        # `MARKETS_TS = all_ts` here would silently create a LOCAL variable
+        # instead (no `global` declaration), leaving the real module list
+        # empty forever and draw_markets stuck on "No data" even after a
+        # successful fetch — exactly the bug the user reported.
+        MARKETS_TS[:] = all_ts
+        MARKETS_DATA.clear()
+        MARKETS_DATA.update(aligned)
+        MARKETS_LOADING[0] = False
+        MARKETS_ERROR[0] = msg
+
+MARKETS_REFRESH_EVT = threading.Event()   # set by [R] to force an immediate re-fetch
+
+def _markets_refresh_loop(stop_evt):
+    """On-demand refresh loop, started fresh on every markets_mode entry —
+    port of charthacker.py's _global_refresh_loop, polling stop_evt instead
+    of state.global_mode. MARKETS_REFRESH_EVT lets [R] break the wait early
+    for an immediate re-fetch (charthacker.py's own [R] does the same via
+    its own key-dispatch calling load_global_data directly — this thread
+    owns the fetch instead, so the key dispatch just signals it)."""
+    MARKETS_REFRESH_EVT.clear()
+    _load_markets_data(initial=True, stop_evt=stop_evt)
+    while not stop_evt.is_set():
+        next_at = time.time() + MARKETS_REFRESH_SECS
+        with MARKETS_LOCK:
+            MARKETS_NEXT_REFRESH[0] = next_at
+        for _ in range(MARKETS_REFRESH_SECS):
+            if stop_evt.wait(1.0):
+                return
+            if MARKETS_REFRESH_EVT.is_set():
+                MARKETS_REFRESH_EVT.clear()
+                break
+        if stop_evt.is_set():
+            return
+        _load_markets_data(initial=False, stop_evt=stop_evt)
+
+def draw_markets(db, rows, cols):
+    """Markets — ported from charthacker.py's own draw_global, adapted from
+    win.move()/safe_add() to Athena's DoubleBuffer db.puts/db.put API, same
+    mechanical adaptation draw_drift/draw_voldrift already went through.
+    Full-screen, draws its own footer hint row (no separate Athena footer
+    underneath, same convention every other full-screen mode uses)."""
+    with MARKETS_LOCK:
+        g_ts = list(MARKETS_TS)
+        g_data = {k: list(v) for k, v in MARKETS_DATA.items()}
+        loading = MARKETS_LOADING[0]
+        gerr = MARKETS_ERROR[0]
+        g_next_ref = MARKETS_NEXT_REFRESH[0]
+
+    HEADER_H, FOOTER_H, TIME_H = 2, 1, 1
+    LEGEND_W = 32
+    chart_top = HEADER_H
+    chart_bot = rows - FOOTER_H - TIME_H - 1
+    chart_h = max(1, chart_bot - chart_top)
+    eff_legend = min(LEGEND_W, max(0, cols - 20))
+    chart_r = max(10, cols - eff_legend - 2)
+    time_row = chart_bot
+    footer_row = rows - 1
+
+    db.puts(0, 2, "Q U A N T A S S E T  |  ATHENA  —  MARKETS", P_STATUS, curses.A_BOLD)
+    now_str = datetime.now(tz=TZ_CT).strftime("%m/%d/%Y  %H:%M:%S")
+    db.puts(0, max(0, cols - len(now_str) - 2), now_str, P_DIM)
+    secs_left = max(0, int(g_next_ref - time.time())) if g_next_ref > 0 else 0
+    cd_str = f"  refresh in {secs_left}s" if not loading else ""
+    db.puts(1, 2, f"[M] Exit   [R] Refresh{cd_str}   [Q] Quit   Today 00:00-now CT", P_DIM)
+
+    if loading or not g_ts:
+        msg = "Fetching global data (parallel)..." if loading else "No data — press [R] to retry"
+        db.puts(chart_top + chart_h // 2, max(0, cols // 2 - len(msg) // 2), msg, P_YELLOW, curses.A_BOLD)
+        if gerr and not loading:
+            db.puts(chart_top + chart_h // 2 + 1, max(0, cols // 2 - len(gerr) // 2), gerr[:cols - 2], P_RED, curses.A_BOLD)
+        db.puts(footer_row, 0, " MARKETS  [R] Retry  [M] Exit".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+        return
+
+    n_total = len(g_ts)
+    if n_total == 0:
+        return
+
+    right_idx = n_total
+    view_n = right_idx
+    step = max(1.0, view_n / chart_r)
+
+    col_ts = []
+    col_closes = {label: [] for label in g_data}
+    for col in range(chart_r):
+        raw_idx = int(col * step)
+        idx = min(right_idx - 1, max(0, raw_idx))
+        col_ts.append(g_ts[idx])
+        for label, closes in g_data.items():
+            col_closes[label].append(closes[idx] if idx < len(closes) else 0.0)
+
+    pct_series, raw_series = {}, {}
+    for label, col_cl in col_closes.items():
+        base = next((v for v in col_cl if v > 0), 0.0)
+        if base == 0:
+            continue
+        pct_series[label] = [(v / base - 1.0) * 100.0 if v > 0 else 0.0 for v in col_cl]
+        raw_series[label] = col_cl
+
+    if not pct_series:
+        db.puts(chart_top + chart_h // 2, cols // 2 - 10, "No pct data", P_YELLOW, curses.A_BOLD)
+        return
+
+    all_vals = [v for pcts in pct_series.values() for v in pcts]
+    y_min, y_max = min(all_vals), max(all_vals)
+    y_span = y_max - y_min or 0.01
+    ypad = y_span * 0.08
+    y_min -= ypad; y_max += ypad; y_span = y_max - y_min
+
+    def pct_to_row(pct):
+        frac = (pct - y_min) / y_span
+        return max(chart_top, min(chart_bot - 1, chart_top + int((1.0 - frac) * (chart_h - 1))))
+
+    for col, ts in enumerate(col_ts):
+        dt = datetime.fromtimestamp(ts, tz=TZ_CT)
+        if 0 <= dt.hour < 2:
+            for r in range(chart_top, chart_bot):
+                if db.buf[r][col][0] == " ":
+                    db.put(r, col, " ", P_DIM, curses.A_DIM)
+
+    zero_row = pct_to_row(0.0)
+    for col in range(chart_r):
+        if db.buf[zero_row][col][0] == " ":
+            db.put(zero_row, col, "-", P_DIM, curses.A_DIM)
+
+    for r in range(chart_top, chart_bot + 1):
+        db.put(r, chart_r, "|", P_DIM)
+    n_ylbl = max(2, chart_h // 5)
+    for yi in range(n_ylbl + 1):
+        pct = y_min + (yi / n_ylbl) * y_span
+        row = pct_to_row(pct)
+        if chart_top <= row < chart_bot:
+            db.puts(row, chart_r + 1, f"{pct:+.2f}%", P_DIM)
+
+    db.puts(time_row, 0, "-" * chart_r + "+", P_DIM)
+    lbl_every = max(1, chart_r // 10)
+    for col in range(0, chart_r, lbl_every):
+        if col < len(col_ts) and col + 4 < chart_r:
+            dt = datetime.fromtimestamp(col_ts[col], tz=TZ_CT)
+            db.puts(time_row, col, dt.strftime("%H:%M"), P_DIM)
+
+    final_pcts, final_prices = {}, {}
+    for label, pcts in pct_series.items():
+        color_pair = next((c for l, _p, _k, _y, c in MARKETS_ASSETS if l == label), P_DEFAULT)
+        prev_r = None
+        for col, pct in enumerate(pcts):
+            row = pct_to_row(pct)
+            db.put(row, col, "*", color_pair, curses.A_BOLD)
+            if prev_r is not None and abs(row - prev_r) > 1:
+                for r in range(min(row, prev_r) + 1, max(row, prev_r)):
+                    if db.buf[r][col][0] in (" ", "-"):
+                        db.put(r, col, "|", color_pair, curses.A_DIM)
+            prev_r = row
+        if pcts:
+            ref_col = len(pcts) - 1
+            final_pcts[label] = pcts[ref_col]
+            final_prices[label] = raw_series.get(label, [0.0] * len(pcts))[ref_col]
+
+    legend_x = chart_r + 1
+    label_rows = {label: pct_to_row(pct) for label, pct in final_pcts.items()}
+    used_rows, placed = {}, {}
+    for label in sorted(label_rows, key=lambda l: label_rows[l]):
+        desired = label_rows[label]
+        row = desired
+        for delta in [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]:
+            candidate = desired + delta
+            if chart_top <= candidate < chart_bot and candidate not in used_rows:
+                row = candidate
+                break
+        used_rows[row] = label
+        placed[label] = row
+
+    for label, row in placed.items():
+        pct = final_pcts[label]
+        color_pair = next((c for l, _p, _k, _y, c in MARKETS_ASSETS if l == label), P_DEFAULT)
+        price = final_prices.get(label, 0.0)
+        price_str = f"(${price:,.2f})" if price > 0 else ""
+        lbl = f"{label:<7}{pct:+.2f}% {price_str}"
+        true_row = label_rows[label]
+        if chart_top <= true_row < chart_bot:
+            db.put(true_row, chart_r, "+", color_pair, curses.A_BOLD)
+        if chart_top <= row < chart_bot:
+            db.puts(row, legend_x, lbl, color_pair, curses.A_BOLD)
+
+    footer = (f" MARKETS  {n_total} pts  {len(pct_series)}/{len(MARKETS_ASSETS)} assets"
+              f"  next refresh:{secs_left}s  [R] refresh  [M] exit  [Q] quit")
+    if gerr:
+        footer += f"  | {gerr}"
+    db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+
+# ── Macro Options Flow — ported from opt_dashboard.py ──────────────────────
+# Put/call volume + IV + expected-move monitor for ETH/BTC (Deribit) and
+# TLT/GLD/QQQ (CBOE, auto-fallback to Nasdaq). On-demand only, same
+# reasoning as Markets above. opt_dashboard.py's own crypto path uses a
+# persistent Deribit WS connection (websockets) purely to fetch book-
+# summary volumes/DVOL — this port replaces that with the same REST
+# endpoints (public/get_book_summary_by_currency, public/get_volatility_
+# index_data) GEX/Status/Net Drift/Volatility Drift already use elsewhere
+# in this file, matching Athena's own established "plain requests, no
+# persistent WS for anything but the raw trade tape" convention, and
+# avoiding a new `websockets` dependency for an on-demand mode.
+OPTFLOW_CURRENCIES = ['ETH', 'BTC']
+OPTFLOW_EQUITY_SYMBOLS = ['TLT', 'GLD', 'QQQ']   # CBOE options-chain data — unrelated
+                                                    # to Athena's own QQQ perpetual trading
+OPTFLOW_DERIBIT_BASE  = "https://www.deribit.com/api/v2"
+OPTFLOW_CBOE_URL      = 'https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json'
+OPTFLOW_NASDAQ_URL    = 'https://api.nasdaq.com/api/quote/{}/option-chain'
+OPTFLOW_NASDAQ_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
+    'Accept':     'application/json',
+    'Referer':    'https://www.nasdaq.com/market-activity/etf/qqq/option-chain',
+}
+OPTFLOW_RISK_FREE_RATE        = 0.045
+OPTFLOW_CBOE_HEALTHCHECK_SYMBOL = 'TLT'
+OPTFLOW_EXP_MOVE_FACTOR       = 1.0
+OPTFLOW_CT_OFFSET             = timedelta(hours=-5)
+OPTFLOW_INTERVAL_SECS         = 30
+OPTFLOW_PHEMEX_TICKER_URL     = "https://api.phemex.com/md/v3/ticker/24hr"
+OPTFLOW_DATA_ROOT             = os.path.join(SCRIPT_DIR, "data", "opt_dashboard")
+
+OPTFLOW_KILL_ZONES = [
+    ('NDO',         0,    210,  'CYN'),
+    ('Morning',     510,  630,  'YLW'),
+    ('Lunchtime',   690,  810,  'YLW'),
+    ('Power Hour',  840,  900,  'YLW'),
+    ('EOD',         960,  1080, 'YLW'),
+    ('EEOD',        1110, 1440, 'YLW'),
+]
+OPTFLOW_EXCL_DAYS_09    = {2, 3}
+OPTFLOW_EXCL_START      = 540
+OPTFLOW_EXCL_END        = 600
+OPTFLOW_EXCL_SUN        = 6
+OPTFLOW_EXCL_EEOD_START = 1110
+
+def _optflow_session_status():
+    now_ct = datetime.now(timezone.utc) + OPTFLOW_CT_OFFSET
+    t_mins = now_ct.hour * 60 + now_ct.minute
+    dow = now_ct.weekday()
+    excl_reason = None
+    if dow == OPTFLOW_EXCL_SUN:
+        excl_reason = 'Sunday — no trading'
+    elif dow in OPTFLOW_EXCL_DAYS_09 and OPTFLOW_EXCL_START <= t_mins < OPTFLOW_EXCL_END:
+        excl_reason = 'Excluded (09:00–10:00)'
+    elif t_mins >= OPTFLOW_EXCL_EEOD_START:
+        excl_reason = 'EEOD — no trading'
+    for name, start, end, col in OPTFLOW_KILL_ZONES:
+        if start <= t_mins < end:
+            return name, col, excl_reason
+    return None, None, excl_reason
+
+def _optflow_get_sentiment(ratio):
+    if ratio >= 1.02:   return 'BEARISH'
+    elif ratio <= 0.98: return 'BULLISH'
+    else:               return 'NEUTRAL'
+
+OPTFLOW_PREV_SENTIMENT = {}
+OPTFLOW_MUTED = [False]   # [U] toggles this — read by the background thread before playing an alert
+
+def _optflow_play_alert():
+    if OPTFLOW_MUTED[0]:
+        return
+    wav = os.path.join(SCRIPT_DIR, 'sentiment.wav')
+    if not os.path.exists(wav):
+        return
+    try:
+        if sys.platform == 'win32':
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        else:
+            import subprocess
+            subprocess.Popen(['aplay', wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def _optflow_fetch_eth_price():
+    try:
+        r = requests.get(OPTFLOW_PHEMEX_TICKER_URL, params={"symbol": "ETHUSDT"}, timeout=8)
+        result = r.json().get('result', {})
+        price = result.get('lastRp') or result.get('lastPrice') or result.get('last')
+        return float(price) if price else None
+    except Exception:
+        return None
+
+def _optflow_deribit_book_summary(currency):
+    """REST replacement for opt_dashboard.py's WS book-summary crypto put/
+    call volume fetch — same instrument-name-suffix classification logic
+    (opt_dashboard.py's own fetch_all loop), reading REST's result list."""
+    r = requests.get(OPTFLOW_DERIBIT_BASE + "/public/get_book_summary_by_currency",
+                      params={"currency": currency, "kind": "option"}, timeout=15)
+    data = r.json()
+    if 'error' in data:
+        raise RuntimeError(data['error'].get('message', 'Deribit error'))
+    put_vol = call_vol = 0.0
+    for inst in data.get('result', []):
+        name = inst.get('instrument_name', '')
+        volume = float(inst.get('volume') or 0)
+        if volume == 0:
+            continue
+        suffix = name.split('-')[-1]
+        if suffix == 'P':
+            put_vol += volume
+        elif suffix == 'C':
+            call_vol += volume
+    ratio = (put_vol / call_vol) if call_vol > 0 else 0.0
+    return put_vol, call_vol, ratio
+
+def _optflow_deribit_dvol(currency):
+    """REST port of opt_dashboard.py's own DVOL fetch, same params."""
+    try:
+        now_ms = int(time.time() * 1000)
+        r = requests.get(OPTFLOW_DERIBIT_BASE + "/public/get_volatility_index_data", params={
+            "currency": currency, "start_timestamp": now_ms - 7200000,
+            "end_timestamp": now_ms, "resolution": "3600",
+        }, timeout=15)
+        candles = (r.json().get('result') or {}).get('data') or []
+        return float(candles[-1][4]) if candles else None
+    except Exception:
+        return None
+
+def _optflow_opt_mid(o):
+    try:
+        bid = float(o.get('bid') or 0)
+        ask = float(o.get('ask') or 0)
+    except (TypeError, ValueError):
+        bid = ask = 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    try:
+        return float(o.get('last_trade_price') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _optflow_cboe_symbol_volume(symbol):
+    """Verbatim port of opt_dashboard.py's own _cboe_symbol_volume, sync via requests."""
+    r = requests.get(OPTFLOW_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    data = r.json().get('data') or {}
+    options = data.get('options') or []
+    if not options:
+        raise RuntimeError('empty chain')
+    try:
+        iv30 = float(data.get('iv30'))
+    except (TypeError, ValueError):
+        iv30 = 0.0
+    try:
+        price = float(data.get('current_price'))
+    except (TypeError, ValueError):
+        price = 0.0
+    today = datetime.now().strftime('%y%m%d')
+    put_vol = call_vol = 0.0
+    legs = {}
+    for o in options:
+        name = o.get('option') or ''
+        if len(name) < 15:
+            continue
+        cp = name[-9]
+        exp = name[-15:-9]
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
+        try:
+            vol = float(o.get('volume') or 0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if cp == 'P':
+            put_vol += vol
+        elif cp == 'C':
+            call_vol += vol
+        else:
+            continue
+        legs.setdefault(exp, {}).setdefault(strike, {})[cp] = _optflow_opt_mid(o)
+    em_is_0dte = today in legs
+    target_exp = today if em_is_0dte else min((e for e in legs if e >= today), default=None)
+    exp_move = 0.0
+    if target_exp and price > 0:
+        strikes = legs[target_exp]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 and lg.get('P', 0) > 0]
+        if atm:
+            k = min(atm, key=lambda s: abs(s - price))
+            exp_move = (strikes[k]['C'] + strikes[k]['P']) * OPTFLOW_EXP_MOVE_FACTOR
+    return put_vol, call_vol, iv30, exp_move, em_is_0dte
+
+def _optflow_norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _optflow_bs_price(S, K, T, r, sigma, is_call):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, (S - K) if is_call else (K - S))
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _optflow_norm_cdf(d1) - K * math.exp(-r * T) * _optflow_norm_cdf(d2)
+    return K * math.exp(-r * T) * _optflow_norm_cdf(-d2) - S * _optflow_norm_cdf(-d1)
+
+def _optflow_implied_vol(price, S, K, T, r, is_call, lo=0.001, hi=5.0, tol=1e-4, max_iter=60):
+    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0.0
+    intrinsic = max(0.0, (S - K) if is_call else (K - S))
+    if price < intrinsic - 1e-6:
+        return 0.0
+    plo, phi = _optflow_bs_price(S, K, T, r, lo, is_call), _optflow_bs_price(S, K, T, r, hi, is_call)
+    if not (plo <= price <= phi):
+        return 0.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        pm = _optflow_bs_price(S, K, T, r, mid, is_call)
+        if abs(pm - price) < tol:
+            return mid
+        if pm < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+_OPTFLOW_NASDAQ_PRICE_RE = re.compile(r'\$([\d,]+\.?\d*)')
+
+def _optflow_nasdaq_mid(row, side):
+    try:
+        bid = float(row.get(f'{side}_Bid') or 0)
+        ask = float(row.get(f'{side}_Ask') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+
+def _optflow_nasdaq_symbol_volume(symbol):
+    """Verbatim port of opt_dashboard.py's own _nasdaq_symbol_volume — used
+    only when CBOE is unreachable. No native IV field, so iv_approx is a
+    Black-Scholes estimate off the ATM straddle nearest 30 calendar days out."""
+    params = {'assetclass': 'etf', 'limit': '10000', 'fromdate': 'all', 'todate': 'all'}
+    r = requests.get(OPTFLOW_NASDAQ_URL.format(symbol), params=params,
+                      headers=OPTFLOW_NASDAQ_HEADERS, timeout=15)
+    r.raise_for_status()
+    data = r.json().get('data') or {}
+    rows = (data.get('table') or {}).get('rows') or []
+    if not rows:
+        raise RuntimeError('empty chain')
+    m = _OPTFLOW_NASDAQ_PRICE_RE.search(data.get('lastTrade') or '')
+    price = float(m.group(1).replace(',', '')) if m else 0.0
+    today = datetime.now().date()
+    put_vol = call_vol = 0.0
+    by_exp = {}
+    def _vol(v):
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return 0.0
+    current_group = None
+    for row in rows:
+        grp = row.get('expirygroup')
+        if grp:
+            try:
+                current_group = datetime.strptime(grp, '%B %d, %Y').date()
+            except ValueError:
+                current_group = None
+            continue
+        if current_group is None:
+            continue
+        try:
+            strike = float(row.get('strike'))
+        except (TypeError, ValueError):
+            continue
+        put_vol  += _vol(row.get('p_Volume'))
+        call_vol += _vol(row.get('c_Volume'))
+        legs = by_exp.setdefault(current_group, {}).setdefault(strike, {})
+        cmid, pmid = _optflow_nasdaq_mid(row, 'c'), _optflow_nasdaq_mid(row, 'p')
+        if cmid > 0: legs['C'] = cmid
+        if pmid > 0: legs['P'] = pmid
+    if not by_exp:
+        raise RuntimeError('no parsable expiries')
+    em_is_0dte = today in by_exp
+    target_em = today if em_is_0dte else min((e for e in by_exp if e >= today), default=None)
+    exp_move = 0.0
+    if target_em and price > 0:
+        strikes = by_exp[target_em]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 and lg.get('P', 0) > 0]
+        if atm:
+            k = min(atm, key=lambda s: abs(s - price))
+            exp_move = (strikes[k]['C'] + strikes[k]['P']) * OPTFLOW_EXP_MOVE_FACTOR
+    iv_approx = 0.0
+    target_30 = min(by_exp, key=lambda e: abs((e - today).days - 30), default=None)
+    if target_30 and price > 0:
+        strikes = by_exp[target_30]
+        atm = [s for s, lg in strikes.items() if lg.get('C', 0) > 0 or lg.get('P', 0) > 0]
+        if atm:
+            k = min(atm, key=lambda s: abs(s - price))
+            T = max((target_30 - today).days, 1) / 365.0
+            legs = strikes[k]
+            ivs = []
+            if legs.get('C', 0) > 0:
+                ivs.append(_optflow_implied_vol(legs['C'], price, k, T, OPTFLOW_RISK_FREE_RATE, True))
+            if legs.get('P', 0) > 0:
+                ivs.append(_optflow_implied_vol(legs['P'], price, k, T, OPTFLOW_RISK_FREE_RATE, False))
+            ivs = [v for v in ivs if v > 0]
+            if ivs:
+                iv_approx = (sum(ivs) / len(ivs)) * 100.0
+    return put_vol, call_vol, iv_approx, exp_move, em_is_0dte
+
+def _optflow_cboe_is_healthy():
+    try:
+        r = requests.get(OPTFLOW_CBOE_URL.format(OPTFLOW_CBOE_HEALTHCHECK_SYMBOL), timeout=8)
+        if r.status_code != 200:
+            return False
+        options = (r.json().get('data') or {}).get('options') or []
+        return bool(options)
+    except Exception:
+        return False
+
+OPTFLOW_SOURCE = ['cboe']   # 'cboe' (primary) or 'nasdaq' (automatic fallback)
+
+def _optflow_fetch_all_equities(fetch_fn, iv_is_approx):
+    results, errors = {}, {}
+    def _one(symbol):
+        try:
+            put_vol, call_vol, iv, exp_move, em_is_0dte = fetch_fn(symbol)
+            ratio = put_vol / call_vol if call_vol > 0 else 0.0
+            results[symbol] = (put_vol, call_vol, ratio, iv, exp_move, em_is_0dte, iv_is_approx)
+        except Exception as e:
+            errors[symbol] = str(e).replace('\n', ' ')[:36]
+    with ThreadPoolExecutor(max_workers=len(OPTFLOW_EQUITY_SYMBOLS)) as ex:
+        list(ex.map(_one, OPTFLOW_EQUITY_SYMBOLS))
+    return results, errors
+
+def _optflow_refresh_equities():
+    """Port of opt_dashboard.py's own refresh_equities — prefers CBOE,
+    fails over to Nasdaq (all-or-nothing) if CBOE errors on any symbol."""
+    results, errors, source_used = {}, {}, OPTFLOW_SOURCE[0]
+    try:
+        if OPTFLOW_SOURCE[0] == 'cboe':
+            results, errors = _optflow_fetch_all_equities(_optflow_cboe_symbol_volume, False)
+            if errors:
+                OPTFLOW_SOURCE[0] = 'nasdaq'
+                source_used = 'nasdaq'
+                results, errors = _optflow_fetch_all_equities(_optflow_nasdaq_symbol_volume, True)
+        else:
+            source_used = 'nasdaq'
+            results, errors = _optflow_fetch_all_equities(_optflow_nasdaq_symbol_volume, True)
+        tag = 'CBOE' if source_used == 'cboe' else 'Nasdaq (fallback)'
+        status = f'OK ({len(results)}/{len(OPTFLOW_EQUITY_SYMBOLS)}) via {tag}'
+    except Exception as e:
+        status = ('err: ' + str(e).replace('\n', ' '))[:40]
+    return results, errors, status
+
+# ── Macro Options Flow CSV logging — data/opt_dashboard/YYYY/MM/DD/, same
+# relative folder name opt_dashboard.py's own standalone runs already use,
+# so any existing external tooling pointed at that path keeps working.
+OPTFLOW_CSV_ROWS     = [0]
+OPTFLOW_CSV_CUR_PATH = [None]
+OPTFLOW_CSV_ERR      = [None]
+
+def _optflow_csv_columns():
+    cols = ['timestamp_utc', 'timestamp_ct', 'session', 'eth_price']
+    for ccy in OPTFLOW_CURRENCIES:
+        cols += [f'{ccy}_put_vol', f'{ccy}_call_vol', f'{ccy}_total_vol',
+                 f'{ccy}_pc_ratio', f'{ccy}_dvol', f'{ccy}_sentiment']
+    for sym in OPTFLOW_EQUITY_SYMBOLS:
+        cols += [f'{sym}_put_vol', f'{sym}_call_vol', f'{sym}_total_vol',
+                 f'{sym}_pc_ratio', f'{sym}_iv30', f'{sym}_iv_source', f'{sym}_exp_move',
+                 f'{sym}_exp_move_0dte', f'{sym}_sentiment']
+    return cols
+
+def _optflow_dated_dir(ct_dt):
+    d = os.path.join(OPTFLOW_DATA_ROOT, ct_dt.strftime('%Y'), ct_dt.strftime('%m'), ct_dt.strftime('%d'))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _optflow_daily_csv_path(ct_dt):
+    return os.path.join(_optflow_dated_dir(ct_dt), f"opt_data_{ct_dt.strftime('%m_%d_%Y')}.csv")
+
+def _optflow_append_csv(fetch_time, results, dvol, eth_price, eq_results):
+    ct = fetch_time + OPTFLOW_CT_OFFSET
+    path = _optflow_daily_csv_path(ct)
+    if path != OPTFLOW_CSV_CUR_PATH[0]:
+        OPTFLOW_CSV_CUR_PATH[0] = path
+        OPTFLOW_CSV_ROWS[0] = 0
+    session_name, _, excl_reason = _optflow_session_status()
+    cols = _optflow_csv_columns()
+    row = {c: '' for c in cols}
+    row['timestamp_utc'] = fetch_time.strftime('%Y-%m-%d %H:%M:%S')
+    row['timestamp_ct']  = ct.strftime('%Y-%m-%d %H:%M:%S')
+    row['session']       = excl_reason or session_name or 'No active session'
+    row['eth_price']     = f'{eth_price:.2f}' if eth_price else ''
+    for ccy in OPTFLOW_CURRENCIES:
+        if ccy in results:
+            pv, cv, ratio = results[ccy]
+            row[f'{ccy}_put_vol']   = f'{pv:.2f}'
+            row[f'{ccy}_call_vol']  = f'{cv:.2f}'
+            row[f'{ccy}_total_vol'] = f'{pv + cv:.2f}'
+            row[f'{ccy}_pc_ratio']  = f'{ratio:.4f}'
+            row[f'{ccy}_sentiment'] = _optflow_get_sentiment(ratio)
+        if dvol.get(ccy) is not None:
+            row[f'{ccy}_dvol'] = f'{dvol[ccy]:.2f}'
+    for sym in OPTFLOW_EQUITY_SYMBOLS:
+        if sym in eq_results:
+            pv, cv, ratio, iv30, em, z, iv_approx = eq_results[sym]
+            row[f'{sym}_put_vol']       = f'{pv:.0f}'
+            row[f'{sym}_call_vol']      = f'{cv:.0f}'
+            row[f'{sym}_total_vol']     = f'{pv + cv:.0f}'
+            row[f'{sym}_pc_ratio']      = f'{ratio:.4f}'
+            row[f'{sym}_iv30']          = f'{iv30:.2f}'
+            row[f'{sym}_iv_source']     = 'Nasdaq(approx)' if iv_approx else 'CBOE'
+            row[f'{sym}_exp_move']      = f'{em:.2f}'
+            row[f'{sym}_exp_move_0dte'] = 'True' if z else 'False'
+            row[f'{sym}_sentiment']     = _optflow_get_sentiment(ratio)
+    try:
+        new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+        OPTFLOW_CSV_ROWS[0] += 1
+        OPTFLOW_CSV_ERR[0] = None
+    except Exception as e:
+        OPTFLOW_CSV_ERR[0] = str(e).replace('\n', ' ')[:40]
+
+# ── Macro Options Flow live state ───────────────────────────────────────────
+OPTFLOW_LOCK         = threading.Lock()
+OPTFLOW_RESULTS      = {}   # currency -> (put_vol, call_vol, ratio)
+OPTFLOW_ERRORS       = {}   # currency -> error string
+OPTFLOW_DVOL         = {}   # currency -> float
+OPTFLOW_ETH_PRICE    = [None]
+OPTFLOW_EQ_RESULTS   = {}   # symbol -> (put_vol, call_vol, ratio, iv, exp_move, em_is_0dte, iv_is_approx)
+OPTFLOW_EQ_ERRORS    = {}
+OPTFLOW_EQ_STATUS    = ['starting…']
+OPTFLOW_LAST_FETCH   = [0.0]
+OPTFLOW_NEXT_REFRESH = [0.0]
+OPTFLOW_REFRESH_EVT  = threading.Event()   # set by [R] to force an immediate re-fetch
+OPTFLOW_READY        = threading.Event()   # set after the first completed cycle, for the loading screen
+
+def _optflow_refresh_loop(stop_evt):
+    """Always-on engine loop, started once at launch (2026-08-15: changed
+    from on-demand per user request — this mode's data now stays warm
+    whether or not Macro Options Flow is the currently-displayed mode,
+    matching GEX/Status/Net Drift/Volatility Drift's own always-on
+    convention; Markets and Chain stay on-demand, unaffected by this).
+    One full cycle (crypto book-summaries + DVOL + ETH price + equities,
+    all concurrent) every OPTFLOW_INTERVAL_SECS, same as the source's own
+    --interval. Each cycle's body is wrapped in its own try/except — same
+    defensive shape _voldrift_engine_loop/_drift_engine_loop already use —
+    so one bad fetch/CSV-write can't silently kill this thread and leave
+    the dashboard's refresh countdown frozen."""
+    OPTFLOW_REFRESH_EVT.clear()
+    with OPTFLOW_LOCK:
+        OPTFLOW_SOURCE[0] = 'cboe'
+        OPTFLOW_EQ_STATUS[0] = 'starting…'
+    while not stop_evt.is_set():
+        try:
+            fetch_time = datetime.now(timezone.utc)
+            results, errors = {}, {}
+
+            def _one_crypto(ccy):
+                try:
+                    results[ccy] = _optflow_deribit_book_summary(ccy)
+                except Exception as e:
+                    errors[ccy] = str(e).replace('\n', ' ')[:36]
+
+            with ThreadPoolExecutor(max_workers=len(OPTFLOW_CURRENCIES) + 3) as ex:
+                crypto_futs = [ex.submit(_one_crypto, ccy) for ccy in OPTFLOW_CURRENCIES]
+                dvol_futs = {ccy: ex.submit(_optflow_deribit_dvol, ccy) for ccy in OPTFLOW_CURRENCIES}
+                eth_fut = ex.submit(_optflow_fetch_eth_price)
+                # Opportunistic CBOE health re-probe folded into this same
+                # cycle while on the Nasdaq fallback (see header comment above).
+                if OPTFLOW_SOURCE[0] == 'nasdaq' and _optflow_cboe_is_healthy():
+                    OPTFLOW_SOURCE[0] = 'cboe'
+                eq_fut = ex.submit(_optflow_refresh_equities)
+                for f in crypto_futs:
+                    f.result()
+                dvol = {ccy: v for ccy, fut in dvol_futs.items() if (v := fut.result()) is not None}
+                eth_price = eth_fut.result()
+                eq_results, eq_errors, eq_status = eq_fut.result()
+
+            if stop_evt.is_set():
+                return
+
+            with OPTFLOW_LOCK:
+                OPTFLOW_RESULTS.clear(); OPTFLOW_RESULTS.update(results)
+                OPTFLOW_ERRORS.clear(); OPTFLOW_ERRORS.update(errors)
+                OPTFLOW_DVOL.clear(); OPTFLOW_DVOL.update(dvol)
+                OPTFLOW_ETH_PRICE[0] = eth_price
+                OPTFLOW_EQ_RESULTS.clear(); OPTFLOW_EQ_RESULTS.update(eq_results)
+                OPTFLOW_EQ_ERRORS.clear(); OPTFLOW_EQ_ERRORS.update(eq_errors)
+                OPTFLOW_EQ_STATUS[0] = eq_status
+                OPTFLOW_LAST_FETCH[0] = time.time()
+            OPTFLOW_READY.set()
+
+            _optflow_append_csv(fetch_time, results, dvol, eth_price, eq_results)
+
+            for ccy in OPTFLOW_CURRENCIES:
+                if ccy in results:
+                    label = _optflow_get_sentiment(results[ccy][2])
+                    if (OPTFLOW_PREV_SENTIMENT.get(ccy) is not None
+                            and OPTFLOW_PREV_SENTIMENT[ccy] != label and label != 'NEUTRAL'):
+                        _optflow_play_alert()
+                    OPTFLOW_PREV_SENTIMENT[ccy] = label
+            for sym, r in eq_results.items():
+                label = _optflow_get_sentiment(r[2])
+                if (OPTFLOW_PREV_SENTIMENT.get(sym) is not None
+                        and OPTFLOW_PREV_SENTIMENT[sym] != label and label != 'NEUTRAL'):
+                    _optflow_play_alert()
+                OPTFLOW_PREV_SENTIMENT[sym] = label
+        except Exception as e:
+            with OPTFLOW_LOCK:
+                OPTFLOW_EQ_STATUS[0] = ('err: ' + str(e).replace('\n', ' '))[:40]
+            OPTFLOW_READY.set()   # a failed-but-alive cycle still counts as "started" for the loading screen
+
+        with OPTFLOW_LOCK:
+            OPTFLOW_NEXT_REFRESH[0] = time.time() + OPTFLOW_INTERVAL_SECS
+        for _ in range(OPTFLOW_INTERVAL_SECS):
+            if stop_evt.wait(1.0):
+                return
+            if OPTFLOW_REFRESH_EVT.is_set():
+                OPTFLOW_REFRESH_EVT.clear()
+                break
+
+def draw_macro_options(db, rows, cols):
+    """Macro Options Flow — port of opt_dashboard.py's own draw_static +
+    update_values, merged into one DoubleBuffer draw function since
+    DoubleBuffer already does its own cell-diffing (no need for the
+    source's own separate 'static skeleton vs. per-cell ROWS update'
+    split — a fresh full layout every call is cheap here, same
+    simplification already applied to every other ported tool tonight)."""
+    with OPTFLOW_LOCK:
+        results = dict(OPTFLOW_RESULTS)
+        errors = dict(OPTFLOW_ERRORS)
+        dvol = dict(OPTFLOW_DVOL)
+        eth_price = OPTFLOW_ETH_PRICE[0]
+        eq_results = dict(OPTFLOW_EQ_RESULTS)
+        eq_errors = dict(OPTFLOW_EQ_ERRORS)
+        eq_status = OPTFLOW_EQ_STATUS[0]
+        next_refresh = OPTFLOW_NEXT_REFRESH[0]
+
+    row = [0]
+    def line(text="", pair=P_DEFAULT, attrs=0):
+        if 0 <= row[0] < rows:
+            db.puts(row[0], 0, text.ljust(cols)[:cols], pair, attrs)
+        row[0] += 1
+
+    line("─" * cols, P_CYAN, curses.A_BOLD)
+    line("  Options Flow Dashboard - Crypto & Equities", P_CYAN, curses.A_BOLD)
+    line("─" * cols, P_CYAN, curses.A_BOLD)
+
+    now_utc = datetime.now(timezone.utc)
+    ct = now_utc + OPTFLOW_CT_OFFSET
+    secs_left = max(0, int(next_refresh - time.time())) if next_refresh > 0 else 0
+    line(f"  {ct.strftime('%A %Y-%m-%d  %H:%M:%S')} CT  /  {now_utc.strftime('%H:%M:%S')} UTC"
+         f"   refresh in {secs_left}s", P_DIM)
+    line()
+
+    line(f"  {'─'*4} MARKET {'─'*max(0, cols - 14)}", P_DEFAULT, curses.A_BOLD)
+    eth_str = f"${eth_price:,.2f}" if eth_price else "unavailable"
+    line(f"    {'ETH Perp (Phemex)':<24} {eth_str}", P_DEFAULT, curses.A_BOLD)
+    session_name, _col, excl_reason = _optflow_session_status()
+    if excl_reason:
+        line(f"    {'Session':<24} {excl_reason}", P_RED, curses.A_BOLD)
+    elif session_name:
+        line(f"    {'Session':<24} {session_name}", P_GREEN, curses.A_BOLD)
+    else:
+        line(f"    {'Session':<24} No active session", P_RED, curses.A_BOLD)
+    line()
+
+    bar_width = 30
+    for ccy in OPTFLOW_CURRENCIES:
+        ccy_pair = P_MAGENTA if ccy == 'BTC' else P_CYAN
+        line(f"  {'─'*4} {ccy} {'─'*max(0, cols - 7 - len(ccy))}", ccy_pair, curses.A_BOLD)
+        if ccy in errors:
+            line(f"    ✗ Error: {errors[ccy]}", P_RED)
+            line()
+            continue
+        if ccy not in results:
+            line("    waiting for data…", P_DIM)
+            line()
+            continue
+        put_vol, call_vol, ratio = results[ccy]
+        total = put_vol + call_vol
+        rc = P_RED if ratio >= 1.02 else (P_GREEN if ratio <= 0.98 else P_YELLOW)
+        put_pct = put_vol / total if total > 0 else 0
+        call_pct = call_vol / total if total > 0 else 0
+        line(f"    {'24h Put Volume':<20} {put_vol:>14,.2f}  {ccy}", P_RED)
+        line(f"    {'24h Call Volume':<20} {call_vol:>14,.2f}  {ccy}", P_GREEN)
+        line(f"    {'24h Total Volume':<20} {total:>14,.2f}  {ccy}", P_DIM)
+        dv = dvol.get(ccy)
+        if dv is not None:
+            line(f"    {'DVOL (30d IV)':<20} {dv:>14.2f}  %", P_CYAN, curses.A_BOLD)
+        else:
+            line(f"    {'DVOL (30d IV)':<20} {'unavailable':>14}", P_DIM)
+        line(f"    {'Put/Call Ratio':<20} {ratio:>14.2f}", rc, curses.A_BOLD)
+        sentiment = _optflow_get_sentiment(ratio)
+        sent_pair = P_RED if sentiment == 'BEARISH' else (P_GREEN if sentiment == 'BULLISH' else P_YELLOW)
+        line(f"    {'Sentiment':<20} {sentiment}", sent_pair, curses.A_BOLD)
+        put_bars = int(round(put_pct * bar_width))
+        call_bars = int(round(call_pct * bar_width))
+        if 0 <= row[0] < rows:
+            db.puts(row[0], 4, "Put  ", P_DIM)
+            db.puts(row[0], 9, "█" * put_bars, P_RED)
+            db.puts(row[0], 9 + put_bars, "█" * call_bars, P_GREEN)
+            db.puts(row[0], 9 + bar_width, "  Call", P_DIM)
+        row[0] += 1
+        line(f"    {'':5}{put_pct*100:>5.1f}%{' '*(bar_width-1)}{call_pct*100:>5.1f}%", P_DIM)
+        line()
+
+    line(f"  {'─'*4} EQUITIES (CBOE/Nasdaq) {'─'*max(0, cols - 25)}", P_YELLOW, curses.A_BOLD)
+    if eq_status.startswith('OK'):
+        st_pair = P_GREEN
+    elif eq_status.startswith('err'):
+        st_pair = P_RED
+    else:
+        st_pair = P_YELLOW
+    line(f"    {'Status':<8} {eq_status}", st_pair)
+    line(f"    {'Symbol':<7}{'Put Vol':>11}{'Call Vol':>11}{'P/C':>7}{'IV':>8}{'Exp Move':>10}  Sentiment",
+         P_DEFAULT, curses.A_BOLD)
+    for sym in OPTFLOW_EQUITY_SYMBOLS:
+        if sym in eq_errors:
+            line(f"    {sym:<8} ✗ {eq_errors[sym]}", P_RED)
+            continue
+        if sym not in eq_results:
+            line(f"    {sym:<8} waiting…", P_DIM)
+            continue
+        put_vol, call_vol, ratio, iv30, exp_move, em_is_0dte, iv_is_approx = eq_results[sym]
+        sentiment = _optflow_get_sentiment(ratio)
+        sent_pair = P_RED if sentiment == 'BEARISH' else (P_GREEN if sentiment == 'BULLISH' else P_YELLOW)
+        iv_str = (f"{iv30:.1f}%" + ("≈" if iv_is_approx else "")) if iv30 else "n/a"
+        em_str = (f"±{exp_move:.2f}" + ("" if em_is_0dte else "*")) if exp_move else "n/a"
+        # Per-column coloring (port of opt_dashboard.py's own RED/GRN/rc/CYN/
+        # MAG segments for this exact row) — Put Vol red, Call Vol green,
+        # ratio in the sentiment color, IV blue, Exp Move purple/magenta,
+        # sentiment word in its own color. A single line() call would flatten
+        # all of this to one color, which is what the user reported as wrong.
+        if 0 <= row[0] < rows:
+            cx = 0
+            db.puts(row[0], cx, f"    {sym:<7}", P_DEFAULT); cx += 4 + 7
+            db.puts(row[0], cx, f"{put_vol:>11,.0f}", P_RED); cx += 11
+            db.puts(row[0], cx, f"{call_vol:>11,.0f}", P_GREEN); cx += 11
+            db.puts(row[0], cx, f"{ratio:>7.2f}", sent_pair, curses.A_BOLD); cx += 7
+            db.puts(row[0], cx, f"{iv_str:>8}", P_BLUE); cx += 8
+            db.puts(row[0], cx, f"{em_str:>10}", P_MAGENTA); cx += 10
+            db.puts(row[0], cx, f"  {sentiment}", sent_pair)
+        row[0] += 1
+    line()
+
+    line("─" * cols, P_CYAN, curses.A_BOLD)
+    line("  Equities P/C = total volume  |  IV = 30-day (matches IBKR)", P_DIM)
+    line("  IV≈ = Nasdaq-fallback estimate (CBOE unreachable, real IV unavailable)", P_DIM)
+    line("  Exp Move = ±ATM straddle to expiry (0DTE, *=nearest)  |  ~15m delay", P_DIM)
+    line("  P/C >= 1.02 = BEARISH  |  P/C <= 0.98 = BULLISH", P_DIM)
+    line("─" * cols, P_CYAN, curses.A_BOLD)
+
+    if OPTFLOW_CSV_ERR[0]:
+        csv_str, csv_pair = f"error: {OPTFLOW_CSV_ERR[0]}", P_RED
+    elif OPTFLOW_CSV_CUR_PATH[0]:
+        rel = os.path.relpath(OPTFLOW_CSV_CUR_PATH[0], OPTFLOW_DATA_ROOT)
+        csv_str, csv_pair = f"{OPTFLOW_CSV_ROWS[0]} rows → {rel}", P_GREEN
+    else:
+        csv_str, csv_pair = "starting…", P_DIM
+    line(f"    {'CSV':<8} {csv_str}", csv_pair)
+    if OPTFLOW_MUTED[0]:
+        line(f"    {'Sound':<8} MUTED (alert.wav disabled)", P_YELLOW)
+    else:
+        line(f"    {'Sound':<8} ON (alert.wav enabled)", P_GREEN)
+    line()
+    line("  [Q]uit   [R]efresh   [U]mute/unmute   Esc/[M] next mode", P_DIM)
+
+# ── Chain — ported from chain.py ────────────────────────────────────────────
+# Live options-chain table (strikes x Greeks) for one symbol at a time —
+# crypto via Deribit, or any CBOE-listed equity/ETF via CBOE. On-demand
+# only, same reasoning as Markets/Macro Options Flow above. Already the
+# simplest of the three ports: chain.py is already curses-based and already
+# has its own runtime [S] symbol switch, so this is a straight port plus
+# the same mechanical curses->DoubleBuffer adaptation every other tool
+# tonight already went through.
+CHAIN_DERIBIT_BASE    = "https://www.deribit.com/api/v2"
+CHAIN_CBOE_URL        = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+CHAIN_YAHOO_URL       = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+_CHAIN_YAHOO_HEADERS  = {"User-Agent": "Mozilla/5.0"}
+CHAIN_MAX_STRIKES     = 36   # rows centred around ATM
+
+def _chain_deribit_api(path, **params):
+    r = requests.get(CHAIN_DERIBIT_BASE + path, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"]["message"])
+    return j["result"]
+
+def _chain_fetch_ticker(name):
+    return name, _chain_deribit_api("/public/ticker", instrument_name=name)
+
+def _chain_phemex_get(path, query):
+    """Signed GET to Phemex, reusing Athena's own credentials/signing
+    (_phemex_headers/PHEMEX_BASE_URL) — no bridge/Termux path, Athena
+    always runs direct, unlike chain.py's own standalone bridge option."""
+    headers = _phemex_headers(path, query)
+    r = requests.get(f"{PHEMEX_BASE_URL}{path}?{query}", headers=headers, timeout=6)
+    return r.json()
+
+def _chain_fetch_perp_mark_price(currency):
+    if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
+        return None, None
+    symbol = f"{currency}USDT"
+    try:
+        data = _chain_phemex_get("/md/v3/ticker/24hr", f"symbol={symbol}")
+        result = data.get("result") or {}
+        for field in ("lastRp", "lastPrice", "markPriceRp", "indexPriceRp", "closeRp"):
+            val = result.get(field)
+            if val:
+                price = float(val)
+                if 100 < price < 1_000_000:
+                    return price, "Phemex"
+    except Exception:
+        pass
+    try:
+        data = _chain_phemex_get("/g-accounts/accountPositions", "currency=USDT")
+        for pos in (data.get("data") or {}).get("positions", []):
+            if pos.get("symbol") != symbol:
+                continue
+            mp = pos.get("markPriceRp")
+            if mp:
+                price = float(mp)
+                if 100 < price < 1_000_000:
+                    return price, "Phemex"
+    except Exception:
+        pass
+    return None, None
+
+def _chain_fetch_all_crypto(currency):
+    """Verbatim port of chain.py's own fetch_all_crypto."""
+    instruments = _chain_deribit_api("/public/get_instruments", currency=currency, kind="option", expired="false")
+    now_ms = int(time.time() * 1000)
+    by_exp = {}
+    for ins in instruments:
+        by_exp.setdefault(ins["expiration_timestamp"], []).append(ins)
+    target_exp = min((e for e in by_exp if e > now_ms), default=None)
+    if not target_exp:
+        raise RuntimeError("No active expiry found")
+    chain_ins = by_exp[target_exp]
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        fut_index = ex.submit(_chain_deribit_api, "/public/get_index_price", index_name=f"{currency.lower()}_usd")
+        fut_perp = ex.submit(_chain_fetch_perp_mark_price, currency)
+        ticker_futs = {ex.submit(_chain_fetch_ticker, ins["instrument_name"]): ins for ins in chain_ins}
+        idx_data = fut_index.result()
+        index_price = idx_data["index_price"]
+        perp_price, perp_source = fut_perp.result()
+        atm_ref_price = perp_price if perp_price else index_price
+        tickers = {}
+        for fut in as_completed(ticker_futs):
+            try:
+                name, t = fut.result()
+                tickers[name] = t
+            except Exception:
+                pass
+    strikes_data = {}
+    for ins in chain_ins:
+        t = tickers.get(ins["instrument_name"])
+        if not t:
+            continue
+        strikes_data.setdefault(ins["strike"], {})[ins["option_type"]] = t
+    atm_strike = min(strikes_data, key=lambda s: abs(s - atm_ref_price))
+    atm_iv = 0.0
+    atm_call = strikes_data.get(atm_strike, {}).get("call")
+    if atm_call:
+        atm_iv = atm_call.get("mark_iv") or 0.0
+    return {
+        "index_price": index_price, "display_price": index_price,
+        "perp_price": perp_price, "perp_source": perp_source,
+        "atm_ref_price": atm_ref_price, "expiry_ts": target_exp,
+        "strikes_data": strikes_data, "atm_strike": atm_strike, "atm_iv": atm_iv,
+        "fetched_at": datetime.now().strftime("%H:%M:%S"),
+    }
+
+def _chain_fetch_live_price_yahoo(symbol):
+    try:
+        r = requests.get(CHAIN_YAHOO_URL.format(symbol), headers=_CHAIN_YAHOO_HEADERS,
+                          params={"interval": "1m", "range": "1d"}, timeout=6)
+        r.raise_for_status()
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        return float(price) if price else None
+    except Exception:
+        return None
+
+def _chain_fetch_all_equity(symbol):
+    """Verbatim port of chain.py's own fetch_all_equity — any CBOE-listed,
+    optionable equity/ETF ticker, OCC symbol parsed offset-from-the-end."""
+    r = requests.get(CHAIN_CBOE_URL.format(symbol), timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    price = float(data.get("current_price") or 0)
+    if price <= 0:
+        raise RuntimeError(f"no spot price for {symbol}")
+    today = datetime.now().strftime("%y%m%d")
+    by_exp = {}
+    for o in data.get("options") or []:
+        name = o.get("option") or ""
+        if len(name) < 15:
+            continue
+        cp_flag = name[-9]
+        exp = name[-15:-9]
+        try:
+            strike = int(name[-8:]) / 1000.0
+        except ValueError:
+            continue
+        by_exp.setdefault(exp, []).append((cp_flag, strike, o))
+    if not by_exp:
+        raise RuntimeError("empty chain")
+    future = sorted(e for e in by_exp if e >= today)
+    target_exp = future[0] if future else min(by_exp)
+    strikes_data = {}
+    for cp_flag, strike, o in by_exp[target_exp]:
+        otype = "call" if cp_flag == "C" else "put"
+        mark = o.get("theo") or o.get("last_trade_price")
+        strikes_data.setdefault(strike, {})[otype] = {
+            "mark_price": mark,
+            "last_price": o.get("prev_day_close"),
+            "greeks": {"theta": o.get("theta"), "gamma": o.get("gamma"), "delta": o.get("delta")},
+            "stats": {"volume": o.get("volume")},
+            "open_interest": o.get("open_interest"),
+            "mark_iv": (o.get("iv") or 0.0) * 100.0,
+        }
+    live_price = _chain_fetch_live_price_yahoo(symbol)
+    spot = live_price if live_price else price
+    atm_strike = min(strikes_data, key=lambda s: abs(s - spot))
+    atm_iv = 0.0
+    atm_call = strikes_data.get(atm_strike, {}).get("call")
+    if atm_call:
+        atm_iv = atm_call.get("mark_iv") or 0.0
+    exp_date = datetime.strptime(target_exp, "%y%m%d").replace(hour=16, minute=0, second=0)
+    expiry_ts = int(exp_date.timestamp() * 1000)
+    return {
+        "index_price": 1.0, "display_price": spot,
+        "perp_price": live_price, "perp_source": "Yahoo" if live_price else None,
+        "atm_ref_price": spot, "expiry_ts": expiry_ts,
+        "strikes_data": strikes_data, "atm_strike": atm_strike, "atm_iv": atm_iv,
+        "fetched_at": datetime.now().strftime("%H:%M:%S"),
+    }
+
+def _chain_fv(v, d=2, sign=False):
+    if v is None:
+        return "—"
+    fmt = f"{'+' if sign else ''}.{d}f"
+    return f"{v:{fmt}}"
+
+def _chain_fvol(v):
+    return f"{int(v):,}" if v else "—"
+
+def _chain_foi(v):
+    return f"{int(v):,}" if v else "—"
+
+def _chain_fmark(mark_usd):
+    return "—" if mark_usd is None else f"{mark_usd:,.2f}"
+
+def _chain_fpct(mark, last):
+    if not mark or not last or last == 0:
+        return "", 0
+    pct = (mark - last) / last * 100
+    arrow = "▲" if pct >= 0 else "▼"
+    return f"{arrow}{abs(pct):.1f}%", (1 if pct >= 0 else -1)
+
+def _chain_fstrike(strike, atm):
+    is_whole = (strike == int(strike))
+    s = f"${strike:,.0f}" if is_whole else f"${strike:,.2f}"
+    return s + " ◆" if strike == atm else s
+
+def _chain_pad(s, width, just):
+    s = str(s)
+    if len(s) > width - 1:
+        s = s[:width - 1]
+    if just == "R":   return s.rjust(width)
+    elif just == "L": return s.ljust(width)
+    else:             return s.center(width)
+
+def _chain_countdown(ts_ms):
+    ms = ts_ms - int(time.time() * 1000)
+    if ms <= 0:
+        return "EXPIRED"
+    h, rem = divmod(ms // 1000, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _chain_columns(simple):
+    """(label, width, justify) triples — mirrors chain.py's own CALL_COLS/
+    STRIKE_COL/PUT_COLS, computed per-call instead of once at launch so
+    [Y] can toggle simple/full at runtime (chain.py's own -s is launch-
+    time only)."""
+    if simple:
+        call_cols = [("Chg", 8, "R"), ("Mark", 11, "R"), ("OI", 10, "R"), ("Vol", 10, "R")]
+        put_cols  = [("Vol", 10, "L"), ("OI", 10, "L"), ("Mark", 11, "L"), ("Chg", 8, "L")]
+    else:
+        call_cols = [("Theta", 11, "R"), ("Gamma", 10, "R"), ("Delta", 9, "R"), ("Chg", 8, "R"),
+                     ("Mark", 11, "R"), ("OI", 10, "R"), ("Vol", 10, "R")]
+        put_cols  = [("Vol", 10, "L"), ("OI", 10, "L"), ("Mark", 11, "L"), ("Chg", 8, "L"),
+                     ("Delta", 9, "L"), ("Gamma", 10, "L"), ("Theta", 11, "L")]
+    strike_col = ("Strike", 14, "C")
+    all_cols = call_cols + [strike_col] + put_cols
+    total_w = sum(w for _, w, _ in all_cols)
+    return call_cols, strike_col, put_cols, all_cols, total_w
+
+CHAIN_LOCK        = threading.Lock()
+CHAIN_SYMBOL      = ["ETH"]
+CHAIN_IS_CRYPTO   = [True]
+CHAIN_DATA        = [None]
+CHAIN_ERROR       = [""]
+CHAIN_REFRESH_SECS = 10
+CHAIN_REFRESH_EVT = threading.Event()   # set by [R] and [S] to force an immediate re-fetch
+
+def _chain_fetch_all():
+    symbol, is_crypto = CHAIN_SYMBOL[0], CHAIN_IS_CRYPTO[0]
+    return _chain_fetch_all_crypto(symbol) if is_crypto else _chain_fetch_all_equity(symbol)
+
+def _chain_refresh_loop(stop_evt):
+    """On-demand refresh loop, started fresh on every chain_mode entry (and
+    re-armed by [S] switching symbols, which also clears CHAIN_DATA so the
+    loading message shows immediately) — port of chain.py's own fetch-
+    scheduling, adapted to a synchronous poll loop instead of the source's
+    own rolling fetch-duration pre-emption (unneeded here: CHAIN_REFRESH_
+    SECS=10s comfortably exceeds one REST round-trip)."""
+    CHAIN_REFRESH_EVT.clear()
+    while not stop_evt.is_set():
+        symbol_at_start = CHAIN_SYMBOL[0]
+        try:
+            d = _chain_fetch_all()
+            with CHAIN_LOCK:
+                if CHAIN_SYMBOL[0] == symbol_at_start:
+                    CHAIN_DATA[0] = d
+                    CHAIN_ERROR[0] = ""
+        except Exception as e:
+            with CHAIN_LOCK:
+                if CHAIN_SYMBOL[0] == symbol_at_start:
+                    CHAIN_ERROR[0] = str(e)
+        for _ in range(CHAIN_REFRESH_SECS):
+            if stop_evt.wait(1.0):
+                return
+            if CHAIN_REFRESH_EVT.is_set() or CHAIN_SYMBOL[0] != symbol_at_start:
+                CHAIN_REFRESH_EVT.clear()
+                break
+
+def draw_chain(db, rows, cols, simple_mode=False):
+    """Chain — port of chain.py's own draw(), adapted from win.addstr/safe_add
+    to Athena's DoubleBuffer db.puts API, same mechanical adaptation every
+    other ported tool tonight already went through."""
+    with CHAIN_LOCK:
+        data = CHAIN_DATA[0]
+        error_msg = CHAIN_ERROR[0]
+        symbol = CHAIN_SYMBOL[0]
+        is_crypto = CHAIN_IS_CRYPTO[0]
+
+    footer_row = rows - 1
+    call_cols, strike_col, put_cols, all_cols, total_w = _chain_columns(simple_mode)
+    n_call = len(call_cols)
+    idx_strike    = n_call
+    idx_call_mark = next(i for i, (l, _, _) in enumerate(call_cols) if l == "Mark")
+    idx_call_chg  = next(i for i, (l, _, _) in enumerate(call_cols) if l == "Chg")
+    idx_put_vol   = idx_strike + 1 + next(i for i, (l, _, _) in enumerate(put_cols) if l == "Vol")
+    idx_put_oi    = idx_strike + 1 + next(i for i, (l, _, _) in enumerate(put_cols) if l == "OI")
+    idx_put_mark  = idx_strike + 1 + next(i for i, (l, _, _) in enumerate(put_cols) if l == "Mark")
+    idx_put_chg   = idx_strike + 1 + next(i for i, (l, _, _) in enumerate(put_cols) if l == "Chg")
+    idx_call_oi   = next(i for i, (l, _, _) in enumerate(call_cols) if l == "OI")
+    idx_call_vol  = next(i for i, (l, _, _) in enumerate(call_cols) if l == "Vol")
+    idx_call_greeks = [i for i, (l, _, _) in enumerate(call_cols) if l in ("Theta", "Gamma", "Delta")]
+    idx_put_greeks  = [idx_strike + 1 + i for i, (l, _, _) in enumerate(put_cols) if l in ("Theta", "Gamma", "Delta")]
+
+    if data is None:
+        msg = f"Error: {error_msg}" if error_msg else f"Fetching {symbol} chain…"
+        db.puts(rows // 2, max(0, cols // 2 - len(msg) // 2), msg, P_RED if error_msg else P_CYAN, curses.A_BOLD)
+        db.puts(footer_row, 0, " Chain  [R]etry  [S]ymbol  Esc/[M] next mode".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+        return
+
+    index_price = data["index_price"]
+    display_price = data.get("display_price", index_price)
+    perp_price = data.get("perp_price")
+    expiry_ts = data["expiry_ts"]
+    strikes_data = data["strikes_data"]
+    atm_strike = data["atm_strike"]
+    atm_iv = data["atm_iv"]
+    fetched_at = data["fetched_at"]
+    ttl = _chain_countdown(expiry_ts)
+    exp_str = datetime.fromtimestamp(expiry_ts / 1000, tz=timezone.utc).strftime("%d %b %Y %H:%M UTC")
+
+    start_x = max(0, (cols - total_w) // 2)
+    instrument_label = f"{symbol}-0DTE" if is_crypto else symbol
+
+    x = start_x
+    pieces = [("QUANTASSET", P_CYAN, curses.A_BOLD), ("  │  ", P_DIM, 0),
+              ("Instrument ", P_DIM, 0), (instrument_label, P_DEFAULT, curses.A_BOLD)]
+    if is_crypto:
+        pieces += [("  Perp Mk ", P_DIM, 0), (f"${perp_price:,.2f}" if perp_price else "—", P_YELLOW, curses.A_BOLD),
+                   ("  Deribit Index ", P_DIM, 0), (f"${index_price:,.2f}", P_DEFAULT, 0)]
+    else:
+        pieces += [("  Spot ", P_DIM, 0), (f"${display_price:,.2f}" if display_price else "—", P_YELLOW, curses.A_BOLD)]
+    pieces += [("  ATM IV ", P_DIM, 0), (f"{atm_iv:.1f}%", P_YELLOW, curses.A_BOLD),
+               ("  Expiry ", P_DIM, 0), (exp_str, P_DEFAULT, 0),
+               ("  Time Left ", P_DIM, 0), (ttl, P_YELLOW, curses.A_BOLD),
+               (f"  Updated {fetched_at}", P_DIM, 0)]
+    for text, pair, attrs in pieces:
+        db.puts(0, x, text, pair, attrs)
+        x += len(text)
+
+    cx = start_x
+    for i, (label, width, just) in enumerate(all_cols):
+        is_call = i < len(call_cols)
+        is_put = i >= len(call_cols) + 1
+        pair = P_GREEN if is_call else (P_RED if is_put else P_DEFAULT)
+        db.puts(2, cx, _chain_pad(label, width, just), pair, curses.A_BOLD)
+        cx += width
+
+    call_w = sum(w for _, w, _ in call_cols)
+    str_w = strike_col[1]
+    put_w = sum(w for _, w, _ in put_cols)
+    db.puts(3, start_x, "─" * call_w, P_GREEN)
+    db.puts(3, start_x + call_w, "─" * str_w, P_DIM, curses.A_DIM)
+    db.puts(3, start_x + call_w + str_w, "─" * put_w, P_RED)
+    db.puts(3, start_x, "── CALLS ", P_GREEN, curses.A_BOLD)
+    puts_lbl = " PUTS ──"
+    db.puts(3, start_x + call_w + str_w + put_w - len(puts_lbl), puts_lbl, P_RED, curses.A_BOLD)
+
+    sorted_strikes = sorted(strikes_data.keys())
+    if atm_strike in sorted_strikes:
+        ai = sorted_strikes.index(atm_strike)
+        half = CHAIN_MAX_STRIKES // 2
+        sorted_strikes = sorted_strikes[max(0, ai - half): min(len(sorted_strikes), ai + half)]
+
+    data_row_start = 4
+    for ri, strike in enumerate(sorted_strikes):
+        row = data_row_start + ri
+        if row >= footer_row:
+            break
+        d = strikes_data[strike]
+        c, p = d.get("call"), d.get("put")
+        is_atm = (strike == atm_strike)
+        cg = c.get("greeks", {}) if c else {}
+        pg = p.get("greeks", {}) if p else {}
+        c_mark_usd = (c.get("mark_price") or 0) * index_price if c else None
+        p_mark_usd = (p.get("mark_price") or 0) * index_price if p else None
+        c_last_usd = (c.get("last_price") or 0) * index_price if c and c.get("last_price") else None
+        p_last_usd = (p.get("last_price") or 0) * index_price if p and p.get("last_price") else None
+        c_pct_str, c_dir = _chain_fpct(c_mark_usd, c_last_usd)
+        p_pct_str, p_dir = _chain_fpct(p_mark_usd, p_last_usd)
+        c_vol_raw = c.get("stats", {}).get("volume") if c else None
+        p_vol_raw = p.get("stats", {}).get("volume") if p else None
+
+        full_cells = [
+            _chain_fv(cg.get("theta"), 4), _chain_fv(cg.get("gamma"), 5), _chain_fv(cg.get("delta"), 3, sign=True),
+            c_pct_str, _chain_fmark(c_mark_usd), _chain_foi(c.get("open_interest") if c else None), _chain_fvol(c_vol_raw),
+            _chain_fstrike(strike, atm_strike),
+            _chain_fvol(p_vol_raw), _chain_foi(p.get("open_interest") if p else None), _chain_fmark(p_mark_usd),
+            p_pct_str, _chain_fv(pg.get("delta"), 3, sign=True), _chain_fv(pg.get("gamma"), 5), _chain_fv(pg.get("theta"), 4),
+        ]
+        call_label_to_full = {"Theta": 0, "Gamma": 1, "Delta": 2, "Chg": 3, "Mark": 4, "OI": 5, "Vol": 6}
+        put_label_to_full  = {"Vol": 8, "OI": 9, "Mark": 10, "Chg": 11, "Delta": 12, "Gamma": 13, "Theta": 14}
+        cells = [full_cells[call_label_to_full[label]] for label, _, _ in call_cols]
+        cells.append(full_cells[7])
+        cells += [full_cells[put_label_to_full[label]] for label, _, _ in put_cols]
+
+        cv_raw, pv_raw = c_vol_raw or 0, p_vol_raw or 0
+        if cv_raw > 0 and pv_raw > 0:
+            call_vol_attr = P_GREEN if cv_raw >= pv_raw else P_RED
+            put_vol_attr  = P_GREEN if pv_raw >= cv_raw else P_RED
+        elif cv_raw > 0:
+            call_vol_attr, put_vol_attr = P_GREEN, P_DIM
+        elif pv_raw > 0:
+            call_vol_attr, put_vol_attr = P_DIM, P_GREEN
+        else:
+            call_vol_attr, put_vol_attr = P_DIM, P_DIM
+
+        cx = start_x
+        for col_i, ((label, width, just), cell) in enumerate(zip(all_cols, cells)):
+            text = _chain_pad(cell, width, just)
+            if col_i == idx_strike:
+                db.puts(row, cx, text, P_CYAN if is_atm else P_DEFAULT, curses.A_BOLD if is_atm else 0)
+            elif col_i == idx_call_mark:
+                db.puts(row, cx, _chain_pad(cell, width, just), P_YELLOW)
+            elif col_i == idx_call_chg:
+                pair = (P_GREEN if c_dir > 0 else P_RED) if cell else P_DIM
+                db.puts(row, cx, _chain_pad(cell or "—", width, just), pair)
+            elif col_i == idx_put_mark:
+                db.puts(row, cx, _chain_pad(cell, width, just), P_YELLOW)
+            elif col_i == idx_put_chg:
+                pair = (P_GREEN if p_dir > 0 else P_RED) if cell else P_DIM
+                db.puts(row, cx, _chain_pad(cell or "—", width, just), pair)
+            elif col_i in idx_call_greeks:
+                db.puts(row, cx, text, P_DIM if cell == "—" else P_GREEN)
+            elif col_i in idx_put_greeks:
+                db.puts(row, cx, text, P_DIM if cell == "—" else P_RED)
+            elif col_i in (idx_call_oi, idx_put_oi):
+                db.puts(row, cx, text, P_DIM if cell == "—" else P_DEFAULT)
+            elif col_i == idx_call_vol:
+                db.puts(row, cx, text, call_vol_attr)
+            elif col_i == idx_put_vol:
+                db.puts(row, cx, text, put_vol_attr)
+            else:
+                db.puts(row, cx, text, P_DEFAULT)
+            cx += width
+
+    mode_tag = "SIMPLE" if simple_mode else "FULL"
+    hint = f" [Q]uit [R]efresh [S]ymbol [Y]:{mode_tag} Esc/[M] next mode  [{symbol}]"
+    db.puts(footer_row, 0, hint.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+
 # ── Startup loading screen ───────────────────────────────────────────────────
 # Shown by curses_main from the moment its startup threads are launched until
 # every one of them has done its first real unit of work (backfill complete,
@@ -14327,6 +15926,7 @@ def _startup_progress():
     steps.append(("Chart engines", all(_ch_ready[a].is_set() for a in ASSETS)))
     steps.append(("Net Drift engines", all(DRIFT_READY[a].is_set() for a in DRIFT_ASSETS)))
     steps.append(("Volatility Drift engines", all(VOLDRIFT_READY[a].is_set() for a in VOLDRIFT_ASSETS)))
+    steps.append(("Macro Options Flow engine", OPTFLOW_READY.is_set()))
     if not DRY_RUN:
         # Only shown at all on a live launch — a DRY_RUN/paper session never
         # starts _phemex_preflight_thread (see curses_main's own thread-
@@ -14556,6 +16156,11 @@ def curses_main(stdscr):
         # per-asset-thread shape as Net Drift's own above.
         for _voldrift_asset in VOLDRIFT_ASSETS:
             threading.Thread(target=_voldrift_engine_loop, args=(_voldrift_asset, _quit_evt), daemon=True).start()
+        # Macro Options Flow engine — ported from opt_dashboard.py, made
+        # always-on per explicit user request (2026-08-15) — unlike
+        # Markets/Chain either side of it in the [M] cycle, which stay
+        # on-demand (started/stopped on mode entry/exit instead).
+        threading.Thread(target=_optflow_refresh_loop, args=(_quit_evt,), daemon=True).start()
 
     # Sync layer — the ONE thread Client Mode ever starts (never touches an
     # exchange, a broker credential, or the trading engine); Server Mode
@@ -14644,10 +16249,11 @@ def curses_main(stdscr):
                             # cycle's next stop after GEX; see gex_mode above
     status_scroll = 0
     drift_mode = False   # full-screen Net Drift (Premium) mode, ported from
-                          # drift.py — 2026-08-12: the cycle was reordered to
-                          # Trading -> GEX -> Net Drift -> Volatility Drift ->
-                          # Status -> Trading (Volatility Drift inserted
-                          # between this and Status; see voldrift_mode below
+                          # drift.py — current cycle (2026-08-15, Status moved
+                          # back to being the last stop per explicit user
+                          # request): Trading -> GEX -> Net Drift -> Volatility
+                          # Drift -> Markets -> Macro Options Flow -> Chain ->
+                          # Status -> Trading; see voldrift_mode below
                           # and each mode's own [M] key-dispatch branch for
                           # where the cycle actually advances).
     drift_live = {"ETH": True, "QQQ": True}         # [H] per-asset live/historical
@@ -14666,6 +16272,12 @@ def curses_main(stdscr):
                                       # (2026-08-12: the old [V] venue-breakdown toggle was
                                       # removed entirely per user request — the breakdown is
                                       # now always shown wherever it applies, see draw_drift)
+    drift_crosshair_active = {"ETH": False, "QQQ": False}   # [X] — 2026-08-15 user request:
+                                      # OHLC + Net Volume/Volume readout for the selected column,
+                                      # same convention as the footprint charts' own [X] crosshair.
+    drift_crosshair_idx = {"ETH": 0, "QQQ": 0}   # columns back from the right edge of the
+                                      # CURRENT view (0 = rightmost) — see draw_drift/
+                                      # _drift_crosshair_clamp for how panning at the edges works.
     voldrift_mode = False   # full-screen Volatility Drift mode, ported from
                              # vol-drift.py (2026-08-12) — sits between Net
                              # Drift and Status in the [M] cycle (see
@@ -14677,6 +16289,33 @@ def curses_main(stdscr):
                              # reasoning as drift_view_offset above
     voldrift_bar_interval = VOLDRIFT_DEFAULT_BAR_INTERVAL   # [B] — shared across both assets,
                              # matches vol-drift.py's own ctrl.bar_interval
+    markets_mode = False   # full-screen Markets mode, ported from charthacker.py's own
+                            # "Macro Mode" (2026-08-15) — cycle order (2026-08-15, Status
+                            # moved back to being the last stop per explicit user request):
+                            # Trading -> GEX -> Net Drift -> Volatility Drift -> Markets ->
+                            # Macro Options Flow -> Chain -> Status -> Trading. On-demand
+                            # only (per explicit user answer) — its own fetch thread starts
+                            # on entry and stops on exit.
+    markets_thread = [None]     # the currently-running _markets_refresh_loop Thread, or None
+    markets_stop_evt = [None]   # its stop Event, set to signal the thread to exit
+    macro_options_mode = False   # full-screen Macro Options Flow mode, ported from
+                                  # opt_dashboard.py (2026-08-15) — ALWAYS-ON (per explicit
+                                  # user request, 2026-08-15), started once at Athena launch
+                                  # alongside GEX/Status/Net Drift/Volatility Drift, not here
+                                  # — unlike markets_mode/chain_mode either side of it, which
+                                  # stay on-demand. Mute state lives in the module-level
+                                  # OPTFLOW_MUTED box (not a plain local here) — the
+                                  # background _optflow_refresh_loop thread needs to read it
+                                  # before playing an alert, so [U]'s key handler flips
+                                  # OPTFLOW_MUTED[0] directly. [U] remaps opt_dashboard.py's
+                                  # own [M] (mute), which collides with Athena's global
+                                  # "next mode" key.
+    chain_mode = False   # full-screen Chain mode, ported from chain.py (2026-08-15) —
+                          # on-demand, sits between Macro Options Flow and Status in the
+                          # [M] cycle, see markets_mode above
+    chain_thread = [None]
+    chain_stop_evt = [None]
+    chain_simple_mode = False   # [Y] — Strike/Vol/OI/Mark-only columns (chain.py's own -s flag)
     dashboard_hidden = False   # [H] — gives the chart the ENTIRE terminal,
                                # same row budget footprint.py's own
                                # full-screen view uses, for when even the
@@ -14777,7 +16416,8 @@ def curses_main(stdscr):
                 else:
                     events = scan_all_trade_events(data_source)
                 data_cache = {"source": data_source, "ts": now_mono, "events": events,
-                              "stats": compute_trade_stats(events, source=data_source)}
+                              "stats": compute_trade_stats(events, source=data_source,
+                                                            current_balance=snap.get("balance"))}
             data_table_info = draw_data_view(db, rows, cols, data_source, data_cache["events"],
                                               data_cache["stats"], trades_cache["trades"], table_scroll, table_hscroll)
         elif gex_mode:
@@ -14808,7 +16448,8 @@ def curses_main(stdscr):
             drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             drift_ui = {"live": drift_live[drift_asset], "view_date": drift_view_date[drift_asset],
                         "view_offset": drift_view_offset[drift_asset], "bar_interval": drift_bar_interval,
-                        "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode}
+                        "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
+                        "crosshair_idx": (drift_crosshair_idx[drift_asset] if drift_crosshair_active[drift_asset] else None)}
             drift_view_offset[drift_asset] = draw_drift(db, drift_asset, 0, rows, 0, cols, drift_ui)
         elif voldrift_mode:
             # Full screen, same convention as drift_mode above — draw_voldrift
@@ -14818,6 +16459,15 @@ def curses_main(stdscr):
             voldrift_ui = {"live": voldrift_live[voldrift_asset], "view_date": voldrift_view_date[voldrift_asset],
                            "view_offset": voldrift_view_offset[voldrift_asset], "bar_interval": voldrift_bar_interval}
             voldrift_view_offset[voldrift_asset] = draw_voldrift(db, voldrift_asset, 0, rows, 0, cols, voldrift_ui)
+        elif markets_mode:
+            # Full screen, same convention as every mode above — draw_markets
+            # draws its own hint row at the very last line, so no separate
+            # Athena footer is drawn underneath (see the footer dispatch below).
+            draw_markets(db, rows, cols)
+        elif macro_options_mode:
+            draw_macro_options(db, rows, cols)
+        elif chain_mode:
+            draw_chain(db, rows, cols, chain_simple_mode)
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
@@ -14850,7 +16500,8 @@ def curses_main(stdscr):
                     draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
                                           profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll[zoom_asset], live_price=live, live_bar=live_bar,
-                                          focused=True, market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
+                                          focused=True,
+                                          market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
                                           crosshair_bar_idx=(chart_crosshair_idx[zoom_asset] if chart_crosshair_active[zoom_asset] else None))
                 else:
                     mid = cols // 2
@@ -14862,7 +16513,8 @@ def curses_main(stdscr):
                     draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, mid, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
-                                          focused=(chart_focus == "QQQ"), market_closed=snap["qqq_market_closed"],
+                                          focused=(chart_focus == "QQQ"),
+                                          market_closed=snap["qqq_market_closed"],
                                           crosshair_bar_idx=(chart_crosshair_idx["QQQ"] if chart_crosshair_active["QQQ"] else None))
 
         if activity_log_open:
@@ -14895,6 +16547,13 @@ def curses_main(stdscr):
         elif voldrift_mode:
             pass   # draw_voldrift already drew its own hint row — same
                    # reasoning as drift_mode above.
+        elif markets_mode:
+            pass   # draw_markets already drew its own hint row — same
+                   # reasoning as voldrift_mode above.
+        elif macro_options_mode:
+            pass   # draw_macro_options already drew its own hint row.
+        elif chain_mode:
+            pass   # draw_chain already drew its own hint row.
         else:
             # [Tab] hint placed right after the scroll hint it's directly
             # related to (not appended at the very end) — the footer is
@@ -14910,7 +16569,7 @@ def curses_main(stdscr):
                 # shorter footer instead of interleaving "not available"
                 # markers into the same dense f-string.
                 footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Status"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Markets/OptFlow/Chain/Status"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             else:
                 risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
@@ -14919,7 +16578,7 @@ def curses_main(stdscr):
                 fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
                 footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                           f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Status"
+                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Markets/OptFlow/Chain/Status"
                           + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                           + "  [F]latten"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
@@ -14962,12 +16621,12 @@ def curses_main(stdscr):
 
         if status_mode:
             # Scrollable full-screen text, not a chart with pan state, so
-            # the key set is smaller than gex_mode's. 2026-08-12: Status is
-            # the LAST stop again in the reordered Trading -> GEX -> Net
-            # Drift -> Volatility Drift -> Status -> Trading cycle (Net
-            # Drift used to be the last stop before Volatility Drift was
-            # inserted ahead of Status) — [M] and Esc both land back on
-            # Trading here, same as before Net Drift was appended.
+            # the key set is smaller than gex_mode's. 2026-08-15: Status is
+            # the LAST stop again, per explicit user request (Trading -> GEX
+            # -> Net Drift -> Volatility Drift -> Markets -> Macro Options
+            # Flow -> Chain -> Status -> Trading) — [M] and Esc both land
+            # back on Trading here, same shape it had before Markets/Macro
+            # Options Flow/Chain were ever appended.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
             elif key in (ord("m"), ord("M"), 27):
@@ -14995,9 +16654,10 @@ def curses_main(stdscr):
             # = back out). z/Z/End alone still does gex.py's own reset.
             #
             # [M] means "next mode" in the Trading -> GEX -> Net Drift ->
-            # Volatility Drift -> Status -> Trading cycle (2026-08-12: GEX
-            # now leads to Net Drift, not Status — Volatility Drift was
-            # inserted between them). Esc remains the fast "back to
+            # Volatility Drift -> Markets -> Macro Options Flow -> Chain ->
+            # Status -> Trading cycle (2026-08-15: Status moved back to
+            # being the last stop, per explicit user request). Esc remains
+            # the fast "back to
             # Trading" escape hatch from any mode, unchanged.
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
@@ -15141,44 +16801,53 @@ def curses_main(stdscr):
                 drift_net_volume_mode = not drift_net_volume_mode
             elif key in (ord("r"), ord("R")):
                 DRIFT_NEXT_POLL_TS[drift_asset] = 0.0
-            elif key == curses.KEY_LEFT:
-                drift_live[drift_asset] = False
-                drift_view_offset[drift_asset] += 1
-            elif key == curses.KEY_RIGHT:
-                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 1)
-                if drift_view_offset[drift_asset] == 0:
-                    drift_live[drift_asset] = True
-            elif key in (curses.KEY_SLEFT, ord("[")):
-                # [2026-08-12 user-reported gap] '[' is drift.py's own
-                # bracket-key alias for the same 10-bar step Shift+Left
-                # gives — a fallback for terminals where Shift+Arrow
-                # doesn't register as KEY_SLEFT (a common curses
-                # portability issue, exactly why drift.py provided it).
-                drift_live[drift_asset] = False
-                drift_view_offset[drift_asset] += 10
-            elif key in (curses.KEY_SRIGHT, ord("]")):
-                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 10)
-                if drift_view_offset[drift_asset] == 0:
-                    drift_live[drift_asset] = True
-            elif key in (curses.KEY_PPAGE, ord("{")):
-                # '{' is drift.py's own bracket-key alias for the 50-bar
-                # step (there, Ctrl+Left's raw terminal-dependent codes;
-                # here, KEY_PPAGE already covers that same big-step role).
-                drift_live[drift_asset] = False
-                drift_view_offset[drift_asset] += 50
-            elif key in (curses.KEY_NPAGE, ord("}")):
-                drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - 50)
-                if drift_view_offset[drift_asset] == 0:
-                    drift_live[drift_asset] = True
+            elif key in (ord("x"), ord("X")):
+                drift_crosshair_active[drift_asset] = not drift_crosshair_active[drift_asset]
+                if drift_crosshair_active[drift_asset]:
+                    # Activates at the current right edge of the view, same
+                    # first-press behavior the footprint charts' own [X] has.
+                    drift_crosshair_idx[drift_asset] = 0
+            elif key in (curses.KEY_LEFT, curses.KEY_SLEFT, ord("["), curses.KEY_PPAGE, ord("{")):
+                # 2026-08-15 user request: crosshair movement and view
+                # panning are ONE function driven by the SAME key set, at
+                # the SAME 1/10/50-column steps these keys have always
+                # panned by ('[' is drift.py's own bracket-key alias for
+                # Shift+Left's 10-column step, a fallback for terminals
+                # where Shift+Arrow doesn't register as KEY_SLEFT; '{' is
+                # the matching 50-column alias) — when the crosshair is
+                # active these keys move IT instead of the view, auto-
+                # panning at the edges via _drift_crosshair_clamp; when
+                # it's off they pan the view directly, exactly as before.
+                step = 50 if key in (curses.KEY_PPAGE, ord("{")) else (10 if key in (curses.KEY_SLEFT, ord("[")) else 1)
+                if drift_crosshair_active[drift_asset]:
+                    plot_w_est = max(1, cols - DRIFT_LEFT_W - DRIFT_RIGHT_W - 1)
+                    drift_crosshair_idx[drift_asset], drift_view_offset[drift_asset] = _drift_crosshair_clamp(
+                        drift_crosshair_idx[drift_asset] + step, drift_view_offset[drift_asset], plot_w_est)
+                else:
+                    drift_live[drift_asset] = False
+                    drift_view_offset[drift_asset] += step
+            elif key in (curses.KEY_RIGHT, curses.KEY_SRIGHT, ord("]"), curses.KEY_NPAGE, ord("}")):
+                step = 50 if key in (curses.KEY_NPAGE, ord("}")) else (10 if key in (curses.KEY_SRIGHT, ord("]")) else 1)
+                if drift_crosshair_active[drift_asset]:
+                    plot_w_est = max(1, cols - DRIFT_LEFT_W - DRIFT_RIGHT_W - 1)
+                    drift_crosshair_idx[drift_asset], drift_view_offset[drift_asset] = _drift_crosshair_clamp(
+                        drift_crosshair_idx[drift_asset] - step, drift_view_offset[drift_asset], plot_w_est)
+                else:
+                    drift_view_offset[drift_asset] = max(0, drift_view_offset[drift_asset] - step)
+                    if drift_view_offset[drift_asset] == 0:
+                        drift_live[drift_asset] = True
             continue
 
         if voldrift_mode:
             # Ported from vol-drift.py's own curses_main key dispatch, same
             # remap reasoning as drift_mode above: [M] continues the cycle
-            # (Volatility Drift -> Status); vol-drift.py's [S] (switch to an
-            # arbitrary symbol) is dropped, Tab switches ETH/QQQ focus
-            # instead; vol-drift.py's Esc (snap to live) moves to [L], Esc
-            # here leaves the mode, matching every other full-screen mode.
+            # (Volatility Drift -> Markets — 2026-08-15: Status moved to be
+            # the LAST stop again, per explicit user request, so it no
+            # longer follows directly after Volatility Drift); vol-drift.py's
+            # [S] (switch to an arbitrary symbol) is dropped, Tab switches
+            # ETH/QQQ focus instead; vol-drift.py's Esc (snap to live) moves
+            # to [L], Esc here leaves the mode, matching every other
+            # full-screen mode.
             voldrift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
@@ -15186,8 +16855,11 @@ def curses_main(stdscr):
                 voldrift_mode = False
             elif key in (ord("m"), ord("M")):
                 voldrift_mode = False
-                status_mode = True
-                status_scroll = 0
+                markets_mode = True
+                markets_stop_evt[0] = threading.Event()
+                markets_thread[0] = threading.Thread(target=_markets_refresh_loop,
+                                                       args=(markets_stop_evt[0],), daemon=True)
+                markets_thread[0].start()
             elif key == 9:   # Tab — switch asset focus, same convention as drift_mode
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("l"), ord("L")):   # snap back to the live edge
@@ -15259,6 +16931,99 @@ def curses_main(stdscr):
                 voldrift_view_offset[voldrift_asset] = max(0, voldrift_view_offset[voldrift_asset] - 50)
                 if voldrift_view_offset[voldrift_asset] == 0:
                     voldrift_live[voldrift_asset] = True
+            continue
+
+        if markets_mode:
+            # Ported from charthacker.py's own Macro Mode key dispatch — on-
+            # demand: leaving the mode (Esc or [M]) stops its fetch thread,
+            # matching the source's own global_mode toggle behavior. No
+            # scrolling/cursor — draw_markets has none, matching the
+            # source's own vestigial (always disabled) scroll state.
+            # Macro Options Flow (the next mode) is now always-on (2026-08-15
+            # — started once at launch, not here) — no thread to start on
+            # entry, unlike before.
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                markets_mode = False
+                if markets_stop_evt[0] is not None:
+                    markets_stop_evt[0].set()
+            elif key in (ord("m"), ord("M")):
+                markets_mode = False
+                if markets_stop_evt[0] is not None:
+                    markets_stop_evt[0].set()
+                macro_options_mode = True
+            elif key in (ord("r"), ord("R")):
+                MARKETS_REFRESH_EVT.set()
+            continue
+
+        if macro_options_mode:
+            # Ported from opt_dashboard.py's own key dispatch. [M] (mute in
+            # the source) collides with Athena's global "next mode" key —
+            # remapped to [U], same category of remap already done for
+            # drift.py's own [M] (min trade $) -> [T]. Always-on (2026-08-15
+            # — per explicit user request, its data keeps refreshing in the
+            # background whether or not this mode is currently displayed;
+            # Esc/[M] here only change what's on screen, they no longer
+            # start/stop the fetch thread).
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                macro_options_mode = False
+            elif key in (ord("m"), ord("M")):
+                macro_options_mode = False
+                chain_mode = True
+                CHAIN_SYMBOL[0] = "ETH"
+                CHAIN_IS_CRYPTO[0] = True
+                CHAIN_DATA[0] = None
+                CHAIN_ERROR[0] = ""
+                chain_stop_evt[0] = threading.Event()
+                chain_thread[0] = threading.Thread(target=_chain_refresh_loop,
+                                                     args=(chain_stop_evt[0],), daemon=True)
+                chain_thread[0].start()
+            elif key in (ord("r"), ord("R")):
+                OPTFLOW_REFRESH_EVT.set()
+            elif key in (ord("u"), ord("U")):
+                OPTFLOW_MUTED[0] = not OPTFLOW_MUTED[0]
+            continue
+
+        if chain_mode:
+            # Ported from chain.py's own key dispatch — already single-
+            # symbol/[S]-switchable, so this is the most direct port of the
+            # three. Esc leaves straight to Trading (resetting CHAIN_SYMBOL
+            # back to "ETH" and stopping the thread, so re-entering always
+            # starts clean, matching chain.py's own launch default); [M]
+            # continues the cycle to Status (2026-08-15: Status moved back
+            # to being the LAST stop, per explicit user request — Chain no
+            # longer wraps straight to Trading).
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                chain_mode = False
+                if chain_stop_evt[0] is not None:
+                    chain_stop_evt[0].set()
+            elif key in (ord("m"), ord("M")):
+                chain_mode = False
+                if chain_stop_evt[0] is not None:
+                    chain_stop_evt[0].set()
+                status_mode = True
+                status_scroll = 0
+            elif key in (ord("r"), ord("R")):
+                CHAIN_REFRESH_EVT.set()
+            elif key in (ord("y"), ord("Y")):
+                chain_simple_mode = not chain_simple_mode
+            elif key in (ord("s"), ord("S")):
+                new_symbol = _prompt_text(stdscr, ["Symbol (e.g. ETH, BTC, SPY, AAPL):"], prompt="> ")
+                db.prev = None
+                if new_symbol and new_symbol.strip():
+                    new_symbol = new_symbol.strip().upper()
+                    if new_symbol != CHAIN_SYMBOL[0]:
+                        CHAIN_SYMBOL[0] = new_symbol
+                        CHAIN_IS_CRYPTO[0] = new_symbol in ("ETH", "BTC")
+                        with CHAIN_LOCK:
+                            CHAIN_DATA[0] = None
+                            CHAIN_ERROR[0] = ""
+                        CHAIN_REFRESH_EVT.set()
             continue
 
         if data_view:

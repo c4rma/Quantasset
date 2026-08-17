@@ -627,6 +627,20 @@ if "--backfill-budget-secs" in args:
     except (IndexError, ValueError):
         pass
 
+# CVD's own backfill window is "since 00:00 CT" — up to a full day, much
+# deeper than footprint's own same-session (~19:00 CT anchor) backfill that
+# INITIAL_FOOTPRINT_BACKFILL_BUDGET_SECS was originally sized for. 2026-08-17:
+# discovered live that Coinbase's backward-paging trades endpoint alone can
+# need well over 30s to walk back a full day for a liquid pair (~68k trades
+# in 30s only covered ~8 of ~9.3 hours needed) — and since
+# _fetch_footprint_trades_range aligns ETH's Kraken+Coinbase merge to
+# whichever source's own paging fell shortest (by design, so the combined
+# window is never lopsided), a too-short deadline silently truncates the
+# WHOLE backfill to that slower source's own reach, not just Coinbase's own
+# bars. CVD's backfill already runs on a background thread (both at startup
+# and on every [I] change), so a longer budget doesn't block the UI.
+CVD_BACKFILL_BUDGET_SECS = 180
+
 DRY_RUN = "--dry-run" in args
 NO_SESSION = "--no-session" in args
 # [A] per-asset on/off toggle (acts on whichever pane is currently [Tab]-
@@ -1035,6 +1049,16 @@ class LiveTape:
         `elif bucket_ts < live["ts"]: return`); this matters a lot more
         now that a rollover persists to disk than it did when a stray
         late trade could only ever corrupt one in-memory tick harmlessly."""
+        # CVD (2026-08-16) — a fully independent second consumer of this
+        # same trade print, decoupled entirely from footprint's own
+        # bucket_ts/lock below (CVD's own bar shape is independently
+        # configurable — seconds/minutes/volume/ticks — and must never be
+        # affected by footprint's own late-trade-for-a-closed-bucket drop
+        # rule a few lines down, which is specific to footprint's fixed
+        # 90s buckets). Called first, unconditionally, before anything
+        # about THIS bucket's own fate is decided.
+        _cvd_ingest_trade(asset, ts, price, qty, is_buy)
+
         bucket_ts = int(ts // FOOTPRINT_BAR_SECS) * FOOTPRINT_BAR_SECS
         with self.lock:
             bar = self.bars[asset]
@@ -6360,6 +6384,524 @@ def _drift_load_historical(asset, date_str):
         hist_state.status = f"no log found for {date_str}"
     DRIFT_HIST_STATE[asset] = hist_state
 
+# ── CVD — ported from cvd.py ─────────────────────────────────────────────────
+# Dual-panel OHLC price + Cumulative Volume Delta candlestick chart, ETH and
+# QQQ tracked simultaneously and always-on. 2026-08-16 user-confirmed
+# deviations from cvd.py's own literal design: tracks both assets at once
+# (not cvd.py's own one-symbol-with-[S]-switch model), reuses Athena's own
+# [X]-toggle crosshair/scroll convention (not cvd.py's own arrows-auto-
+# activate-a-crosshair model), resets automatically each day (cvd.py's own
+# CVD total is an explicit "never-reset running sum" — only [Z] rebases it
+# manually) — QQQ at calendar midnight (00:00 CT), ETH at 19:00 CT instead
+# (2026-08-17 user correction: crypto trades 24/7, so calendar midnight has
+# no real session meaning for it; 19:00 CT is the SAME boundary
+# _trading_day_key/_bj_reset_window_key already use elsewhere in this file
+# for ETH's own "trading day" concept — see _cvd_session_date_str), and
+# adds a genuinely new tick-bar mode (closes every N raw trade prints)
+# alongside cvd.py's own time/volume bar modes.
+#
+# ZERO new exchange connections needed: Athena already runs every feed
+# cvd.py itself uses — _phemex_trade_ws/_kraken_trade_ws/_coinbase_trade_ws
+# (ETH's Phemex+Kraken+Coinbase aggregate) and _alpaca_trade_ws (QQQ's real
+# IEX feed) all already call LiveTape.ingest() for the footprint charts.
+# CVD hooks into that exact same stream via the _cvd_ingest_trade() call
+# LiveTape.ingest() now makes first, before any footprint-specific bucket
+# logic runs (see that call site's own comment) — CVD is a second,
+# completely independent consumer of the same trade prints, never touching
+# footprint's own state.
+#
+# Backfills from each asset's own session start (2026-08-17 user request)
+# on startup, reusing _fetch_footprint_trades_range directly — zero new
+# fetchers. This DOES
+# replay historical REST trades through the same _cvd_ingest_trade() hook
+# the ALREADY-RUNNING live feeds also call, which would otherwise race a
+# concurrently-arriving live trade for the same asset (double-counting, or
+# corrupting bucket order) — unlike footprint.py's own backfill-then-feeds
+# sequencing, CVD can't defer the SHARED live feed threads without also
+# delaying footprint. Solved instead with a buffer: while a backfill is in
+# flight for an asset, _cvd_ingest_trade queues incoming live trades rather
+# than processing them, and _cvd_backfill_then_ready drains that queue, in
+# order, right after its own REST fetch completes — see both functions'
+# own docstrings. Resumes whatever bar interval was last used today
+# (_cvd_infer_last_interval) and only the last-persisted log's own GAP is
+# actually backfilled (same "resume beats refetch" precedent Net
+# Drift/Volatility Drift already use), not a full re-fetch every restart.
+# Likewise dropped: [G] Goto + infinite backward REST scrollback (cvd.py's
+# own one continuous never-resetting timeline) — incompatible with a daily
+# reset; [H] browsing a past day's own separate log (below) is the
+# replacement, same as Net Drift/Volatility Drift.
+CVD_ASSETS = ("ETH", "QQQ")
+CVD_AXIS_W = 12   # right-side price/CVD axis label gutter — module constant (not a
+                  # draw_cvd local) so the key handler can compute the same visible-
+                  # bar-count estimate draw_cvd itself uses, for crosshair clamping.
+CVD_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "cvd_logs")
+
+class _CvdState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.history = []           # closed bars for the CURRENT session only
+        self.live = None            # currently-forming bar
+        self.raw_cvd = 0.0          # resets to 0.0 at every daily session rollover
+                                     # (see _cvd_session_date_str — 00:00 CT for QQQ, 19:00 CT for ETH)
+        self.cvd_offset = 0.0       # [Z] — manual in-session rebase, same meaning as cvd.py's own
+        self.bar_label = "1m"
+        self.bar_mode = "time"      # "time" | "volume" | "tick"
+        self.bar_secs = 60
+        self.vol_threshold = None
+        self.tick_threshold = None  # NEW — not in cvd.py
+        self.last_day = None        # MM_DD_YYYY — detects the midnight rollover
+        self.log_rows = 0
+        self.log_err = None
+        self.last_price = None
+        # 2026-08-17 user-requested backfill-from-00:00-CT support — see
+        # _cvd_backfill_then_ready's own docstring for the full mechanism.
+        # While buffering is True, _cvd_ingest_trade diverts incoming LIVE
+        # trades into `buffer` instead of processing them immediately, so a
+        # REST backfill in flight can't race a live trade for the same
+        # asset (double-counting or corrupting bucket order) — the buffer
+        # is drained, in order, right after the backfill's own REST fetch
+        # completes.
+        self.buffering = False
+        self.buffer = []
+
+CVD_STATE = {a: _CvdState() for a in CVD_ASSETS}
+CVD_READY = {a: threading.Event() for a in CVD_ASSETS}   # loading screen
+CVD_HIST_STATE = {}   # asset -> read-only _CvdState snapshot loaded via [H]
+
+CVD_INTERVAL_SECS = {
+    "1s": 1, "5s": 5, "15s": 15, "30s": 30,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "1H": 3600,
+}
+
+def _cvd_parse_interval(raw):
+    """Same syntax as cvd.py's own parse_interval (time label, or a volume
+    bar like "500V"), PLUS a new "<N>T" tick-bar suffix (closes every N raw
+    trade prints — confirmed with the user as an intentional addition
+    beyond cvd.py's own two bar types). Returns (label, mode, secs,
+    vol_threshold, tick_threshold), or None if invalid."""
+    if raw in CVD_INTERVAL_SECS:
+        return raw, "time", CVD_INTERVAL_SECS[raw], None, None
+    if raw and raw[-1] in "vV" and raw[:-1].replace(".", "", 1).isdigit():
+        return raw[:-1] + "V", "volume", None, float(raw[:-1]), None
+    if raw and raw[-1] in "tT" and raw[:-1].isdigit():
+        return raw[:-1] + "T", "tick", None, None, int(raw[:-1])
+    return None
+
+def _cvd_date_folder(asset, date_str):
+    mm, dd, yyyy = date_str.split("_")
+    folder = os.path.join(CVD_LOG_DIR_BASE, asset, yyyy, mm, dd)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _cvd_log_path(asset, date_str, bar_label):
+    return os.path.join(_cvd_date_folder(asset, date_str), f"cvd_{bar_label}.jsonl")
+
+def _cvd_append_log(asset, date_str, bar_label, bar):
+    try:
+        with open(_cvd_log_path(asset, date_str, bar_label), "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": bar["ts"], "o": bar["o"], "h": bar["h"], "l": bar["l"], "c": bar["c"],
+                "buy_vol": bar["buy_vol"], "sell_vol": bar["sell_vol"], "delta": bar["delta"],
+                "cvd": bar["cvd"], "cvd_open": bar["cvd_open"],
+                "cvd_high": bar["cvd_high"], "cvd_low": bar["cvd_low"],
+            }) + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)[:60]
+
+def _cvd_load_log(asset, date_str, bar_label):
+    path = _cvd_log_path(asset, date_str, bar_label)
+    bars = []
+    if not os.path.exists(path):
+        return bars
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                bars.append(json.loads(line))
+            except Exception:
+                continue
+    return bars
+
+def _cvd_new_bar(ts, price, cvd_open):
+    """Verbatim port of cvd.py's own _new_bar — cvd_open carries the running
+    displayed CVD over from the previous bar's close, making the CVD panel
+    a proper OHLC candle series, mirroring the price panel exactly."""
+    return {"ts": ts, "o": price, "h": price, "l": price, "c": price,
+            "buy_vol": 0.0, "sell_vol": 0.0, "delta": 0.0,
+            "cvd_open": cvd_open, "cvd_high": cvd_open, "cvd_low": cvd_open, "cvd": cvd_open}
+
+def _cvd_session_date_str(asset, now=None):
+    """Which daily CVD reset window `now` falls into, as an MM_DD_YYYY
+    string — 2026-08-17 user correction: "CVD should reset at 19:00 CT each
+    day for ETH. QQQ is fine the way it is [00:00 CT]." Crypto trades 24/7,
+    so calendar midnight has no real session meaning for ETH; 19:00 CT is
+    the SAME boundary _trading_day_key/_bj_reset_window_key already use
+    elsewhere in this file for ETH's own "trading day" concept — not
+    reused directly since this is CVD's own distinct rule with its own
+    distinct state, same reasoning _bj_reset_window_key's own docstring
+    gives for not reusing _trading_day_key. Naive local time, same
+    convention every other CVD/_drift/_voldrift day-boundary check in this
+    file already uses (the process's own system TZ is CT)."""
+    now = now or datetime.now()
+    if asset == "ETH" and now.hour < 19:
+        now = now - timedelta(days=1)
+    return now.strftime("%m_%d_%Y")
+
+def _cvd_session_start_ts(asset, now=None):
+    """The epoch ts of the CURRENT reset window's own start instant —
+    00:00 for QQQ, 19:00 CT for ETH — derived from _cvd_session_date_str
+    so the backfill anchor and the log-folder date always agree."""
+    now = now or datetime.now()
+    mm, dd, yyyy = _cvd_session_date_str(asset, now).split("_")
+    hour = 19 if asset == "ETH" else 0
+    return datetime(int(yyyy), int(mm), int(dd), hour, 0, 0).timestamp()
+
+def _cvd_session_label(asset):
+    """User-facing text for CVD's own reset/backfill anchor — see
+    _cvd_session_date_str's own docstring for why ETH and QQQ differ."""
+    return "19:00 CT" if asset == "ETH" else "00:00 CT"
+
+def _cvd_maybe_reset_for_new_day(state, asset):
+    """Daily reset (per-asset boundary — see _cvd_session_date_str) — must
+    be called on every ingest, with state.lock already held. Same
+    convention as _drift_maybe_reset_for_new_day (this file's own
+    established day-boundary check), but CVD's own reset is a hard
+    requirement of this feature (cvd.py's own CVD is an explicit
+    NEVER-reset running sum — this is the one deliberate behavioral
+    deviation the user asked for): closes out any live bar into the
+    PREVIOUS session's own log first (via state.last_day, not yet
+    overwritten at that point), then zeroes history/raw_cvd/cvd_offset for
+    the fresh session. Returns True if a reset just happened."""
+    today = _cvd_session_date_str(asset)
+    rolled = state.last_day is not None and today != state.last_day
+    if rolled:
+        if state.live is not None:
+            _cvd_close_live(state, asset)
+        state.history = []
+        state.raw_cvd = 0.0
+        state.cvd_offset = 0.0
+        state.log_rows = 0
+        state.log_err = None
+    state.last_day = today
+    return rolled
+
+def _cvd_close_live(state, asset):
+    """Finalize state.live into history + the current session's own log.
+    Caller holds state.lock and replaces/clears state.live afterward. Uses
+    state.last_day (not a freshly-computed "now") specifically so the ONE
+    call site inside _cvd_maybe_reset_for_new_day's own rollover — where
+    wall-clock time has already crossed into the NEW session but the bar
+    being closed still belongs to the OLD one — files it under the correct
+    (old) session's log rather than misattributing it to the new day."""
+    live = state.live
+    state.history.append(live)
+    date_str = state.last_day or _cvd_session_date_str(asset)
+    ok, err = _cvd_append_log(asset, date_str, state.bar_label, live)
+    if ok:
+        state.log_rows += 1
+        state.log_err = None
+    else:
+        state.log_err = err
+
+def _cvd_ingest_trade_locked(state, asset, ts, price, qty, is_buy):
+    """The actual bucketing logic (time/volume/tick), factored out of
+    _cvd_ingest_trade so both the live wrapper AND backfill/buffer replay
+    (_cvd_backfill_then_ready) can drive it — caller already holds
+    state.lock. Direct port of cvd.py's own ingest_trade(), plus the new
+    "tick" bar mode (closes once the live bar has seen tick_threshold raw
+    prints, mirroring the existing volume-threshold branch's shape)."""
+    live = state.live
+    cvd_open = state.raw_cvd - state.cvd_offset
+
+    if state.bar_mode == "time":
+        bucket_ts = int(ts // state.bar_secs * state.bar_secs)
+        if live is None:
+            state.live = _cvd_new_bar(bucket_ts, price, cvd_open)
+            live = state.live
+        elif bucket_ts > live["ts"]:
+            _cvd_close_live(state, asset)
+            state.live = _cvd_new_bar(bucket_ts, price, cvd_open)
+            live = state.live
+        elif bucket_ts < live["ts"]:
+            return   # late/out-of-order print for an already-closed bucket
+    else:
+        if live is None:
+            state.live = _cvd_new_bar(ts, price, cvd_open)
+            live = state.live
+
+    live["h"] = max(live["h"], price)
+    live["l"] = min(live["l"], price)
+    live["c"] = price
+    if is_buy:
+        live["buy_vol"] += qty
+        state.raw_cvd += qty
+    else:
+        live["sell_vol"] += qty
+        state.raw_cvd -= qty
+    live["delta"] = live["buy_vol"] - live["sell_vol"]
+    state.last_price = price
+
+    disp_cvd = state.raw_cvd - state.cvd_offset
+    live["cvd"] = disp_cvd
+    live["cvd_high"] = max(live["cvd_high"], disp_cvd)
+    live["cvd_low"] = min(live["cvd_low"], disp_cvd)
+
+    if state.bar_mode == "volume" and (live["buy_vol"] + live["sell_vol"]) >= state.vol_threshold:
+        _cvd_close_live(state, asset)
+        state.live = None
+    elif state.bar_mode == "tick":
+        live["_tick_count"] = live.get("_tick_count", 0) + 1
+        if live["_tick_count"] >= state.tick_threshold:
+            _cvd_close_live(state, asset)
+            state.live = None
+
+def _cvd_ingest_trade(asset, ts, price, qty, is_buy):
+    """The CVD hook — called from LiveTape.ingest() for every trade print
+    from every live feed (Phemex/Kraken/Coinbase for ETH, Alpaca for QQQ),
+    completely independent of footprint's own bucketing. While a backfill
+    is in flight for this asset (state.buffering — see
+    _cvd_backfill_then_ready), incoming live trades are queued rather than
+    processed immediately, so the backfill's own REST fetch can't race a
+    live trade for the same asset."""
+    state = CVD_STATE.get(asset)
+    if state is None:
+        return
+    with state.lock:
+        if state.buffering:
+            state.buffer.append((ts, price, qty, is_buy))
+            return
+        _cvd_maybe_reset_for_new_day(state, asset)
+        _cvd_ingest_trade_locked(state, asset, ts, price, qty, is_buy)
+
+def _cvd_infer_last_interval(asset, date_str):
+    """2026-08-17 user request: CVD should resume with whatever bar
+    interval the user was last using, across a restart — not always reset
+    to the hardcoded default. Inferred from whichever cvd_<label>.jsonl log
+    file already exists for today (most recently modified, if somehow more
+    than one) rather than a separate settings file, since the log filename
+    itself already records the label. Returns a parsed interval tuple, or
+    None when there's no log yet (a genuinely fresh day)."""
+    folder = _cvd_date_folder(asset, date_str)
+    try:
+        candidates = [f for f in os.listdir(folder) if f.startswith("cvd_") and f.endswith(".jsonl")]
+    except Exception:
+        candidates = []
+    if not candidates:
+        return None
+    candidates.sort(key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True)
+    label = candidates[0][len("cvd_"):-len(".jsonl")]
+    return _cvd_parse_interval(label)
+
+def _cvd_backfill_for_spec(asset, bar_label, bar_mode, bar_secs, vol_th, tick_th):
+    """Shared backfill worker — (re)loads CVD for `asset` from its own
+    session start (00:00 CT for QQQ, 19:00 CT for ETH — see
+    _cvd_session_date_str) for the given bar spec, race-safely via the
+    buffering mechanism (see _cvd_ingest_trade's own docstring). Used both
+    at startup (_cvd_backfill_then_ready, spec inferred from today's
+    last-used log) AND on every [I] interval change (2026-08-17 user
+    request: "CVD should always load from [session start] when the user
+    changes the interval so the whole day's data is able to be seen or
+    scrolled to" — previously [I] just wiped history and rebuilt forward
+    from the moment of the switch, which is why the chart could only ever
+    scroll back to whenever the user last changed interval). Always
+    resumes today's own already-persisted log for THIS bar_label when one
+    exists (only backfilling the gap since its last bar) rather than a
+    full re-fetch — same "resume beats refetch" precedent as footprint's
+    own backfill — which also makes switching back and forth between a few
+    interval choices in one session cheap after the first fetch of each.
+    Reuses _fetch_footprint_trades_range directly — zero new fetchers, see
+    this section's own header comment. Rebuilds state.history from scratch
+    (discarding whatever spec was previously loaded), since bars from a
+    different bar_label aren't valid to keep. Returns (trades_fetched,
+    resumed_bars)."""
+    state = CVD_STATE[asset]
+    date_str = _cvd_session_date_str(asset)
+
+    with state.lock:
+        state.last_day = date_str
+        state.bar_label, state.bar_mode = bar_label, bar_mode
+        state.bar_secs = bar_secs or 60
+        state.vol_threshold = vol_th
+        state.tick_threshold = tick_th
+        state.buffering = True
+        state.buffer = []
+        state.live = None
+        state.history = []
+        state.raw_cvd = 0.0
+        state.cvd_offset = 0.0
+        state.log_rows = 0
+
+    t_start = time.time()
+    since_ts = _cvd_session_start_ts(asset)
+
+    existing = _cvd_load_log(asset, date_str, bar_label)
+    if existing:
+        since_ts = max(since_ts, existing[-1]["ts"] + 1)
+
+    trades = []
+    if since_ts < t_start:
+        try:
+            deadline = time.time() + CVD_BACKFILL_BUDGET_SECS
+            trades = _fetch_footprint_trades_range(asset, since_ts, t_start, deadline=deadline)
+        except Exception as e:
+            console_log(f"{asset}: CVD backfill failed ({e}) — starting from today's log only")
+
+    with state.lock:
+        if existing:
+            state.history = existing
+            state.raw_cvd = existing[-1]["cvd"]
+            state.log_rows = len(existing)
+        for ts, price, qty, is_buy in trades:
+            _cvd_ingest_trade_locked(state, asset, ts, price, qty, is_buy)
+        buffered = state.buffer
+        state.buffer = []
+        state.buffering = False
+        # Only replay buffered trades that arrived AT OR AFTER t_start — the
+        # backfill above already covers everything strictly before it, so
+        # this is the non-overlapping partition that keeps every trade
+        # counted exactly once (see this function's own docstring).
+        for ts, price, qty, is_buy in buffered:
+            if ts >= t_start:
+                _cvd_ingest_trade_locked(state, asset, ts, price, qty, is_buy)
+    return len(trades), len(existing)
+
+def _cvd_backfill_then_ready(asset):
+    """On startup: backfill CVD from its own session start (00:00 CT for
+    QQQ, 19:00 CT for ETH — see _cvd_session_date_str) using whichever bar
+    interval the user was last using today (_cvd_infer_last_interval), not
+    always the hardcoded default. CVD_READY is only set once the backfill
+    (+ drained live-trade buffer) has actually landed, so the loading
+    screen's own "CVD engines" line doesn't flip to [OK] prematurely. See
+    _cvd_backfill_for_spec (this function's own worker) for the mechanism."""
+    state = CVD_STATE[asset]
+    date_str = _cvd_session_date_str(asset)
+    inferred = _cvd_infer_last_interval(asset, date_str)
+    if inferred is not None:
+        label, mode, secs, vol_th, tick_th = inferred
+    else:
+        label, mode, secs, vol_th, tick_th = state.bar_label, state.bar_mode, state.bar_secs, None, None
+
+    n_trades, n_resumed = _cvd_backfill_for_spec(asset, label, mode, secs, vol_th, tick_th)
+    CVD_READY[asset].set()
+    src = "Kraken+Coinbase" if asset == "ETH" else "Alpaca (IEX)"
+    console_log(f"{asset}: CVD backfilled {n_trades} {src} trades + resumed {n_resumed} bars "
+                f"since {_cvd_session_label(asset)} (bar: {label})")
+
+def _cvd_load_historical(asset, date_str, bar_label):
+    """[H]: load a past day's own separate log into a standalone read-only
+    snapshot — same convention as _drift_load_historical. Does NOT touch
+    CVD_STATE[asset]; the live hook keeps accumulating today's real session
+    regardless."""
+    bars = _cvd_load_log(asset, date_str, bar_label)
+    hist = _CvdState()
+    hist.bar_label = bar_label
+    if bars:
+        hist.history = bars
+        hist.raw_cvd = bars[-1]["cvd"]
+        hist.log_rows = len(bars)
+    CVD_HIST_STATE[asset] = hist
+    return bool(bars)
+
+# ── CVD Big Trade Detector (recreated from chart.py via cvd.py) ────────────
+CVD_BTD_LOOKBACK = 10
+CVD_BTD_SIGMA = 3.0
+
+def _cvd_compute_btd_signals(bars, lookback=CVD_BTD_LOOKBACK, sigma=CVD_BTD_SIGMA):
+    """Verbatim port of cvd.py's own compute_btd_signals — see its own
+    docstring there for why this uses chart.py's candle-shape-derived
+    buy/sell intensity proxy rather than CVD's own real per-side volume
+    (empirically far better-behaved as a rolling-baseline input)."""
+    buy_iv, sell_iv = [], []
+    for b in bars:
+        rng = b["h"] - b["l"]
+        vol = b["buy_vol"] + b["sell_vol"]
+        if rng > 0:
+            buy_iv.append((b["c"] - b["l"]) / rng * vol)
+            sell_iv.append((b["h"] - b["c"]) / rng * vol)
+        else:
+            buy_iv.append(0.0)
+            sell_iv.append(0.0)
+    signals = {}
+    n = len(bars)
+    for i in range(lookback, n):
+        wb = buy_iv[i - lookback:i]
+        ws = sell_iv[i - lookback:i]
+        m = len(wb)
+        if m < 2:
+            continue
+        mb, ms = sum(wb) / m, sum(ws) / m
+        sdb = (sum((x - mb) ** 2 for x in wb) / (m - 1)) ** 0.5
+        sds = (sum((x - ms) ** 2 for x in ws) / (m - 1)) ** 0.5
+        cb, cs = buy_iv[i], sell_iv[i]
+        entry = {}
+        t1b, t2b, t3b = mb + sdb * sigma, mb + sdb * (sigma + 1.5), mb + sdb * (sigma + 3.0)
+        if cb > t1b:
+            entry["buy"] = 3 if cb > t3b else (2 if cb > t2b else 1)
+        t1s, t2s, t3s = ms + sds * sigma, ms + sds * (sigma + 1.5), ms + sds * (sigma + 3.0)
+        if cs > t1s:
+            entry["sell"] = 3 if cs > t3s else (2 if cs > t2s else 1)
+        if entry:
+            signals[i] = entry
+    return signals
+
+# ── CVD zoom — [+]/[-] merges N real bars into 1 displayed candle ──────────
+CVD_ZOOM_MAX_GROUP = 500
+
+def _cvd_merge_bars(group):
+    """Verbatim port of cvd.py's own merge_bars."""
+    if len(group) == 1:
+        return group[0]
+    o, c = group[0]["o"], group[-1]["c"]
+    h = max(b["h"] for b in group)
+    l = min(b["l"] for b in group)
+    buy_vol = sum(b["buy_vol"] for b in group)
+    sell_vol = sum(b["sell_vol"] for b in group)
+    cvd_open = group[0].get("cvd_open", group[0].get("cvd", 0.0))
+    cvd = group[-1].get("cvd", cvd_open)
+    cvd_high = max(b.get("cvd_high", b.get("cvd", cvd_open)) for b in group)
+    cvd_low = min(b.get("cvd_low", b.get("cvd", cvd_open)) for b in group)
+    return {"ts": group[0]["ts"], "o": o, "h": h, "l": l, "c": c,
+            "buy_vol": buy_vol, "sell_vol": sell_vol, "delta": buy_vol - sell_vol,
+            "cvd_open": cvd_open, "cvd_high": cvd_high, "cvd_low": cvd_low, "cvd": cvd}
+
+def _cvd_zoom_bars(all_bars, group_size):
+    if group_size <= 1 or not all_bars:
+        return all_bars
+    return [_cvd_merge_bars(all_bars[i:i + group_size]) for i in range(0, len(all_bars), group_size)]
+
+def _cvd_zoom_step(size, direction):
+    if direction > 0:
+        return min(CVD_ZOOM_MAX_GROUP, size + max(1, size // 3) + 1)
+    return max(1, size - max(1, size // 4) - 1)
+
+def _cvd_fmt_qty(q):
+    if abs(q) >= 1000:
+        return f"{q/1000:,.1f}k"
+    return f"{q:,.2f}"
+
+def _cvd_fmt_time(ts, bar_mode, bar_secs):
+    fine = bar_mode in ("volume", "tick") or (bar_mode == "time" and bar_secs < 60)
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S" if fine else "%H:%M")
+
+def _cvd_fmt_bar_progress(state):
+    """Status-header text for how close the currently-forming bar is to
+    closing — countdown for time bars, accumulated/threshold ratio for
+    volume bars, tick count/threshold for tick bars. None if no live bar."""
+    live = state.live
+    if live is None:
+        return None
+    if state.bar_mode == "time":
+        remaining = max(0, (live["ts"] + state.bar_secs) - time.time())
+        mins, secs = divmod(int(remaining), 60)
+        return f"closes in {mins}:{secs:02d}"
+    if state.bar_mode == "volume":
+        accumulated = live["buy_vol"] + live["sell_vol"]
+        return f"{_cvd_fmt_qty(accumulated)} / {state.vol_threshold:g}"
+    return f"{live.get('_tick_count', 0)} / {state.tick_threshold} ticks"
+
 # ── Volatility Drift — ported from vol-drift.py ─────────────────────────────
 # Realized volatility (ARV, measured directly from price action) plotted
 # against at-the-money implied volatility (read from the nearest-ATM
@@ -10018,6 +10560,15 @@ def init_curses_colors():
     curses.init_pair(P_BLUE,    curses.COLOR_BLUE,   BG)
     curses.init_pair(P_MAGENTA, curses.COLOR_MAGENTA, BG)
 
+# CVD [C] candle color scheme — must sit after the P_* pairs above are
+# actually defined (a module-level dict literal referencing them any
+# earlier in the file raises NameError at import time, before
+# init_curses_colors() even runs).
+CVD_CANDLE_COLORS = {
+    "green_red":  {"up": P_GREEN,   "down": P_RED},
+    "blue_white": {"up": P_DEFAULT, "down": P_BLUE},
+}
+
 _ANSI_RE = re.compile(r'(\033\[[0-9;]*m)')
 
 def ansi_segments(s):
@@ -10056,10 +10607,9 @@ CLOSE_MARKER = "●"
 VP_BLOCK_FULL = "█"
 VP_GHOST_CH = "|"
 CROSSHAIR_LINE_CH = "│"   # [Z]/[X] crosshair vertical line — matches footprint.py's own
-IMBALANCE_RATIO = 3.0
+IMBALANCE_RATIO = {"ETH": 3.0, "QQQ": 5.0}   # 2026-08-17 user request — per-asset now, was one shared 3.0
 MIN_IMBALANCE_VOL = 0.0
 STACK_COUNT = 3
-BIG_TRADE_SIZE = 100.0
 PROFILE_MODES = ("volume", "delta", "ohlc", "off")
 DASHBOARD_H = 25   # fixed row budget so the chart region's top edge never
                    # jitters cycle to cycle regardless of how much optional
@@ -10083,30 +10633,37 @@ CHART_HISTORY_BARS = 300   # how much bar history AppState loads so [<-]/[->]
                            # draw_footprint_panel only ever shows a small
                            # visible window sliced out of this
 
-def compute_imbalances(levels, ratio=IMBALANCE_RATIO, min_vol=MIN_IMBALANCE_VOL):
-    """Ported verbatim from footprint.py: diagonal footprint imbalance —
-    ask volume at level L vs bid volume one tick below (buy imbalance), or
-    bid at L vs ask one tick above (sell imbalance)."""
-    out = {}
+def compute_imbalances(levels, ratio=3.0, min_vol=MIN_IMBALANCE_VOL):
+    """Diagonal footprint imbalance — ask volume at level L vs bid volume
+    one tick below (buy imbalance), or bid at L vs ask one tick above (sell
+    imbalance). 2026-08-16 user-clarified with a worked example ("if the
+    volume at 2 price levels are 3x10 and 30x1, the imbalanced number would
+    be 30 and would be colored green, all other numbers remain white unless
+    THEY independently qualify against their own adjacent level"): buy and
+    sell are checked and returned INDEPENDENTLY per level — a level's ask
+    and bid can each separately qualify (or not), rather than one picking
+    a single winning direction for the whole level the way an earlier
+    version of this function did (that version's `buy_ok and sell_ok ->
+    pick whichever ratio is bigger` tie-break silently dropped a second,
+    equally real, simultaneous imbalance on the other side of the same
+    level — exactly the over-coloring the user was seeing, compounded by
+    the caller then coloring the WHOLE bid x ask cell text one color
+    instead of just the qualifying number). Returns (buy_levels,
+    sell_levels) — two sets of raw tick levels."""
+    buy_levels, sell_levels = set(), set()
     for lvl, cell in levels.items():
         bid, ask = cell[0], cell[1]
         below_cell = levels.get(lvl - 1)
         above_cell = levels.get(lvl + 1)
         below_bid = below_cell[0] if below_cell is not None else None
         above_ask = above_cell[1] if above_cell is not None else None
-        buy_ok = (ask > 0 and ask >= min_vol and below_bid is not None
-                  and (below_bid == 0 or ask / below_bid >= ratio))
-        sell_ok = (bid > 0 and bid >= min_vol and above_ask is not None
-                   and (above_ask == 0 or bid / above_ask >= ratio))
-        if buy_ok and sell_ok:
-            r_buy = ask / below_bid if below_bid else float("inf")
-            r_sell = bid / above_ask if above_ask else float("inf")
-            out[lvl] = "buy" if r_buy >= r_sell else "sell"
-        elif buy_ok:
-            out[lvl] = "buy"
-        elif sell_ok:
-            out[lvl] = "sell"
-    return out
+        if (ask > 0 and ask >= min_vol and below_bid is not None
+                and (below_bid == 0 or ask / below_bid >= ratio)):
+            buy_levels.add(lvl)
+        if (bid > 0 and bid >= min_vol and above_ask is not None
+                and (above_ask == 0 or bid / above_ask >= ratio)):
+            sell_levels.add(lvl)
+    return buy_levels, sell_levels
 
 def compute_stacks(imbalances, stack_count=STACK_COUNT):
     """Ported verbatim from footprint.py: consecutive tick levels flagged
@@ -10490,23 +11047,47 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                 # forces group_size much past 1), but this fix applies to
                 # both assets uniformly since the underlying bug wasn't
                 # ETH-specific, just far more visible there.
-                raw_imbalances = compute_imbalances(levels)
-                group_imbalance = {}
-                for raw_lvl, direction in raw_imbalances.items():
-                    group_imbalance[raw_lvl // group_size] = direction
+                raw_buy_lvls, raw_sell_lvls = compute_imbalances(levels, ratio=IMBALANCE_RATIO.get(asset, 3.0))
+                group_buy = set(raw_lvl // group_size for raw_lvl in raw_buy_lvls)
+                group_sell = set(raw_lvl // group_size for raw_lvl in raw_sell_lvls)
                 for g, cell in display_levels.items():
                     r_i = group_to_row.get(g)
                     if r_i is None:
                         continue
                     row_y = top + r_i
                     bid, ask = cell[0], cell[1]
-                    txt = f"{fmt_lvl_qty(bid)}x{fmt_lvl_qty(ask)}"[:cell_w]
-                    direction = group_imbalance.get(g)
-                    if direction == "sell": pair, attrs = P_RED, curses.A_BOLD
-                    elif direction == "buy": pair, attrs = P_GREEN, curses.A_BOLD
-                    elif bid >= BIG_TRADE_SIZE or ask >= BIG_TRADE_SIZE: pair, attrs = P_CYAN, curses.A_BOLD
-                    else: pair, attrs = P_DEFAULT, 0
-                    db.puts(row_y, cx + 1, txt.center(cell_w), pair, attrs)
+                    bid_str, ask_str = fmt_lvl_qty(bid), fmt_lvl_qty(ask)
+                    full_txt = f"{bid_str}x{ask_str}"
+                    txt = full_txt[:cell_w]
+                    # 2026-08-16 user-clarified with a worked example: only
+                    # the SPECIFIC number that's actually diagonally
+                    # imbalanced gets colored (bid red if it's a sell
+                    # imbalance, ask green if it's a buy imbalance) — bid
+                    # and ask are independent, so a level can show one, the
+                    # other, both, or neither colored, never the whole
+                    # "bidxask" text painted one color the way a single
+                    # per-level winning `direction` used to (see
+                    # compute_imbalances' own docstring for why that was
+                    # wrong). BIG_TRADE_SIZE's old third cyan category is
+                    # also gone (2026-08-16, previous turn) — only genuine
+                    # imbalances get color, everything else is P_DEFAULT.
+                    # (The raw-tick-vs-grouped DETECTION itself, just above,
+                    # is untouched — a separate, deliberate 2026-07-25 fix.)
+                    bid_len = len(bid_str)
+                    seg_bid, seg_x, seg_ask = txt[:bid_len], txt[bid_len:bid_len + 1], txt[bid_len + 1:]
+                    centered = txt.center(cell_w)
+                    left_pad = len(centered) - len(centered.lstrip(" "))
+                    xx = cx + 1 + left_pad
+                    if seg_bid:
+                        pair, attrs = (P_RED, curses.A_BOLD) if g in group_sell else (P_DEFAULT, 0)
+                        db.puts(row_y, xx, seg_bid, pair, attrs)
+                        xx += len(seg_bid)
+                    if seg_x:
+                        db.puts(row_y, xx, seg_x, P_DEFAULT, 0)
+                        xx += len(seg_x)
+                    if seg_ask:
+                        pair, attrs = (P_GREEN, curses.A_BOLD) if g in group_buy else (P_DEFAULT, 0)
+                        db.puts(row_y, xx, seg_ask, pair, attrs)
                     if g == poc_g:
                         db.put(row_y, cx, POC_MARKER, P_YELLOW, curses.A_BOLD)
 
@@ -12037,7 +12618,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  Esc=dashboard  M=next(Status)  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" q=quit  Esc=dashboard  M=next(Status) K=back(Trading)  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -12154,7 +12735,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-    hint = (f" q=quit  Esc=dashboard  M=next(Status)  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
+    hint = (f" q=quit  Esc=dashboard  M=next(Status) K=back(Trading)  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
             f"g=by-strike  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
@@ -12199,7 +12780,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  Esc=dashboard  M=next(Status)  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" q=quit  Esc=dashboard  M=next(Status) K=back(Trading)  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -12324,7 +12905,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-    hint = (f" q=quit  Esc=dashboard  M=next(Status)  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
+    hint = (f" q=quit  Esc=dashboard  M=next(Status) K=back(Trading)  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
             f"g=interval map  n=net/separate  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
@@ -13707,7 +14288,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
     if not lines:
         msg = "Waiting for first status snapshot…"
         db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg[:w], P_CYAN)
-        hint = " q=quit  Esc=dashboard  M=next(Trading) "
+        hint = " q=quit  Esc=dashboard  M=next(Trading)  K=back(Chain) "
         db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
         return 0
 
@@ -13717,7 +14298,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
         db.puts_ansi(y0 + i, x0, line[:w])
 
     scroll_tag = f"  [{scroll + 1}-{min(total, scroll + visible_rows)} of {total}]" if total > visible_rows else ""
-    hint = f" q=quit  Esc=dashboard  M=next(Trading)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
+    hint = f" q=quit  Esc=dashboard  M=next(Trading)  K=back(Chain)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
     db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
     return scroll
 
@@ -14022,10 +14603,257 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
     vol_str = "   bottom: Net Vol" if net_volume_mode else "   bottom: Volume"
     ch_hint = " [X]:crosshair-ON" if ch_col is not None else " [X]:crosshair"
     footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint}{ch_hint} "
-              f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
+              f"[L]ive [R]efresh Esc/[M]exit [K]back [Q]uit    "
               f"poll {interval}s   {_drift_fmt_duration(bar_interval)} bars   {min_str}{dz_str}{filt_str}{vol_str}    "
               f"{countdown}    last update {last_str} ")
     db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
+    return view_offset
+
+# ── CVD chart rendering — port of cvd.py's own draw()/draw_candles() ───────
+def _cvd_draw_candles(db, row_top, row_bot, x0, visible, ohlc_fn, plot_w, zero_line=False,
+                       cursor_idx=-1, fmt_fn=None, btd_signals=None, live_price=None,
+                       color_scheme="green_red"):
+    """Shared OHLC candlestick renderer for both the price and CVD panels —
+    port of cvd.py's own draw_candles(), db.put/db.puts replacing
+    win.addstr/_shadow_put (DoubleBuffer already tracks exactly what
+    _shadow_put existed to track, so no separate shadow buffer is needed).
+    Returns (vmin, vmax, live_row)."""
+    rows = list(range(row_top, row_bot + 1))
+    n_rows = len(rows)
+    highs = [ohlc_fn(b)[1] for b in visible]
+    lows = [ohlc_fn(b)[2] for b in visible]
+    vmax, vmin = max(highs), min(lows)
+    if vmax == vmin:
+        vmax += 1e-9
+
+    def to_row(v):
+        frac = (v - vmin) / (vmax - vmin)
+        r = int(round((1 - frac) * (n_rows - 1)))
+        return rows[max(0, min(n_rows - 1, r))]
+
+    live_row = to_row(live_price) if (live_price is not None and vmin <= live_price <= vmax) else None
+
+    if zero_line and vmin <= 0.0 <= vmax:
+        db.puts(to_row(0.0), x0, "·" * max(1, plot_w), P_DIM)
+
+    occupied = set()
+    cursor_row = cursor_val = None
+    scheme = CVD_CANDLE_COLORS[color_scheme]
+    for i, b in enumerate(visible):
+        o, hi, lo, c = ohlc_fn(b)
+        r_hi, r_lo, r_op, r_cl = to_row(hi), to_row(lo), to_row(o), to_row(c)
+        is_cursor = (i == cursor_idx)
+        up = c >= o
+        pair = P_YELLOW if is_cursor else (scheme["up"] if up else scheme["down"])
+        cx = x0 + i
+        for r in range(r_hi, r_lo + 1):
+            db.put(r, cx, "│", P_DIM)
+            occupied.add((r, cx))
+        body_top, body_bot = min(r_op, r_cl), max(r_op, r_cl)
+        for r in range(body_top, body_bot + 1):
+            db.put(r, cx, "█", pair, curses.A_BOLD)
+            occupied.add((r, cx))
+        if body_top == body_bot:
+            db.put(body_top, cx, "─", pair, curses.A_BOLD)
+            occupied.add((body_top, cx))
+        if is_cursor:
+            cursor_row, cursor_val = r_cl, c
+
+        if btd_signals and i in btd_signals:
+            sig = btd_signals[i]
+            rev = curses.A_BOLD | curses.A_REVERSE
+            if "buy" in sig:
+                tier = sig["buy"]
+                row_b = min(rows[-1], r_lo + 1)
+                width = 3 if tier == 3 else 1
+                for dx in range(-(width // 2), width // 2 + 1):
+                    col = x0 + i + dx
+                    if x0 <= col < x0 + plot_w and (row_b, col) not in occupied:
+                        db.put(row_b, col, "#", P_CYAN, rev)
+                        occupied.add((row_b, col))
+                        if tier >= 2 and row_b + 1 <= rows[-1] and (row_b + 1, col) not in occupied:
+                            db.put(row_b + 1, col, "#", P_CYAN, rev)
+                            occupied.add((row_b + 1, col))
+            if "sell" in sig:
+                tier = sig["sell"]
+                row_s = max(rows[0], r_hi - 1)
+                width = 3 if tier == 3 else 1
+                for dx in range(-(width // 2), width // 2 + 1):
+                    col = x0 + i + dx
+                    if x0 <= col < x0 + plot_w and (row_s, col) not in occupied:
+                        db.put(row_s, col, "#", P_MAGENTA, rev)
+                        occupied.add((row_s, col))
+                        if tier >= 2 and row_s - 1 >= rows[0] and (row_s - 1, col) not in occupied:
+                            db.put(row_s - 1, col, "#", P_MAGENTA, rev)
+                            occupied.add((row_s - 1, col))
+
+    if 0 <= cursor_idx < len(visible):
+        cxx = x0 + cursor_idx
+        for r in rows:
+            if (r, cxx) not in occupied:
+                db.put(r, cxx, ":", P_YELLOW, curses.A_DIM)
+    if cursor_row is not None:
+        for c2 in range(x0, x0 + plot_w):
+            if (cursor_row, c2) not in occupied:
+                db.put(cursor_row, c2, "-", P_YELLOW, curses.A_DIM)
+        if fmt_fn:
+            db.puts(cursor_row, x0 + plot_w + 1, fmt_fn(cursor_val), P_YELLOW, curses.A_BOLD)
+
+    if live_row is not None:
+        for c2 in range(x0, x0 + plot_w):
+            if (live_row, c2) not in occupied:
+                db.put(live_row, c2, "─", P_YELLOW, curses.A_DIM)
+        if fmt_fn:
+            db.puts(live_row, x0 + plot_w + 1, f"▶{fmt_fn(live_price)}", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+
+    return vmin, vmax, live_row
+
+def draw_cvd(db, asset, y0, y1, x0, x1, ui):
+    """CVD — port of cvd.py's own draw(), dual stacked panels (price OHLC
+    candles on top, CVD OHLC candles on bottom) sharing one time axis.
+    `ui` carries: crosshair_idx (None when [X] is off, else "columns back
+    from the right edge", same convention as drift_ui's own), zoom_group,
+    show_btd, color_scheme, view_offset ("bars scrolled back from the live
+    edge", same hscroll_bars convention the footprint charts use — 2026-08-17
+    user request: the crosshair/pan keys must be able to reach all the way
+    back through a full day's own backfilled history, not just whatever
+    fits in one screen-width of bars). Returns the (possibly edge-clamped)
+    view_offset so the caller can persist it back, same pattern draw_drift's
+    own view_offset return already uses."""
+    live = ui["live"]
+    state = CVD_STATE[asset] if live else (CVD_HIST_STATE.get(asset) or CVD_STATE[asset])
+    crosshair_idx = ui.get("crosshair_idx")
+    zoom_group = ui.get("zoom_group", 1)
+    show_btd = ui.get("show_btd", False)
+    color_scheme = ui.get("color_scheme", "green_red")
+    view_offset = ui.get("view_offset", 0)
+
+    with state.lock:
+        history = list(state.history)
+        live_bar = dict(state.live) if state.live else None
+        bar_label = state.bar_label
+        bar_mode = state.bar_mode
+        bar_secs = state.bar_secs
+        last_price = state.last_price
+        log_rows = state.log_rows
+        log_err = state.log_err
+        bar_progress = _cvd_fmt_bar_progress(state)
+        backfilling = state.buffering
+
+    h, w = y1 - y0, x1 - x0
+    zoom_tag = f"  zoom:{zoom_group}x" if zoom_group > 1 else ""
+    btd_tag = "  BTD:ON" if show_btd else ""
+    color_tag = "  colors:blue/white" if color_scheme == "blue_white" else ""
+    hist_tag = "" if live else "  (historical)"
+    progress_tag = f"  |  {bar_progress}" if bar_progress else ""
+    scroll_tag = f"  [SCROLLED {view_offset}b back]" if view_offset else ""
+    header = f" CVD — {asset}  bar:{bar_label}{zoom_tag}{btd_tag}{color_tag}{hist_tag}{scroll_tag}{progress_tag} "
+    db.puts(y0, x0, header.ljust(w)[:w], P_STATUS, curses.A_BOLD)
+
+    all_bars = history + ([live_bar] if live_bar else [])
+    if len(all_bars) < 1:
+        msg = f"backfilling from {_cvd_session_label(asset)}…" if backfilling else "waiting for trades…"
+        db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg, P_CYAN)
+        return 0
+
+    all_bars = _cvd_zoom_bars(all_bars, zoom_group)
+    btd_signals_full = _cvd_compute_btd_signals(all_bars) if show_btd else None
+
+    axis_w = CVD_AXIS_W
+    plot_w = max(1, w - axis_w)
+    total = len(all_bars)
+    view_offset = max(0, min(view_offset, max(0, total - 1)))
+    end = total - view_offset
+    n = min(end, plot_w)
+    visible = all_bars[max(0, end - n):end]
+    ch_col = None
+    if crosshair_idx is not None and 0 <= crosshair_idx < n:
+        ch_col = n - 1 - crosshair_idx
+    offset = end - n
+    btd_signals = ({i: btd_signals_full[offset + i] for i in range(n) if (offset + i) in btd_signals_full}
+                   if btd_signals_full else None)
+
+    bottom_reserved = 2
+    top = y0 + 1
+    divider_row = top + (h - 1 - bottom_reserved) * 55 // 100
+    price_top, price_bot = top, divider_row - 1
+    cvd_top, cvd_bot = divider_row + 1, y1 - 1 - bottom_reserved
+    if price_bot <= price_top or cvd_bot <= cvd_top:
+        return view_offset
+
+    db.puts(divider_row, x0, (("─" * plot_w) + " CVD ".center(axis_w, "─"))[:w], P_DIM)
+
+    def _price_ohlc(b):
+        return b["o"], b["h"], b["l"], b["c"]
+
+    pmin, pmax, live_row = _cvd_draw_candles(db, price_top, price_bot, x0, visible, _price_ohlc, plot_w,
+                                              cursor_idx=ch_col if ch_col is not None else -1, fmt_fn=fmt_price,
+                                              btd_signals=btd_signals,
+                                              live_price=last_price if view_offset == 0 else None,
+                                              color_scheme=color_scheme)
+    prows = price_bot - price_top + 1
+    for tick_frac in (0.0, 0.5, 1.0):
+        r = price_top + int(round(tick_frac * (prows - 1)))
+        if r == live_row:
+            continue
+        p = pmax - tick_frac * (pmax - pmin)
+        db.puts(r, x0 + plot_w + 1, fmt_price(p), P_DIM)
+
+    def _cvd_ohlc(b):
+        c = b["cvd"] if b.get("cvd") is not None else 0.0
+        o = b.get("cvd_open", c)
+        hi = b.get("cvd_high", max(o, c))
+        lo = b.get("cvd_low", min(o, c))
+        return o, hi, lo, c
+
+    cmin, cmax, _ = _cvd_draw_candles(db, cvd_top, cvd_bot, x0, visible, _cvd_ohlc, plot_w, zero_line=True,
+                                       cursor_idx=ch_col if ch_col is not None else -1, fmt_fn=_cvd_fmt_qty,
+                                       color_scheme=color_scheme)
+    crows = cvd_bot - cvd_top + 1
+    for tick_frac in (0.0, 0.5, 1.0):
+        r = cvd_top + int(round(tick_frac * (crows - 1)))
+        v = cmax - tick_frac * (cmax - cmin)
+        db.puts(r, x0 + plot_w + 1, _cvd_fmt_qty(v), P_DIM)
+
+    axis_row = y1 - bottom_reserved
+    lbl_w = len(_cvd_fmt_time(visible[0]["ts"], bar_mode, bar_secs))
+    step = max(lbl_w + 2, n // 6)
+    last_end = -1
+    for i in range(0, n, step):
+        if i == ch_col:
+            continue
+        lbl = _cvd_fmt_time(visible[i]["ts"], bar_mode, bar_secs)
+        xx = x0 + max(0, i - len(lbl) // 2)
+        if xx <= last_end:
+            continue
+        db.puts(axis_row, xx, lbl, P_DIM)
+        last_end = xx + len(lbl)
+    if ch_col is not None:
+        lbl = _cvd_fmt_time(visible[ch_col]["ts"], bar_mode, bar_secs)
+        db.puts(axis_row, x0 + max(0, ch_col - len(lbl) // 2), lbl, P_YELLOW, curses.A_BOLD)
+
+    if ch_col is not None:
+        sel = visible[ch_col]
+        o, hi, lo, c = _price_ohlc(sel)
+        co, ch_, cl, cc = _cvd_ohlc(sel)
+        info = (f" [{_cvd_fmt_time(sel['ts'], bar_mode, bar_secs)}] O:{fmt_price(o)} H:{fmt_price(hi)} "
+                f"L:{fmt_price(lo)} C:{fmt_price(c)}  "
+                f"CVD O:{_cvd_fmt_qty(co)} H:{_cvd_fmt_qty(ch_)} L:{_cvd_fmt_qty(cl)} C:{_cvd_fmt_qty(cc)} "
+                f"Δ:{sel.get('delta', 0.0):+,.2f}")
+    else:
+        last_cvd = _cvd_ohlc(visible[-1])[3] if visible else 0.0
+        last_delta = visible[-1].get("delta", 0.0) if visible else 0.0
+        if asset == "ETH":
+            feed_status = f"Phemex:{LIVE_TAPE.status.get('ETH','—')}  Kraken/Coinbase aggregate"
+        else:
+            feed_status = f"feed:{LIVE_TAPE.status.get('QQQ','—')}"
+        info = (f" px:{fmt_price(last_price)}  CVD:{last_cvd:+,.2f}  Δbar:{last_delta:+,.2f}  "
+                f"{feed_status}  log:{log_rows}")
+    if log_err:
+        info += f"  ⚠ log: {log_err}"
+    hint = "  [←→]pan [X]crosshair Tab=asset [Z]rebase [I]nterval [T]BTD [C]olor [+/-]zoom [L]ive Esc/[M]exit [K]back [Q]uit"
+    footer = (info + hint).ljust(w)[:w]
+    db.puts(y1 - 1, x0, footer, P_STATUS)
     return view_offset
 
 # ── Volatility Drift chart math (pure — no curses dependency) ──────────────
@@ -14361,7 +15189,7 @@ def draw_voldrift(db, asset, y0, y1, x0, x1, ui):
     else:
         countdown = "live tracking continues in background"
     footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [W]rvWindow [D]eadzone "
-              f"[L]ive [R]efresh Esc/[M]exit [Q]uit    "
+              f"[L]ive [R]efresh Esc/[M]exit [K]back [Q]uit    "
               f"poll {interval}s   {_voldrift_fmt_duration(bar_interval)} bars   "
               f"rv window {_voldrift_fmt_duration(rv_window)}   deadzone {deadzone:g}pt    "
               f"{countdown}    last update {last_str} ")
@@ -14706,7 +15534,7 @@ def draw_markets(db, rows, cols):
             db.puts(row, legend_x, lbl, color_pair, curses.A_BOLD)
 
     footer = (f" MARKETS  {n_total} pts  {len(pct_series)}/{len(MARKETS_ASSETS)} assets"
-              f"  next refresh:{secs_left}s  [R] refresh  [M] exit  [Q] quit")
+              f"  next refresh:{secs_left}s  [R] refresh  [M] exit  [K] back  [Q] quit")
     if gerr:
         footer += f"  | {gerr}"
     db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
@@ -15382,7 +16210,7 @@ def draw_macro_options(db, rows, cols):
     else:
         line(f"    {'Sound':<8} ON (alert.wav enabled)", P_GREEN)
     line()
-    line("  [Q]uit   [R]efresh   [U]mute/unmute   Esc/[M] next mode", P_DIM)
+    line("  [Q]uit   [R]efresh   [U]mute/unmute   Esc/[M] next mode   [K]back", P_DIM)
 
 # ── Chain — ported from chain.py ────────────────────────────────────────────
 # Live options-chain table (strikes x Greeks) for one symbol at a time —
@@ -15685,7 +16513,7 @@ def draw_chain(db, rows, cols, simple_mode=False):
     if data is None:
         msg = f"Error: {error_msg}" if error_msg else f"Fetching {symbol} chain…"
         db.puts(rows // 2, max(0, cols // 2 - len(msg) // 2), msg, P_RED if error_msg else P_CYAN, curses.A_BOLD)
-        db.puts(footer_row, 0, " Chain  [R]etry  [S]ymbol  Esc/[M] next mode".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+        db.puts(footer_row, 0, " Chain  [R]etry  [S]ymbol  Esc/[M] next mode  [K]back".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
         return
 
     index_price = data["index_price"]
@@ -15815,7 +16643,7 @@ def draw_chain(db, rows, cols, simple_mode=False):
             cx += width
 
     mode_tag = "SIMPLE" if simple_mode else "FULL"
-    hint = f" [Q]uit [R]efresh [S]ymbol [Y]:{mode_tag} Esc/[M] next mode  [{symbol}]"
+    hint = f" [Q]uit [R]efresh [S]ymbol [Y]:{mode_tag} Esc/[M] next mode [K]back  [{symbol}]"
     db.puts(footer_row, 0, hint.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
 
 # ── Startup loading screen ───────────────────────────────────────────────────
@@ -15925,6 +16753,7 @@ def _startup_progress():
     steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
     steps.append(("Chart engines", all(_ch_ready[a].is_set() for a in ASSETS)))
     steps.append(("Net Drift engines", all(DRIFT_READY[a].is_set() for a in DRIFT_ASSETS)))
+    steps.append(("CVD engines", all(CVD_READY[a].is_set() for a in CVD_ASSETS)))
     steps.append(("Volatility Drift engines", all(VOLDRIFT_READY[a].is_set() for a in VOLDRIFT_ASSETS)))
     steps.append(("Macro Options Flow engine", OPTFLOW_READY.is_set()))
     if not DRY_RUN:
@@ -16152,6 +16981,19 @@ def curses_main(stdscr):
         # BackgroundTracker split.
         for _drift_asset in DRIFT_ASSETS:
             threading.Thread(target=_drift_engine_loop, args=(_drift_asset, _quit_evt), daemon=True).start()
+        # CVD — ported from cvd.py (2026-08-16). No dedicated feed thread of
+        # its own: it's a passive second consumer of the ALREADY-always-on
+        # footprint feed threads above (Phemex/Kraken/Coinbase/Alpaca, all
+        # already calling LiveTape.ingest(), which now also calls
+        # _cvd_ingest_trade() — see that hook's own comment). Backfills from
+        # each asset's own session start (00:00 CT for QQQ, 19:00 CT for
+        # ETH) on whatever bar interval was last used today (2026-08-17
+        # user request), race-safe against the ALREADY-running live feeds
+        # via _cvd_ingest_trade's own buffering — see
+        # _cvd_backfill_then_ready's own docstring. Only sets CVD_READY once
+        # that backfill has actually landed.
+        for _cvd_asset in CVD_ASSETS:
+            threading.Thread(target=_cvd_backfill_then_ready, args=(_cvd_asset,), daemon=True).start()
         # Volatility Drift engine — ported from vol-drift.py, same always-on
         # per-asset-thread shape as Net Drift's own above.
         for _voldrift_asset in VOLDRIFT_ASSETS:
@@ -16278,10 +17120,32 @@ def curses_main(stdscr):
     drift_crosshair_idx = {"ETH": 0, "QQQ": 0}   # columns back from the right edge of the
                                       # CURRENT view (0 = rightmost) — see draw_drift/
                                       # _drift_crosshair_clamp for how panning at the edges works.
+    cvd_mode = False   # full-screen CVD mode, ported from cvd.py (2026-08-16) — sits
+                        # between Net Drift and Volatility Drift in the [M] cycle:
+                        # Trading -> GEX -> Net Drift -> CVD -> Volatility Drift ->
+                        # Markets -> Macro Options Flow -> Chain -> Status -> Trading.
+                        # Always-on for both assets (piggybacks on the ALREADY-always-on
+                        # footprint feed threads via the _cvd_ingest_trade hook inside
+                        # LiveTape.ingest() — no dedicated CVD feed thread of its own).
+    cvd_crosshair_active = {"ETH": False, "QQQ": False}   # [X] — same convention as
+                                      # drift_crosshair_active above, per explicit user request
+                                      # ("same crosshair/scrolling functionality used in other modes").
+    cvd_crosshair_idx = {"ETH": 0, "QQQ": 0}
+    cvd_view_offset = {"ETH": 0, "QQQ": 0}   # [←→]/[]/{} — bars scrolled back from the
+                                      # live edge, same "hscroll_bars" convention footprint's
+                                      # own charts use (2026-08-17: CVD previously only ever
+                                      # showed the last screen-width of bars with no way to
+                                      # pan further back, even once backfilled from session start —
+                                      # per explicit user request, this now lets the crosshair/
+                                      # pan keys reach all the way back through the whole day).
+    cvd_zoom_group = 1     # [+]/[-] — shared across both assets, matches cvd.py's own
+                            # single (not per-symbol) zoom_group
+    cvd_show_btd = False   # [T] Big Trade Detector overlay — shared across both assets
+    cvd_color_scheme = "green_red"   # [C] — shared across both assets
     voldrift_mode = False   # full-screen Volatility Drift mode, ported from
-                             # vol-drift.py (2026-08-12) — sits between Net
-                             # Drift and Status in the [M] cycle (see
-                             # drift_mode's own comment above for the full
+                             # vol-drift.py (2026-08-12) — sits between CVD
+                             # and Markets in the [M] cycle (see
+                             # cvd_mode's own comment above for the full
                              # cycle order).
     voldrift_live = {"ETH": True, "QQQ": True}
     voldrift_view_date = {"ETH": None, "QQQ": None}
@@ -16290,12 +17154,12 @@ def curses_main(stdscr):
     voldrift_bar_interval = VOLDRIFT_DEFAULT_BAR_INTERVAL   # [B] — shared across both assets,
                              # matches vol-drift.py's own ctrl.bar_interval
     markets_mode = False   # full-screen Markets mode, ported from charthacker.py's own
-                            # "Macro Mode" (2026-08-15) — cycle order (2026-08-15, Status
-                            # moved back to being the last stop per explicit user request):
-                            # Trading -> GEX -> Net Drift -> Volatility Drift -> Markets ->
-                            # Macro Options Flow -> Chain -> Status -> Trading. On-demand
-                            # only (per explicit user answer) — its own fetch thread starts
-                            # on entry and stops on exit.
+                            # "Macro Mode" (2026-08-15) — cycle order (2026-08-16, CVD
+                            # inserted between Net Drift and Volatility Drift):
+                            # Trading -> GEX -> Net Drift -> CVD -> Volatility Drift ->
+                            # Markets -> Macro Options Flow -> Chain -> Status -> Trading.
+                            # On-demand only (per explicit user answer) — its own fetch
+                            # thread starts on entry and stops on exit.
     markets_thread = [None]     # the currently-running _markets_refresh_loop Thread, or None
     markets_stop_evt = [None]   # its stop Event, set to signal the thread to exit
     macro_options_mode = False   # full-screen Macro Options Flow mode, ported from
@@ -16451,6 +17315,15 @@ def curses_main(stdscr):
                         "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
                         "crosshair_idx": (drift_crosshair_idx[drift_asset] if drift_crosshair_active[drift_asset] else None)}
             drift_view_offset[drift_asset] = draw_drift(db, drift_asset, 0, rows, 0, cols, drift_ui)
+        elif cvd_mode:
+            # Full screen, same convention as drift_mode above — draw_cvd
+            # draws its own hint row at the very last line, so no separate
+            # Athena footer is drawn underneath (see the footer dispatch below).
+            cvd_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            cvd_ui = {"live": True, "zoom_group": cvd_zoom_group, "show_btd": cvd_show_btd,
+                      "color_scheme": cvd_color_scheme, "view_offset": cvd_view_offset[cvd_asset],
+                      "crosshair_idx": (cvd_crosshair_idx[cvd_asset] if cvd_crosshair_active[cvd_asset] else None)}
+            cvd_view_offset[cvd_asset] = draw_cvd(db, cvd_asset, 0, rows, 0, cols, cvd_ui)
         elif voldrift_mode:
             # Full screen, same convention as drift_mode above — draw_voldrift
             # draws its own hint row at the very last line, so no separate
@@ -16544,6 +17417,9 @@ def curses_main(stdscr):
         elif drift_mode:
             pass   # draw_drift already drew its own hint row — same
                    # reasoning as gex_mode/status_mode above.
+        elif cvd_mode:
+            pass   # draw_cvd already drew its own hint row — same
+                   # reasoning as drift_mode above.
         elif voldrift_mode:
             pass   # draw_voldrift already drew its own hint row — same
                    # reasoning as drift_mode above.
@@ -16569,16 +17445,17 @@ def curses_main(stdscr):
                 # shorter footer instead of interleaving "not available"
                 # markers into the same dense f-string.
                 footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Markets/OptFlow/Chain/Status"
+                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:GEX/Drift/CVD/VolDrift/Markets/OptFlow/Chain/Status [K]:back"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
             else:
                 risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
                 bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
                 sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
                 fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
+                imb_hint = f" [T]imb:{IMBALANCE_RATIO.get(focus_asset, 3.0):g}x"
                 footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
                           f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                          f"{risk_hint}{sl_hint}{fee_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Drift/VolDrift/Markets/OptFlow/Chain/Status"
+                          f"{risk_hint}{sl_hint}{fee_hint}{imb_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:GEX/Drift/CVD/VolDrift/Markets/OptFlow/Chain/Status [K]:back"
                           + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
                           + "  [F]latten"
                           + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
@@ -16623,14 +17500,28 @@ def curses_main(stdscr):
             # Scrollable full-screen text, not a chart with pan state, so
             # the key set is smaller than gex_mode's. 2026-08-15: Status is
             # the LAST stop again, per explicit user request (Trading -> GEX
-            # -> Net Drift -> Volatility Drift -> Markets -> Macro Options
-            # Flow -> Chain -> Status -> Trading) — [M] and Esc both land
+            # -> Net Drift -> CVD -> Volatility Drift -> Markets -> Macro
+            # Options Flow -> Chain -> Status -> Trading) — [M] and Esc both land
             # back on Trading here, same shape it had before Markets/Macro
             # Options Flow/Chain were ever appended.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
             elif key in (ord("m"), ord("M"), 27):
                 status_mode = False
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user
+                                                  # request) to Chain, the mode right before
+                                                  # Status, same thread-start shape
+                                                  # macro_options_mode's own [M] uses.
+                status_mode = False
+                chain_mode = True
+                CHAIN_SYMBOL[0] = "ETH"
+                CHAIN_IS_CRYPTO[0] = True
+                CHAIN_DATA[0] = None
+                CHAIN_ERROR[0] = ""
+                chain_stop_evt[0] = threading.Event()
+                chain_thread[0] = threading.Thread(target=_chain_refresh_loop,
+                                                     args=(chain_stop_evt[0],), daemon=True)
+                chain_thread[0].start()
             elif key == curses.KEY_UP:
                 status_scroll = max(0, status_scroll - 1)
             elif key == curses.KEY_DOWN:
@@ -16654,9 +17545,9 @@ def curses_main(stdscr):
             # = back out). z/Z/End alone still does gex.py's own reset.
             #
             # [M] means "next mode" in the Trading -> GEX -> Net Drift ->
-            # Volatility Drift -> Markets -> Macro Options Flow -> Chain ->
-            # Status -> Trading cycle (2026-08-15: Status moved back to
-            # being the last stop, per explicit user request). Esc remains
+            # CVD -> Volatility Drift -> Markets -> Macro Options Flow ->
+            # Chain -> Status -> Trading cycle (2026-08-16: CVD inserted
+            # between Net Drift and Volatility Drift). Esc remains
             # the fast "back to
             # Trading" escape hatch from any mode, unchanged.
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
@@ -16667,6 +17558,11 @@ def curses_main(stdscr):
             elif key in (ord("m"), ord("M")):
                 gex_mode = False
                 drift_mode = True
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user
+                                                  # request) to the PREVIOUS mode; GEX is
+                                                  # the first stop after Trading, so this
+                                                  # just leaves, same as Esc.
+                gex_mode = False
             elif key in (ord("g"), ord("G")):
                 gex_by_strike = not gex_by_strike
             elif key in (ord("n"), ord("N")) and gex_by_strike:
@@ -16730,16 +17626,15 @@ def curses_main(stdscr):
         if drift_mode:
             # Ported from drift.py's own curses_main key dispatch, remapped
             # per the approved plan: [M] is taken globally (next mode — same
-            # as gex_mode/status_mode above; 2026-08-12: Net Drift now leads
-            # to Volatility Drift instead of wrapping to Trading, since
-            # Volatility Drift was inserted right after it in the cycle),
-            # drift.py's own [M] (min trade $ threshold) moves to [T];
-            # drift.py's [S] (switch to an arbitrary symbol) is dropped
-            # entirely since Athena only ever tracks ETH/QQQ — Tab switches
-            # focus between them instead, matching gex_mode's own
-            # convention; drift.py's Esc (snap to live) moves to [L],
-            # freeing Esc for the same cross-mode "back to Trading"
-            # convention every other full-screen mode uses.
+            # as gex_mode/status_mode above; 2026-08-16: Net Drift now leads
+            # to CVD instead of Volatility Drift, since CVD was inserted
+            # right after it in the cycle), drift.py's own [M] (min trade $
+            # threshold) moves to [T]; drift.py's [S] (switch to an
+            # arbitrary symbol) is dropped entirely since Athena only ever
+            # tracks ETH/QQQ — Tab switches focus between them instead,
+            # matching gex_mode's own convention; drift.py's Esc (snap to
+            # live) moves to [L], freeing Esc for the same cross-mode "back
+            # to Trading" convention every other full-screen mode uses.
             drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
@@ -16747,7 +17642,10 @@ def curses_main(stdscr):
                 drift_mode = False
             elif key in (ord("m"), ord("M")):
                 drift_mode = False
-                voldrift_mode = True
+                cvd_mode = True
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                drift_mode = False
+                gex_mode = True
             elif key == 9:   # Tab — switch asset focus, same convention as gex_mode
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("l"), ord("L")):   # snap back to the live edge
@@ -16838,6 +17736,110 @@ def curses_main(stdscr):
                         drift_live[drift_asset] = True
             continue
 
+        if cvd_mode:
+            # Ported from cvd.py's own curses_main key dispatch, remapped to
+            # Athena's own established [X]-toggle crosshair/scroll
+            # convention per explicit user request (cvd.py's own
+            # arrows-auto-activate-a-crosshair model isn't used here — see
+            # cvd_mode's own state-declaration comment above). [G]oto,
+            # [S]witch-symbol, and [P] screenshot are dropped — see this
+            # mode's own header comment in the CVD section above for why.
+            # cvd_view_offset lets arrows/brackets pan back through the
+            # WHOLE day's own backfilled history (2026-08-17 user request —
+            # previously these keys only ever moved the crosshair within
+            # whatever fit on one screen, which is why panning appeared to
+            # hit a wall well before session start even once the backfill
+            # itself was fixed to actually reach back that far).
+            cvd_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            cvd_state_obj = CVD_STATE[cvd_asset]
+            if key in (ord("q"), ord("Q")):
+                _quit_evt.set()
+            elif key == 27:
+                cvd_mode = False
+            elif key in (ord("m"), ord("M")):
+                cvd_mode = False
+                voldrift_mode = True
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                cvd_mode = False
+                drift_mode = True
+            elif key == 9:   # Tab — switch asset focus, same convention as drift_mode
+                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key in (curses.KEY_HOME, ord("l"), ord("L")):   # snap back to live (clears crosshair + pan)
+                cvd_crosshair_active[cvd_asset] = False
+                cvd_crosshair_idx[cvd_asset] = 0
+                cvd_view_offset[cvd_asset] = 0
+            elif key in (ord("x"), ord("X")):
+                cvd_crosshair_active[cvd_asset] = not cvd_crosshair_active[cvd_asset]
+                if cvd_crosshair_active[cvd_asset]:
+                    cvd_crosshair_idx[cvd_asset] = 0
+            elif key in (ord("z"), ord("Z")):   # rebase CVD to 0 from this point forward, same meaning as cvd.py's own
+                with cvd_state_obj.lock:
+                    cvd_state_obj.cvd_offset = cvd_state_obj.raw_cvd
+            elif key in (ord("t"), ord("T")):
+                cvd_show_btd = not cvd_show_btd
+            elif key in (ord("c"), ord("C")):
+                cvd_color_scheme = "blue_white" if cvd_color_scheme == "green_red" else "green_red"
+            elif key in (ord("+"), ord("=")):
+                cvd_zoom_group = _cvd_zoom_step(cvd_zoom_group, -1)
+            elif key in (ord("-"), ord("_")):
+                cvd_zoom_group = _cvd_zoom_step(cvd_zoom_group, 1)
+            elif key in (ord("i"), ord("I")):
+                raw = _prompt_text(stdscr, [f"{cvd_asset} — new bar interval (e.g. 1m, 3m, 500V, 100T)"], prompt="> ")
+                db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
+                if raw is not None:
+                    parsed = _cvd_parse_interval(raw.strip())
+                    if parsed is None:
+                        console_log(f"{YLW}Invalid CVD interval '{raw.strip()}' — use 1m/3m/500V/100T style{RST}")
+                    else:
+                        label, new_mode, new_secs, vol_th, tick_th = parsed
+                        # 2026-08-17 user request: interval changes must
+                        # reload from the asset's own session start (not
+                        # just start empty and build forward from the
+                        # switch), so the whole session's data is
+                        # scrollable at the new bar spec — see
+                        # _cvd_backfill_for_spec's own docstring. Runs in a
+                        # background thread (REST fetch, shouldn't block
+                        # the UI loop); draw_cvd shows "backfilling…" via
+                        # state.buffering while it's in flight.
+                        _cvd_asset_for_bf = cvd_asset
+                        _cvd_session_label_for_bf = _cvd_session_label(cvd_asset)
+                        threading.Thread(
+                            target=lambda: console_log(
+                                f"{_cvd_asset_for_bf}: CVD backfilled "
+                                f"{_cvd_backfill_for_spec(_cvd_asset_for_bf, label, new_mode, new_secs, vol_th, tick_th)[0]} "
+                                f"trades since {_cvd_session_label_for_bf} (bar: {label}, via [I])"
+                            ),
+                            daemon=True,
+                        ).start()
+                        cvd_crosshair_active[cvd_asset] = False
+                        cvd_crosshair_idx[cvd_asset] = 0
+                        cvd_view_offset[cvd_asset] = 0
+                        console_log(f"{YLW}{cvd_asset} CVD interval -> {label} (via [I]) — "
+                                    f"backfilling from {_cvd_session_label_for_bf}…{RST}")
+            elif key in (curses.KEY_LEFT, curses.KEY_SLEFT, ord("["), curses.KEY_PPAGE, ord("{")):
+                # Crosshair movement and view panning are ONE function
+                # driven by the SAME key set, same merge already built for
+                # drift_mode (see its own comment) — when the crosshair is
+                # active these keys move IT instead, auto-panning at the
+                # edges via _drift_crosshair_clamp (pure/generic, reused
+                # as-is); when it's off they pan the view directly.
+                step = 50 if key in (curses.KEY_PPAGE, ord("{")) else (10 if key in (curses.KEY_SLEFT, ord("[")) else 1)
+                if cvd_crosshair_active[cvd_asset]:
+                    plot_w_est = max(1, cols - CVD_AXIS_W)
+                    cvd_crosshair_idx[cvd_asset], cvd_view_offset[cvd_asset] = _drift_crosshair_clamp(
+                        cvd_crosshair_idx[cvd_asset] + step, cvd_view_offset[cvd_asset], plot_w_est)
+                else:
+                    cvd_view_offset[cvd_asset] += step
+            elif key in (curses.KEY_RIGHT, curses.KEY_SRIGHT, ord("]"), curses.KEY_NPAGE, ord("}")):
+                step = 50 if key in (curses.KEY_NPAGE, ord("}")) else (10 if key in (curses.KEY_SRIGHT, ord("]")) else 1)
+                if cvd_crosshair_active[cvd_asset]:
+                    plot_w_est = max(1, cols - CVD_AXIS_W)
+                    cvd_crosshair_idx[cvd_asset], cvd_view_offset[cvd_asset] = _drift_crosshair_clamp(
+                        cvd_crosshair_idx[cvd_asset] - step, cvd_view_offset[cvd_asset], plot_w_est)
+                else:
+                    cvd_view_offset[cvd_asset] = max(0, cvd_view_offset[cvd_asset] - step)
+            continue
+
         if voldrift_mode:
             # Ported from vol-drift.py's own curses_main key dispatch, same
             # remap reasoning as drift_mode above: [M] continues the cycle
@@ -16860,6 +17862,9 @@ def curses_main(stdscr):
                 markets_thread[0] = threading.Thread(target=_markets_refresh_loop,
                                                        args=(markets_stop_evt[0],), daemon=True)
                 markets_thread[0].start()
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                voldrift_mode = False
+                cvd_mode = True
             elif key == 9:   # Tab — switch asset focus, same convention as drift_mode
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("l"), ord("L")):   # snap back to the live edge
@@ -16953,6 +17958,11 @@ def curses_main(stdscr):
                 if markets_stop_evt[0] is not None:
                     markets_stop_evt[0].set()
                 macro_options_mode = True
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                markets_mode = False
+                if markets_stop_evt[0] is not None:
+                    markets_stop_evt[0].set()
+                voldrift_mode = True
             elif key in (ord("r"), ord("R")):
                 MARKETS_REFRESH_EVT.set()
             continue
@@ -16981,6 +17991,13 @@ def curses_main(stdscr):
                 chain_thread[0] = threading.Thread(target=_chain_refresh_loop,
                                                      args=(chain_stop_evt[0],), daemon=True)
                 chain_thread[0].start()
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                macro_options_mode = False
+                markets_mode = True
+                markets_stop_evt[0] = threading.Event()
+                markets_thread[0] = threading.Thread(target=_markets_refresh_loop,
+                                                       args=(markets_stop_evt[0],), daemon=True)
+                markets_thread[0].start()
             elif key in (ord("r"), ord("R")):
                 OPTFLOW_REFRESH_EVT.set()
             elif key in (ord("u"), ord("U")):
@@ -17008,6 +18025,11 @@ def curses_main(stdscr):
                     chain_stop_evt[0].set()
                 status_mode = True
                 status_scroll = 0
+            elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
+                chain_mode = False
+                if chain_stop_evt[0] is not None:
+                    chain_stop_evt[0].set()
+                macro_options_mode = True
             elif key in (ord("r"), ord("R")):
                 CHAIN_REFRESH_EVT.set()
             elif key in (ord("y"), ord("Y")):
@@ -17176,6 +18198,24 @@ def curses_main(stdscr):
                 console_log(f"{w_asset}: {YLW}SL distance changed {fmt_num(cur_sl)} -> {fmt_num(new_sl)} (via [W]){RST}")
                 log_event(w_asset, "sl_distance_changed", {"old_sl": cur_sl, "new_sl": new_sl})
                 ASSETS[w_asset]["sl"] = new_sl
+        elif key in (ord("t"), ord("T")):
+            # 2026-08-17 user request: "Instead of having a static imbalance
+            # amount, let the user set it." — was IMBALANCE_RATIO = {"ETH":
+            # 3.0, "QQQ": 5.0}, now editable per-[Tab]-focused-asset at
+            # runtime, same convention [W]/[E] already use (session-only,
+            # not persisted to disk). IMBALANCE_RATIO is mutated IN PLACE
+            # (not reassigned) so draw_footprint_panel's own
+            # IMBALANCE_RATIO.get(asset, 3.0) read picks up the new value on
+            # its very next frame with no further plumbing needed.
+            t_asset = chart_focus if both_panes else "ETH"
+            cur_ratio = IMBALANCE_RATIO.get(t_asset, 3.0)
+            new_ratio = _prompt_number(stdscr, f"{t_asset} footprint imbalance ratio (current {cur_ratio:g}x, Enter keeps it): ",
+                                        default=cur_ratio)
+            db.prev = None
+            if new_ratio is not None and new_ratio > 0 and abs(new_ratio - cur_ratio) > 1e-9:
+                console_log(f"{t_asset}: {YLW}Imbalance ratio changed {cur_ratio:g}x -> {new_ratio:g}x (via [T]){RST}")
+                log_event(t_asset, "imbalance_ratio_changed", {"old_ratio": cur_ratio, "new_ratio": new_ratio})
+                IMBALANCE_RATIO[t_asset] = new_ratio
         elif key in (ord("e"), ord("E")):
             # 2026-07-31 user request: "Allow the user to set the fees for
             # each asset. ETH will be in terms of % of position value
@@ -17250,6 +18290,13 @@ def curses_main(stdscr):
         elif key in (ord("m"), ord("M")):
             gex_mode = True
             console_log(f"{YLW}GEX mode ({chart_focus if chart_focus in ASSETS else 'ETH'}) — via [M]{RST}")
+        elif key in (ord("k"), ord("K")):
+            # [K] — cycle backward (2026-08-17 user request): from Trading,
+            # the "previous" stop wraps to the LAST mode in the cycle
+            # (Status), symmetric with [M] entering the FIRST (GEX).
+            status_mode = True
+            status_scroll = 0
+            console_log(f"{YLW}Status mode — via [K]{RST}")
         elif key in (ord("x"), ord("X")):
             asset = chart_focus if both_panes else "ETH"
             chart_crosshair_active[asset] = not chart_crosshair_active[asset]

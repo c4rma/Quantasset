@@ -873,10 +873,10 @@ def clusters_from_gex_export(gex_export, price, direction):
     out.sort(key=lambda kt: abs(kt[0] - price))
     return out
 
-def reconstruct_targets(log_targets, gex_export, price, regime):
+def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None):
     """[{'type','level'}, ...]: BT/ST, then every qualifying gamma
     Cluster (Large before Medium — explicit user request 2026-07-23),
-    then GEX Flip last.
+    then ER 100%/150%, then GEX Flip last.
 
     Clusters are computed LIVE from this cycle's own gex_export via
     clusters_from_gex_export rather than read back out of status.py's
@@ -888,6 +888,25 @@ def reconstruct_targets(log_targets, gex_export, price, regime):
     whatever status.py had last written). log_targets is still the
     source for BT/ST (status.py fetches the live options chain for
     those; Athena doesn't replicate that call).
+
+    er_targets (2026-08-22, user request) is the {"u100","l100","u150",
+    "l150"} dict compute_dashboard_snapshot's own inst_snap["er_targets"]
+    stores (see evaluate_hpls' own `er` return value) — the Expected
+    Range's 100%/150% levels, derived once per session from session-open
+    + IV. Placed AFTER every Cluster but BEFORE GEX Flip: a Cluster is a
+    real, live options-flow-driven wall (top-tier per _check_confirmation's
+    own _is_top_tier), ER 100%/150% are a static vol-projection boundary
+    computed once at session open — more concrete than GEX Flip's
+    continuously-recomputed synthetic level, but not treated as top-tier
+    either (same fallback-only bucket _is_top_tier already puts GEX Flip
+    and Medium clusters in, until/unless the user asks otherwise). Only
+    the side matching `regime` is used (upper levels for a long, lower for
+    a short) — the OTHER side is never a valid profit target for this
+    trade's own direction. Unlike GEX Flip/Cluster, an ER level never
+    moves once a position is open (_sync_moving_tps only refreshes
+    "GEX Flip"/"Cluster"/"BT"/"ST"-typed legs by name — an "ER 100%"/
+    "ER 150%" leg simply falls through untouched, which is correct: ER
+    is fixed for the session, there's nothing to resync).
 
     GEX Flip is placed LAST, after every cluster (explicit user request
     2026-07-24, following from 'medium clusters are not ignored' — a real
@@ -915,6 +934,13 @@ def reconstruct_targets(log_targets, gex_export, price, regime):
             # docstring) so it can tell a Large cluster apart from a Medium
             # one without re-deriving clusters a second time.
             full.append({"type": "Cluster", "level": strike, "tier": tier})
+
+    if er_targets and regime in ("long", "short"):
+        near_key, far_key = ("u100", "u150") if regime == "long" else ("l100", "l150")
+        if er_targets.get(near_key) is not None:
+            full.append({"type": "ER 100%", "level": float(er_targets[near_key])})
+        if er_targets.get(far_key) is not None:
+            full.append({"type": "ER 150%", "level": float(er_targets[far_key])})
 
     gex_flip = gex_export.get("gex_flip") if gex_export else None
     if gex_flip is not None:
@@ -965,7 +991,8 @@ def instrument_lights(snapshot, asset):
     lights["Targets"] = bool(log_targets)
 
     gex_export = read_gex_export(asset)
-    targets_full = reconstruct_targets(log_targets, gex_export, price, regime)
+    er_targets = inst.get("er_targets")
+    targets_full = reconstruct_targets(log_targets, gex_export, price, regime, er_targets=er_targets)
     return lights, regime, price, targets_full, False
 
 # ── footprint.py bar log — tail last CLOSED bar ───────────────────────────────
@@ -3509,7 +3536,12 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         cluster_str = "none"
     rows.append(("Med/Large Gamma Clusters", cluster_str, hit))
 
-    return rows
+    # 2026-08-22 user request: ER 100%/150% are now also usable as TP
+    # targets (see reconstruct_targets) — returning the raw `er` dict
+    # (upper/lower 40/80/100/150, or None if ER wasn't computable) lets
+    # callers pull the numeric 100%/150% levels without recomputing
+    # session_open/status_compute_er a second time themselves.
+    return rows, er
 
 def hpl_any_active(rows, closed):
     """Ported verbatim from status.py's own hpl_any_active — True if at
@@ -3564,11 +3596,21 @@ def compute_dashboard_snapshot(data):
 
         export = read_status_charthacker_export(inst_name)
         gex_export = read_gex_export(inst_name)
-        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
-                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
-                              ratio=(pcvr["ratio"] if pcvr else None))
+        rows, er = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
+                                  export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                                  ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and status_qqq_market_closed()
         inst_snap["market_closed"] = closed
+        # 2026-08-22: raw ER 100%/150% levels, stored under string keys
+        # (not evaluate_hpls' own int-keyed er["upper"]/er["lower"] dicts)
+        # since this snap gets json.dump'd to status_logs — a dict with
+        # int keys round-trips as STRING keys once read back from disk,
+        # but stays int-keyed in the in-memory STATUS_SNAPSHOT global, so
+        # a consumer reading either source needs one consistent shape.
+        # See reconstruct_targets for where these get used as TP targets.
+        inst_snap["er_targets"] = ({"u100": er["upper"][100], "l100": er["lower"][100],
+                                     "u150": er["upper"][150], "l150": er["lower"][150]}
+                                    if er else None)
 
         hpl = {}
         for label_, level_str, ok in rows:
@@ -3688,6 +3730,8 @@ def _status_build_render_lines(display_data):
 
     p(f"  {BLD}4. High-Probability Levels{RST}")
     active_status = {}
+    er_by_inst = {}   # raw ER upper/lower dicts, captured here for section 5's own
+                        # ER 100%/150% target display (see reconstruct_targets)
     for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
         ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
         ("QQQ", "qqq_price", "qqq_chain", "qqq_candles", "qqq_prev_close", "qqq_iv", 0.25, 0.35, 0.35, False),
@@ -3712,9 +3756,10 @@ def _status_build_render_lines(display_data):
             active_status[inst_name] = False
             continue
         p(f"        {STATUS_LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
-        rows = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
-                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
-                              ratio=(pcvr["ratio"] if pcvr else None))
+        rows, er = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
+                                  export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                                  ratio=(pcvr["ratio"] if pcvr else None))
+        er_by_inst[inst_name] = er
         closed = inst_name == "QQQ" and status_qqq_market_closed()
         rows_by_label = {label_: (level_str, ok) for label_, level_str, ok in rows}
         any_active = hpl_any_active(rows, closed)
@@ -3771,6 +3816,7 @@ def _status_build_render_lines(display_data):
         # wasn't ported, same documented simplification Phase 3a already
         # made for the gamma-cluster fallback.
         gex_flip = gex_export.get("gex_flip") if gex_export else None
+        er = er_by_inst.get(inst_name)
         # User request 2026-07-27: order the Targets list by PRICE, lowest
         # to highest — was previously in TYPE priority order (BT/ST, GEX
         # Flip, then clusters), same ordering convention reconstruct_targets
@@ -3787,6 +3833,12 @@ def _status_build_render_lines(display_data):
                 targets.append((gex_flip, f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})"))
             above, _below = status_gamma_cluster_targets_directional(gex_export, price)
             targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in above]
+            # 2026-08-22 user request: ER 100%/150% also usable as TP
+            # targets (see reconstruct_targets) — a long uses the UPPER
+            # ER levels (targets sit above price).
+            if er:
+                targets.append((er["upper"][100], f"ER 100% {GRN}{BLD}${er['upper'][100]:,.2f}{RST} ({target_rel(er['upper'][100])})"))
+                targets.append((er["upper"][150], f"ER 150% {GRN}{BLD}${er['upper'][150]:,.2f}{RST} ({target_rel(er['upper'][150])})"))
         elif ratio > 1.02:
             _bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
             if st is not None:
@@ -3795,6 +3847,10 @@ def _status_build_render_lines(display_data):
                 targets.append((gex_flip, f"GEX Flip {GRN}{BLD}${gex_flip:,.2f}{RST} ({target_rel(gex_flip)})"))
             _above, below = status_gamma_cluster_targets_directional(gex_export, price)
             targets += [(k, f"Cluster ({t}) {GRN}{BLD}${k:,.2f}{RST} ({target_rel(k)})") for k, t in below]
+            # Short uses the LOWER ER levels (targets sit below price).
+            if er:
+                targets.append((er["lower"][100], f"ER 100% {GRN}{BLD}${er['lower'][100]:,.2f}{RST} ({target_rel(er['lower'][100])})"))
+                targets.append((er["lower"][150], f"ER 150% {GRN}{BLD}${er['lower'][150]:,.2f}{RST} ({target_rel(er['lower'][150])})"))
         targets.sort(key=lambda t: t[0])
         targets = [s for _, s in targets]
         has_targets[inst_name] = bool(targets)
@@ -5019,7 +5075,8 @@ async def place_sl(symbol, pos_side, sl_price, price_decimals):
 # (which just stores "type" directly, no encoding needed there — Athena
 # owns that whole data structure; a real Phemex order has no such custom
 # field, so the clOrdID itself is the only place to carry this).
-_TP_TYPE_CODES = {"BT": "BT", "ST": "ST", "GEX Flip": "GF", "Cluster": "CL"}
+_TP_TYPE_CODES = {"BT": "BT", "ST": "ST", "GEX Flip": "GF", "Cluster": "CL",
+                   "ER 100%": "E1", "ER 150%": "E2"}
 _TP_TYPE_CODES_REV = {v: k for k, v in _TP_TYPE_CODES.items()}
 
 def _tp_type_code(target_type):
@@ -5031,7 +5088,8 @@ def _tp_type_from_code(code):
 # Display label for the trades table's TP1/TP2 TYPE columns — collapses
 # BT/ST into one combined label per explicit user request ("GEXFLIP,
 # CLUSTER, or BT/ST"), rather than showing BT and ST as two separate values.
-_TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluster": "CLUSTER"}
+_TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluster": "CLUSTER",
+                     "ER 100%": "ER100", "ER 150%": "ER150"}
 
 def _tp_type_display(target_type):
     return _TP_TYPE_DISPLAY.get(target_type, "—")

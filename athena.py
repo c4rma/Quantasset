@@ -434,6 +434,60 @@ def _reset_daily_loss_state():
     DAILY_LOSS_STATE = _default_daily_loss_state()
     _save_daily_loss_state()
 
+# ── Max Win Limit (explicit user request, 2026-08-21) ─────────────────────────
+# 5 CONSECUTIVE wins (by NET pnl, fees included — same "win" definition
+# _update_blackjack/_update_daily_loss_limit already use) on one asset
+# blocks new entries on THAT asset until 19:30 CT passes. Added after a
+# 6-trade win streak gave back its entire profit by continuing to trade —
+# the risk isn't just a losing streak, it's also overstaying a hot streak.
+# Same state shape as the Daily Loss Limit above (independent state,
+# blocked/blocked_regime/blocked_at persisted the same way), but
+# DELIBERATELY a narrower unblock: a PCVR regime switch does NOT clear
+# this block the way it clears the loss limit's (explicit user
+# correction, 2026-08-21) — once hit, no new trades on this asset
+# regardless of regime until the 19:30 CT rollover. blocked_regime is
+# still recorded for parity/diagnostics even though it's never read for
+# unblocking here. Also deliberately does NOT touch BLACKJACK_STATE the
+# way the loss limit does (that reset is specifically about the LOSS
+# ladder returning to 1R) — a win streak hitting this limit has nothing
+# analogous to force-reset.
+MAX_WIN_STATE_PATH = os.path.join(SCRIPT_DIR, "max_win_state.json")
+MAX_WIN_LIMIT = 5
+
+def _default_max_win_state():
+    return {a: {"consecutive_wins": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
+                "win_streak_day": None} for a in ASSETS}
+
+def _load_max_win_state():
+    try:
+        with open(MAX_WIN_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        state = _default_max_win_state()
+        for a in ASSETS:
+            if a in data:
+                state[a].update(data[a])
+        return state
+    except Exception:
+        return _default_max_win_state()
+
+def _save_max_win_state():
+    try:
+        with open(MAX_WIN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(MAX_WIN_STATE, f)
+    except Exception:
+        pass
+
+MAX_WIN_STATE = _load_max_win_state()
+
+def _reset_max_win_state():
+    """Same reasoning as _reset_daily_loss_state — a fresh paper account
+    via [R]/--reset-sim should start the win-streak tracking fresh too,
+    not carry forward a block (or a partial win streak) from whatever
+    the account was doing before the reset."""
+    global MAX_WIN_STATE
+    MAX_WIN_STATE = _default_max_win_state()
+    _save_max_win_state()
+
 # ── "Closed PnL Today" dashboard stat (explicit user request, 2026-07-30) ────
 # "Closed PnL Today should be calculated from all trades entered on the
 # same day. Resets at 00:00 CT." A trade is attributed to whichever CT
@@ -8006,16 +8060,18 @@ class AthenaInstrument:
 
         required = required_status_lights()
         gate_ok = all(lights5[n] for n in required)
-        # Daily Loss Limit (2026-07-25) — same scope as ATHENA_ENABLED/
-        # _in_entry_blackout: only gates WATCHING->ARMED, never touches an
-        # already-open PENDING_FILL/IN_POSITION. Computed once per cycle
-        # (it also performs its own unblock check/side effect — see the
-        # method's own docstring) and reused in both branches below.
+        # Daily Loss Limit (2026-07-25) / Max Win Limit (2026-08-21) — same
+        # scope as ATHENA_ENABLED/_in_entry_blackout: only gates WATCHING->
+        # ARMED, never touches an already-open PENDING_FILL/IN_POSITION.
+        # Computed once per cycle (each also performs its own unblock
+        # check/side effect — see the methods' own docstrings) and reused
+        # in both branches below.
         daily_loss_blocked = self._daily_loss_limit_active(regime)
+        max_win_blocked = self._max_win_limit_active()
 
         if self.state == "WATCHING":
             self.lights["Order Flow"] = False
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked:
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked:
                 return
             self.state = "ARMED"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching order flow ({regime})"
@@ -8041,11 +8097,12 @@ class AthenaInstrument:
             # against its predecessor (see read_last_two_footprint_bars).
 
         if self.state == "ARMED":
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked:
+            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked:
                 self.state = "WATCHING"
                 self.lights["Order Flow"] = False
                 reason = ("19:00-19:30 CT entry blackout" if _in_entry_blackout()
                           else "Daily Loss Limit active" if daily_loss_blocked
+                          else "Max Win Limit active" if max_win_blocked
                           else f"{self.asset} paused ([A])" if not ATHENA_ENABLED[self.asset] else "a required condition dropped")
                 console_log(f"{self.asset}: {reason} — back to WATCHING")
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
@@ -8407,6 +8464,79 @@ class AthenaInstrument:
                     blocked_at = blocked_at.replace(tzinfo=TZ_CT)
                 if datetime.now(TZ_CT) >= _next_1930_ct_after(blocked_at):
                     self._clear_daily_loss_block("19:30 CT reached")
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _update_max_win_limit(self, pnl):
+        """Max Win Limit tracking (explicit user request, 2026-08-21) — see
+        the MAX_WIN_STATE module-level comment for the full spec. Called
+        alongside _update_daily_loss_limit from every close site.
+
+        Same trading-day scoping as the Daily Loss Limit's own
+        'loss_streak_day' handling: 5 consecutive wins must all fall
+        within the SAME trading day (19:00 CT to 19:00 CT — see
+        _trading_day_key) to trigger — a streak spanning across that
+        boundary, even with no intervening loss, must not combine into
+        one trigger. Tracked via the 'win_streak_day' field: a win on a
+        DIFFERENT trading day than the streak's own last win resets the
+        counter to 0 first, as if starting fresh, before counting this
+        one."""
+        if pnl is None:
+            return
+        mw = MAX_WIN_STATE[self.asset]
+        if pnl <= 0:
+            mw["consecutive_wins"] = 0
+            mw["win_streak_day"] = None
+        else:
+            now = datetime.now(TZ_CT) if TZ_CT else None
+            today_key = _trading_day_key(now) if now else None
+            if today_key is not None and mw.get("win_streak_day") != today_key:
+                mw["consecutive_wins"] = 0
+                mw["win_streak_day"] = today_key
+            mw["consecutive_wins"] += 1
+            if mw["consecutive_wins"] >= MAX_WIN_LIMIT:
+                mw["consecutive_wins"] = 0
+                mw["blocked"] = True
+                mw["blocked_regime"] = self.regime
+                mw["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
+                console_log(f"{self.asset}: {RED}{BLD}Max Win Limit hit — {MAX_WIN_LIMIT} consecutive wins. "
+                            f"No new entries until 19:30 CT.{RST}")
+                log_event(self.asset, "max_win_limit_hit", {"blocked_regime": mw["blocked_regime"]})
+        _save_max_win_state()
+
+    def _clear_max_win_block(self, reason):
+        mw = MAX_WIN_STATE[self.asset]
+        mw["blocked"] = False
+        mw["blocked_regime"] = None
+        mw["blocked_at"] = None
+        _save_max_win_state()
+        console_log(f"{self.asset}: {GRN}Max Win Limit cleared ({reason}) — new entries allowed again{RST}")
+        log_event(self.asset, "max_win_limit_cleared", {"reason": reason})
+
+    def _max_win_limit_active(self):
+        """True if this asset is currently blocked from NEW entries by the
+        Max Win Limit. Also performs the unblock check itself (and clears
+        the block as a side effect) — called every cycle from
+        process_cycle's own gate.
+
+        2026-08-21 user correction: unlike the Daily Loss Limit, a PCVR
+        regime switch does NOT clear this block — once the win limit is
+        hit, no new trades on this asset until 19:30 CT rolls over,
+        regardless of regime. blocked_regime is still recorded (parity
+        with DAILY_LOSS_STATE's shape, useful for diagnostics) but is
+        never read here."""
+        mw = MAX_WIN_STATE[self.asset]
+        if not mw["blocked"]:
+            return False
+        if TZ_CT and mw["blocked_at"]:
+            try:
+                blocked_at = datetime.fromisoformat(mw["blocked_at"])
+                if blocked_at.tzinfo is None:
+                    blocked_at = blocked_at.replace(tzinfo=TZ_CT)
+                if datetime.now(TZ_CT) >= _next_1930_ct_after(blocked_at):
+                    self._clear_max_win_block("19:30 CT reached")
                     return False
             except Exception:
                 pass
@@ -8950,6 +9080,7 @@ class AthenaInstrument:
                 net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_max_win_limit(net_pnl)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -9142,6 +9273,7 @@ class AthenaInstrument:
             # asset the ladder is already sitting at 1R.
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_max_win_limit(net_pnl)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -9649,6 +9781,7 @@ class AthenaInstrument:
                 net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
             self._update_blackjack(net_pnl)
             self._update_daily_loss_limit(net_pnl)
+            self._update_max_win_limit(net_pnl)
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
@@ -10611,8 +10744,22 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
     old full-screen draw_trades_table so it can share the screen with the
     equity curve (top half chart / bottom half table) per explicit user
     request, instead of a [T]-toggled full-screen alternate page. Returns
-    (visible_rows, total) so the caller's footer/scroll-hint can report the
-    EXACT window shown without duplicating this function's own row math.
+    (visible_rows, total, scroll, hscroll) — the last two are the CLAMPED
+    values (see below), which the caller must write back into its own
+    persistent table_scroll/table_hscroll after every call. 2026-08-21
+    user-reported bug ("reach the end of scrolling and it freezes in
+    either direction for a while"): curses_main's own key handlers
+    increment/decrement table_scroll/table_hscroll with NO upper/lower
+    bound of their own (`table_scroll += 1`, `table_hscroll += 1` — only
+    this function's OWN internal clamp bounded what got DISPLAYED). Holding
+    or repeatedly pressing a key past the point where the display stops
+    visibly changing let the stored counter keep drifting arbitrarily far
+    past the valid range; reversing direction then had to "unwind" through
+    all of that invisible excess — many presses of nothing appearing to
+    happen — before the display re-entered the valid range and started
+    responding again. Returning the clamped value here and overwriting the
+    caller's own stored variable with it closes that gap at the source:
+    the stored counter can never drift out of range in the first place.
 
     hscroll (2026-07-27, new, user request "make the trade log horizontally
     scrollable"): number of LEFTMOST columns to skip, not a character
@@ -10635,7 +10782,18 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
     # won't be in `trades` at all — same as any other day with zero closed
     # trades, handled by the "no closed trades yet" branch below.
 
-    hscroll = max(0, min(hscroll, len(TRADES_TABLE_COLS) - 1))
+    # 2026-08-21 user report: capped only at "1 column left," so a wide
+    # terminal could scroll arbitrarily far right into blank space well
+    # past the last column's own value. Width-aware instead: stop at the
+    # smallest hscroll whose REMAINING columns already fill the screen —
+    # going any further would only shrink that already-fitting content,
+    # widening the blank gap on the right for no benefit.
+    max_hscroll = len(TRADES_TABLE_COLS) - 1
+    for i in range(len(TRADES_TABLE_COLS)):
+        if sum(w + 1 for _, w in TRADES_TABLE_COLS[i:]) <= cols:
+            max_hscroll = i
+            break
+    hscroll = max(0, min(hscroll, max_hscroll))
     visible_cols = TRADES_TABLE_COLS[hscroll:]
 
     header = ""
@@ -10652,7 +10810,7 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
     total = len(trades)
     if not trades:
         db.puts(y, 0, "no closed trades yet", P_DIM)
-        return visible_rows, total
+        return visible_rows, total, 0, hscroll
 
     scroll = max(0, min(scroll, max(0, total - visible_rows)))
     # Newest first — most recently closed trade at the top, matching every
@@ -10691,7 +10849,7 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
             db.puts(row_y, x, text.ljust(w)[:max(0, min(w, cols - x))], pair)
             x += w + 1
 
-    return visible_rows, total
+    return visible_rows, total, scroll, hscroll
 
 def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, table_hscroll=0):
     """Stats stay put (unchanged), then the screen splits in half: equity
@@ -11639,6 +11797,7 @@ class AppState:
                 "market_closed": i.market_closed,
                 "sl_missing": i._sl_missing,
                 "daily_loss_blocked": DAILY_LOSS_STATE[i.asset]["blocked"],
+                "max_win_blocked": MAX_WIN_STATE[i.asset]["blocked"],
             }
         # Enough history to actually scroll back through, not just the
         # live tail — CHART_HISTORY_BARS, not the handful the visible pane
@@ -13290,6 +13449,7 @@ async def engine_loop():
             sim.reset(SIM_BALANCE_ARG)
             _reset_blackjack_state()
             _reset_daily_loss_state()
+            _reset_max_win_state()
             _reset_closed_pnl_state_sim()
             console_log(f"{YLW}Paper account reset to ${SIM_BALANCE_ARG:,.2f}{RST}")
         else:
@@ -13345,6 +13505,7 @@ async def engine_loop():
                 get_sim_account().reset(new_balance)
                 _reset_blackjack_state()
                 _reset_daily_loss_state()
+                _reset_max_win_state()
                 _reset_closed_pnl_state_sim()
                 # A wiped sim ledger has no positions/orders left for these
                 # to match against — force them back to WATCHING too, or
@@ -13562,7 +13723,8 @@ def draw_dashboard(db, snap, cols):
         count = sum(1 for n in names if lights.get(n))
         paused_tag = " [PAUSED]" if not ATHENA_ENABLED[asset] else ""
         loss_limit_tag = " [LOSS LIMIT]" if inst.get("daily_loss_blocked") else ""
-        title = f"── {asset}{paused_tag}{loss_limit_tag} "
+        win_limit_tag = " [WIN LIMIT]" if inst.get("max_win_blocked") else ""
+        title = f"── {asset}{paused_tag}{loss_limit_tag}{win_limit_tag} "
         db.puts(y, 0, (title + "─" * max(2, min(cols, BOX_W) - len(title)))[:cols], P_DIM)
         if paused_tag:
             # Overlay just the tag in red/bold — the dash-fill above is
@@ -13575,6 +13737,12 @@ def draw_dashboard(db, snap, cols):
             # can show at once — paused and loss-limited are independent).
             tag_x = len(f"── {asset}{paused_tag}")
             db.puts(y, tag_x, loss_limit_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
+        if win_limit_tag:
+            # Same overlay technique again, positioned after loss_limit_tag
+            # (paused, loss-limited, and win-limited are all independent —
+            # any combination can show at once).
+            tag_x = len(f"── {asset}{paused_tag}{loss_limit_tag}")
+            db.puts(y, tag_x, win_limit_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         y += 1
         if inst.get("market_closed"):
             regime_txt, state_txt = "n/a", "CLOSED"
@@ -21524,9 +21692,14 @@ def curses_main(stdscr):
     trades_cache = {"source": None, "ts": 0.0, "trades": []}
     table_scroll = 0
     table_hscroll = 0   # [←]/[→] in Data view — see _draw_trades_table's own docstring
-    data_table_info = (0, 0)   # (visible_rows, total) — set from draw_data_view's
-                               # own return each frame, so the footer's scroll
-                               # hint never drifts from the table's real layout
+    data_table_info = (0, 0, 0, 0)   # (visible_rows, total, scroll, hscroll) — set
+                               # from draw_data_view's own return each frame, so the
+                               # footer's scroll hint never drifts from the table's
+                               # real layout, AND (2026-08-21) so table_scroll/
+                               # table_hscroll themselves get written back to their
+                               # clamped values every frame — see
+                               # _draw_trades_table's own docstring for why this
+                               # closes the "scrolling freezes at the boundary" bug.
     activity_log_open = False   # [L] — popup overlay over the FULL
                                  # EVENT_LOG_MAXLEN buffer, not just the
                                  # dashboard's own last-2-lines preview
@@ -21564,6 +21737,7 @@ def curses_main(stdscr):
                 src = SYNC_DATA_VIEW.get(data_source, SYNC_DATA_VIEW["sim"])
             data_table_info = draw_data_view(db, rows, cols, data_source, src["events"],
                                               src["stats"], src["trades"], table_scroll, table_hscroll)
+            _, _, table_scroll, table_hscroll = data_table_info
         elif data_view:
             now_mono = time.time()
             # 2026-07-31 CRITICAL fix, user-reported ("the Balance and
@@ -21607,6 +21781,7 @@ def curses_main(stdscr):
                                                             current_balance=snap.get("balance"))}
             data_table_info = draw_data_view(db, rows, cols, data_source, data_cache["events"],
                                               data_cache["stats"], trades_cache["trades"], table_scroll, table_hscroll)
+            _, _, table_scroll, table_hscroll = data_table_info
         elif chart_mode:
             # Full screen, same convention as every mode below — draw_chart
             # draws its own hint row at the very last line, so no separate
@@ -21727,7 +21902,7 @@ def curses_main(stdscr):
             footer = f"{ts}   {YLW}Reset paper account — [R] again to enter a new balance, any other key to cancel{RST}"
             db.puts_ansi(footer_row, 0, footer.ljust(cols)[:cols])
         elif data_view:
-            visible_rows, total = data_table_info
+            visible_rows, total, _, _ = data_table_info
             scroll_tag = ""
             if total:
                 shown = min(table_scroll + 1, total)

@@ -616,6 +616,8 @@ def _bj_reset_window_key(asset, dt_ct):
 # recompute it continuously.
 GEX_FLIP_TP_BUFFER = 3.00
 
+_MARGIN_RECOVERED = {}
+
 # Best-effort qty-step fallback if Phemex's /public/products response shape
 # doesn't match what we expect — always used as a floor (never sized up), so
 # a wrong guess here means a smaller/rougher order, never an oversized one.
@@ -3839,6 +3841,9 @@ def _status_build_render_lines(display_data):
             if er:
                 targets.append((er["upper"][100], f"ER 100% {GRN}{BLD}${er['upper'][100]:,.2f}{RST} ({target_rel(er['upper'][100])})"))
                 targets.append((er["upper"][150], f"ER 150% {GRN}{BLD}${er['upper'][150]:,.2f}{RST} ({target_rel(er['upper'][150])})"))
+            mr = _MARGIN_RECOVERED.get(inst_name)
+            if mr is not None:
+                targets.append((mr, f"Margin Recovered {GRN}{BLD}${mr:,.2f}{RST} ({target_rel(mr)})"))
         elif ratio > 1.02:
             _bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
             if st is not None:
@@ -3851,6 +3856,9 @@ def _status_build_render_lines(display_data):
             if er:
                 targets.append((er["lower"][100], f"ER 100% {GRN}{BLD}${er['lower'][100]:,.2f}{RST} ({target_rel(er['lower'][100])})"))
                 targets.append((er["lower"][150], f"ER 150% {GRN}{BLD}${er['lower'][150]:,.2f}{RST} ({target_rel(er['lower'][150])})"))
+            mr = _MARGIN_RECOVERED.get(inst_name)
+            if mr is not None:
+                targets.append((mr, f"Margin Recovered {GRN}{BLD}${mr:,.2f}{RST} ({target_rel(mr)})"))
         targets.sort(key=lambda t: t[0])
         targets = [s for _, s in targets]
         has_targets[inst_name] = bool(targets)
@@ -5076,7 +5084,7 @@ async def place_sl(symbol, pos_side, sl_price, price_decimals):
 # owns that whole data structure; a real Phemex order has no such custom
 # field, so the clOrdID itself is the only place to carry this).
 _TP_TYPE_CODES = {"BT": "BT", "ST": "ST", "GEX Flip": "GF", "Cluster": "CL",
-                   "ER 100%": "E1", "ER 150%": "E2"}
+                   "ER 100%": "E1", "ER 150%": "E2", "Margin Recovered": "MR"}
 _TP_TYPE_CODES_REV = {v: k for k, v in _TP_TYPE_CODES.items()}
 
 def _tp_type_code(target_type):
@@ -5089,7 +5097,7 @@ def _tp_type_from_code(code):
 # BT/ST into one combined label per explicit user request ("GEXFLIP,
 # CLUSTER, or BT/ST"), rather than showing BT and ST as two separate values.
 _TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluster": "CLUSTER",
-                     "ER 100%": "ER100", "ER 150%": "ER150"}
+                     "ER 100%": "ER100", "ER 150%": "ER150", "Margin Recovered": "MARGIN"}
 
 def _tp_type_display(target_type):
     return _TP_TYPE_DISPLAY.get(target_type, "—")
@@ -8075,6 +8083,11 @@ class AthenaInstrument:
             realized_pnl = -fee_for_leg(self.asset, size, fill_price)
             if DRY_RUN:
                 realized_pnl += already_realized
+            leverage = self.cfg["leverage"]
+            mr_level = fill_price * (1.0 + 1.0 / leverage) if pos_side == "Long" \
+                else fill_price * (1.0 - 1.0 / leverage)
+            _MARGIN_RECOVERED[self.asset] = mr_level
+
             self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "sl_order_id": sl_order_id, "tp_legs": tp_legs,
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
@@ -8259,14 +8272,27 @@ class AthenaInstrument:
                 return self._realized_since_last_fill(symbol, pos_side)
         return pnl_approx
 
-    def _update_blackjack(self, pnl):
+    def _update_blackjack(self, pnl, home_run=False):
         """Advances this asset's OWN Blackjack progression (BLACKJACK_STATE
         is per-asset, independent — explicit user answer 2026-07-24) off
         one trade's realized net pnl. No I/O of its own — "R" is always
         computed fresh, from CURRENT balance, at the next entry's sizing
         time (see _check_confirmation), not frozen at the moment a trade
         closes. See BLACKJACK_STEPS' own comment for the full spec this
-        implements."""
+        implements.
+
+        home_run (explicit user request, 2026-08-22): True when the
+        caller has already determined this trade was a 5R/3R+ "home run"
+        (see _check_5r_home_run). Skips the normal win-progression
+        arming below entirely — no bonus should carry into the next
+        trade off a home-run win, the loss ladder resets straight to 1R
+        instead (that reset is _check_5r_home_run's own job, called by
+        the same caller right after this). Only ever relevant on the
+        freshly-winning branch: bj["in_win_progression"] is guaranteed
+        already False for a home-run trade (sequence_label couldn't have
+        been the bare "5R" otherwise — see _check_5r_home_run's own
+        docstring), so this never needs to special-case the "2nd trade
+        of a win progression" branch above it."""
         if not BLACKJACK_MODE or pnl is None:
             return
         bj = BLACKJACK_STATE[self.asset]
@@ -8279,6 +8305,8 @@ class AthenaInstrument:
                 bj["loss_step"] = 0   # two wins in a row — full reset
             # else: loss progression simply resumes at the level it was
             # frozen at when the win progression started — NOT touched here.
+        elif home_run:
+            return   # win-progression arming skipped; _check_5r_home_run resets the ladder to 1R instead
         elif pnl > 0:
             step_back = max(0, bj["loss_step"] - 1)
             bj["win_step_back"] = BLACKJACK_STEPS[step_back]
@@ -8355,6 +8383,55 @@ class AthenaInstrument:
         if not first_ever:
             console_log(f"{self.asset}: {YLW}Blackjack progression reset to 1R (new trading day){RST}")
             log_event(self.asset, "blackjack_daily_reset", {"reset_day": key})
+
+    def _check_5r_home_run(self, pnl):
+        """"5R home run" rule (explicit user request, 2026-08-22): a trade
+        originally risked at the ladder's max 5R step (BLACKJACK_STEPS'
+        own top step) that closes with a NET profit of 3R or more forces
+        the loss ladder straight back to 1R — same reset shape
+        _update_daily_loss_limit/_check_bj_daily_reset already use
+        elsewhere. Called once per close, from every close site, BEFORE
+        _update_blackjack — its own return value is passed into
+        _update_blackjack's `home_run` parameter so that call skips
+        arming the normal win-progression bonus for this trade instead
+        of arming it and then having it immediately overwritten here.
+        Does NOT affect the Max Win Limit's own consecutive-win counter
+        (2026-08-22 correction — a home-run trade still counts as a
+        completely normal win there, _update_max_win_limit always runs
+        unconditionally regardless of this return value). Returns True
+        (a home run) or False.
+
+        "3R" here is the SAME fixed 'R' the 1R,1R,2R,3R,5R step labels
+        themselves use, i.e. this specific trade's own trade_risk_dollars
+        (persisted on self.position at fill — see _check_confirmation's
+        sizing block and _check_fill's own position-build) divided back
+        by 5. Only a trade whose sequence_label is the bare "5R" ever
+        qualifies: a Layer 2 R-multiple cap or an active win-progression
+        bonus produce a DIFFERENT label ("3R" after a cap, "Win
+        (2R+$X)", ...) precisely because the dollar amount actually
+        risked wasn't a clean 5x of that trade's own 1R — sequence_label
+        already encodes that distinction, so no separate cap/win-
+        progression check is needed here."""
+        if pnl is None or not self.position:
+            return False
+        if self.position.get("sequence_label") != "5R":
+            return False
+        trade_risk_dollars = self.position.get("trade_risk_dollars")
+        if not trade_risk_dollars:
+            return False
+        one_r_dollars = trade_risk_dollars / 5.0
+        if pnl < 3.0 * one_r_dollars:
+            return False
+        bj = BLACKJACK_STATE[self.asset]
+        bj["loss_step"] = 0
+        bj["in_win_progression"] = False
+        bj["win_step_back"] = None
+        bj["win_profit_dollars"] = None
+        _save_blackjack_state()
+        console_log(f"{self.asset}: {GRN}{BLD}5R trade closed +{pnl / one_r_dollars:.1f}R — loss progression "
+                    f"reset to 1R, win-progression skipped (Max Win Limit streak still counts it){RST}")
+        log_event(self.asset, "blackjack_5r_home_run", {"pnl": pnl, "one_r_dollars": one_r_dollars})
+        return True
 
     def _update_daily_loss_limit(self, pnl):
         """Daily Loss Limit tracking (explicit user request, 2026-07-25) —
@@ -8647,7 +8724,7 @@ class AthenaInstrument:
         # cluster) is still fine either way — that's not settling for
         # something weaker.
         def _is_top_tier(t):
-            return t["type"] in ("BT", "ST") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+            return t["type"] in ("BT", "ST", "Margin Recovered") or (t["type"] == "Cluster" and t.get("tier") == "Large")
 
         top_tier_present = any(_is_top_tier(t) for t in targets_full)
         usable_target = None
@@ -8813,6 +8890,15 @@ class AthenaInstrument:
                          # the entry. Threaded through here so the real
                          # trade log's SEQUENCE column isn't blank.
                          "sequence_label": sequence_label,
+                         # 2026-08-22 user request: the "5R trade closes at
+                         # 3R+ net profit" home-run rule (see
+                         # _check_5r_home_run) needs to recover this
+                         # trade's own dollar value of "1R" at CLOSE time,
+                         # which can be minutes/hours after entry — by then
+                         # BLACKJACK_1R_DOLLARS may have changed, so the
+                         # dollar amount actually risked at sizing time has
+                         # to be captured here rather than recomputed later.
+                         "trade_risk_dollars": trade_risk_dollars,
                          # 2026-07-27 user request: a resting LIMIT entry
                          # shouldn't wait forever for price to revert to
                          # the confirming bar's own VAH/VAL — see
@@ -8881,7 +8967,12 @@ class AthenaInstrument:
         symbol = self.cfg["phemex_symbol"]
         await self._place_sl_with_retry(symbol, p["pos_side"], sl_price, p["price_decimals"])
 
-        targets = p["targets"]
+        leverage = self.cfg["leverage"]
+        mr_level = fill_price * (1.0 + 1.0 / leverage) if p["pos_side"] == "Long" \
+            else fill_price * (1.0 - 1.0 / leverage)
+        _MARGIN_RECOVERED[self.asset] = mr_level
+
+        targets = [{"type": "Margin Recovered", "level": mr_level}] + list(p["targets"])
         qd = p["qty_decimals"]
         step = 10 ** (-qd) if qd else 1.0
         total_steps = round(qty / step)
@@ -8996,7 +9087,13 @@ class AthenaInstrument:
                           # by each TP leg's own net contribution as legs
                           # actually close — see _manage_position's partial-
                           # fill block below.
-                          "realized_pnl": -fee_for_leg(self.asset, qty, fill_price)}
+                          "realized_pnl": -fee_for_leg(self.asset, qty, fill_price),
+                          # sequence_label/trade_risk_dollars (2026-08-22):
+                          # threaded from self.pending the same way
+                          # entry_day_ct etc. already are — see
+                          # _check_5r_home_run, the only reader of these two
+                          # once the trade is open.
+                          "sequence_label": p.get("sequence_label"), "trade_risk_dollars": p.get("trade_risk_dollars")}
         self._tp1_lock_done = False
         self.pending = None
         self.state = "IN_POSITION"
@@ -9136,9 +9233,11 @@ class AthenaInstrument:
                 # trade) — realized_pnl-based net_pnl is a genuine fix
                 # there, not just a parallel option.
                 net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
-            self._update_blackjack(net_pnl)
+            home_run = self._check_5r_home_run(net_pnl)
+            self._update_blackjack(net_pnl, home_run=home_run)
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
+            _MARGIN_RECOVERED.pop(self.asset, None)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -9329,9 +9428,11 @@ class AthenaInstrument:
             # to 1R the MOMENT the limit is hit (not when it's later
             # cleared), so by the time a flip ever reactivates a blocked
             # asset the ladder is already sitting at 1R.
-            self._update_blackjack(net_pnl)
+            home_run = self._check_5r_home_run(net_pnl)
+            self._update_blackjack(net_pnl, home_run=home_run)
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
+            _MARGIN_RECOVERED.pop(self.asset, None)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -9837,12 +9938,14 @@ class AthenaInstrument:
                 # trade) — realized_pnl-based net_pnl is a genuine fix
                 # there, not just a parallel option.
                 net_pnl = self._trade_net_pnl(pnl_approx, symbol, pos_side)
-            self._update_blackjack(net_pnl)
+            home_run = self._check_5r_home_run(net_pnl)
+            self._update_blackjack(net_pnl, home_run=home_run)
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
+        _MARGIN_RECOVERED.pop(self.asset, None)
         self.pending = None
         self.position = None
         self.state = "WATCHING"

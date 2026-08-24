@@ -76,6 +76,7 @@ import json
 import shutil
 import math
 import bisect
+import statistics
 import time
 import hmac
 import hashlib
@@ -281,6 +282,10 @@ FUNDING_RATE = {}   # asset -> {"rate": float, "pred_rate": float, "ts": float}
                      # apply_funding_if_due (paper trading's own charge/credit).
 _funding_poll_ts = [0.0]   # single-item box, same convention as SYNC_CLIENT_
                             # STATUS etc. — last time FUNDING_RATE was refreshed
+
+FUNDING_REGIME_WINDOW = 90
+FUNDING_REGIME = {}
+_funding_regime_date = [None]
 
 # ── "Blackjack" position-sizing mode ([B] toggle) ─────────────────────────────
 # Loss progression 1R,1R,2R,3R,5R (R = balance*PCT/100, the SAME "1 unit of
@@ -3719,8 +3724,29 @@ def _status_build_render_lines(display_data):
         p(f"     {STATUS_LIGHT_BLANK}  {DIM}VXN (QQQ) unavailable{RST}")
     p()
 
+    fr = FUNDING_REGIME
+    p(f"  {BLD}3. Funding Rate{RST}")
+    if fr and fr.get("regime"):
+        regime = fr["regime"]
+        regime_col = {
+            "Favorable": GRN, "Soft": CYN, "Normal noise": YLW,
+            "Elevated caution": MAG, "Extreme": RED,
+        }.get(regime, DIM)
+        cur_r = fr.get("current_rate") or 0.0
+        pred_r = fr.get("predicted_rate") or 0.0
+        tmean = fr.get("trailing_mean") or 0.0
+        streak = fr.get("negative_streak", 0)
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}{'Regime':<12}{RST}{regime_col}{BLD}{regime}{RST}")
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}{'Current':<12}{RST}{CYN}{BLD}{cur_r*100:>+8.4f}%{RST}   "
+          f"{DIM}Predicted{RST} {CYN}{BLD}{pred_r*100:>+8.4f}%{RST}")
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}{'Mean (90p)':<12}{RST}{CYN}{BLD}{tmean*100:>+8.4f}%{RST}   "
+          f"{DIM}Neg streak{RST} {(RED if streak > 3 else YLW if streak > 0 else GRN)}{BLD}{streak}{RST}")
+    else:
+        p(f"     {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")
+    p()
+
     pcvr = display_data.get("pcvr")
-    p(f"  {BLD}3. PCVR{RST}")
+    p(f"  {BLD}4. PCVR{RST}")
     if pcvr:
         ratio = pcvr["ratio"]
         col = RED if ratio >= 1.02 else (GRN if ratio <= 0.98 else YLW)
@@ -3730,9 +3756,9 @@ def _status_build_render_lines(display_data):
         p(f"     {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")
     p()
 
-    p(f"  {BLD}4. High-Probability Levels{RST}")
+    p(f"  {BLD}5. High-Probability Levels{RST}")
     active_status = {}
-    er_by_inst = {}   # raw ER upper/lower dicts, captured here for section 5's own
+    er_by_inst = {}   # raw ER upper/lower dicts, captured here for section 6's own
                         # ER 100%/150% target display (see reconstruct_targets)
     for inst_name, price_key, chain_key, candles_key, prev_key, iv_key, tol, gtol, gyellow, is_crypto in (
         ("ETH", "eth_price", "eth_chain", "eth_candles", None, "eth_iv", 2.00, 2.00, 5.00, True),
@@ -3776,7 +3802,7 @@ def _status_build_render_lines(display_data):
                 p(f"        {dot}  {label_:<26}{level_str}")
         p()
 
-    p(f"  {BLD}5. Targets{RST}")
+    p(f"  {BLD}6. Targets{RST}")
     has_targets = {}
     ratio = pcvr["ratio"] if pcvr else None
     for inst_name, price_key, chain_key, is_crypto, gated in (
@@ -5332,6 +5358,88 @@ async def fetch_funding_rate(symbol):
                 float(pred) if pred is not None else None)
     except Exception:
         return None, None
+
+async def _fetch_funding_history(limit=FUNDING_REGIME_WINDOW):
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{PHEMEX_BASE_URL}/api-data/public/data/funding-rate-history",
+                                  params={"symbol": ".ETHUSDTFR8H", "limit": limit})
+        rows = r.json().get("data", {}).get("rows", [])
+        if not rows:
+            return None
+        return [float(row["fundingRate"]) for row in rows]
+    except Exception:
+        return None
+
+def _funding_regime_classify(current_rate, predicted_rate, trailing_mean, negative_streak):
+    if current_rate >= trailing_mean or predicted_rate >= trailing_mean:
+        return "Favorable"
+    if current_rate > 0 or predicted_rate > 0:
+        return "Soft"
+    if negative_streak <= 3:
+        return "Normal noise"
+    if negative_streak <= 7:
+        return "Elevated caution"
+    return "Extreme"
+
+async def _refresh_funding_regime():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _funding_regime_date[0] == today and FUNDING_REGIME:
+        with FUNDING_RATE_LOCK:
+            info = FUNDING_RATE.get("ETH")
+        if not info:
+            return
+        cur, pred = info.get("rate"), info.get("pred_rate")
+        if cur is None:
+            return
+        regime = _funding_regime_classify(cur, pred or 0.0,
+                                           FUNDING_REGIME.get("trailing_mean", 0.0),
+                                           FUNDING_REGIME.get("negative_streak", 0))
+        prev_regime = FUNDING_REGIME.get("regime")
+        FUNDING_REGIME["regime"] = regime
+        FUNDING_REGIME["current_rate"] = cur
+        FUNDING_REGIME["predicted_rate"] = pred
+        if prev_regime and regime != prev_regime:
+            log_event("ETH", "funding_regime_change", {
+                "from": prev_regime, "to": regime,
+                "current_rate": cur, "predicted_rate": pred,
+                "trailing_mean": FUNDING_REGIME.get("trailing_mean"),
+                "negative_streak": FUNDING_REGIME.get("negative_streak"),
+            })
+        return
+    rates = await _fetch_funding_history(FUNDING_REGIME_WINDOW)
+    if not rates:
+        return
+    mean_val = statistics.mean(rates)
+    median_val = statistics.median(rates)
+    neg_streak = 0
+    for r in reversed(rates):
+        if r < 0:
+            neg_streak += 1
+        else:
+            break
+    with FUNDING_RATE_LOCK:
+        info = FUNDING_RATE.get("ETH")
+    cur = info.get("rate", 0.0) if info else 0.0
+    pred = info.get("pred_rate", 0.0) if info else 0.0
+    regime = _funding_regime_classify(cur or 0.0, pred or 0.0, mean_val, neg_streak)
+    prev_regime = FUNDING_REGIME.get("regime")
+    FUNDING_REGIME.update({
+        "regime": regime,
+        "current_rate": cur,
+        "predicted_rate": pred,
+        "trailing_mean": mean_val,
+        "trailing_median": median_val,
+        "negative_streak": neg_streak,
+        "window_size": len(rates),
+    })
+    _funding_regime_date[0] = today
+    if prev_regime is None or regime != prev_regime:
+        log_event("ETH", "funding_regime_change", {
+            "from": prev_regime, "to": regime,
+            "current_rate": cur, "predicted_rate": pred,
+            "trailing_mean": mean_val, "negative_streak": neg_streak,
+        })
 
 def _most_recent_funding_boundary(now_ts=None):
     """The most recent 00:00/08:00/16:00 UTC funding timestamp at or before
@@ -13745,6 +13853,10 @@ async def engine_loop():
                 if rate is not None:
                     with FUNDING_RATE_LOCK:
                         FUNDING_RATE[inst.asset] = {"rate": rate, "pred_rate": pred, "ts": time.time()}
+            try:
+                await _refresh_funding_regime()
+            except Exception:
+                pass
 
         await _fast_match_wait(INTERVAL)
 

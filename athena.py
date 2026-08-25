@@ -6026,6 +6026,28 @@ def _drift_seed_state_from_samples(state, samples, is_crypto):
     else:
         state.expiry_label = last.get("expiry")
 
+def _drift_rebuild_netvol_in_history(history, all_raw_items, min_trade_usd):
+    """Replay raw items to rebuild the net_vol/net_vol_f field in every
+    history sample.  Called once at seed time so persisted samples that
+    were written under an older net_vol formula get corrected in-place."""
+    if not history or not all_raw_items:
+        return
+    items = sorted(all_raw_items, key=lambda it: it["ts"])
+    nv = nv_f = 0.0
+    idx = 0
+    for sample in history:
+        ts = sample["ts"]
+        while idx < len(items) and items[idx]["ts"] <= ts:
+            it = items[idx]
+            if it["usd"] >= min_trade_usd:
+                ds = it["sign"] if it["otype"] == "call" else -it["sign"]
+                nv += ds * it["contracts"]
+                if it.get("otm", False):
+                    nv_f += ds * it["contracts"]
+            idx += 1
+        sample["net_vol"] = nv
+        sample["net_vol_f"] = nv_f
+
 def _drift_seed_today(state, asset, is_crypto):
     date_str = datetime.now().strftime("%m_%d_%Y")
     samples = _drift_load_log(asset, date_str)
@@ -6048,8 +6070,16 @@ def _drift_seed_today(state, asset, is_crypto):
             venue = state.venues.get(item.get("venue"))
             if venue is not None and item.get("expiry") == venue["expiry_label"]:
                 venue["raw_items"].append(item)
+        all_raw = [it for v in state.venues.values() for it in v["raw_items"]]
     else:
         state.raw_items.extend(it for it in raw_items if it.get("expiry") == state.expiry_label)
+        all_raw = state.raw_items
+    if all_raw and state.history:
+        min_usd = DRIFT_MIN_TRADE_USD.get(asset, DRIFT_DEFAULT_MIN_TRADE_USD)
+        _drift_rebuild_netvol_in_history(state.history, all_raw, min_usd)
+        last = state.history[-1]
+        state.net_vol_cum = last.get("net_vol", 0.0)
+        state.net_vol_cum_f = last.get("net_vol_f", 0.0)
 
 def _drift_maybe_reset_for_new_day(state):
     """Calendar-day reset — must be called EVERY poll (not just at startup),
@@ -6150,9 +6180,10 @@ def _drift_poll_venue_deribit(asset, cursor_prev, expiry_prev, min_trade_usd, fa
                      "otype": otype, "sign": sign, "otm": otm, "venue": "deribit", "expiry": expiry_label})
         if usd < min_trade_usd:
             continue
-        d_netvol += sign * contracts
+        dir_sign = sign if otype == "call" else -sign
+        d_netvol += dir_sign * contracts
         if otm:
-            d_netvol_f += sign * contracts
+            d_netvol_f += dir_sign * contracts
         if otype == "call":
             d_calls += usd * sign
             if otm:
@@ -6200,9 +6231,10 @@ def _drift_poll_venue_okx(asset, cursor_prev, expiry_prev, min_trade_usd, fallba
                      "otype": otype, "sign": sign, "otm": otm, "venue": "okx", "expiry": expiry_label})
         if usd < min_trade_usd:
             continue
-        d_netvol += sign * contracts
+        dir_sign = sign if otype == "call" else -sign
+        d_netvol += dir_sign * contracts
         if otm:
-            d_netvol_f += sign * contracts
+            d_netvol_f += dir_sign * contracts
         if otype == "call":
             d_calls += usd * sign
             if otm:
@@ -6255,9 +6287,10 @@ def _drift_poll_venue_bybit(asset, cursor_prev, expiry_prev, min_trade_usd, fall
                      "otype": otype, "sign": sign, "otm": otm, "venue": "bybit", "expiry": expiry_label})
         if usd < min_trade_usd:
             continue
-        d_netvol += sign * contracts
+        dir_sign = sign if otype == "call" else -sign
+        d_netvol += dir_sign * contracts
         if otm:
-            d_netvol_f += sign * contracts
+            d_netvol_f += dir_sign * contracts
         if otype == "call":
             d_calls += usd * sign
             if otm:
@@ -6301,9 +6334,10 @@ def _drift_recompute_crypto_from_raw(state, min_trade_usd):
         for it in venue["raw_items"]:
             if it["usd"] < min_trade_usd:
                 continue
-            netvol += it["sign"] * it["contracts"]
+            ds = it["sign"] if it["otype"] == "call" else -it["sign"]
+            netvol += ds * it["contracts"]
             if it["otm"]:
-                netvol_f += it["sign"] * it["contracts"]
+                netvol_f += ds * it["contracts"]
             contribution = it["usd"] * it["sign"]
             if it["otype"] == "call":
                 calls += contribution
@@ -6428,9 +6462,10 @@ def _drift_recompute_cboe_from_raw(state, min_trade_usd):
     for it in state.raw_items:
         if it["usd"] < min_trade_usd:
             continue
-        netvol += it["sign"] * it["contracts"]
+        ds = it["sign"] if it["otype"] == "call" else -it["sign"]
+        netvol += ds * it["contracts"]
         if it["otm"]:
-            netvol_f += it["sign"] * it["contracts"]
+            netvol_f += ds * it["contracts"]
         contribution = it["usd"] * it["sign"]
         if it["otype"] == "call":
             calls += contribution
@@ -6500,9 +6535,10 @@ def _drift_poll_once_cboe(asset, state, min_trade_usd, confidence_deadzone):
             _drift_raw_append_log(asset, dict(item, asset=asset))
             if usd < min_trade_usd:
                 continue
-            d_netvol += sign * delta_contracts
+            dir_sign = sign if c["otype"] == "call" else -sign
+            d_netvol += dir_sign * delta_contracts
             if otm:
-                d_netvol_f += sign * delta_contracts
+                d_netvol_f += dir_sign * delta_contracts
             if c["otype"] == "call":
                 d_calls += usd * sign
                 if otm:
@@ -6820,8 +6856,16 @@ def _drift_load_historical(asset, date_str):
                 venue = hist_state.venues.get(item.get("venue"))
                 if venue is not None and item.get("expiry") == venue["expiry_label"]:
                     venue["raw_items"].append(item)
+            all_raw = [it for v in hist_state.venues.values() for it in v["raw_items"]]
         else:
             hist_state.raw_items.extend(it for it in raw_items if it.get("expiry") == hist_state.expiry_label)
+            all_raw = hist_state.raw_items
+        if all_raw and hist_state.history:
+            min_usd = DRIFT_MIN_TRADE_USD.get(asset, DRIFT_DEFAULT_MIN_TRADE_USD)
+            _drift_rebuild_netvol_in_history(hist_state.history, all_raw, min_usd)
+            last = hist_state.history[-1]
+            hist_state.net_vol_cum = last.get("net_vol", 0.0)
+            hist_state.net_vol_cum_f = last.get("net_vol_f", 0.0)
     else:
         hist_state.status = f"no log found for {date_str}"
     DRIFT_HIST_STATE[asset] = hist_state
@@ -8832,7 +8876,7 @@ class AthenaInstrument:
         # cluster) is still fine either way — that's not settling for
         # something weaker.
         def _is_top_tier(t):
-            return t["type"] in ("BT", "ST", "Margin Recovered") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+            return t["type"] in ("BT", "ST") or (t["type"] == "Cluster" and t.get("tier") == "Large")
 
         top_tier_present = any(_is_top_tier(t) for t in targets_full)
         usable_target = None
@@ -9080,43 +9124,31 @@ class AthenaInstrument:
             else fill_price * (1.0 - 1.0 / leverage)
         _MARGIN_RECOVERED[self.asset] = mr_level
 
-        targets = [{"type": "Margin Recovered", "level": mr_level}] + list(p["targets"])
+        targets = list(p["targets"])
         qd = p["qty_decimals"]
         step = 10 ** (-qd) if qd else 1.0
         total_steps = round(qty / step)
 
         def _tp_level(target):
-            # GEX Flip is a moving target (status.py/gex.py recompute it
-            # every cycle) — per spec, a TP tracking it never sits exactly
-            # AT the flip level, always $3 on the near side (below for a
-            # long, above for a short). _manage_position keeps this synced
-            # for as long as the position stays open.
             if target["type"] == "GEX Flip":
                 return target["level"] - GEX_FLIP_TP_BUFFER if p["pos_side"] == "Long" else target["level"] + GEX_FLIP_TP_BUFFER
             return target["level"]
 
         def _valid_tp(level):
-            # A TP must sit at least R past the ACTUAL fill price on the
-            # profit side — without this, a target that's genuinely close
-            # to price (or a GEX-Flip target the $3 buffer pushes past
-            # price when GEX Flip itself is within $3 of the fill) becomes
-            # instantly triggerable the moment price ticks at all, closing
-            # the position within seconds at (near-)break-even. Confirmed
-            # live 2026-07-23: GEX Flip $1922.10, -$3 buffer -> $1919.10,
-            # BELOW a $1920.83 long fill — that TP leg filled in 6 seconds.
             return level >= fill_price + R if p["pos_side"] == "Long" else level <= fill_price - R
 
         candidates = [(_tp_level(t), t) for t in targets]
         valid = [(lvl, t) for lvl, t in candidates if _valid_tp(lvl)]
-        # 2026-07-29 user-reported bug: TP1 must always be the NEARER
-        # target and TP2 the FARTHER one, so TP1 is reachable first as
-        # price moves in the trade's favor — targets/targets_full are
-        # ordered by tier/priority, not by distance from the actual fill,
-        # so a lower-priority-but-closer target could otherwise land in
-        # the TP2 slot while a higher-priority-but-farther one took TP1,
-        # meaning TP2 would fill before TP1 ever could.
         valid.sort(key=lambda lt: abs(lt[0] - fill_price))
         dropped = [t for lvl, t in candidates if not _valid_tp(lvl)]
+
+        mr_dist = abs(mr_level - fill_price)
+        if valid:
+            nearest_dist = abs(valid[0][0] - fill_price)
+            if nearest_dist > mr_dist and _valid_tp(mr_level):
+                valid.insert(0, (mr_level, {"type": "Margin Recovered", "level": mr_level}))
+        elif _valid_tp(mr_level):
+            valid.insert(0, (mr_level, {"type": "Margin Recovered", "level": mr_level}))
         if dropped:
             console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
             log_event(self.asset, "tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
@@ -9598,7 +9630,7 @@ class AthenaInstrument:
         "refresh" it in the first place, since its price never changes
         here."""
         tp_legs = self.position.get("tp_legs") or []
-        if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST") for leg in tp_legs):
+        if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST", "Margin Recovered") for leg in tp_legs):
             return
 
         fill_price = self.position.get("fill_price")
@@ -9733,6 +9765,15 @@ class AthenaInstrument:
                     if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_bt_st_level) > 0.01:
                         console_log(f"{self.asset}: {YLW}{leg['type']} too close to fill (${fmt_num(new_bt_st_level)}) — TP refresh skipped this cycle{RST}")
                         self._tp_skip_warned[warn_key] = new_bt_st_level
+            elif leg.get("type") == "Margin Recovered" and new_bt_st_level is not None:
+                tracked = True
+                if _safe(new_bt_st_level):
+                    level, leg_changed = new_bt_st_level, True
+                    leg = dict(leg, type=bt_st_type)
+                    console_log(f"{self.asset}: {GRN}MR leg replaced with {bt_st_type} ${fmt_num(new_bt_st_level)}{RST}")
+                    log_event(self.asset, "mr_leg_replaced", {"old_level": leg.get("level"), "new_level": new_bt_st_level, "new_type": bt_st_type})
+                else:
+                    pinned = True
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?"),

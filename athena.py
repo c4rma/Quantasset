@@ -2499,17 +2499,7 @@ def fetch_status_pcvr():
     return {"underlying": underlying, "put_vol": put_vol, "call_vol": call_vol, "ratio": ratio}
 
 STATUS_BT_ST_BAND_PCT = {"crypto": 0.20, "equity": 0.12}
-# 2026-07-27 user-requested change, DELIBERATE divergence from status.py's
-# own original (crypto: 3) — confirmed byte-for-byte identical to
-# status.py's own compute_bt_st before this change (verified against a
-# real live Deribit chain), so a 3-strike run was never a porting bug; the
-# spec itself just let a near-ATM, none-too-meaningful 3-run qualify as
-# BT/ST, since ATM strikes often show a slight volume lean from both
-# sides just from normal ATM activity. A 5-strike run requires a much
-# more durable, decisive dominance shift before it counts — the user's
-# own worked example (a run of well over 5 consecutive put-dominant
-# strikes below $1,880) confirmed this wouldn't break a genuine case.
-STATUS_BT_ST_RUN_LEN = {"crypto": 5, "equity": 5}
+STATUS_BT_ST_RUN_LEN = {"crypto": 3, "equity": 5}
 
 def compute_bt_st(strikes, is_crypto, spot, ratio):
     """Computes ONE side ("primary") by scanning for the nearest-to-spot
@@ -3422,30 +3412,22 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
         dist = 0.0 if lo <= price <= hi else min(abs(price - lo), abs(price - hi))
         return f" ({dist_color(dist)}{BLD}${dist:,.2f} away{RST})"
 
-    if export:
-        vah, val, poc = export.get("vah"), export.get("val"), export.get("poc")
-        vwap = export.get("vwap")
-        sd_p05, sd_m05 = export.get("sd_p05"), export.get("sd_m05")
-        sd_p2,  sd_m2  = export.get("sd_p2"),  export.get("sd_m2")
-        sd_p25, sd_m25 = export.get("sd_p25"), export.get("sd_m25")
-        session_open = export.get("session_open")
-        if export.get("iv") is not None:
-            iv = export["iv"]
+    vp = status_compute_vp(session_candles)
+    poc = vah = val = None
+    if vp:
+        poc, vah, val = vp
+    vwap, sd = status_compute_vwap_sd(session_candles)
+    if vwap is not None and sd is not None:
+        sd_p05, sd_m05 = vwap + 0.5 * sd, vwap - 0.5 * sd
+        sd_p2,  sd_m2  = vwap + 2.0 * sd, vwap - 2.0 * sd
+        sd_p25, sd_m25 = vwap + 2.5 * sd, vwap - 2.5 * sd
     else:
-        vp = status_compute_vp(session_candles)
-        poc = vah = val = None
-        if vp:
-            poc, vah, val = vp
-        vwap, sd = status_compute_vwap_sd(session_candles)
-        if vwap is not None and sd is not None:
-            sd_p05, sd_m05 = vwap + 0.5 * sd, vwap - 0.5 * sd
-            sd_p2,  sd_m2  = vwap + 2.0 * sd, vwap - 2.0 * sd
-            sd_p25, sd_m25 = vwap + 2.5 * sd, vwap - 2.5 * sd
-        else:
-            sd_p05 = sd_m05 = sd_p2 = sd_m2 = sd_p25 = sd_m25 = None
-        _prev_ts, curr_open_ts = status_session_open_ts()
-        open_candidates = [c for c in session_candles if c[0] >= curr_open_ts]
-        session_open = open_candidates[0][1] if open_candidates else (session_candles[0][1] if session_candles else None)
+        sd_p05 = sd_m05 = sd_p2 = sd_m2 = sd_p25 = sd_m25 = None
+    _prev_ts, curr_open_ts = status_session_open_ts()
+    open_candidates = [c for c in session_candles if c[0] >= curr_open_ts]
+    session_open = open_candidates[0][1] if open_candidates else (session_candles[0][1] if session_candles else None)
+    if export and export.get("iv") is not None:
+        iv = export["iv"]
 
     if is_crypto and session_open is not None:
         prev_close = session_open
@@ -3771,12 +3753,10 @@ def _status_build_render_lines(display_data):
         iv = display_data.get(iv_key)
         export = read_status_charthacker_export(inst_name)
         gex_export = read_gex_export(inst_name)
-        tags = []
-        if export:
-            tags.append(f"{GRN}VP/VWAP: charthacker.py{RST}{DIM}")
+        tags = [f"{GRN}VP/VWAP: REST{RST}{DIM}"]
         if gex_export:
             tags.append(f"{GRN}clusters/flip: gex.py{RST}{DIM}")
-        src_tag = ", ".join(tags) if tags else "status.py REST snapshot"
+        src_tag = ", ".join(tags)
         p(f"     {BLD}{YLW}── {inst_name} {RST}{DIM}({src_tag}){RST}")
         if not chain or price is None:
             p(f"        {STATUS_LIGHT_BLANK}  {DIM}unavailable{RST}")

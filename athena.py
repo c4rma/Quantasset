@@ -221,6 +221,7 @@ ALPACA_REST_URL      = 'https://data.alpaca.markets/v2'
 SCRIPT_DIR          = os.path.dirname(os.path.abspath(__file__))
 STATUS_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "status_logs")
 FOOTPRINT_DATA_DIR  = os.path.join(SCRIPT_DIR, "data", "footprint")
+OHLC_1M_DATA_DIR    = os.path.join(SCRIPT_DIR, "data", "ohlc_1m")
 ATHENA_LOG_DIR_BASE = os.path.join(SCRIPT_DIR, "athena_logs")
 SIM_STATE_PATH      = os.path.join(SCRIPT_DIR, "sim_account.json")
 SIM_LOG_DIR_BASE    = os.path.join(SCRIPT_DIR, "sim_logs")
@@ -229,6 +230,8 @@ BLACKJACK_STATE_PATH = os.path.join(SCRIPT_DIR, "blackjack_state.json")
 
 FOOTPRINT_INTERVAL_LABEL = "90s"
 FOOTPRINT_BAR_SECS       = 90   # numeric form of FOOTPRINT_INTERVAL_LABEL, for bucket math
+OHLC_1M_BAR_SECS         = 60   # 1-minute OHLC bars for the BTD trading mode + footprint OHLC view
+OHLC_1M_MAX_BARS         = 500  # in-memory cap per asset
 GEX_EXPORT_MAX_AGE       = 120   # matches status.py's GEX_STATUS_EXPORT_MAX_AGE
 # 2026-07-27 user request: a resting LIMIT entry order shouldn't wait
 # forever for price to revert to the confirming bar's own VAH/VAL — after
@@ -731,6 +734,45 @@ if "--sim-balance" in args:
     except (IndexError, ValueError):
         pass
 
+def _load_trading_mode():
+    """Persisted the same way BLACKJACK_MODE/BLACKJACK_1R_DOLLARS already
+    are — a reserved top-level key in blackjack_state.json (never
+    collides with a real asset name or the "_mode"/"_one_r_dollars" keys
+    those use) — 2026-08-26 user request ("Athena should remember the
+    trading mode it was last in and load into that upon relaunch"):
+    TRADING_MODE was never persisted at all before this, so every restart
+    silently reset it to "CCCCWIDE" regardless of what the user had it set
+    to, exactly the same class of bug BLACKJACK_MODE's own 2026-07-29 fix
+    (see _load_blackjack_settings' own docstring) already addressed for a
+    different setting."""
+    try:
+        with open(BLACKJACK_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        mode = data.get("_trading_mode")
+        if mode in TRADING_MODES:
+            return mode
+    except Exception:
+        pass
+    return "CCCCWIDE"
+
+def _save_trading_mode():
+    try:
+        try:
+            with open(BLACKJACK_STATE_PATH, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            payload = {}
+        payload["_trading_mode"] = TRADING_MODE
+        with open(BLACKJACK_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+TRADING_MODES = ("CCCCWIDE", "BTD")
+TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
+BTD_ENTRY_LOOKBACK = 10
+BTD_ENTRY_SIGMA    = 3.0
+
 STATUS_LIGHT_NAMES = ["Session", "Volatility", "PCVR", "HPLs", "Targets"]
 
 def required_status_lights():
@@ -896,10 +938,14 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None)
     source for BT/ST (status.py fetches the live options chain for
     those; Athena doesn't replicate that call).
 
-    er_targets (2026-08-22, user request) is the {"u100","l100","u150",
-    "l150"} dict compute_dashboard_snapshot's own inst_snap["er_targets"]
-    stores (see evaluate_hpls' own `er` return value) — the Expected
-    Range's 100%/150% levels, derived once per session from session-open
+    er_targets (2026-08-22, user request) is the fuller {"u40","l40","u80",
+    "l80","u100","l100","u150","l150","open"} dict compute_dashboard_
+    snapshot's own inst_snap["er_bands"] stores (renamed from "er_targets"
+    2026-08-25 once it grew past just the two TP tiers — see evaluate_hpls'
+    own `er` return value) — only the "u100"/"l100"/"u150"/"l150" keys are
+    used here as TP levels; the rest feeds the OHLC chart panel's own ER
+    fill overlay instead. The Expected Range's 100%/150% levels are
+    derived once per session from session-open
     + IV. Placed AFTER every Cluster but BEFORE GEX Flip: a Cluster is a
     real, live options-flow-driven wall (top-tier per _check_confirmation's
     own _is_top_tier), ER 100%/150% are a static vol-projection boundary
@@ -955,9 +1001,17 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None)
     return full
 
 def instrument_lights(snapshot, asset):
-    """(lights_dict, regime, price, targets_full, market_closed) for one
-    instrument, from the latest status.py snapshot + this cycle's gex
-    export. regime is 'long' (PCVR<=0.98), 'short' (PCVR>=1.02), or None.
+    """(lights_dict, regime, price, targets_full, market_closed, er_bands)
+    for one instrument, from the latest status.py snapshot + this cycle's
+    gex export. regime is 'long' (PCVR<=0.98), 'short' (PCVR>=1.02), or
+    None.
+
+    er_bands (2026-08-25) is the FULL raw ER dict (40/80/100/150% tiers +
+    session open) status.py's own snapshot already carries — targets_full
+    only ever uses the 100/150 tiers as TP levels (see reconstruct_targets),
+    but the OHLC chart panel's own ER fill overlay (mirroring Chart mode's
+    show_er) needs the 40/80% tiers and open price too, so the full dict
+    is returned here rather than re-deriving it a second time.
 
     market_closed (QQQ outside 08:45-15:00 CT weekdays — status.py's own
     qqq.market_closed, same field §_flatten_eod reuses) forces every light
@@ -968,13 +1022,13 @@ def instrument_lights(snapshot, asset):
     cfg = ASSETS[asset]
     lights = {"Session": False, "Volatility": False, "PCVR": False, "HPLs": False, "Targets": False}
     if snapshot is None:
-        return lights, None, None, [], False
+        return lights, None, None, [], False, None
 
     inst = snapshot.get(cfg["snap_key"]) or {}
     price = inst.get("price")
     market_closed = bool(inst.get("market_closed"))
     if market_closed:
-        return lights, None, price, [], True
+        return lights, None, price, [], True, None
 
     lights["Session"] = bool((snapshot.get("session") or {}).get("in_session"))
 
@@ -998,9 +1052,9 @@ def instrument_lights(snapshot, asset):
     lights["Targets"] = bool(log_targets)
 
     gex_export = read_gex_export(asset)
-    er_targets = inst.get("er_targets")
-    targets_full = reconstruct_targets(log_targets, gex_export, price, regime, er_targets=er_targets)
-    return lights, regime, price, targets_full, False
+    er_bands = inst.get("er_bands")
+    targets_full = reconstruct_targets(log_targets, gex_export, price, regime, er_targets=er_bands)
+    return lights, regime, price, targets_full, False, er_bands
 
 # ── footprint.py bar log — tail last CLOSED bar ───────────────────────────────
 def footprint_log_paths(asset):
@@ -1091,6 +1145,58 @@ def _persist_closed_footprint_bar(asset, bar):
     except Exception:
         pass
 
+# ── 1m OHLC bar log — same day-folder-glob persistence footprint's own 90s
+# bars already have, just for LiveTape's separate 1m accumulator (see that
+# class's own ohlc_1m_closed/ohlc_1m_live). Added 2026-08-26, user-reported
+# ("every time I relaunch Athena, all of the candles and data disappear and
+# the chart starts from scratch"): the 1m OHLC pipeline only ever had ONE
+# history source — _seed_ohlc_1m's own REST fetch, itself scoped to "this
+# session's own 19:00 CT open through now" (status_session_open_ts) — so a
+# restart late in a session, or one that's simply been running long enough
+# to accumulate MORE live-ingested bars than the current session's own
+# elapsed minutes, throws all of that away and starts over from just the
+# REST fetch. footprint.py's 90s bars never had this problem because
+# _persist_closed_footprint_bar/read_last_n_footprint_bars already give them
+# real cross-restart, cross-session-day persistence — this mirrors that
+# exact mechanism for the 1m bars instead of inventing a new one.
+def _ohlc_1m_log_path_for_bar(asset, bar_ts):
+    dt = datetime.fromtimestamp(bar_ts)
+    day_dir = os.path.join(OHLC_1M_DATA_DIR, f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}")
+    os.makedirs(day_dir, exist_ok=True)
+    return os.path.join(day_dir, f"ohlc1m_{ASSETS[asset]['phemex_symbol']}.jsonl")
+
+def _persist_closed_ohlc_1m_bar(asset, bar):
+    try:
+        path = _ohlc_1m_log_path_for_bar(asset, bar["ts"])
+        row = {"ts": bar["ts"], "o": bar["o"], "h": bar["h"], "l": bar["l"], "c": bar["c"], "v": bar["v"]}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+def ohlc_1m_log_paths(asset):
+    pattern = os.path.join(OHLC_1M_DATA_DIR, "**", f"ohlc1m_{ASSETS[asset]['phemex_symbol']}.jsonl")
+    matches = glob.glob(pattern, recursive=True)
+    matches.sort()
+    return matches
+
+def read_last_n_ohlc_1m_bars(asset, n):
+    paths = ohlc_1m_log_paths(asset)
+    bars = []
+    for path in reversed(paths):
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = [l for l in f if l.strip()]
+        except Exception:
+            continue
+        try:
+            bars = [json.loads(l) for l in lines] + bars
+        except Exception:
+            continue
+        if len(bars) >= n:
+            break
+    return bars[-n:]
+
 # ── Live trade tape (self-contained — no dependency on footprint.py at all) ──
 # Athena's still-forming bar previously either (a) approximated O/H/L/C from
 # polled ticker prices with no per-level data, or (b) read a snapshot file
@@ -1110,8 +1216,10 @@ class LiveTape:
         self.lock = threading.Lock()
         self.bars = {a: None for a in ASSETS}
         self.status = {a: "connecting…" for a in ASSETS}
+        self.ohlc_1m_closed = {a: [] for a in ASSETS}
+        self.ohlc_1m_live = {a: None for a in ASSETS}
 
-    def ingest(self, asset, ts, price, qty, is_buy, tick):
+    def ingest(self, asset, ts, price, qty, is_buy, tick, exchange="phemex"):
         """A brand-new bucket's O/H/L/C all start at the triggering trade's
         own price — matches footprint.py's own `_new_bar()` exactly (it
         does NOT seed from the previous bar's close either; verified by
@@ -1147,8 +1255,26 @@ class LiveTape:
         # about THIS bucket's own fate is decided.
         _cvd_ingest_trade(asset, ts, price, qty, is_buy)
 
+        minute_ts = int(ts // OHLC_1M_BAR_SECS) * OHLC_1M_BAR_SECS
         bucket_ts = int(ts // FOOTPRINT_BAR_SECS) * FOOTPRINT_BAR_SECS
         with self.lock:
+            # 2026-08-26 user-reported ("BTD signals ... in the main
+            # dashboard are not the same as ... Chart"): this 1-minute OHLC
+            # feeds BOTH the real BTD candle-close trade trigger
+            # (_check_btd_confirmation) and this panel's own candle/BTD-
+            # marker display — for ETH it used to accept ticks from all
+            # three live feeds (Phemex+Kraken+Coinbase) blended together,
+            # while Chart mode's own BTD overlay reads a single-exchange
+            # feed (Phemex by default). Same root cause as the earlier
+            # PHEMEX_LAST_PRICE fix, one layer up: BTD's "candle-close
+            # confirmation" should mean a PHEMEX candle closed, since
+            # that's the only place any real order for either asset
+            # actually executes. QQQ is untouched — its own 1m OHLC is
+            # already single-sourced (Alpaca when configured, Phemex
+            # otherwise; see _phemex_trade_ws's own docstring), so this
+            # condition is always true for QQQ.
+            if asset != "ETH" or exchange == "phemex":
+                self._ingest_1m(asset, minute_ts, price, qty)
             bar = self.bars[asset]
             if bar is not None and bucket_ts < bar["ts"]:
                 return
@@ -1185,11 +1311,102 @@ class LiveTape:
             copy["levels"] = {k: list(v) for k, v in bar["levels"].items()}
             return copy
 
+    def _ingest_1m(self, asset, minute_ts, price, qty):
+        bar = self.ohlc_1m_live[asset]
+        if bar is not None and minute_ts < bar["ts"]:
+            return
+        if bar is None or bar["ts"] != minute_ts:
+            if bar is not None:
+                closed = self.ohlc_1m_closed[asset]
+                closed.append(bar)
+                if len(closed) > OHLC_1M_MAX_BARS:
+                    self.ohlc_1m_closed[asset] = closed[-OHLC_1M_MAX_BARS:]
+                _persist_closed_ohlc_1m_bar(asset, bar)
+            self.ohlc_1m_live[asset] = {"ts": minute_ts, "o": price, "h": price,
+                                         "l": price, "c": price, "v": qty}
+        else:
+            bar["h"] = max(bar["h"], price)
+            bar["l"] = min(bar["l"], price)
+            bar["c"] = price
+            bar["v"] += qty
+
+    def snapshot_1m(self, asset):
+        with self.lock:
+            closed = list(self.ohlc_1m_closed[asset])
+            live = dict(self.ohlc_1m_live[asset]) if self.ohlc_1m_live[asset] else None
+            return closed, live
+
+    def seed_1m(self, asset, candles):
+        """Merges `candles` (oldest-first (ts,o,h,l,c,v) tuples, from REST)
+        into ohlc_1m_closed/ohlc_1m_live by UNION on ts — new candles
+        overwrite anything already at the same ts, everything else already
+        present is kept. NOT the old "skip any candle <= the current live
+        bar's own ts" policy: that broke the instant _run_footprint_
+        backfill's own trade replay (footprint's SEPARATE 90s-bar
+        backfill, an entirely different concern) started ALSO advancing
+        this same 1m accumulator as a side effect of sharing LiveTape.
+        ingest() — since that backfill runs BEFORE this seed call
+        (_backfill_then_feeds' own ordering), ohlc_1m_live was often
+        already sitting at a near-"now" timestamp by the time this ran,
+        so the old skip-based logic silently discarded nearly the ENTIRE
+        REST seed every time (2026-08-26 user-reported: "ETH is still
+        starting from scratch" even after the disk-persistence and
+        widened-lookback fixes — this ordering interaction was the actual
+        remaining cause, not reproducible in an isolated call to this
+        function alone since nothing had populated ohlc_1m_live first)."""
+        with self.lock:
+            all_bars = {b["ts"]: b for b in self.ohlc_1m_closed[asset]}
+            live = self.ohlc_1m_live[asset]
+            if live is not None:
+                all_bars[live["ts"]] = live
+            for ts, o, h, l, c, v in candles:
+                all_bars[int(ts)] = {"ts": int(ts), "o": float(o), "h": float(h),
+                                       "l": float(l), "c": float(c), "v": float(v)}
+            if not all_bars:
+                return
+            sorted_ts = sorted(all_bars)
+            self.ohlc_1m_live[asset] = all_bars[sorted_ts[-1]]
+            closed = [all_bars[ts] for ts in sorted_ts[:-1]]
+            if len(closed) > OHLC_1M_MAX_BARS:
+                closed = closed[-OHLC_1M_MAX_BARS:]
+            self.ohlc_1m_closed[asset] = closed
+
     def set_status(self, asset, text):
         with self.lock:
             self.status[asset] = text
 
 LIVE_TAPE = LiveTape()
+
+# ── Phemex-only last-trade price (2026-08-26 user request) ──────────────────
+# "For entries, PnL tracking, and anything a part of the actual trade
+# executions [Athena] should solely use Phemex's feed since that is where
+# I'm actually trading on the live account. Right now, if any of the feeds
+# reach the entry price then the trade is executed, but this is not how
+# Athena actually trades and yields misleading results." Every REAL order
+# (place_entry/place_sl/place_tp_leg/market_close) already only ever
+# executes against Phemex regardless of asset (even QQQ trades the
+# QQQUSDT perp, not a real equity) — but LIVE_TAPE.snapshot()'s own "c"
+# (last close), which SimAccount.tick_matching()/apply_funding_if_due()
+# and the dashboard's own live-price/unrealized-PnL calc all read from,
+# is a BLENDED multi-exchange price for ETH (Phemex+Kraken+Coinbase all
+# feed the same LiveTape.ingest() call) and, for QQQ, is Alpaca's real-
+# stock tape when configured — neither one is what the REAL Phemex order
+# book actually traded at, so a limit/SL/TP that only ever got touched on
+# Kraken/Coinbase/Alpaca (never on Phemex) was firing in the sim when it
+# never would have on the real account. This dict is updated ONLY from
+# Phemex's own WS trade prints (_phemex_trade_ws), independent of
+# whichever feed(s) also populate the blended LIVE_TAPE for order-flow/
+# signal purposes — see that function's own updated docstring.
+PHEMEX_LAST_PRICE = {a: None for a in ASSETS}
+
+def phemex_reference_price(asset):
+    """The one Phemex-only price every trade-EXECUTION concern (sim fill/
+    SL/TP matching, sim funding mark price, live uPnL/live-price display)
+    should read — never LIVE_TAPE.snapshot() directly for those purposes.
+    Falls back to None if Phemex's own WS hasn't delivered a print yet
+    (right at startup) — every caller already has its own fetch_last_price
+    REST fallback for exactly that gap."""
+    return PHEMEX_LAST_PRICE.get(asset)
 
 # ── Footprint startup backfill (mirrors footprint.py's initialize_today) ────
 # Ported from footprint.py's own REST historical-trades fetchers (its own
@@ -1437,7 +1654,7 @@ def _run_footprint_backfill(asset):
             return
         trades = _fetch_footprint_trades_range(asset, since_ts, until_ts, deadline=deadline)
         for ts, price, qty, is_buy in trades:
-            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick, exchange="backfill")
         LIVE_TAPE.set_status(asset, f"resumed, caught up {len(trades)} trades")
         console_log(f"{asset}: resumed {len(existing)} bars from today's log, caught up {len(trades)} newer trades")
         return
@@ -1449,7 +1666,7 @@ def _run_footprint_backfill(asset):
     trades = _fetch_footprint_trades_range(asset, since_ts, until_ts, deadline=deadline)
     if trades:
         for ts, price, qty, is_buy in trades:
-            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick, exchange="backfill")
         src = "Kraken+Coinbase" if asset == "ETH" else "Alpaca (IEX)"
         since_str = datetime.fromtimestamp(since_ts).strftime('%H:%M:%S')
         LIVE_TAPE.set_status(asset, f"backfilled {len(trades)} trades")
@@ -1475,9 +1692,42 @@ def _backfill_then_feeds(asset, feed_starters):
         _run_footprint_backfill(asset)
     except Exception as e:
         console_log(f"{asset}: backfill failed ({e}) — starting live feed anyway")
+    try:
+        _seed_ohlc_1m(asset)
+    except Exception as e:
+        console_log(f"{asset}: 1m OHLC seed failed ({e})")
     _backfill_ready[asset].set()
     for target, fargs in feed_starters:
         threading.Thread(target=target, args=fargs, daemon=True).start()
+
+def _seed_ohlc_1m(asset):
+    """REST — for ETH, a fixed OHLC_1M_MAX_BARS-minute lookback ending now
+    (fetch_status_phemex_recent_candles; ETH trades 24/7, no real session
+    boundary for the underlying market), for QQQ the existing multi-day
+    Yahoo fetch — merged with whatever this asset's own on-disk 1m log
+    already has (potentially spanning many PRIOR restarts/sessions, up to
+    OHLC_1M_MAX_BARS once LIVE_TAPE.seed_1m caps it) — union by ts, REST
+    wins on overlap since it's the freshest read of anything still within
+    that window. This is the fix for the 2026-08-26 user reports described
+    in _persist_closed_ohlc_1m_bar's and fetch_status_phemex_recent_
+    candles' own docstrings: a restart used to only ever see whatever
+    REST's own (previously session-bounded, now fixed-lookback) window
+    covered, silently losing anything the disk log would otherwise add on
+    top of that."""
+    cfg = ASSETS[asset]
+    if asset == "ETH":
+        rest_candles = fetch_status_phemex_recent_candles(cfg["phemex_symbol"], 60, OHLC_1M_MAX_BARS)
+    else:
+        rest_candles = fetch_status_yahoo_candles("QQQ", interval="1m")
+    disk_bars = read_last_n_ohlc_1m_bars(asset, OHLC_1M_MAX_BARS)
+    merged = {b["ts"]: (b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"]) for b in disk_bars}
+    for c in rest_candles:
+        merged[c[0]] = c   # REST overwrites disk on any overlapping ts
+    candles = [merged[ts] for ts in sorted(merged)]
+    if candles:
+        LIVE_TAPE.seed_1m(asset, candles)
+        console_log(f"{asset}: seeded {len(candles)} 1m OHLC bars "
+                    f"({len(disk_bars)} from disk, {len(rest_candles)} from REST)")
 
 # ── GEX engine (mirrors gex.py — Phase 2 of the standalone-merge plan) ──────
 # Ported from gex.py's own fetch/GEX-math/persistence/export layer
@@ -2621,9 +2871,22 @@ def compute_bt_st(strikes, is_crypto, spot, ratio):
 STATUS_PHEMEX_KLINE_LIST_URL = "https://api.phemex.com/exchange/public/md/v2/kline/list"
 
 def fetch_status_phemex_session_candles(symbol="ETHUSDT", resolution=60):
-    """Ported verbatim from status.py's own fetch_phemex_session_candles —
-    oldest-first [(ts,o,h,l,c,v), ...] spanning the current session's
-    19:00 CT open through now."""
+    """oldest-first [(ts,o,h,l,c,v), ...] spanning the current session's
+    19:00 CT open through now.
+
+    2026-08-25 CRITICAL bug fixed, user-reported (1m OHLC chart showing no
+    pre-startup history — traced further to find this): row fields were
+    off by one — row[2] is Phemex's "last close" (the PRIOR candle's
+    close), not this candle's open, so the old `o,h,l,c,v = row[2:7]`
+    read last_close as open, open as high, high as low, low as close, and
+    close as volume (a price, not a size) — producing OHLC bars where low
+    could exceed high. Cross-checked against _chart_fetch_phemex's own
+    already-correct parsing of this exact same endpoint
+    (o=row[3],h=row[4],l=row[5],c=row[6],v=row[7]) and against a live
+    fetch. This function also seeds _ch_bootstrap's initial CH_STATE
+    candles (VAH/VAL/POC/VWAP — the same levels Athena's HPL lights and
+    BT/ST targets are computed from), so this corrupted every session's
+    opening stretch of levels until enough live WS candles diluted it."""
     _prev_open_ts, curr_open_ts = status_session_open_ts()
     now_ts = int(time.time())
     minutes = max(1, int((now_ts - curr_open_ts) / resolution) + 5)
@@ -2639,7 +2902,40 @@ def fetch_status_phemex_session_candles(symbol="ETHUSDT", resolution=60):
     rows = (d.get("data") or {}).get("rows") or []
     out = []
     for row in rows:
-        ts, _interval, o, h, l, c, v = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+        ts, o, h, l, c, v = row[0], row[3], row[4], row[5], row[6], row[7]
+        out.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
+    return out
+
+def fetch_status_phemex_recent_candles(symbol="ETHUSDT", resolution=60, minutes=500):
+    """Same endpoint/field-mapping as fetch_status_phemex_session_candles,
+    but bounded by a FIXED lookback window ending now, not "since this
+    session's own 19:00 CT open." 2026-08-26 user-reported ("ETH is still
+    starting from scratch" — QQQ's own Yahoo-based seed already spans a
+    multi-day window, ETH's Phemex-based one didn't): ETH trades 24/7 —
+    19:00 CT only matters for ATHENA's own trading-hours gate, not for the
+    underlying market — so bounding the 1m OHLC chart's own displayable
+    history to "however many minutes have elapsed since the last 19:00 CT
+    mark" starves it early in a session even though the exchange already
+    has OHLC_1M_MAX_BARS minutes of real price action sitting right there.
+    Used ONLY by _seed_ohlc_1m; the Status engine's own VAH/VAL/POC/VWAP
+    computation (fetch_status_phemex_session_candles, _ch_bootstrap) is
+    untouched and stays genuinely session-scoped, which is correct for
+    what THAT computes."""
+    now_ts = int(time.time())
+    from_ts = now_ts - minutes * resolution
+    limit = min(2000, minutes + 5)
+    r = requests.get(STATUS_PHEMEX_KLINE_LIST_URL, params={
+        "symbol": symbol, "resolution": resolution,
+        "from": from_ts, "to": now_ts, "limit": limit,
+    }, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != 0:
+        raise RuntimeError(d.get("msg") or "phemex kline error")
+    rows = (d.get("data") or {}).get("rows") or []
+    out = []
+    for row in rows:
+        ts, o, h, l, c, v = row[0], row[3], row[4], row[5], row[6], row[7]
         out.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
     return out
 
@@ -2750,6 +3046,7 @@ def status_compute_er(open_price, iv):
     return {
         "upper": {p: open_price + dist * (p / 100.0) for p in (40, 80, 100, 150)},
         "lower": {p: open_price + dist * (-p / 100.0) for p in (40, 80, 100, 150)},
+        "open": open_price,
     }
 
 STATUS_CHARTHACKER_EXPORT_MAX_AGE = 30
@@ -3590,16 +3887,22 @@ def compute_dashboard_snapshot(data):
                                   ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and status_qqq_market_closed()
         inst_snap["market_closed"] = closed
-        # 2026-08-22: raw ER 100%/150% levels, stored under string keys
-        # (not evaluate_hpls' own int-keyed er["upper"]/er["lower"] dicts)
-        # since this snap gets json.dump'd to status_logs — a dict with
-        # int keys round-trips as STRING keys once read back from disk,
-        # but stays int-keyed in the in-memory STATUS_SNAPSHOT global, so
-        # a consumer reading either source needs one consistent shape.
-        # See reconstruct_targets for where these get used as TP targets.
-        inst_snap["er_targets"] = ({"u100": er["upper"][100], "l100": er["lower"][100],
-                                     "u150": er["upper"][150], "l150": er["lower"][150]}
-                                    if er else None)
+        # 2026-08-22: raw ER levels, stored under string keys (not
+        # evaluate_hpls' own int-keyed er["upper"]/er["lower"] dicts) since
+        # this snap gets json.dump'd to status_logs — a dict with int keys
+        # round-trips as STRING keys once read back from disk, but stays
+        # int-keyed in the in-memory STATUS_SNAPSHOT global, so a consumer
+        # reading either source needs one consistent shape. See
+        # reconstruct_targets for where the 100%/150% tiers get used as TP
+        # targets, and _draw_ohlc_chart_panel for where the full set
+        # (40/80% tiers + session open too, 2026-08-25) draws the same
+        # green/red filled ER band Chart mode's own show_er overlay has.
+        inst_snap["er_bands"] = ({"u40": er["upper"][40], "l40": er["lower"][40],
+                                   "u80": er["upper"][80], "l80": er["lower"][80],
+                                   "u100": er["upper"][100], "l100": er["lower"][100],
+                                   "u150": er["upper"][150], "l150": er["lower"][150],
+                                   "open": er.get("open")}
+                                  if er else None)
 
         hpl = {}
         for label_, level_str, ok in rows:
@@ -4115,18 +4418,34 @@ def _current_tick(asset):
     guess anymore, the tick is known upfront."""
     return ASSETS[asset]["tick"]
 
-def _phemex_trade_ws(asset, stop_evt):
+def _phemex_trade_ws(asset, stop_evt, feed_live_tape=True):
     """Background thread: subscribes to Phemex's public trade_p feed for
-    this asset's own traded symbol and folds every print into LIVE_TAPE.
-    Reconnects with backoff on any disconnect/error — same convention as
-    footprint.py's own ws_phemex(), trimmed down (no multi-symbol session
-    staleness tracking needed; this thread only ever serves one asset for
-    its whole lifetime, stopped via stop_evt at quit)."""
+    this asset's own traded symbol. Reconnects with backoff on any
+    disconnect/error — same convention as footprint.py's own ws_phemex(),
+    trimmed down (no multi-symbol session staleness tracking needed; this
+    thread only ever serves one asset for its whole lifetime, stopped via
+    stop_evt at quit).
+
+    Every print ALWAYS updates PHEMEX_LAST_PRICE (2026-08-26 — see that
+    dict's own module-level docstring: the one price every trade-execution
+    concern, sim or real, should read, since Phemex is the only place any
+    REAL order for either asset actually executes). Whether it ALSO folds
+    into the blended LIVE_TAPE (order-flow/footprint/signal generation) is
+    controlled by feed_live_tape: True for ETH (one of its three always-on
+    feeds, unchanged) and for QQQ when Alpaca isn't configured (this is
+    QQQ's ONLY feed then, same as before); False for QQQ when Alpaca IS
+    configured, where this thread runs SOLELY to keep PHEMEX_LAST_PRICE
+    current — Alpaca's own real-stock tape remains QQQ's signal feed,
+    unchanged, but the real account only ever trades QQQUSDT on Phemex, so
+    sim fills/PnL for QQQ need Phemex's own QQQUSDT price just as much as
+    ETH needs it, even though the CONFIRMATION logic itself stays on the
+    more informative real-equity tape."""
     symbol = ASSETS[asset]["phemex_symbol"]
 
     def on_open(ws):
         ws.send(json.dumps({"id": 1, "method": "trade_p.subscribe", "params": [symbol]}))
-        LIVE_TAPE.set_status(asset, "live")
+        if feed_live_tape:
+            LIVE_TAPE.set_status(asset, "live")
 
     def on_message(ws, message):
         try:
@@ -4149,14 +4468,18 @@ def _phemex_trade_ws(asset, stop_evt):
                 qty = float(row[3])
             except Exception:
                 continue
-            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
-        LIVE_TAPE.set_status(asset, "live")
+            PHEMEX_LAST_PRICE[asset] = price
+            if feed_live_tape:
+                LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+        if feed_live_tape:
+            LIVE_TAPE.set_status(asset, "live")
 
     def on_error(ws, err):
-        LIVE_TAPE.set_status(asset, f"err: {str(err)[:30]}")
+        if feed_live_tape:
+            LIVE_TAPE.set_status(asset, f"err: {str(err)[:30]}")
 
     def on_close(ws, code, msg):
-        if not stop_evt.is_set():
+        if feed_live_tape and not stop_evt.is_set():
             LIVE_TAPE.set_status(asset, "reconnecting…")
 
     _ping_ws = [None]
@@ -4342,7 +4665,7 @@ def _kraken_trade_ws(asset, stop_evt):
                 is_buy = t["side"] == "buy"
             except Exception:
                 continue
-            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick)
+            LIVE_TAPE.ingest(asset, ts, price, qty, is_buy, tick, exchange="kraken")
         LIVE_TAPE.set_status(asset, "live")
 
     def on_error(ws, err):
@@ -4553,6 +4876,38 @@ def footprint_confirmation(prev_bar, new_bar, regime):
         return ok, new_vah, new_val
     return False, new_vah, new_val
 
+def btd_confirmation(bars_1m, regime, lookback=BTD_ENTRY_LOOKBACK, sigma=BTD_ENTRY_SIGMA):
+    """Check if the most recent CLOSED 1m candle has a Big Buy (for longs)
+    or Big Sell (for shorts) signal. Returns (confirmed, entry_price) where
+    entry_price is the candle close (market order entry)."""
+    if len(bars_1m) < lookback + 1:
+        return False, None
+    bar = bars_1m[-1]
+    buy_iv, sell_iv = [], []
+    for b in bars_1m:
+        rng = b["h"] - b["l"]
+        if rng > 0:
+            buy_iv.append((b["c"] - b["l"]) / rng * b["v"])
+            sell_iv.append((b["h"] - b["c"]) / rng * b["v"])
+        else:
+            buy_iv.append(0.0)
+            sell_iv.append(0.0)
+    ci = len(bars_1m) - 1
+    wb = buy_iv[max(0, ci - lookback):ci]
+    ws = sell_iv[max(0, ci - lookback):ci]
+    if len(wb) < 2:
+        return False, None
+    nn = len(wb)
+    mb = sum(wb) / nn
+    ms = sum(ws) / nn
+    sdb = (sum((x - mb) ** 2 for x in wb) / (nn - 1)) ** 0.5
+    sds = (sum((x - ms) ** 2 for x in ws) / (nn - 1)) ** 0.5
+    if regime == "long" and buy_iv[ci] > mb + sdb * sigma:
+        return True, bar["c"]
+    if regime == "short" and sell_iv[ci] > ms + sds * sigma:
+        return True, bar["c"]
+    return False, None
+
 # ── Simulated ("paper") account for --dry-run ─────────────────────────────────
 # sim_logs/YYYY/MM/DD/sim_MM_DD_YYYY.jsonl — append-only ledger of every
 # simulated fill/close, same per-day-folder convention as status_logs/
@@ -4597,25 +4952,38 @@ def _archive_sim_logs():
         pass
 
 async def live_price_for_symbol(symbol):
-    """LIVE_TAPE's own real-time WS trade price (in-memory, no network
-    round trip) when available, else fetch_last_price's REST poll as a
-    fallback (e.g. right at startup before the WS thread connects). Same
-    LIVE_TAPE-first pattern SimAccount.tick_matching already uses — pulled
-    out into its own helper so every OTHER SimAccount method that needs a
-    current price (to_account_snapshot, market_close, place_entry's market
-    branch) gets the same speed instead of each making its own always-REST
-    fetch_last_price call. That inconsistency was the actual root cause of
-    "flatten takes 10+ seconds": [F]latten alone chains cancel_all ->
-    fetch_account (-> to_account_snapshot, one REST call PER open
-    position) -> market_close (another REST call) -> a THIRD REST call for
-    the athena_logs exit-price note — each with up to a 6s httpx timeout,
-    easily compounding into a double-digit-second wait on anything but a
-    fast/lucky network, when every one of those prices was already sitting
-    in memory via LIVE_TAPE the whole time."""
+    """PHEMEX_LAST_PRICE's own real-time WS trade price (in-memory, no
+    network round trip) when available, else fetch_last_price's REST poll
+    as a fallback (e.g. right at startup before Phemex's own WS thread
+    connects). Same LIVE_TAPE-first SPEED pattern SimAccount.tick_matching
+    already uses — pulled out into its own helper so every OTHER
+    SimAccount method that needs a current price (to_account_snapshot,
+    market_close, place_entry's market branch) gets the same speed instead
+    of each making its own always-REST fetch_last_price call. That
+    inconsistency was the actual root cause of "flatten takes 10+
+    seconds": [F]latten alone chains cancel_all -> fetch_account (->
+    to_account_snapshot, one REST call PER open position) -> market_close
+    (another REST call) -> a THIRD REST call for the athena_logs exit-
+    price note — each with up to a 6s httpx timeout, easily compounding
+    into a double-digit-second wait on anything but a fast/lucky network,
+    when every one of those prices was already sitting in memory the
+    whole time.
+
+    2026-08-26 CRITICAL fix, user-reported ("if any of the feeds reach the
+    entry price then the trade is executed... this is not how Athena
+    actually trades"): this used to read LIVE_TAPE.snapshot() — for ETH, a
+    BLEND of Phemex+Kraken+Coinbase; for QQQ, Alpaca's real-stock tape.
+    Every one of this function's own callers records or acts on a REAL
+    trade-execution price (a market-order's own fill price, a flatten/
+    PCVR-flip close price, the sim account's own equity/PnL snapshot) —
+    the real account only ever executes on Phemex (QQQUSDT included for
+    QQQ), so this must read PHEMEX_LAST_PRICE specifically, same as
+    tick_matching/apply_funding_if_due. See that dict's own module-level
+    docstring."""
     asset = ASSET_BY_SYMBOL.get(symbol)
-    tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
-    if tape_bar is not None:
-        return tape_bar["c"]
+    price = phemex_reference_price(asset) if asset else None
+    if price is not None:
+        return price
     return await fetch_last_price(symbol)
 
 class SimAccount:
@@ -4789,24 +5157,35 @@ class SimAccount:
 
     async def tick_matching(self):
         """Check every resting sim order against the live price and
-        fill/close whatever now qualifies. Prefers LIVE_TAPE's own
-        real-time WS trade price (in-memory, no network round trip,
-        updates on every print) over fetch_last_price's REST ticker poll
-        — a REST-only check here meant fills/SL/TP could only ever react
-        to whatever price a poll happened to sample, which on a symbol
-        that briefly touched a level between polls could silently miss
-        the touch entirely and only catch it (at a worse price) on a
-        LATER poll once price had moved further. LIVE_TAPE is cheap
+        fill/close whatever now qualifies. Prefers PHEMEX_LAST_PRICE (in-
+        memory, no network round trip, updates on every Phemex print) over
+        fetch_last_price's REST ticker poll — a REST-only check here meant
+        fills/SL/TP could only ever react to whatever price a poll happened
+        to sample, which on a symbol that briefly touched a level between
+        polls could silently miss the touch entirely and only catch it (at
+        a worse price) on a LATER poll once price had moved further. Cheap
         enough that this can now be called far more often than once per
-        engine cycle (see engine_loop's fast matching wait) without
-        adding any extra REST load. Falls back to fetch_last_price only
-        for a symbol LIVE_TAPE has no data for yet (e.g. right at
-        startup, before its WS thread connects)."""
+        engine cycle (see engine_loop's fast matching wait) without adding
+        any extra REST load. Falls back to fetch_last_price only for a
+        symbol Phemex's own WS has no data for yet (e.g. right at startup,
+        before its WS thread connects).
+
+        2026-08-26 CRITICAL fix, user-reported ("if any of the feeds reach
+        the entry price then the trade is executed, but this is not how
+        Athena actually trades and yields misleading results"): this used
+        to read LIVE_TAPE.snapshot()'s own "c" — for ETH, a BLEND of
+        Phemex+Kraken+Coinbase trade prints into one bar, and for QQQ,
+        Alpaca's real-stock tape — so a limit/SL/TP that only ever got
+        touched on Kraken/Coinbase/Alpaca, and NEVER on Phemex, could fire
+        in the sim when the real account (which only ever trades on
+        Phemex, QQQUSDT included) never would have filled at all. See
+        PHEMEX_LAST_PRICE's own module-level docstring."""
         symbols = {o["symbol"] for o in self.orders.values()} | set(self.positions.keys())
         for symbol in symbols:
             asset = ASSET_BY_SYMBOL.get(symbol)
-            tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
-            price = tape_bar["c"] if tape_bar is not None else await fetch_last_price(symbol)
+            price = phemex_reference_price(asset) if asset else None
+            if price is None:
+                price = await fetch_last_price(symbol)
             if price is None:
                 continue
             for oid, o in list(self.orders.items()):
@@ -4887,8 +5266,10 @@ class SimAccount:
                             # engine_loop's next poll lands a real rate,
                             # rather than silently skipping it forever
             rate = info["rate"]
-            tape_bar = LIVE_TAPE.snapshot(asset) if asset else None
-            mark_price = tape_bar["c"] if tape_bar is not None else pos["avg_entry"]
+            # 2026-08-26: mark price for funding is Phemex-only too (see
+            # PHEMEX_LAST_PRICE's own docstring) — real Phemex funding
+            # settles against ITS OWN mark price, not a blended one.
+            mark_price = (phemex_reference_price(asset) if asset else None) or pos["avg_entry"]
             side_sign = 1.0 if pos["pos_side"] == "Long" else -1.0
             notional = pos["qty"] * mark_price
             payment = -side_sign * notional * rate
@@ -7919,6 +8300,11 @@ class AthenaInstrument:
         self.regime = None
         self.price = None
         self.market_closed = False
+        self.last_targets = None   # see process_cycle's own comment — every-cycle
+                                     # BT/ST/Cluster/ER/GEX-Flip levels for the
+                                     # OHLC chart panel, independent of self.pending/position
+        self.last_er_bands = None   # every-cycle full ER dict (40/80/100/150% + open)
+                                      # for the OHLC chart panel's own ER fill overlay
         self._last_checked_bar_ts = None   # ts of the last bar we've already run a confirmation check against
         self.pending = None     # while PENDING_FILL
         self.position = None    # while IN_POSITION
@@ -8244,11 +8630,20 @@ class AthenaInstrument:
         # correct whenever the user next needs it.
         self._check_bj_daily_reset()
 
-        lights5, regime, price, targets_full, market_closed = instrument_lights(snapshot, self.asset)
+        lights5, regime, price, targets_full, market_closed, er_bands = instrument_lights(snapshot, self.asset)
         self.lights.update(lights5)
         self.regime = regime
         self.price = price
         self.market_closed = market_closed
+        self.last_er_bands = er_bands   # every cycle — feeds the OHLC chart
+                                          # panel's own ER fill overlay (see
+                                          # AppState.publish()'s inst_snap)
+        self.last_targets = targets_full   # every cycle, regardless of trading
+                                             # state — unlike self.pending/position's
+                                             # own "targets" (only set once an order
+                                             # is actually placed), this lets the OHLC
+                                             # chart panel draw BT/ST/Cluster/ER/GEX
+                                             # Flip levels even while just WATCHING.
 
         # QQQ-only: status.py's own qqq.market_closed already zeroes
         # HPLs/Targets outside 08:45-15:00 CT (weekdays), so the 5-light
@@ -8277,7 +8672,8 @@ class AthenaInstrument:
             if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked:
                 return
             self.state = "ARMED"
-            console_log(f"{self.asset}: all required conditions active — ARMED, watching order flow ({regime})"
+            trigger_desc = "BTD candle closes" if TRADING_MODE == "BTD" else "order flow"
+            console_log(f"{self.asset}: all required conditions active — ARMED, watching {trigger_desc} ({regime})"
                         + (" [24H MODE]" if NO_SESSION else ""))
             # 2026-07-28 debugging aid, user-reported ("ETH entered a trade
             # while only ST was active, which should NOT validate an entry
@@ -8311,12 +8707,20 @@ class AthenaInstrument:
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
                                                      "athena_enabled": ATHENA_ENABLED[self.asset]})
                 return
-            prev_bar, bar = read_last_two_footprint_bars(self.asset)
-            is_fresh_pair = (bar is not None and prev_bar is not None
-                             and bar.get("ts") != self._last_checked_bar_ts)
-            if is_fresh_pair and regime in ("long", "short"):
-                self._last_checked_bar_ts = bar.get("ts")
-                await self._check_confirmation(prev_bar, bar, regime, price, targets_full)
+            if TRADING_MODE == "BTD":
+                bars_1m, _ = LIVE_TAPE.snapshot_1m(self.asset)
+                if bars_1m and regime in ("long", "short"):
+                    last_ts = bars_1m[-1]["ts"]
+                    if last_ts != self._last_checked_bar_ts:
+                        self._last_checked_bar_ts = last_ts
+                        await self._check_btd_confirmation(bars_1m, regime, price, targets_full)
+            else:
+                prev_bar, bar = read_last_two_footprint_bars(self.asset)
+                is_fresh_pair = (bar is not None and prev_bar is not None
+                                 and bar.get("ts") != self._last_checked_bar_ts)
+                if is_fresh_pair and regime in ("long", "short"):
+                    self._last_checked_bar_ts = bar.get("ts")
+                    await self._check_confirmation(prev_bar, bar, regime, price, targets_full)
             return
 
         if self.state == "PENDING_FILL":
@@ -9046,6 +9450,114 @@ class AthenaInstrument:
         console_log(f"{self.asset}: entry order placed{tag} — {pos_side} {order_type} {qty_str} @ "
                     f"{price_str or 'market'}")
         log_event(self.asset, "entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
+
+    async def _check_btd_confirmation(self, bars_1m, regime, live_price_fallback, targets_full):
+        confirmed, entry_price = btd_confirmation(bars_1m, regime)
+        if not confirmed:
+            return
+        if entry_price is None:
+            return
+
+        R = self.cfg["sl"]
+        live_price = await reference_price(self.asset, self.cfg["phemex_symbol"])
+        if live_price is None:
+            live_price = entry_price
+
+        def _is_top_tier(t):
+            return t["type"] in ("BT", "ST") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+
+        top_tier_present = any(_is_top_tier(t) for t in targets_full)
+        usable_target = None
+        for t in targets_full:
+            if abs(t["level"] - live_price) < R:
+                continue
+            if top_tier_present and not _is_top_tier(t):
+                continue
+            usable_target = t["level"]
+            break
+
+        if usable_target is None:
+            nearest_dist = min((abs(t["level"] - live_price) for t in targets_full), default=None)
+            dist_txt = "n/a" if nearest_dist is None else f"{nearest_dist:.2f}"
+            reason = ("a top-tier target exists but none clear it"
+                      if top_tier_present else f"no target >= {R}R away")
+            console_log(f"{self.asset}: BTD confirmed {regime.upper()} but rejected — {reason} (nearest {dist_txt})")
+            log_event(self.asset, "btd_rejected_viability", {"regime": regime, "targets": targets_full,
+                                                               "nearest_distance": nearest_dist, "R": R})
+            return
+
+        order_type = "market"
+
+        try:
+            acc = await fetch_account()
+            balance = account_available_balance(acc)
+        except Exception as e:
+            console_log(f"{self.asset}: balance fetch failed ({e}) — skipping BTD entry")
+            return
+
+        qty_step, price_step = await fetch_contract_spec(self.cfg["phemex_symbol"])
+        qty_step = qty_step or DEFAULT_QTY_STEP[self.asset]
+        price_step = price_step or DEFAULT_PRICE_STEP[self.asset]
+        price_decimals = _decimals_for_step(price_step)
+
+        if self.asset == "ETH":
+            dvol_for_layers = (read_last_status_snapshot() or {}).get("dvol")
+            layer1_mult, layer2_r_cap = dvol_layer_values(dvol_for_layers)
+        else:
+            layer1_mult, layer2_r_cap = 1.0, None
+
+        if BLACKJACK_MODE:
+            one_r_dollars = BLACKJACK_1R_DOLLARS if BLACKJACK_1R_DOLLARS is not None else balance * (PCT / 100.0)
+            one_r_dollars *= layer1_mult
+            bj = BLACKJACK_STATE[self.asset]
+            if bj["in_win_progression"]:
+                risked_r = bj["win_step_back"]
+                if layer2_r_cap is not None and risked_r > layer2_r_cap:
+                    risked_r = layer2_r_cap
+                trade_risk_dollars = risked_r * one_r_dollars + bj["win_profit_dollars"]
+                sequence_label = f"Win ({risked_r:g}R+${bj['win_profit_dollars']:,.2f})"
+            else:
+                risked_r = BLACKJACK_STEPS[bj["loss_step"]]
+                if layer2_r_cap is not None and risked_r > layer2_r_cap:
+                    risked_r = layer2_r_cap
+                trade_risk_dollars = risked_r * one_r_dollars
+                sequence_label = f"{risked_r:g}R"
+        else:
+            trade_risk_dollars = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) \
+                else balance * (PCT / 100.0)
+            trade_risk_dollars *= layer1_mult
+            sequence_label = "Flat"
+        raw_qty = trade_risk_dollars / R
+        qty = floor_to_step(raw_qty, qty_step)
+        if qty <= 0:
+            console_log(f"{self.asset}: BTD sized qty is 0 — skipping entry")
+            return
+
+        qty_decimals = _decimals_for_step(qty_step)
+        pos_side = "Long" if regime == "long" else "Short"
+        qty_str = f"{qty:.{qty_decimals}f}"
+
+        detail = {"regime": regime, "order_type": order_type, "pos_side": pos_side, "qty": qty_str,
+                   "price": f"market (~{live_price})", "targets": targets_full, "sl_distance": R,
+                   "trigger": "BTD"}
+
+        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, None, sequence_label)
+        if not (isinstance(result, dict) and result.get("code") == 0):
+            console_log(f"{self.asset}: BTD entry order FAILED — {result}")
+            log_event(self.asset, "btd_entry_failed", {"result": result, **detail})
+            return
+
+        self.pending = {"pos_side": pos_side, "qty": qty, "qty_decimals": qty_decimals,
+                         "price_decimals": price_decimals, "targets": targets_full, "regime": regime,
+                         "order_type": order_type, "entry_price": live_price,
+                         "sequence_label": sequence_label,
+                         "trade_risk_dollars": trade_risk_dollars,
+                         "placed_bar_ts": bars_1m[-1]["ts"]}
+        self.state = "PENDING_FILL"
+        self.lights["Order Flow"] = True
+        tag = " (sim)" if DRY_RUN else ""
+        console_log(f"{self.asset}: BTD entry placed{tag} — {pos_side} market {qty_str} @ ~{live_price}")
+        log_event(self.asset, "btd_entry_placed", {"result": result, "sim": DRY_RUN, **detail})
 
     def _entry_order_stale(self):
         """True once ENTRY_ORDER_EXPIRY_BARS new footprint bars have closed
@@ -11546,9 +12058,784 @@ def build_trade_markers(asset, bars, inst_snap, trade_pairs):
                             "label": t.get("reason", "close").upper(), "pair": P_MAGENTA})
     return events
 
+HISTORICAL_VP_BINS = 200   # matches VP_BUCKETS/STATUS_VP_BUCKETS everywhere
+                             # else this session already computes a volume
+                             # profile, so "Historical Mode"'s own trace
+                             # lands on the same values "Normal Mode"'s flat
+                             # line already shows at the session's current
+                             # (rightmost) point — no visible discontinuity
+                             # when toggling between the two.
+
+def _historical_vp_map(candles, bins=HISTORICAL_VP_BINS):
+    """{ts: (poc, vah, val)} — one entry per candle, built in a SINGLE
+    forward pass so the "developing" value at every point in the session
+    is available for O(1) per-column lookup at render time (same shape as
+    draw_chart's own build_vwap_map/draw_vwap_on_candles, which solves the
+    identical problem for VWAP's own already-continuous line). Naively
+    calling compute_vp/_ch_compute_vp — which each rebuild a fresh
+    O(bins) histogram from a full candle list — once per growing prefix
+    (candles[0:1], [0:2], ... [0:n]) would cost O(n^2*bins): infeasible
+    in a real-time render loop (n~500, bins=200 -> tens of millions of
+    ops). Fixing the histogram's price range ONCE up front from the
+    whole session's own lo/hi (exactly what "Normal Mode"'s own single
+    end-of-session compute_vp call already does) avoids the classic
+    expanding-bucket-range problem an incremental histogram would
+    otherwise have, and keeps the whole thing to O(n*bins) — recomputing
+    POC (argmax) and the 70%-of-volume VAH/VAL expansion from the
+    CURRENT cumulative histogram after each candle, not rebuilding it.
+
+    candles: plain (ts, o, h, l, c, v) tuples — the same shape
+    fetch_status_phemex_session_candles/fetch_status_yahoo_candles/etc.
+    already use — so both _draw_ohlc_chart_panel (dict bars) and
+    draw_chart (_ChartCandle objects) can feed this ONE implementation
+    via a one-line conversion instead of needing two."""
+    if not candles:
+        return {}
+    s_lo = min(c[3] for c in candles)
+    s_hi = max(c[2] for c in candles)
+    s_range = s_hi - s_lo
+    if s_range <= 0:
+        return {}
+    vp = [0.0] * bins
+
+    def ptb(p):
+        return max(0, min(bins - 1, int((p - s_lo) / s_range * (bins - 1))))
+
+    out = {}
+    for ts, o, h, l, c, v in candles:
+        body_hi, body_lo = max(o, c), min(o, c)
+        wv = v * 0.5
+        bw, bh = ptb(l), ptb(h)
+        sw = max(1, bh - bw + 1)
+        for b in range(bw, bh + 1):
+            vp[b] += wv / sw
+        bv = v * 0.5
+        bl, bb = ptb(body_lo), ptb(body_hi)
+        sb = max(1, bb - bl + 1)
+        if sb > 1:
+            for b in range(bl, bb + 1):
+                vp[b] += bv / sb
+        else:
+            vp[ptb(c)] += bv
+
+        tv = sum(vp)
+        if tv <= 0:
+            continue
+        pi = vp.index(max(vp))
+        poc_p = s_lo + (pi / (bins - 1)) * s_range
+        tgt = tv * 0.70
+        acc = vp[pi]
+        lo_b = hi_b = pi
+        while acc < tgt:
+            ab = vp[hi_b + 1] if hi_b < bins - 1 else 0.0
+            bb2 = vp[lo_b - 1] if lo_b > 0 else 0.0
+            if ab == 0 and bb2 == 0:
+                break
+            if ab >= bb2:
+                hi_b += 1; acc += ab
+            else:
+                lo_b -= 1; acc += bb2
+        vah_p = s_lo + (hi_b / (bins - 1)) * s_range
+        val_p = s_lo + (lo_b / (bins - 1)) * s_range
+        out[ts] = (poc_p, vah_p, val_p)
+    return out
+
+def _historical_vwap_map(candles):
+    """{ts: (vwap, sd)} — one entry per candle, the developing VWAP +
+    standard-deviation as of that candle. Ported verbatim from draw_chart's
+    own build_vwap_map closure (a Welford-style online mean/variance over
+    cumulative typical-price*volume — already a single forward pass, no
+    O(n^2) concern the way _historical_vp_map's histogram had). 2026-08-26
+    user-reported ("VWAP/+0.5sd/-0.5sd area is static and does not reflect
+    its actual movement"): this panel used to only ever draw ONE flat
+    snapshot value (from CH_STATE's _ch_build_vwap_map, which deliberately
+    collapses to just the final tuple for the background export loop's own
+    purposes) across the whole visible window — this map instead gives
+    every column its own value, exactly like Chart mode's own VWAP line.
+
+    candles: plain (ts, o, h, l, c, v) tuples, same shape _historical_vp_map
+    takes — see that function's own docstring for why."""
+    cum_tpv = 0.0
+    cum_vol = 0.0
+    cum_dev2 = 0.0
+    out = {}
+    for ts, o, h, l, c, v in candles:
+        tp = (h + l + c) / 3.0
+        old_vol = cum_vol
+        cum_tpv += tp * v
+        cum_vol += v
+        if cum_vol > 0:
+            vw = cum_tpv / cum_vol
+            if old_vol > 0:
+                old_vw = (cum_tpv - tp * v) / old_vol
+                cum_dev2 += v * (tp - old_vw) * (tp - vw)
+            sd = max(0.0, cum_dev2 / cum_vol) ** 0.5
+        else:
+            vw, sd = 0.0, 0.0
+        out[ts] = (vw, sd)
+    return out
+
+def _ohlc_compute_vp(candles, bins=HISTORICAL_VP_BINS):
+    """(vp, s_lo, s_hi, poc_p, vah_p, val_p) — a single end-of-session
+    volume-profile histogram, ported verbatim from draw_chart's own
+    compute_vp closure (same 200-bucket wick/body volume split, same 70%
+    value-area expansion). Returns None if there's no usable price range.
+    Companion to _historical_vp_map (same math, but that one returns a
+    developing per-ts map instead of one final histogram — Historical
+    Mode's stepped trace and the always-on current-session bars this
+    feeds serve different rendering needs, see _draw_ohlc_chart_panel's
+    own vp_historical handling)."""
+    if not candles:
+        return None
+    s_lo = min(c[3] for c in candles)
+    s_hi = max(c[2] for c in candles)
+    s_range = s_hi - s_lo
+    if s_range <= 0:
+        return None
+    vp = [0.0] * bins
+
+    def ptb(p):
+        return max(0, min(bins - 1, int((p - s_lo) / s_range * (bins - 1))))
+
+    for ts, o, h, l, c, v in candles:
+        body_hi, body_lo = max(o, c), min(o, c)
+        wv = v * 0.5
+        bw, bh = ptb(l), ptb(h)
+        sw = max(1, bh - bw + 1)
+        for b in range(bw, bh + 1):
+            vp[b] += wv / sw
+        bv = v * 0.5
+        bl, bb = ptb(body_lo), ptb(body_hi)
+        sb = max(1, bb - bl + 1)
+        if sb > 1:
+            for b in range(bl, bb + 1):
+                vp[b] += bv / sb
+        else:
+            vp[ptb(c)] += bv
+
+    tv = sum(vp)
+    if tv <= 0:
+        return None
+    pi = vp.index(max(vp))
+    poc_p = s_lo + (pi / (bins - 1)) * s_range
+    tgt = tv * 0.70
+    acc = vp[pi]
+    lo_b = hi_b = pi
+    while acc < tgt:
+        ab = vp[hi_b + 1] if hi_b < bins - 1 else 0.0
+        bb2 = vp[lo_b - 1] if lo_b > 0 else 0.0
+        if ab == 0 and bb2 == 0:
+            break
+        if ab >= bb2:
+            hi_b += 1; acc += ab
+        else:
+            lo_b -= 1; acc += bb2
+    vah_p = s_lo + (hi_b / (bins - 1)) * s_range
+    val_p = s_lo + (lo_b / (bins - 1)) * s_range
+    return vp, s_lo, s_hi, poc_p, vah_p, val_p
+
+OHLC_BTD_LOOKBACK = 10
+OHLC_BTD_SIGMA    = 3.0
+OHLC_PRICE_W      = 10
+OHLC_VOL_H        = 4   # smaller than draw_chart's own VOL_H=6 — this panel
+                          # is one of two side-by-side halves, not a full-
+                          # screen chart, so it gives up less vertical room
+
+def _ohlc_target_style(t_type):
+    """Color/weight per Athena target type — this panel's own analogue of
+    draw_chart's BT/ST/GEX-Flip overlay (_chart_draw_bt_st_gex), just
+    sourced from Athena's own reconstruct_targets() output (which also
+    covers Cluster/ER, concepts Chart mode's own compute_bt_st/
+    compute_gex_flip don't have) instead of re-deriving GEX curves here.
+    Colors matched EXACTLY to _chart_draw_bt_st_gex's own `_line()` calls
+    (2026-08-26 user request — "all indicator/level lines need to be
+    colored the exact same way they are in Chart"): BT green, ST red,
+    GEX Flip blue. Cluster/ER have no Chart-mode equivalent (Athena-only
+    concepts) — Cluster keeps a distinct color of its own; ER is handled
+    separately by this panel's own ER fill+lines block, already matching
+    Chart's own show_er colors, so it never reaches this function (see
+    the targets-loop's own ER-type skip)."""
+    if t_type == "BT":
+        return P_GREEN, curses.A_BOLD
+    if t_type == "ST":
+        return P_RED, curses.A_BOLD
+    if t_type == "GEX Flip":
+        return P_BLUE, curses.A_BOLD
+    if t_type == "Cluster":
+        return P_MAGENTA, curses.A_BOLD
+    return P_DIM, curses.A_NORMAL
+
+def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_price, hscroll_bars,
+                            position=None, pending=None, levels=None, targets=None, er=None,
+                            vert_offset=0, ui=None):
+    ui = ui or {}
+    show_sessions = ui.get("show_sessions", True)
+    line_mode = ui.get("line_mode", False)
+    vp_historical = ui.get("vp_historical", False)
+    cols = x1 - x0
+    rows_avail = y1 - top
+    if rows_avail < 12 or cols < OHLC_PRICE_W + 4:
+        db.puts(top, x0, "too small", P_DIM)
+        return
+
+    # Layout mirrors draw_chart's own row order top-to-bottom: price chart,
+    # one blank row, time axis, volume histogram (19380-19393) — just
+    # scaled to this panel's own smaller geometry instead of full-terminal.
+    TIME_H = 1
+    chart_top = top
+    chart_bot_excl = y1 - 1 - TIME_H - OHLC_VOL_H
+    chart_h = max(1, chart_bot_excl - chart_top)
+    chart_r = x0 + cols - OHLC_PRICE_W - 1
+    chart_w = max(1, chart_r - x0)
+    time_row = chart_bot_excl + 1
+    vol_top = time_row + 1
+    vol_bot_excl = vol_top + OHLC_VOL_H
+
+    all_candles = list(bars_1m)
+    if live_1m:
+        all_candles.append(live_1m)
+    n_all = len(all_candles)
+    if n_all == 0:
+        db.puts(top, x0, "no 1m data yet", P_DIM)
+        return
+
+    hscroll_bars = max(0, min(hscroll_bars, max(0, n_all - 1)))
+    right_idx = n_all - hscroll_bars
+    left_idx = max(0, right_idx - chart_w)
+    visible = all_candles[left_idx:right_idx]
+    n_vis = len(visible)
+    if n_vis == 0:
+        return
+
+    lo_p = min(b["l"] for b in visible)
+    hi_p = max(b["h"] for b in visible)
+    span = hi_p - lo_p
+    pad = max(span * 0.05, hi_p * 0.0005)
+    lo_p -= pad
+    hi_p += pad
+    # Extend the range to always include Entry/SL/TP1/TP2 — 2026-08-26
+    # user request ("Show the Entry, SL, and TP1/TP2 levels on the OHLC
+    # chart & adjust them automatically as they change"): a TP target
+    # especially can sit far outside the visible candles' own recent
+    # range, so without this these levels only ever showed if price
+    # happened to already be near them. Read fresh from position/pending
+    # every render (no caching), so this — and the level lines themselves
+    # further below — already track any later SL/TP change automatically
+    # (a breakeven-lock move, a moving-TP resync, etc.) with no extra work.
+    _pos_prices = []
+    if position:
+        for _k in ("fill_price", "sl_price"):
+            if position.get(_k) is not None:
+                _pos_prices.append(position[_k])
+        for _leg in (position.get("tp_legs") or []):
+            if _leg.get("level") is not None:
+                _pos_prices.append(_leg["level"])
+    elif pending and pending.get("entry_price") is not None:
+        _pos_prices.append(pending["entry_price"])
+    if _pos_prices:
+        lo_p = min(lo_p, min(_pos_prices) - pad)
+        hi_p = max(hi_p, max(_pos_prices) + pad)
+    # Vertical price-axis pan — same shift-the-window-before-p2r approach
+    # as CHART_STATE.vert_offset (draw_chart:19421-19437), just applied to
+    # this panel's own per-asset offset instead of Chart mode's single one.
+    if vert_offset:
+        _vshift = vert_offset * (hi_p - lo_p) * 0.15
+        lo_p += _vshift
+        hi_p += _vshift
+
+    def p2r(price):
+        if hi_p == lo_p:
+            return chart_h // 2
+        return int((1.0 - (price - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+
+    clamp = lambda v: max(chart_top, min(chart_bot_excl - 1, v))
+    start_col = chart_r - n_vis
+
+    label_step = max(1, chart_h // 12)
+    for r in range(chart_h):
+        if r % label_step == 0:
+            price_at_row = hi_p - (r / max(1, chart_h - 1)) * (hi_p - lo_p)
+            db.puts(chart_top + r, chart_r + 1, fmt_price(price_at_row).rjust(OHLC_PRICE_W), P_DIM)
+        db.put(chart_top + r, chart_r, "│", P_DIM)
+
+    # ── LEVEL LINES ──────────────────────────────────────────────────────
+    # VAH/VAL/POC/VWAP+SD (read from CH_STATE, already computed by the
+    # always-running _ch_export_loop), Athena's own BT/ST/Cluster/ER/GEX-
+    # Flip targets, and the open position's entry/SL/TP legs. Drawn BEFORE
+    # candles so candle bodies naturally win over a level line wherever
+    # they share a cell (same visual priority the live price line below
+    # already gives price action over itself via its own blank-cell check).
+    def _level_line(price_val, tag, pair, attr=curses.A_DIM):
+        # 2026-08-26 user request: labels belong on the price axis (right
+        # side), same as draw_chart's own draw_level_line — not split
+        # between a left-edge tag and a right-edge bare price the way this
+        # used to be.
+        if price_val is None or not (lo_p <= price_val <= hi_p):
+            return
+        r = clamp(chart_top + p2r(price_val))
+        for c2 in range(x0, chart_r):
+            db.put(r, c2, "·", pair, attr)
+        lbl = f"{tag} {fmt_price(price_val)}" if tag else fmt_price(price_val)
+        # 2026-08-26 user-reported ("values from ETH's chart are bleeding
+        # into QQQ's chart"): db.put only bounds-checks against the WHOLE
+        # shared buffer's own width, not this ONE pane's own x1 — an
+        # unclipped label longer than the price-axis gutter (once tags
+        # started combining with the price in one string, right after
+        # this same fix) could write straight past this pane's own right
+        # edge into whatever the ADJACENT pane (QQQ, when split) already
+        # drew there.
+        db.puts(r, chart_r + 1, lbl[:max(0, x1 - (chart_r + 1))], pair, attr)
+
+    levels = levels or {}
+
+    # ── SESSION SPLIT (shared by the VP histogram + VWAP bands below) ──────
+    # Both features develop across the session and reset at session open —
+    # this panel is always 1-minute, so the split always applies (same as
+    # draw_chart's own _is_1m_vwap case). Same 19:00 CT daily anchor the
+    # background CH export loop/Status engine already use.
+    _prev_open_ts, _curr_open_ts = status_session_open_ts()
+    _prev_sess_candles = [b for b in all_candles if _prev_open_ts <= b["ts"] < _curr_open_ts]
+    _curr_sess_candles = [b for b in all_candles if b["ts"] >= _curr_open_ts]
+
+    # ── VOLUME PROFILE HISTOGRAM ─────────────────────────────────────────
+    # 2026-08-26 user request ("OHLC is missing the VP - include it, and
+    # have it look precisely the same way it does in Chart"): this panel
+    # used to only ever draw VAH/VAL/POC as flat level lines — never the
+    # actual density histogram. Ported from draw_chart's own compute_vp/
+    # draw_vp_bars closures (_ohlc_compute_vp above does the bucketing):
+    # bars are drawn OVERLAID directly on the candle columns (not a
+    # separate sidebar), anchored at this session's own first visible
+    # column, length scaled by that row's volume relative to the row-max.
+    # Current session only, always at normal (non-dimmed) styling —
+    # matches this panel's own already-established "Historical Mode ADDS
+    # a layer, never replaces" precedent (see the vp_historical block
+    # below), so there's no "lighter shading in historical view" to
+    # reintroduce here.
+    def _draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p, col_start):
+        s_range = s_hi - s_lo
+        if s_range <= 0:
+            return
+
+        def _row0(price):
+            return max(0, min(chart_h - 1, p2r(price)))
+
+        row_vol = [0.0] * chart_h
+        for b, vol in enumerate(vp):
+            price = s_lo + (b / (HISTORICAL_VP_BINS - 1)) * s_range
+            if price < lo_p or price > hi_p:
+                continue
+            row_vol[_row0(price)] += vol
+        mrv = max(row_vol) or 1.0
+        vp_max_w = max(4, chart_w // 5)
+        poc_row = _row0(poc_p)
+        vah_row = _row0(vah_p)
+        val_row = _row0(val_p)
+        for b, bvol in enumerate(row_vol):
+            if bvol <= 0:
+                continue
+            bar_w = max(1, int(bvol / mrv * vp_max_w))
+            row = chart_top + b
+            if not (chart_top <= row < chart_bot_excl):
+                continue
+            in_va = (vah_row <= b <= val_row)
+            if b == poc_row:
+                pair, attrs, char = P_YELLOW, curses.A_BOLD, "="
+            elif in_va:
+                pair, attrs, char = P_YELLOW, curses.A_NORMAL, "-"
+            else:
+                pair, attrs, char = P_YELLOW, curses.A_DIM, "-"
+            for c2 in range(col_start, min(chart_r, col_start + bar_w)):
+                db.put(row, c2, char, pair, attrs)
+
+    if _curr_sess_candles:
+        _vp_result = _ohlc_compute_vp([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"])
+                                        for b in _curr_sess_candles])
+        if _vp_result:
+            _vp, _vp_slo, _vp_shi, _vp_poc, _vp_vah, _vp_val = _vp_result
+            _curr_ts_set = {b["ts"] for b in _curr_sess_candles}
+            _curr_col_start = chart_r
+            for _i, _bar in enumerate(visible):
+                if _bar["ts"] in _curr_ts_set:
+                    _curr_col_start = start_col + _i
+                    break
+            _draw_vp_bars(_vp, _vp_slo, _vp_shi, _vp_poc, _vp_vah, _vp_val, max(x0, _curr_col_start))
+
+    # Colors matched exactly to draw_chart's own convention (2026-08-26
+    # user request — "all indicator/level lines need to be colored the
+    # exact same way they are in Chart"): VAH/VAL magenta (draw_level_line
+    # calls, athena.py's own VP block), POC yellow, VWAP line P_DEFAULT
+    # (draw_vwap_on_candles), ±2σ/±2.5σ yellow, ±0.5σ a cyan-dim SHADED
+    # BAND (not just boundary lines — draw_vwap_on_candles' own ":" fill).
+    _level_line(levels.get("vah"), "VAH", P_MAGENTA, curses.A_BOLD)
+    _level_line(levels.get("val"), "VAL", P_MAGENTA, curses.A_BOLD)
+    _level_line(levels.get("poc"), "POC", P_YELLOW, curses.A_BOLD)
+    if vp_historical:
+        # "Historical Mode" — ADDS a stepped developing VAH/VAL/POC trace
+        # on top of the flat current-value lines above (2026-08-26 user-
+        # reported: this used to REPLACE them, silently dropping the
+        # labels — now both layers always show, matching draw_chart's own
+        # fix for the exact same report). Built once via
+        # _historical_vp_map's own single forward pass (see that
+        # function's docstring for why a naive per-bar recompute isn't
+        # feasible), then one lookup per visible column.
+        _vp_map = _historical_vp_map([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"]) for b in all_candles])
+        for _i, _bar in enumerate(visible):
+            _col = start_col + _i
+            if not (x0 <= _col < chart_r):
+                continue
+            _hv = _vp_map.get(_bar["ts"])
+            if _hv is None:
+                continue
+            _poc_p, _vah_p, _val_p = _hv
+            if lo_p <= _poc_p <= hi_p:
+                db.put(clamp(chart_top + p2r(_poc_p)), _col, "═", P_YELLOW, curses.A_BOLD)
+            if lo_p <= _vah_p <= hi_p:
+                db.put(clamp(chart_top + p2r(_vah_p)), _col, "~", P_MAGENTA, curses.A_BOLD)
+            if lo_p <= _val_p <= hi_p:
+                db.put(clamp(chart_top + p2r(_val_p)), _col, "~", P_MAGENTA, curses.A_BOLD)
+    # ── VWAP + ±SD BANDS — developing per-candle, current + previous session ──
+    # 2026-08-26 user-reported ("VWAP/+0.5sd/-0.5sd area is static and does
+    # not reflect its actual movement like it should", compared against
+    # Chart mode's own genuinely-moving line): the old code below drew ONE
+    # flat snapshot value (from `levels`, CH_STATE's background export
+    # loop, which deliberately collapses to a single final tuple for ITS
+    # own purposes) across the entire visible width. Ported from
+    # draw_chart's own build_vwap_map/draw_vwap_on_candles instead (see
+    # _historical_vwap_map's own docstring) — two independent maps, one
+    # per session (this panel is always 1-minute, so the session split
+    # always applies, same as draw_chart's own _is_1m_vwap case),
+    # previous session dimmed, current session bold. Reuses the same
+    # _prev_sess_candles/_curr_sess_candles split the VP histogram above
+    # already computed — same session boundary, no need for a second one.
+    _prev_vwap_candles, _curr_vwap_candles = _prev_sess_candles, _curr_sess_candles
+
+    def _draw_vwap_session(_candles, _dim):
+        if not _candles:
+            return None
+        _vmap = _historical_vwap_map([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"]) for b in _candles])
+        _cts = {b["ts"] for b in _candles}
+        _line_a = curses.A_DIM if _dim else curses.A_BOLD
+        _last = None
+        for _i, _bar in enumerate(visible):
+            if _bar["ts"] not in _cts:
+                continue
+            _col = start_col + _i
+            if not (x0 <= _col < chart_r):
+                continue
+            _hv = _vmap.get(_bar["ts"])
+            if _hv is None:
+                continue
+            _vw, _sd = _hv
+            if _vw <= 0:
+                continue
+            _last = (_vw, _sd)
+            _r_vwap  = clamp(chart_top + p2r(_vw))
+            _r_sd05u = clamp(chart_top + p2r(_vw + 0.5 * _sd)); _r_sd05l = clamp(chart_top + p2r(_vw - 0.5 * _sd))
+            _r_sd2u  = clamp(chart_top + p2r(_vw + 2.0 * _sd)); _r_sd2l  = clamp(chart_top + p2r(_vw - 2.0 * _sd))
+            _r_sd25u = clamp(chart_top + p2r(_vw + 2.5 * _sd)); _r_sd25l = clamp(chart_top + p2r(_vw - 2.5 * _sd))
+            for _r in range(min(_r_sd05u, _r_sd05l), max(_r_sd05u, _r_sd05l) + 1):
+                if db.buf[_r][_col][0] == " ":
+                    db.put(_r, _col, ":", P_CYAN, curses.A_DIM)
+            if db.buf[_r_vwap][_col][0] in (" ", ":"):
+                db.put(_r_vwap, _col, "-", P_DEFAULT, _line_a)
+            for _r in (_r_sd2u, _r_sd2l):
+                if db.buf[_r][_col][0] in (" ", ":"):
+                    db.put(_r, _col, "~", P_YELLOW, curses.A_DIM if _dim else curses.A_NORMAL)
+            for _r in (_r_sd25u, _r_sd25l):
+                if db.buf[_r][_col][0] in (" ", ":"):
+                    db.put(_r, _col, "~", P_YELLOW, curses.A_DIM)
+        return _last
+
+    _draw_vwap_session(_prev_vwap_candles, True)
+    _vwap_last = _draw_vwap_session(_curr_vwap_candles, False)
+
+    if _vwap_last:
+        _vw_last, _sd_last = _vwap_last
+        def _vwap_axis_lbl(price, tag, pair, attr=curses.A_BOLD):
+            _r = clamp(chart_top + p2r(price))
+            lbl = f"{tag} {fmt_price(price)}"
+            db.puts(_r, chart_r + 1, lbl[:max(0, x1 - (chart_r + 1))], pair, attr)
+        _vwap_axis_lbl(_vw_last,                 "VWAP",  P_DEFAULT)
+        _vwap_axis_lbl(_vw_last + 0.5 * _sd_last, "+0.5σ", P_CYAN, curses.A_DIM)
+        _vwap_axis_lbl(_vw_last - 0.5 * _sd_last, "-0.5σ", P_CYAN, curses.A_DIM)
+        _vwap_axis_lbl(_vw_last + 2.0 * _sd_last, "+2σ",   P_YELLOW, curses.A_NORMAL)
+        _vwap_axis_lbl(_vw_last - 2.0 * _sd_last, "-2σ",   P_YELLOW, curses.A_NORMAL)
+        _vwap_axis_lbl(_vw_last + 2.5 * _sd_last, "+2.5σ", P_YELLOW, curses.A_DIM)
+        _vwap_axis_lbl(_vw_last - 2.5 * _sd_last, "-2.5σ", P_YELLOW, curses.A_DIM)
+
+    # ── EXPECTED RANGE (IV-implied daily move) ──────────────────────────
+    # Ported from draw_chart's own show_er overlay (_er_line/_er_fill,
+    # 20111-20145) — same green/red filled band + labeled ±40/80/100/150%
+    # lines + dotted session-open line, just fed by Athena's OWN already-
+    # computed ER (status_compute_er via evaluate_hpls — same source
+    # driving the Volatility light/BT-ST targets) instead of Chart mode's
+    # own separate IV fetch, since this panel is asset-locked to ETH/QQQ
+    # rather than a free-symbol tool.
+    if er:
+        def _er_line(price_val, pair, attrs, label):
+            # Label on the price axis (right side), matching draw_chart's
+            # own _er_line convention — see _level_line's own 2026-08-26 fix.
+            if price_val is None or not (lo_p <= price_val <= hi_p):
+                return
+            _row = clamp(chart_top + p2r(price_val))
+            for c2 in range(x0, chart_r):
+                if db.buf[_row][c2][0] in (" ", ".", "-", "·"):
+                    db.put(_row, c2, "█", pair, attrs)
+            _lbl = f"{label} {fmt_price(price_val)}"
+            db.puts(_row, chart_r + 1, _lbl[:max(0, x1 - (chart_r + 1))], pair, attrs | curses.A_REVERSE)
+
+        def _er_fill(price_a, price_b, pair):
+            if price_a is None or price_b is None:
+                return
+            _r_hi = clamp(chart_top + p2r(max(price_a, price_b)))
+            _r_lo = clamp(chart_top + p2r(min(price_a, price_b)))
+            for _r in range(_r_hi, _r_lo + 1):
+                for c2 in range(x0, chart_r):
+                    if db.buf[_r][c2][0] == " ":
+                        db.put(_r, c2, "█", pair, curses.A_DIM)
+
+        _er_fill(er.get("u40"), er.get("u80"), P_GREEN)
+        _er_fill(er.get("l40"), er.get("l80"), P_RED)
+        _er_line(er.get("u40"), P_GREEN, curses.A_NORMAL, "+40%")
+        _er_line(er.get("u80"), P_GREEN, curses.A_NORMAL, "+80%")
+        _er_line(er.get("l40"), P_RED, curses.A_NORMAL, "-40%")
+        _er_line(er.get("l80"), P_RED, curses.A_NORMAL, "-80%")
+        _er_line(er.get("u100"), P_GREEN, curses.A_BOLD, "+100%")
+        _er_line(er.get("l100"), P_RED, curses.A_BOLD, "-100%")
+        _er_line(er.get("u150"), P_MAGENTA, curses.A_BOLD, "+150%")
+        _er_line(er.get("l150"), P_MAGENTA, curses.A_BOLD, "-150%")
+        _level_line(er.get("open"), "EOpen", P_DEFAULT, curses.A_DIM)
+
+    for _t in (targets or []):
+        if _t.get("type") in ("ER 100%", "ER 150%"):
+            continue   # already drawn as the real ER fill+lines above —
+                         # a second thin target line at the same price
+                         # would just be redundant clutter
+        _pair, _attr = _ohlc_target_style(_t.get("type"))
+        _level_line(_t.get("level"), _t.get("type") or "", _pair, _attr)
+
+    if position:
+        _level_line(position.get("fill_price"), "ENTRY", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+        _level_line(position.get("sl_price"), "SL", P_RED, curses.A_BOLD)
+        for _tpi, _leg in enumerate(position.get("tp_legs") or [], start=1):
+            _level_line(_leg.get("level"), f"TP{_tpi}", P_GREEN, curses.A_BOLD)
+    elif pending:
+        _level_line(pending.get("entry_price"), "ENTRY", P_YELLOW, curses.A_BOLD)
+
+    # ── SESSIONS OVERLAY ─────────────────────────────────────────────────
+    # Ported from draw_chart's own sessions indicator (19952-20030),
+    # adapted from _ChartCandle attribute access to this panel's plain
+    # dict bars and from full-terminal chart_bot to this panel's own
+    # chart_bot_excl. Resolution is always 1m here, so the source's own
+    # `_sess_resolution <= 180` gate is always satisfied — dropped.
+    if show_sessions and visible and chart_h > 0:
+        OHLC_SESSIONS = [
+            ("NDO",   (0,  0), (3, 30), P_BLUE,   None),
+            ("Morn",  (8, 30), (10,30), P_CYAN,  None),
+            ("Excl",  (9,  0), (10, 0), P_RED,   [2, 3]),
+            ("Lunch", (11,30), (13,30), P_YELLOW,  None),
+            ("PWR",   (14, 0), (15, 0), P_MAGENTA,   None),
+            ("EOD",   (16, 0), (18, 0), P_GREEN, None),
+            ("EEOD",  (18,30), (23,59), P_RED,   None),
+        ]
+        from itertools import groupby as _groupby
+        def _sess_date_key(_pair):
+            _i, _c = _pair
+            return datetime.fromtimestamp(_c["ts"]).date()
+
+        _indexed = [(i, c) for i, c in enumerate(visible)]
+        for _sname, _sstart, _send, _scol, _sdays in OHLC_SESSIONS:
+            _sh, _sm = _sstart; _eh, _em = _send
+            _s_mins = _sh * 60 + _sm; _e_mins = _eh * 60 + _em
+            for _day, _day_group in _groupby(_indexed, _sess_date_key):
+                _day_candles = list(_day_group)
+                _sess_cols, _sess_hi, _sess_lo = [], None, None
+                for _i, _candle in _day_candles:
+                    _col = start_col + _i
+                    if not (x0 <= _col < chart_r):
+                        continue
+                    _dt = datetime.fromtimestamp(_candle["ts"])
+                    if _sdays and _dt.weekday() not in _sdays:
+                        continue
+                    _mins = _dt.hour * 60 + _dt.minute
+                    if _s_mins <= _mins < _e_mins:
+                        _sess_cols.append(_col)
+                        if _sess_hi is None or _candle["h"] > _sess_hi:
+                            _sess_hi = _candle["h"]
+                        if _sess_lo is None or _candle["l"] < _sess_lo:
+                            _sess_lo = _candle["l"]
+                if not _sess_cols or _sess_hi is None:
+                    continue
+                _c0, _c1 = _sess_cols[0], _sess_cols[-1]
+                _r_top = clamp(chart_top + p2r(_sess_hi))
+                _r_bot = clamp(chart_top + p2r(_sess_lo))
+                for _bc in range(_c0, _c1 + 1):
+                    if x0 <= _bc < chart_r:
+                        db.put(_r_top, _bc, "-", _scol, curses.A_BOLD)
+                if _r_bot != _r_top:
+                    for _bc in range(_c0, _c1 + 1):
+                        if x0 <= _bc < chart_r:
+                            db.put(_r_bot, _bc, "-", _scol, curses.A_BOLD)
+                for _r in range(_r_top, _r_bot + 1):
+                    if db.buf[_r][_c0][0] == " ":
+                        db.put(_r, _c0, "|", _scol, curses.A_BOLD)
+                    if db.buf[_r][_c1][0] == " ":
+                        db.put(_r, _c1, "|", _scol, curses.A_BOLD)
+                if _c0 + 1 < chart_r:
+                    db.puts(_r_top, _c0 + 1, _sname, _scol, curses.A_BOLD)
+
+    # ── PERIOD SEPARATOR — 19:00 CT vertical line ───────────────────────
+    for _i, _bar in enumerate(visible):
+        _col_s = start_col + _i
+        if not (x0 <= _col_s < chart_r):
+            continue
+        _dt_c = datetime.fromtimestamp(_bar["ts"])
+        if _dt_c.hour == 19 and _dt_c.minute == 0:
+            for _r in range(chart_top, chart_bot_excl):
+                if db.buf[_r][_col_s][0] == " ":
+                    db.put(_r, _col_s, ":", P_DIM, curses.A_DIM)
+            db.puts(chart_top, _col_s, "S", P_DEFAULT, curses.A_DIM)
+
+    # ── CANDLES / LINE CHART ─────────────────────────────────────────────
+    if line_mode:
+        _prev_row = None
+        for i, bar in enumerate(visible):
+            col = start_col + i
+            if not (x0 <= col < chart_r):
+                _prev_row = None
+                continue
+            r_c = clamp(chart_top + p2r(bar["c"]))
+            db.put(r_c, col, "*", P_CYAN, curses.A_BOLD)
+            if _prev_row is not None and col > x0:
+                r_from, r_to = min(_prev_row, r_c), max(_prev_row, r_c)
+                for r in range(r_from, r_to):
+                    if db.buf[r][col - 1][0] == " ":
+                        db.put(r, col - 1, "|", P_CYAN, curses.A_DIM)
+            _prev_row = r_c
+    else:
+        for i, bar in enumerate(visible):
+            col = start_col + i
+            if col < x0 or col >= chart_r:
+                continue
+            bull = bar["c"] >= bar["o"]
+            body_pair = _chart_bull_pair() if bull else _chart_bear_pair()
+            r_hi = clamp(chart_top + p2r(bar["h"]))
+            r_top = clamp(chart_top + p2r(max(bar["o"], bar["c"])))
+            r_bot = clamp(chart_top + p2r(min(bar["o"], bar["c"])))
+            r_lo = clamp(chart_top + p2r(bar["l"]))
+            for r in range(r_hi, r_lo + 1):
+                db.put(r, col, "│", P_DIM)
+            if r_top == r_bot:
+                db.put(r_top, col, "─", body_pair, curses.A_BOLD)
+            else:
+                for r in range(r_top, r_bot + 1):
+                    db.put(r, col, "█", body_pair)
+
+    if live_price and lo_p < live_price < hi_p:
+        pr = clamp(chart_top + p2r(live_price))
+        for c2 in range(x0, chart_r):
+            cell_ch = db.buf[pr][c2][0] if pr < len(db.buf) and c2 < len(db.buf[pr]) else " "
+            if cell_ch in (" ", "-", ".", "·"):
+                db.put(pr, c2, "-", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+        db.puts(pr, chart_r + 1, fmt_price(live_price).rjust(OHLC_PRICE_W), P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+
+    if n_all >= OHLC_BTD_LOOKBACK + 2:
+        buy_iv, sell_iv = [], []
+        for b in all_candles:
+            rng = b["h"] - b["l"]
+            if rng > 0:
+                buy_iv.append((b["c"] - b["l"]) / rng * b["v"])
+                sell_iv.append((b["h"] - b["c"]) / rng * b["v"])
+            else:
+                buy_iv.append(0.0)
+                sell_iv.append(0.0)
+        _rev = curses.A_BOLD | curses.A_REVERSE
+        for i, bar in enumerate(visible):
+            col = start_col + i
+            if col < x0 or col >= chart_r:
+                continue
+            ci = left_idx + i
+            if ci < OHLC_BTD_LOOKBACK:
+                continue
+            wb = buy_iv[max(0, ci - OHLC_BTD_LOOKBACK):ci]
+            ws = sell_iv[max(0, ci - OHLC_BTD_LOOKBACK):ci]
+            if len(wb) < 2:
+                continue
+            nn = len(wb)
+            mb = sum(wb) / nn
+            ms = sum(ws) / nn
+            sdb = (sum((x - mb) ** 2 for x in wb) / (nn - 1)) ** 0.5
+            sds = (sum((x - ms) ** 2 for x in ws) / (nn - 1)) ** 0.5
+            cb, cs = buy_iv[ci], sell_iv[ci]
+            t1b = mb + sdb * OHLC_BTD_SIGMA
+            t2b = mb + sdb * (OHLC_BTD_SIGMA + 1.5)
+            t3b = mb + sdb * (OHLC_BTD_SIGMA + 3.0)
+            t1s = ms + sds * OHLC_BTD_SIGMA
+            t2s = ms + sds * (OHLC_BTD_SIGMA + 1.5)
+            t3s = ms + sds * (OHLC_BTD_SIGMA + 3.0)
+            row_b = min(chart_bot_excl - 1, clamp(chart_top + p2r(bar["l"])) + 1)
+            row_s = max(chart_top, clamp(chart_top + p2r(bar["h"])) - 1)
+            if cb > t1b and chart_top <= row_b < chart_bot_excl:
+                if cb > t3b:
+                    for dx in range(-1, 2):
+                        if x0 <= col + dx < chart_r:
+                            db.put(row_b, col + dx, "#", P_CYAN, _rev)
+                            if row_b + 1 < chart_bot_excl:
+                                db.put(row_b + 1, col + dx, "#", P_CYAN, _rev)
+                elif cb > t2b:
+                    db.put(row_b, col, "#", P_CYAN, _rev)
+                    if row_b + 1 < chart_bot_excl:
+                        db.put(row_b + 1, col, "#", P_CYAN, _rev)
+                else:
+                    db.put(row_b, col, "#", P_CYAN, _rev)
+            if cs > t1s and chart_top <= row_s < chart_bot_excl:
+                if cs > t3s:
+                    for dx in range(-1, 2):
+                        if x0 <= col + dx < chart_r:
+                            db.put(row_s, col + dx, "#", P_MAGENTA, _rev)
+                            if row_s - 1 >= chart_top:
+                                db.put(row_s - 1, col + dx, "#", P_MAGENTA, _rev)
+                elif cs > t2s:
+                    db.put(row_s, col, "#", P_MAGENTA, _rev)
+                    if row_s - 1 >= chart_top:
+                        db.put(row_s - 1, col, "#", P_MAGENTA, _rev)
+                else:
+                    db.put(row_s, col, "#", P_MAGENTA, _rev)
+
+    # ── VOLUME ───────────────────────────────────────────────────────────
+    # Ported from draw_chart's own volume histogram (20231-20246).
+    db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
+    for r in range(vol_top, vol_bot_excl):
+        db.put(r, chart_r, "│", P_DIM)
+    max_vol = max((b["v"] for b in visible), default=1) or 1
+    for i, bar in enumerate(visible):
+        col = start_col + i
+        if col < x0 or col >= chart_r:
+            continue
+        bull = bar["c"] >= bar["o"]
+        vol_pair = _chart_vol_bull_pair() if bull else _chart_vol_bear_pair()
+        bar_h = max(1, int(bar["v"] / max_vol * OHLC_VOL_H))
+        for r in range(vol_bot_excl - bar_h, vol_bot_excl):
+            db.put(r, col, "#", vol_pair)
+
+    # ── TIME AXIS ────────────────────────────────────────────────────────
+    db.put(time_row, chart_r, "│", P_DIM)
+    # min 6 cols/label ("HH:MM" + 1 gap) — n_vis//8 alone could pack labels
+    # closer than that when n_vis is small, overwriting each other into
+    # unreadable runs like "1717171717:35" (2026-08-25 user-reported).
+    time_step = max(6, n_vis // 8)
+    for i in range(0, n_vis, time_step):
+        bar = visible[i]
+        col = start_col + i
+        if col < x0 or col + 5 >= chart_r:
+            continue
+        lbl = datetime.fromtimestamp(bar["ts"]).strftime("%H:%M")
+        db.puts(time_row, col, lbl, P_DIM)
+
 def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mode, trade_events,
                           hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False,
-                          crosshair_bar_idx=None):
+                          crosshair_bar_idx=None, ohlc_1m_bars=None, ohlc_1m_live=None,
+                          ohlc_levels=None, ohlc_targets=None, ohlc_er=None, ohlc_vert_offset=0, ohlc_ui=None):
     """One footprint chart pane within rows [y0,y1) / cols [x0,x1) — ported
     rendering from footprint.py's draw(), adapted to (a) write into a
     DoubleBuffer instead of directly to a curses window, (b) a fixed
@@ -11580,7 +12867,8 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
         db.puts(y0, x0, f"{asset}: pane too small"[:max(0, cols)], P_DIM)
         return
 
-    scroll_tag = f"  [SCROLLED {hscroll_bars}b back]" if hscroll_bars else ""
+    vert_tag = f" v{ohlc_vert_offset:+d}" if (profile_mode == "ohlc" and ohlc_vert_offset) else ""
+    scroll_tag = f"  [SCROLLED {hscroll_bars}b back{vert_tag}]" if (hscroll_bars or vert_tag) else ""
     # Persistent on-chart focus indicator — a footer hint alone was easy to
     # miss (and on a narrow terminal, easy to lose entirely to truncation,
     # since it used to be appended at the very end of an already-long
@@ -11615,6 +12903,15 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
+
+    if profile_mode == "ohlc":
+        _draw_ohlc_chart_panel(db, asset, ohlc_1m_bars or [], ohlc_1m_live,
+                                y0 + 1, y1, x0, x1, live_price, hscroll_bars,
+                                position=inst_snap.get("position"), pending=inst_snap.get("pending"),
+                                levels=ohlc_levels or {}, targets=ohlc_targets or [], er=ohlc_er,
+                                vert_offset=ohlc_vert_offset, ui=ohlc_ui or {})
+        return
+
     top = y0 + 1
     bottom_reserved = 10   # divider + O/H/L/C/Δ/VAH/VAL/POC + time axis
     plot_bottom = y1 - bottom_reserved - 1
@@ -12033,6 +13330,8 @@ class AppState:
         self.trade_pairs = []
         self.footprint_bars = {}
         self.live_bars = {}
+        self.ohlc_1m_bars = {}
+        self.ohlc_1m_live = {}
         self.qqq_market_closed = True
         self._last_footprint_broadcast = 0.0   # see publish()'s own use of
                                                  # this — how the recurring
@@ -12066,10 +13365,28 @@ class AppState:
             for asset, bar in live_bars.items():
                 if bar is None:
                     continue
-                self.live_bars[asset] = bar
+                self.live_bars[asset] = bar   # still the blended feed —
+                                                # this is the CHART's own
+                                                # forming-bar display, an
+                                                # order-flow/signal concern,
+                                                # deliberately untouched
                 inst = self.instruments.get(asset)
                 if inst is not None:
-                    inst["live_price"] = bar["c"]
+                    # 2026-08-26 fix (see PHEMEX_LAST_PRICE's own
+                    # docstring): inst["live_price"] feeds unrealized PnL
+                    # and the dashboard's own displayed live price — an
+                    # account/execution concern, not signal generation —
+                    # so it must NOT come from bar["c"] (the same blended
+                    # multi-exchange/Alpaca price self.live_bars above
+                    # uses for charting). This fast path used to overwrite
+                    # publish()'s own already-correct Phemex-only value
+                    # right back to the blended one every 0.25s.
+                    _px = phemex_reference_price(asset)
+                    if _px is not None:
+                        inst["live_price"] = _px
+            for asset in ASSETS:
+                om_live = LIVE_TAPE.ohlc_1m_live[asset]
+                self.ohlc_1m_live[asset] = dict(om_live) if om_live else None
         _sync_broadcast_live_bars(live_bars)   # no-op on a Client / with no connected clients
 
     def publish(self, instruments, age, acc, live_prices, qqq_market_closed):
@@ -12088,12 +13405,18 @@ class AppState:
                 "sl_missing": i._sl_missing,
                 "daily_loss_blocked": DAILY_LOSS_STATE[i.asset]["blocked"],
                 "max_win_blocked": MAX_WIN_STATE[i.asset]["blocked"],
+                "targets": list(i.last_targets) if i.last_targets else [],
+                "er_bands": dict(i.last_er_bands) if i.last_er_bands else None,
             }
         # Enough history to actually scroll back through, not just the
         # live tail — CHART_HISTORY_BARS, not the handful the visible pane
         # itself can show at once (draw_footprint_panel slices whatever
         # window it needs out of this via hscroll_bars).
         bars = {i.asset: read_last_n_footprint_bars(i.asset, CHART_HISTORY_BARS) for i in instruments}
+        ohlc_1m = {}
+        for i in instruments:
+            closed, live = LIVE_TAPE.snapshot_1m(i.asset)
+            ohlc_1m[i.asset] = closed
         with self.lock:
             self.instruments = inst_snap
             self.snapshot_age = age
@@ -12106,6 +13429,7 @@ class AppState:
             self.closed_trades = recent_closed_trades(6)
             self.trade_pairs = recent_trade_pairs(8)
             self.footprint_bars = bars
+            self.ohlc_1m_bars = ohlc_1m
             self.qqq_market_closed = qqq_market_closed
         # Full snapshot (incl. footprint_bars) only every SYNC_FOOTPRINT_
         # PUSH_INTERVAL seconds — every OTHER publish() cycle sends
@@ -12128,6 +13452,7 @@ class AppState:
                 "event_log": self.event_log, "closed_trades": self.closed_trades,
                 "trade_pairs": self.trade_pairs,
                 "footprint_bars": self.footprint_bars, "live_bars": self.live_bars,
+                "ohlc_1m_bars": self.ohlc_1m_bars, "ohlc_1m_live": self.ohlc_1m_live,
                 "qqq_market_closed": self.qqq_market_closed,
             }
 
@@ -13336,7 +14661,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  Esc=dashboard  M=next(Status) K=back(Chart)  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" [H]elp  q=quit  Esc=dashboard  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -13453,8 +14778,7 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
-    hint = (f" q=quit  Esc=dashboard  M=next(Status) K=back(Chart)  time:←/→/PgUp/PgDn  strikes:↑/↓/[/]/{{/}}  z/End=reset  "
-            f"g=by-strike  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
+    hint = (f" [H]elp  q=quit  Esc=dashboard  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
 def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
@@ -13498,7 +14822,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
         msg = "Waiting for first snapshot…"
         db.puts(y0 + h // 2, x0 + 2, msg[:max(0, w - 2)], P_CYAN)
         bot = y1 - 1
-        hint = f" q=quit  Esc=dashboard  M=next(Status) K=back(Chart)  [{asset}]  {GEX_STATUS[asset]}"
+        hint = f" [H]elp  q=quit  Esc=dashboard  [{asset}]  {GEX_STATUS[asset]}"
         db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
         return
 
@@ -13623,8 +14947,7 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-    hint = (f" q=quit  Esc=dashboard  M=next(Status) K=back(Chart)  ←/→/PgUp/PgDn/↑/↓/[/]/{{/}}=pan strikes  z/End=reset  "
-            f"g=interval map  n=net/separate  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
+    hint = (f" [H]elp  q=quit  Esc=dashboard  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
 FAST_MATCH_STEP = 0.5   # DRY_RUN only — see _fast_match_wait
@@ -13840,17 +15163,26 @@ async def engine_loop():
         # Fetched unconditionally now (not just for positioned instruments)
         # — open_pnl and the dashboard's per-instrument price fallback need
         # it regardless of whether Athena itself currently holds anything.
-        # Prefers LIVE_TAPE's own real-time WS price (no network round trip,
-        # already fresher than a REST poll) — fetch_last_price is now only
-        # a fallback for the brief window before the WS connects. The
-        # still-forming CHART bar itself is no longer built here at all —
-        # see _fast_publish_loop, which reads LIVE_TAPE far more often than
-        # this REST-heavy cycle runs, so the chart isn't bottlenecked on
-        # process_cycle/fetch_account/fetch_last_price latency.
+        # Prefers PHEMEX_LAST_PRICE (no network round trip, already fresher
+        # than a REST poll) — fetch_last_price is now only a fallback for
+        # the brief window before Phemex's own WS connects. The still-
+        # forming CHART bar itself is no longer built here at all — see
+        # _fast_publish_loop, which reads LIVE_TAPE (the blended, signal-
+        # only feed) far more often than this REST-heavy cycle runs, so
+        # the chart isn't bottlenecked on process_cycle/fetch_account/
+        # fetch_last_price latency.
+        #
+        # 2026-08-26 CRITICAL fix, user-reported: this used to prefer
+        # LIVE_TAPE.snapshot() — the same blended (ETH: Phemex+Kraken+
+        # Coinbase; QQQ: Alpaca) feed order-flow signals use — for
+        # unrealized PnL and the dashboard's own displayed live price.
+        # Both are account/execution concerns (see PHEMEX_LAST_PRICE's own
+        # docstring), not order-flow analysis, so they need Phemex's own
+        # price specifically, same as tick_matching/apply_funding_if_due.
         live_prices = {}
         for inst in instruments:
-            tape_bar = LIVE_TAPE.snapshot(inst.asset)
-            live_prices[inst.asset] = tape_bar["c"] if tape_bar is not None \
+            price = phemex_reference_price(inst.asset)
+            live_prices[inst.asset] = price if price is not None \
                 else await fetch_last_price(inst.cfg["phemex_symbol"])
 
         qqq_market_closed = bool((snapshot.get("qqq") or {}).get("market_closed")) if snapshot else True
@@ -14075,10 +15407,11 @@ def draw_dashboard(db, snap, cols):
                 bj_txt = f"   {DIM}BJ: win progression ({fmt_num(bj['win_step_back'], 0)}R + ${bj['win_profit_dollars']:,.2f}){RST}"
             else:
                 bj_txt = f"   {DIM}BJ: {fmt_num(BLACKJACK_STEPS[bj['loss_step']], 0)}R{RST}"
-        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{funding_txt}{bj_txt}")
+        mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "CCCCWIDE" else ""
+        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{funding_txt}{bj_txt}{mode_tag}")
         y += 1
         detail = "  " + "  ".join(
-            (GRN if lights.get(n) else RED) + n + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
+            (GRN if lights.get(n) else RED) + ("BTD" if n == "Order Flow" and TRADING_MODE == "BTD" else n) + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
             for n in LIGHT_ORDER)
         db.puts_ansi(y, 0, detail)
         y += 1
@@ -15080,7 +16413,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
     if not lines:
         msg = "Waiting for first status snapshot…"
         db.puts(y0 + h // 2, x0 + max(0, (w - len(msg)) // 2), msg[:w], P_CYAN)
-        hint = " q=quit  Esc=dashboard  M=next(Trading)  K=back(Markets) "
+        hint = " [H]elp  q=quit  Esc=dashboard "
         db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
         return 0
 
@@ -15090,7 +16423,7 @@ def draw_status_screen(db, y0, y1, x0, x1, scroll):
         db.puts_ansi(y0 + i, x0, line[:w])
 
     scroll_tag = f"  [{scroll + 1}-{min(total, scroll + visible_rows)} of {total}]" if total > visible_rows else ""
-    hint = f" q=quit  Esc=dashboard  M=next(Trading)  K=back(Markets)  ↑/↓/PgUp/PgDn=scroll{scroll_tag} "
+    hint = f" [H]elp  q=quit  Esc=dashboard{scroll_tag} "
     db.puts(y1 - 1, x0, hint.ljust(w)[:w], P_STATUS)
     return scroll
 
@@ -15387,15 +16720,11 @@ def draw_drift(db, asset, y0, y1, x0, x1, ui):
         countdown = f"next refresh in {max(0, int(round(next_poll_ts - time.time())))}s"
     else:
         countdown = "live tracking continues in background"
-    v_hint = "" if is_crypto else "   [C] deadzone"   # no [V] hint needed —
-                                                        # venue breakdown is always on now
     min_str = f"min ${min_trade_usd:g}"
     dz_str = f"   dz {confidence_deadzone * 100:g}%" if not is_crypto else ""
     filt_str = "   FILTERED (OTM)" if filtered_mode else ""
     vol_str = "   bottom: Net Vol" if net_volume_mode else "   bottom: Volume"
-    ch_hint = " [X]:crosshair-ON" if ch_col is not None else " [X]:crosshair"
-    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [T]hreshold [F]iltered [N]etVol{v_hint}{ch_hint} "
-              f"[L]ive [R]efresh Esc/[M]exit [K]back [Q]uit    "
+    footer = (f" [H]elp  q=quit  Esc=dashboard    "
               f"poll {interval}s   {_drift_fmt_duration(bar_interval)} bars   {min_str}{dz_str}{filt_str}{vol_str}    "
               f"{countdown}    last update {last_str} ")
     db.puts(y1 - 1, x0, footer.ljust(w)[:w], P_STATUS)
@@ -15643,7 +16972,7 @@ def draw_cvd(db, asset, y0, y1, x0, x1, ui):
                 f"{feed_status}  log:{log_rows}")
     if log_err:
         info += f"  ⚠ log: {log_err}"
-    hint = "  [←→]pan [X]crosshair Tab=asset [Z]rebase [I]nterval [T]BTD [C]olor [+/-]zoom [L]ive Esc/[M]exit [K]back [Q]uit"
+    hint = "  [H]elp  q=quit  Esc=dashboard"
     footer = (info + hint).ljust(w)[:w]
     db.puts(y1 - 1, x0, footer, P_STATUS)
     return view_offset
@@ -15980,8 +17309,7 @@ def draw_voldrift(db, asset, y0, y1, x0, x1, ui):
         countdown = f"next refresh in {max(0, int(round(next_poll_ts - time.time())))}s"
     else:
         countdown = "live tracking continues in background"
-    footer = (f" [←/→]pan Tab=asset [H]istory [I]nterval [B]ars [W]rvWindow [D]eadzone "
-              f"[L]ive [R]efresh Esc/[M]exit [K]back [Q]uit    "
+    footer = (f" [H]elp  q=quit  Esc=dashboard    "
               f"poll {interval}s   {_voldrift_fmt_duration(bar_interval)} bars   "
               f"rv window {_voldrift_fmt_duration(rv_window)}   deadzone {deadzone:g}pt    "
               f"{countdown}    last update {last_str} ")
@@ -16325,8 +17653,8 @@ def draw_markets(db, rows, cols):
         if chart_top <= row < chart_bot:
             db.puts(row, legend_x, lbl, color_pair, curses.A_BOLD)
 
-    footer = (f" MARKETS  {n_total} pts  {len(pct_series)}/{len(MARKETS_ASSETS)} assets"
-              f"  next refresh:{secs_left}s  [R] refresh  [M] exit  [K] back  [Q] quit")
+    footer = (f" [H]elp  q=quit  Esc=dashboard   MARKETS  {n_total} pts  {len(pct_series)}/{len(MARKETS_ASSETS)} assets"
+              f"  next refresh:{secs_left}s")
     if gerr:
         footer += f"  | {gerr}"
     db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
@@ -17002,7 +18330,7 @@ def draw_macro_options(db, rows, cols):
     else:
         line(f"    {'Sound':<8} ON (alert.wav enabled)", P_GREEN)
     line()
-    line("  [Q]uit   [R]efresh   [U]mute/unmute   Esc/[M] next mode   [K]back", P_DIM)
+    line("  [H]elp  q=quit  Esc=dashboard", P_DIM)
 
 # ── Chain — ported from chain.py ────────────────────────────────────────────
 # Live options-chain table (strikes x Greeks) for one symbol at a time —
@@ -17305,7 +18633,7 @@ def draw_chain(db, rows, cols, simple_mode=False):
     if data is None:
         msg = f"Error: {error_msg}" if error_msg else f"Fetching {symbol} chain…"
         db.puts(rows // 2, max(0, cols // 2 - len(msg) // 2), msg, P_RED if error_msg else P_CYAN, curses.A_BOLD)
-        db.puts(footer_row, 0, " Chain  [R]etry  [S]ymbol  Esc/[M] next mode  [K]back".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
+        db.puts(footer_row, 0, " [H]elp  q=quit  Esc=dashboard".ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
         return
 
     index_price = data["index_price"]
@@ -17435,7 +18763,7 @@ def draw_chain(db, rows, cols, simple_mode=False):
             cx += width
 
     mode_tag = "SIMPLE" if simple_mode else "FULL"
-    hint = f" [Q]uit [R]efresh [S]ymbol [Y]:{mode_tag} Esc/[M] next mode [K]back  [{symbol}]"
+    hint = f" [H]elp  q=quit  Esc=dashboard  {mode_tag}  [{symbol}]"
     db.puts(footer_row, 0, hint.ljust(cols)[:cols], P_STATUS, curses.A_BOLD)
 
 # ── Chart — ported from charthacker.py ──────────────────────────────────────
@@ -17678,6 +19006,11 @@ class _ChartState:
         self.view_offset    = 0
         self.cursor_col_idx = -1
         self.vert_offset    = 0
+        self.vp_historical  = False   # [4] — VAH/VAL/POC as a stepped
+                                        # developing trace instead of one
+                                        # flat line at the current value
+                                        # (2026-08-25 user request) — see
+                                        # _historical_vp_map's own docstring
         self.color_scheme   = "bw"
         self.show_vp        = True
         self.show_vwap      = True
@@ -18921,6 +20254,7 @@ def draw_chart(db, rows, cols):
         error         = CHART_STATE.error
         color_scheme      = CHART_STATE.color_scheme
         show_vp           = CHART_STATE.show_vp
+        vp_historical     = CHART_STATE.vp_historical
         show_vwap         = CHART_STATE.show_vwap
         show_er           = CHART_STATE.show_er
         er_iv             = CHART_STATE.er_iv
@@ -19354,10 +20688,19 @@ def draw_chart(db, rows, cols):
                     if db.buf[_hr][c2][0] in (" ", ".", "-", _hch):
                         db.put(_hr, c2, _hch, _hpr, curses.A_DIM)
 
-        curr_result = compute_vp(session_candles)
         _deferred_vp = None
+        curr_result = compute_vp(session_candles)
         if curr_result:
             vp, c_slo, c_shi, poc_price, vah_price, val_price = curr_result
+            # 2026-08-26 user-reported ("VAH/VAL/POC should still have
+            # labels and the VP should not change to a lighter shading"):
+            # Historical Mode [4] used to REPLACE this whole block (bars +
+            # labels) with just the stepped trace, silently dropping the
+            # volume-profile histogram shading and the VAH/VAL/POC text
+            # labels entirely. It's an ADDITION now — the current-value
+            # bars/labels always render (unchanged from Normal Mode), and
+            # when vp_historical is on, the developing trace draws ON TOP
+            # of them as an extra layer, not a replacement.
             draw_vp_bars(vp, c_slo, c_shi, poc_price, vah_price, val_price,
                          alpha_dim=False, col_start=max(0, curr_col_start))
             draw_level_line(vah_price, "~", P_MAGENTA, curses.A_BOLD, "VAH",
@@ -19367,6 +20710,25 @@ def draw_chart(db, rows, cols):
             draw_level_line(poc_price, "=", P_YELLOW, curses.A_BOLD, "POC",
                             col_start=max(0, curr_col_start))
             _deferred_vp = {"vah": vah_price, "val": val_price, "poc": poc_price}
+            if vp_historical:
+                _vp_map = _historical_vp_map([(c.ts, c.o, c.h, c.l, c.c, c.v) for c in session_candles])
+                for _i, _vc in enumerate(visible):
+                    _col = start_col_base + _i
+                    if not (max(0, curr_col_start) <= _col < chart_r):
+                        continue
+                    _hv = _vp_map.get(_vc.ts)
+                    if _hv is None:
+                        continue
+                    _poc_p, _vah_p, _val_p = _hv
+                    _r_poc = chart_top + price_to_row(_poc_p)
+                    _r_vah = chart_top + price_to_row(_vah_p)
+                    _r_val = chart_top + price_to_row(_val_p)
+                    if chart_top <= _r_poc < chart_bot:
+                        db.put(_r_poc, _col, "═", P_YELLOW, curses.A_BOLD)
+                    if chart_top <= _r_vah < chart_bot:
+                        db.put(_r_vah, _col, "~", P_MAGENTA, curses.A_BOLD)
+                    if chart_top <= _r_val < chart_bot:
+                        db.put(_r_val, _col, "~", P_MAGENTA, curses.A_BOLD)
     else:
         _deferred_vp = None
 
@@ -19910,7 +21272,7 @@ def draw_chart(db, rows, cols):
         auth_tag = f"/{('auth' if PHEMEX_API_KEY else 'no-auth')}" if feed == "phemex" else ""
         err_str  = f"  ! {error}" if error and visible else ""
         scheme_tag = "B/W" if color_scheme == "bw" else "R/G"
-        vp_tag     = "VP:ON" if show_vp else "VP:OFF"
+        vp_tag     = ("VP:HIST" if vp_historical else "VP:ON") if show_vp else "VP:OFF"
         hist_tag = "  [loading history...]" if history_loading else ""
         mode_tag_  = "LINE" if chart_mode == "line" else "CANDLE"
         vwap_tag  = "W:ON" if show_vwap else "W:OFF"
@@ -19923,7 +21285,7 @@ def draw_chart(db, rows, cols):
         _scr_tag   = f"  [SCROLLED {vert_offset:+d}, Esc to reset]" if vert_offset else ""
         _er_shown  = er_iv if er_iv > 0 else CHART_ER_MANUAL_IV
         er_tag     = f"ER:ON({_er_shown:.0f}%IV)" if show_er else "ER:OFF"
-        footer   = (f" [E]Sym [F]eed:{_feed_tag} [C]{scheme_tag} [I]{ivl_label} [L]{mode_tag_} [W]{vwap_tag} [V]{vp_tag} [B]{er_tag} [T]{btd_tag} [S]{sess_tag} [;]BTG [A]{n_alerts}alrt [`]lines [|]hln [\\]pos [U]save [M]next [K]back [Q]uit"
+        footer   = (f" [E]Sym [F]eed:{_feed_tag} [C]{scheme_tag} [I]{ivl_label} [L]{mode_tag_} [W]{vwap_tag} [V]{vp_tag} [4]hist [B]{er_tag} [T]{btd_tag} [S]{sess_tag} [;]BTG [A]{n_alerts}alrt [`]lines [|]hln [\\]pos [U]save [M]next [K]back [Q]uit"
                     f"   {len(all_candles)} candles  sess:{_n_sess}  {_feed_tag}{auth_tag}{cinfo}{err_str}{hist_tag}{_scr_tag}")
         db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
         if vert_offset:
@@ -20002,7 +21364,8 @@ def draw_chart(db, rows, cols):
 
     # ── HELP OVERLAY (drawn last, on top of everything) ─────────────────
     if show_help:
-        _chart_draw_help_overlay(db, rows, cols, help_scroll)
+        _draw_key_menu_overlay(db, rows, cols, CHART_HELP_LINES, CHART_HELP_BOX_W,
+                                help_scroll, close_key_hint="[H]/[?]")
 
     # ── Deferred state writes (after draw completes, mirrors the source's
     # own draw()-returns-a-dict / main()-applies-it split, just inlined) ──
@@ -21308,61 +22671,339 @@ CHART_HELP_SECTIONS = [
     ]),
 ]
 
-def _chart_build_help_lines():
+def _build_key_menu_lines(title, sections, close_hint="[H] / [Esc]  Close menu"):
+    """Shared by every mode's own full-key-reference overlay (2026-08-26
+    user request: every mode's dense one-line footer was hard to read and
+    didn't fit — generalized from what was originally Chart-mode-only
+    _chart_build_help_lines/_chart_draw_help_overlay, now parameterized by
+    title/sections/close_hint instead of reading Chart-specific globals,
+    so each mode can build its OWN menu from its OWN key inventory while
+    sharing one rendering implementation). Returns (lines, box_w) — the
+    flattened, pre-formatted line list plus the box width it needs,
+    computed once at import time same as Chart mode's own tables always
+    were, not rebuilt per frame."""
     lines = []
-    lines.append("  C H A R T  —  Key Reference")
+    lines.append(f"  {title}")
     lines.append("")
-    for section, entries in CHART_HELP_SECTIONS:
+    for section, entries in sections:
         lines.append(f"  ── {section} " + "─" * max(0, 44 - len(section)))
         for key, desc in entries:
             lines.append(f"    {key:<18}  {desc}")
         lines.append("")
-    lines.append("  [H] / [?] / [Esc]  Close help")
-    return lines
+    lines.append(f"  {close_hint}")
+    box_w = max((len(l) for l in lines), default=40) + 4
+    return lines, box_w
 
-CHART_HELP_LINES = _chart_build_help_lines()
-CHART_HELP_BOX_W = max((len(l) for l in CHART_HELP_LINES), default=40) + 4
+CHART_HELP_LINES, CHART_HELP_BOX_W = _build_key_menu_lines(
+    "C H A R T  —  Key Reference", CHART_HELP_SECTIONS,
+    close_hint="[H] / [?] / [Esc]  Close help")
 
-def _chart_draw_help_overlay(db, rows: int, cols: int, scroll: int = 0):
-    box_w    = min(cols - 4, CHART_HELP_BOX_W)
+def _help_menu_max_scroll(n_lines, rows):
+    """The same box_h/max_rows math _draw_key_menu_overlay computes
+    internally to clamp ITS OWN local scroll value before rendering —
+    exposed here so the key-handling side can clamp the STORED scroll
+    value too. 2026-08-26 user-reported ("scrolls to the bottom... freezes
+    for a few seconds before allowing the user to scroll back up"): every
+    mode's own scroll-down handler only ever incremented with no upper
+    bound (`mode_help_scroll[...] += key_repeat_n`), while the render
+    function silently re-clamped its own copy every frame — so holding
+    [Down] at the bottom kept inflating the STORED value far past the
+    real max (invisibly, since the display already looked "stuck" at
+    100%), and pressing [Up] afterward had to unwind that entire excess
+    before the displayed position visibly moved at all."""
+    box_h = min(rows - 4, 36)
+    max_rows = box_h - 3
+    return max(0, n_lines - max_rows)
+
+def _draw_key_menu_overlay(db, rows: int, cols: int, lines, box_w: int,
+                            scroll: int = 0, close_key_hint: str = "[H]"):
+    box_w    = min(cols - 4, box_w)
     box_h    = min(rows - 4, 36)
     box_y    = max(0, (rows - box_h) // 2)
     box_x    = max(0, (cols - box_w) // 2)
-    n_lines  = len(CHART_HELP_LINES)
+    n_lines  = len(lines)
     max_rows = box_h - 3
 
     scroll = max(0, min(scroll, max(0, n_lines - max_rows)))
 
-    # 2026-08-19 user report — same fix as the Economic Calendar/Drawings/
-    # Alerts overlays: P_STATUS is black-on-WHITE, picked by name-
-    # similarity to the source's own C_HEADER, which is actually white-on-
-    # BLACK. P_DEFAULT matches the intended dark background.
+    # Filled with P_STATUS (black-on-WHITE, see init_curses_colors), matching
+    # what nearly every content row already renders as — 2026-08-26 user-
+    # reported ("background is black instead of light grey"): the box used
+    # to fill with P_DEFAULT (the terminal's own dark default background)
+    # while content rows use P_STATUS, so any row NOT covered by a content
+    # line — section-header rows (fixed separately above) and, on a short
+    # menu, empty rows below the last real content line — showed through
+    # as a jarring black patch against an otherwise light box.
     for r in range(box_h):
         for c in range(box_w):
-            db.put(box_y + r, box_x + c, " ", P_DEFAULT)
+            db.put(box_y + r, box_x + c, " ", P_STATUS)
 
-    title = "  C H A R T  —  Key Reference  "
+    title_text = lines[0].strip() if lines else ""
+    title = f"  {title_text}  "
     for ci, ch in enumerate(f"{title:^{box_w}}"[:box_w]):
         db.put(box_y, box_x + ci, ch, P_CYAN, curses.A_BOLD)
 
     pct = int(scroll / max(1, n_lines - max_rows) * 100)
-    hint = f" ↑↓ scroll  {scroll+1}-{min(scroll+max_rows,n_lines)}/{n_lines}  {pct}%  [H] close "
+    hint = f" ↑↓ scroll  {scroll+1}-{min(scroll+max_rows,n_lines)}/{n_lines}  {pct}%  {close_key_hint} close "
     db.puts(box_y + box_h - 1, box_x + 1, hint[:box_w - 2], P_DIM, curses.A_DIM)
 
-    visible = CHART_HELP_LINES[scroll: scroll + max_rows]
+    visible = lines[scroll: scroll + max_rows]
     for li, line in enumerate(visible):
         row  = box_y + 1 + li
         text = line[:box_w - 2].ljust(box_w - 2)
         if line.startswith("  ──"):
-            pair, attrs = P_DEFAULT, curses.A_BOLD
-        elif line.startswith("  C H A R T") or line.strip().startswith("—"):
+            # 2026-08-26 user-reported ("three sections... background is
+            # black instead of light grey"): P_DEFAULT's own background is
+            # the TERMINAL's default (dark, in a dark-themed terminal) —
+            # every OTHER row in this box uses P_STATUS (black-on-WHITE,
+            # see init_curses_colors), so a section-header row using
+            # P_DEFAULT instead stood out as a literal black hole in an
+            # otherwise light box. P_STATUS+BOLD keeps section headers
+            # visually distinct without breaking the box's own background.
+            pair, attrs = P_STATUS, curses.A_BOLD
+        elif (li + scroll) == 0 or line.strip().startswith("—"):
             pair, attrs = P_YELLOW, curses.A_BOLD
-        elif "  [H]" in line:
+        elif (li + scroll) == n_lines - 1:
+            # 2026-08-26 user-reported ("still some areas where the
+            # background is black"): this used to match by CONTENT
+            # ("  [" in line and "close" in line.lower()), which also
+            # matched ANY ordinary content row that happened to mention
+            # "close"/"closed" in its own description (e.g. "Flatten —
+            # close any open position", "[T] toggles BTD when closed") —
+            # common wording in help text about closing things. The
+            # close-hint is always the LAST line _build_key_menu_lines
+            # appends, so matching by position is exact.
             pair, attrs = P_DIM, curses.A_DIM
         else:
             pair, attrs = P_STATUS, curses.A_NORMAL
         for ci, ch in enumerate(text):
             db.put(row, box_x + 1 + ci, ch, pair, attrs)
+
+# ── full-key-menu tables for every mode besides Chart (which already had
+# its own, above) — 2026-08-26 user request. Each mirrors CHART_HELP_
+# SECTIONS' own shape; _build_key_menu_lines flattens each into its own
+# LINES/BOX_W pair once at import time, exactly like Chart's own table.
+TRADING_HELP_SECTIONS = [
+    ("VIEW & NAVIGATION", [
+        ("[Tab]",      "Switch which pane (ETH/QQQ) is focused/scrolled"),
+        ("[←] [→]",    "Scroll the focused chart back/forward in time"),
+        ("[Shift+←→] [[] []]", "Scroll 10 bars at a time"),
+        ("[PgUp/PgDn] [{] [}]", "Scroll 50 bars at a time"),
+        ("[Home] / [Esc]", "Snap back to the live edge"),
+        ("[X]",        "Toggle crosshair on the focused pane"),
+        ("[Z]",        "Toggle fullscreen zoom on the focused pane"),
+        ("[V]",        "Cycle chart view  (volume -> delta -> ohlc -> off)"),
+        ("[S]",        "Show/hide the dashboard header (more room for the chart)"),
+    ]),
+    ("OHLC VIEW  (only while [V]iew:ohlc)", [
+        ("[↑] [↓]",    "Pan the price axis up/down"),
+        ("[J]",        "Reset the price-axis pan"),
+        ("[O]",        "Toggle the Sessions overlay"),
+        ("[0]",        "Toggle candle vs. line chart style"),
+        ("[4]",        "Toggle VAH/VAL/POC Historical Mode (developing trace) vs. Normal"),
+    ]),
+    ("RISK & SIZING", [
+        ("[P]",        "Set risk per trade  (% of balance or a flat $ amount)"),
+        ("[W]",        "Set the stop-loss distance in points for the focused asset"),
+        ("[E]",        "Set the fee assumption used in PnL math"),
+        ("[T]",        "Set the order-flow imbalance ratio threshold"),
+        ("[B]",        "Toggle Blackjack sizing  (1R,1R,2R,3R,5R loss ladder)"),
+        ("[1]",        "Manually reset the focused asset's Blackjack progression to 1R"),
+    ]),
+    ("TRADING CONTROLS", [
+        ("[9]",        "Cycle trading mode  (CCCCWIDE order-flow  <->  BTD candle-close)"),
+        ("[A]",        "Pause/resume new entries for the focused asset"),
+        ("[N]",        "Toggle 24H mode  (bypass the Session gate)"),
+        ("[F]",        "Flatten — close any open position immediately"),
+        ("[G]",        "Go live / go sim  (toggle real trading vs. paper/DRY_RUN)"),
+        ("[R]",        "Reset the paper account balance  (DRY_RUN only)"),
+    ]),
+    ("DATA & LOGS", [
+        ("[D]",        "Open the raw data table view"),
+        ("[L]",        "Open the full activity log"),
+        ("[C]",        "Save a screenshot"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Trading -> Chart)"),
+        ("[K]",        "Previous mode  (Trading -> Status)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+TRADING_HELP_LINES, TRADING_HELP_BOX_W = _build_key_menu_lines(
+    "T R A D I N G  —  Key Reference", TRADING_HELP_SECTIONS)
+
+GEX_HELP_SECTIONS = [
+    ("VIEW & NAVIGATION", [
+        ("[Tab]",      "Switch asset focus  (ETH/QQQ)"),
+        ("[G]",        "Toggle view  (time-series dot map  <->  GEX by strike)"),
+        ("[N]",        "Toggle net vs. separate call/put bars  (by-strike view only)"),
+        ("[z] / [End]",  "Reset to live-follow  (time + vertical)"),
+    ]),
+    ("PANNING", [
+        ("[←] [→]",    "Pan time back/forward  (by-strike: shift strikes down/up)"),
+        ("[PgUp] [PgDn]", "Page time back/forward  (by-strike: page strikes down/up)"),
+        ("[↑] [↓]",    "Step the strike window up/down  (by-strike view)"),
+        ("[[] []]",    "Page the strike window up/down"),
+        ("[{] [}]",    "Jump the strike window to the top/bottom"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (GEX -> Net Drift)"),
+        ("[K]",        "Previous mode  (GEX -> Chart)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+GEX_HELP_LINES, GEX_HELP_BOX_W = _build_key_menu_lines("G E X  —  Key Reference", GEX_HELP_SECTIONS)
+
+DRIFT_HELP_SECTIONS = [
+    ("VIEW & NAVIGATION", [
+        ("[Tab]",      "Switch asset focus  (ETH/QQQ)"),
+        ("[L]",        "Snap back to the live edge"),
+        ("[X]",        "Toggle crosshair"),
+        ("[N]",        "Toggle net-volume vs. volume bottom panel"),
+        ("[F]",        "Toggle filtered (OTM) mode"),
+    ]),
+    ("PANNING", [
+        ("[←] [→]",    "Pan/move crosshair 1 bar"),
+        ("[Shift+←→] [[] []]", "Pan/move crosshair 10 bars"),
+        ("[PgUp/PgDn] [{] [}]", "Pan/move crosshair 50 bars"),
+    ]),
+    ("SETTINGS", [
+        ("[Y]",        "Browse a historical date  (or type \"live\" to return)"),
+        ("[I]",        "Set the poll interval  (seconds)"),
+        ("[B]",        "Set the bar interval  (seconds)"),
+        ("[T]",        "Set the minimum trade $ threshold"),
+        ("[C]",        "Set the confidence deadzone  ($)"),
+        ("[R]",        "Force an immediate refresh"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Net Drift -> CVD)"),
+        ("[K]",        "Previous mode  (Net Drift -> GEX)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+DRIFT_HELP_LINES, DRIFT_HELP_BOX_W = _build_key_menu_lines("N E T   D R I F T  —  Key Reference", DRIFT_HELP_SECTIONS)
+
+CVD_HELP_SECTIONS = [
+    ("VIEW & NAVIGATION", [
+        ("[Tab]",      "Switch asset focus  (ETH/QQQ)"),
+        ("[Home] / [L]", "Snap back to live  (clears crosshair + pan)"),
+        ("[X]",        "Toggle crosshair"),
+        ("[Z]",        "Rebase CVD to 0 from this point forward"),
+        ("[T]",        "Toggle BTD  (buy-the-dip signal) markers"),
+        ("[C]",        "Toggle color scheme"),
+    ]),
+    ("PANNING & ZOOM", [
+        ("[←] [→]",    "Pan/move crosshair 1 bar"),
+        ("[Shift+←→] [[] []]", "Pan/move crosshair 10 bars"),
+        ("[PgUp/PgDn] [{] [}]", "Pan/move crosshair 50 bars"),
+        ("[+] / [-]",  "Zoom in/out  (finer/coarser bar aggregation)"),
+        ("[I]",        "Set a custom bar interval  (e.g. 1m, 500V, 100T)"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (CVD -> Volatility Drift)"),
+        ("[K]",        "Previous mode  (CVD -> Net Drift)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+CVD_HELP_LINES, CVD_HELP_BOX_W = _build_key_menu_lines("C V D  —  Key Reference", CVD_HELP_SECTIONS)
+
+VOLDRIFT_HELP_SECTIONS = [
+    ("VIEW & NAVIGATION", [
+        ("[Tab]",      "Switch asset focus  (ETH/QQQ)"),
+        ("[L]",        "Snap back to the live edge"),
+    ]),
+    ("PANNING", [
+        ("[←] [→]",    "Pan 1 bar"),
+        ("[Shift+←→] [[] []]", "Pan 10 bars"),
+        ("[PgUp/PgDn] [{] [}]", "Pan 50 bars"),
+    ]),
+    ("SETTINGS", [
+        ("[Y]",        "Browse a historical date  (or type \"live\" to return)"),
+        ("[I]",        "Set the poll interval  (seconds)"),
+        ("[B]",        "Set the bar interval  (seconds)"),
+        ("[W]",        "Set the realized-vol window  (seconds)"),
+        ("[D]",        "Set the divergence deadzone  (percentage points)"),
+        ("[R]",        "Force an immediate refresh"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Volatility Drift -> Chain)"),
+        ("[K]",        "Previous mode  (Volatility Drift -> CVD)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+VOLDRIFT_HELP_LINES, VOLDRIFT_HELP_BOX_W = _build_key_menu_lines(
+    "V O L A T I L I T Y   D R I F T  —  Key Reference", VOLDRIFT_HELP_SECTIONS)
+
+MARKETS_HELP_SECTIONS = [
+    ("CONTROLS", [
+        ("[R]",        "Force an immediate refresh"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Markets -> Status)"),
+        ("[K]",        "Previous mode  (Markets -> Macro Options Flow)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+MARKETS_HELP_LINES, MARKETS_HELP_BOX_W = _build_key_menu_lines("M A R K E T S  —  Key Reference", MARKETS_HELP_SECTIONS)
+
+CHAIN_HELP_SECTIONS = [
+    ("CONTROLS", [
+        ("[R]",        "Force an immediate refresh"),
+        ("[S]",        "Enter a new symbol  (e.g. ETH, BTC, SPY, AAPL)"),
+        ("[Y]",        "Toggle simple mode  (fewer columns)"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Chain -> Macro Options Flow)"),
+        ("[K]",        "Previous mode  (Chain -> Volatility Drift)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+CHAIN_HELP_LINES, CHAIN_HELP_BOX_W = _build_key_menu_lines("C H A I N  —  Key Reference", CHAIN_HELP_SECTIONS)
+
+MACRO_OPTIONS_HELP_SECTIONS = [
+    ("CONTROLS", [
+        ("[R]",        "Force an immediate refresh"),
+        ("[U]",        "Mute/unmute sound alerts"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M]",        "Next mode  (Macro Options Flow -> Markets)"),
+        ("[K]",        "Previous mode  (Macro Options Flow -> Chain)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Esc]",      "Back to Trading"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+MACRO_OPTIONS_HELP_LINES, MACRO_OPTIONS_HELP_BOX_W = _build_key_menu_lines(
+    "M A C R O   O P T I O N S   F L O W  —  Key Reference", MACRO_OPTIONS_HELP_SECTIONS)
+
+STATUS_HELP_SECTIONS = [
+    ("NAVIGATION", [
+        ("[↑] [↓]",    "Scroll up/down one line"),
+        ("[PgUp] [PgDn]", "Scroll up/down one page  (10 lines)"),
+        ("[Home] / [End]", "Jump to the top/bottom"),
+    ]),
+    ("MODE SWITCHING", [
+        ("[M] / [Esc]", "Back to Trading  (Status is the last stop in the cycle)"),
+        ("[K]",        "Previous mode  (Status -> Markets)"),
+        ("[H]",        "Toggle this help menu"),
+        ("[Q]",        "Quit Athena"),
+    ]),
+]
+STATUS_HELP_LINES, STATUS_HELP_BOX_W = _build_key_menu_lines("S T A T U S  —  Key Reference", STATUS_HELP_SECTIONS)
+
 # ── orchestration — on-demand start/stop (mirrors Markets/Chain's own
 # on-demand thread lifecycle, but Chart needs several cooperating
 # background threads instead of Markets/Chain's single refresh loop each,
@@ -21632,7 +23273,7 @@ def draw_loading_screen(db, rows, cols, steps, tick):
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS
+    global PCT, NO_SESSION, ATHENA_ENABLED, BLACKJACK_MODE, BLACKJACK_1R_DOLLARS, RISK_MODE, RISK_DOLLARS, TRADING_MODE
     global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -21683,6 +23324,14 @@ def curses_main(stdscr):
             # of leaving QQQ's live chart with no feed at all.
             if asset == "QQQ" and ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
                 feed_starters.append((_alpaca_trade_ws, (asset, _quit_evt)))
+                # 2026-08-26 user request: sim fills/PnL/funding must use
+                # Phemex's own QQQUSDT price (the real account only ever
+                # trades that, never real QQQ shares), even though Alpaca's
+                # real-stock tape stays QQQ's own signal/confirmation feed
+                # above — this thread runs SOLELY to keep PHEMEX_LAST_PRICE
+                # current, feed_live_tape=False so it never touches the
+                # blended LIVE_TAPE Alpaca already owns for QQQ.
+                feed_starters.append((_phemex_trade_ws, (asset, _quit_evt, False)))
             else:
                 if asset == "QQQ":
                     console_log(f"{YLW}ALPACA_API_ATHENA_ID/ALPACA_API_SECRET_KEY_ATHENA not set — "
@@ -21811,6 +23460,26 @@ def curses_main(stdscr):
     # or the trading engine. hscroll_bars follows footprint.py's own "N
     # bars back from the newest" convention; 0 is always the live tail.
     chart_scroll = {"ETH": 0, "QQQ": 0}
+    # Vertical price-axis pan for the footprint dashboard's own OHLC view —
+    # mirrors CHART_STATE.vert_offset/[Up]/[Down]/[J] exactly (see
+    # draw_chart's own p2r shift), just scoped per-asset like chart_scroll
+    # itself rather than Chart mode's single active symbol.
+    ohlc_vert_offset = {"ETH": 0, "QQQ": 0}
+    ohlc_show_sessions = True   # shared (not per-asset) view prefs, same as
+    ohlc_line_mode = False       # profile_mode/chart_zoom already are
+    ohlc_vp_historical = False   # [4] — VAH/VAL/POC "Historical Mode"
+                                   # (stepped developing trace) vs today's
+                                   # only "Normal Mode" (flat current-value
+                                   # line) — shared with CHART_STATE.vp_historical
+    # [H] full-key-menu overlay state for every mode EXCEPT Chart mode
+    # (which already had its own, CHART_STATE.show_help/help_scroll, from
+    # an earlier port) — 2026-08-26 user request: every mode's dense
+    # one-line footer was hard to read and didn't fit on screen. See
+    # _draw_key_menu_overlay's own docstring for the shared rendering.
+    mode_help_open = {"trading": False, "gex": False, "drift": False, "cvd": False,
+                       "voldrift": False, "markets": False, "chain": False,
+                       "macro_options": False, "status": False}
+    mode_help_scroll = {k: 0 for k in mode_help_open}
     chart_focus = "ETH"
     chart_zoom = False   # [Z] — fullscreen whichever pane is [Tab]-focused
                           # instead of the normal ETH/QQQ side-by-side split
@@ -22096,12 +23765,16 @@ def curses_main(stdscr):
                 draw_gex_by_strike(db, gex_asset, 0, rows, 0, cols, gex_ui)
             else:
                 draw_gex_map(db, gex_asset, 0, rows, 0, cols, gex_ui)
+            if mode_help_open["gex"]:
+                _draw_key_menu_overlay(db, rows, cols, GEX_HELP_LINES, GEX_HELP_BOX_W, mode_help_scroll["gex"])
         elif status_mode:
             # Full screen, same convention as gex_mode above — draw_status_
             # screen draws its own hint row at the very last line, so no
             # separate Athena footer is drawn underneath (see the footer
             # dispatch below).
             status_scroll = draw_status_screen(db, 0, rows, 0, cols, status_scroll)
+            if mode_help_open["status"]:
+                _draw_key_menu_overlay(db, rows, cols, STATUS_HELP_LINES, STATUS_HELP_BOX_W, mode_help_scroll["status"])
         elif drift_mode:
             # Full screen, same convention as gex_mode/status_mode above —
             # draw_drift draws its own hint row at the very last line, so no
@@ -22113,6 +23786,9 @@ def curses_main(stdscr):
                         "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
                         "crosshair_idx": (drift_crosshair_idx[drift_asset] if drift_crosshair_active[drift_asset] else None)}
             drift_view_offset[drift_asset] = draw_drift(db, drift_asset, 0, rows, 0, cols, drift_ui)
+            if mode_help_open["drift"]:
+                _draw_key_menu_overlay(db, rows, cols, DRIFT_HELP_LINES, DRIFT_HELP_BOX_W, mode_help_scroll["drift"],
+                                        close_key_hint="[H]")
         elif cvd_mode:
             # Full screen, same convention as drift_mode above — draw_cvd
             # draws its own hint row at the very last line, so no separate
@@ -22122,6 +23798,8 @@ def curses_main(stdscr):
                       "color_scheme": cvd_color_scheme, "view_offset": cvd_view_offset[cvd_asset],
                       "crosshair_idx": (cvd_crosshair_idx[cvd_asset] if cvd_crosshair_active[cvd_asset] else None)}
             cvd_view_offset[cvd_asset] = draw_cvd(db, cvd_asset, 0, rows, 0, cols, cvd_ui)
+            if mode_help_open["cvd"]:
+                _draw_key_menu_overlay(db, rows, cols, CVD_HELP_LINES, CVD_HELP_BOX_W, mode_help_scroll["cvd"])
         elif voldrift_mode:
             # Full screen, same convention as drift_mode above — draw_voldrift
             # draws its own hint row at the very last line, so no separate
@@ -22130,15 +23808,25 @@ def curses_main(stdscr):
             voldrift_ui = {"live": voldrift_live[voldrift_asset], "view_date": voldrift_view_date[voldrift_asset],
                            "view_offset": voldrift_view_offset[voldrift_asset], "bar_interval": voldrift_bar_interval}
             voldrift_view_offset[voldrift_asset] = draw_voldrift(db, voldrift_asset, 0, rows, 0, cols, voldrift_ui)
+            if mode_help_open["voldrift"]:
+                _draw_key_menu_overlay(db, rows, cols, VOLDRIFT_HELP_LINES, VOLDRIFT_HELP_BOX_W,
+                                        mode_help_scroll["voldrift"], close_key_hint="[H]")
         elif markets_mode:
             # Full screen, same convention as every mode above — draw_markets
             # draws its own hint row at the very last line, so no separate
             # Athena footer is drawn underneath (see the footer dispatch below).
             draw_markets(db, rows, cols)
+            if mode_help_open["markets"]:
+                _draw_key_menu_overlay(db, rows, cols, MARKETS_HELP_LINES, MARKETS_HELP_BOX_W, mode_help_scroll["markets"])
         elif macro_options_mode:
             draw_macro_options(db, rows, cols)
+            if mode_help_open["macro_options"]:
+                _draw_key_menu_overlay(db, rows, cols, MACRO_OPTIONS_HELP_LINES, MACRO_OPTIONS_HELP_BOX_W,
+                                        mode_help_scroll["macro_options"])
         elif chain_mode:
             draw_chain(db, rows, cols, chain_simple_mode)
+            if mode_help_open["chain"]:
+                _draw_key_menu_overlay(db, rows, cols, CHAIN_HELP_LINES, CHAIN_HELP_BOX_W, mode_help_scroll["chain"])
         else:
             chart_top = 0 if dashboard_hidden else (DASHBOARD_H if rows - 1 > DASHBOARD_H + 10 else 0)
             if chart_top:
@@ -22156,6 +23844,21 @@ def curses_main(stdscr):
                 qqq_live = qqq_inst.get("live_price") if qqq_inst.get("live_price") is not None else qqq_inst.get("price")
                 eth_live_bar = snap["live_bars"].get("ETH")
                 qqq_live_bar = snap["live_bars"].get("QQQ")
+                eth_1m = snap.get("ohlc_1m_bars", {}).get("ETH") or []
+                qqq_1m = snap.get("ohlc_1m_bars", {}).get("QQQ") or []
+                eth_1m_live = snap.get("ohlc_1m_live", {}).get("ETH")
+                qqq_1m_live = snap.get("ohlc_1m_live", {}).get("QQQ")
+                # VAH/VAL/POC/VWAP+SD — already computed continuously by
+                # _ch_export_loop (Status engine's own background thread)
+                # into CH_STATE[asset].indicator_levels; read-only snapshot
+                # here rather than re-deriving Chart mode's own VP/VWAP
+                # closures a second time for the OHLC panel.
+                with CH_STATE["ETH"].lock:
+                    eth_levels = dict(CH_STATE["ETH"].indicator_levels)
+                with CH_STATE["QQQ"].lock:
+                    qqq_levels = dict(CH_STATE["QQQ"].indicator_levels)
+                ohlc_ui_common = dict(show_sessions=ohlc_show_sessions, line_mode=ohlc_line_mode,
+                                       vp_historical=ohlc_vp_historical)
                 if chart_zoom:
                     # [Z] fullscreen — whichever pane [Tab] currently has
                     # focused gets the ENTIRE chart width, same panel-
@@ -22168,25 +23871,52 @@ def curses_main(stdscr):
                     inst = eth_inst if zoom_asset == "ETH" else qqq_inst
                     live = eth_live if zoom_asset == "ETH" else qqq_live
                     live_bar = eth_live_bar if zoom_asset == "ETH" else qqq_live_bar
+                    z_1m = eth_1m if zoom_asset == "ETH" else qqq_1m
+                    z_1m_live = eth_1m_live if zoom_asset == "ETH" else qqq_1m_live
+                    z_levels = eth_levels if zoom_asset == "ETH" else qqq_levels
                     draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
                                           profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll[zoom_asset], live_price=live, live_bar=live_bar,
                                           focused=True,
                                           market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
-                                          crosshair_bar_idx=(chart_crosshair_idx[zoom_asset] if chart_crosshair_active[zoom_asset] else None))
+                                          crosshair_bar_idx=(chart_crosshair_idx[zoom_asset] if chart_crosshair_active[zoom_asset] else None),
+                                          ohlc_1m_bars=z_1m, ohlc_1m_live=z_1m_live,
+                                          ohlc_levels=z_levels, ohlc_targets=inst.get("targets") or [],
+                                          ohlc_er=inst.get("er_bands"),
+                                          ohlc_vert_offset=ohlc_vert_offset[zoom_asset], ohlc_ui=ohlc_ui_common)
                 else:
                     mid = cols // 2
-                    draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, mid,
+                    # 2026-08-26 user request: a blank gutter between ETH's
+                    # own price axis and QQQ's left edge — previously mid
+                    # was both ETH's x1 AND QQQ's x0, so ETH's rightmost
+                    # price-axis column sat flush against QQQ's candles
+                    # with no visual separation at all.
+                    pane_gap = 2
+                    eth_x1 = mid - pane_gap // 2
+                    qqq_x0 = mid + pane_gap // 2
+                    draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, eth_x1,
                                           profile_mode, build_trade_markers("ETH", eth_bars, eth_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["ETH"], live_price=eth_live, live_bar=eth_live_bar,
                                           focused=(chart_focus == "ETH"),
-                                          crosshair_bar_idx=(chart_crosshair_idx["ETH"] if chart_crosshair_active["ETH"] else None))
-                    draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, mid, cols,
+                                          crosshair_bar_idx=(chart_crosshair_idx["ETH"] if chart_crosshair_active["ETH"] else None),
+                                          ohlc_1m_bars=eth_1m, ohlc_1m_live=eth_1m_live,
+                                          ohlc_levels=eth_levels, ohlc_targets=eth_inst.get("targets") or [],
+                                          ohlc_er=eth_inst.get("er_bands"),
+                                          ohlc_vert_offset=ohlc_vert_offset["ETH"], ohlc_ui=ohlc_ui_common)
+                    draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, qqq_x0, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
                                           focused=(chart_focus == "QQQ"),
                                           market_closed=snap["qqq_market_closed"],
-                                          crosshair_bar_idx=(chart_crosshair_idx["QQQ"] if chart_crosshair_active["QQQ"] else None))
+                                          crosshair_bar_idx=(chart_crosshair_idx["QQQ"] if chart_crosshair_active["QQQ"] else None),
+                                          ohlc_1m_bars=qqq_1m, ohlc_1m_live=qqq_1m_live,
+                                          ohlc_levels=qqq_levels, ohlc_targets=qqq_inst.get("targets") or [],
+                                          ohlc_er=qqq_inst.get("er_bands"),
+                                          ohlc_vert_offset=ohlc_vert_offset["QQQ"], ohlc_ui=ohlc_ui_common)
+
+            if mode_help_open["trading"]:
+                _draw_key_menu_overlay(db, rows, cols, TRADING_HELP_LINES, TRADING_HELP_BOX_W,
+                                        mode_help_scroll["trading"])
 
         if activity_log_open:
             draw_activity_log_popup(db, rows, cols, snap["event_log"], activity_log_scroll)
@@ -22239,27 +23969,22 @@ def curses_main(stdscr):
             # below, which is exactly what was hiding this hint before.
             tab_hint = f" [Tab]:{chart_focus} [Z]:{'full' if chart_zoom else 'split'}" if both_panes else ""
             focus_asset = chart_focus if both_panes else "ETH"
-            x_hint = " [X]:crosshair-ON" if chart_crosshair_active.get(focus_asset) else " [X]:crosshair"
+            # Shrunk 2026-08-26 (user request — the full key list moved into
+            # the new [H] help menu, see TRADING_HELP_SECTIONS) to just what's
+            # genuinely glance-critical: quit, the help hint itself, per-asset
+            # pause state, view mode, trading mode, live-vs-paper status
+            # (safety-critical — DRY_RUN vs real money), and the one
+            # emergency action ([F]latten) worth keeping one keypress away
+            # from a bare footer read rather than a menu open.
             if CLIENT_MODE:
-                # Every trading-control hint below is dead in Client Mode
-                # (see CLIENT_BLOCKED_KEYS) — a completely separate, much
-                # shorter footer instead of interleaving "not available"
-                # markers into the same dense f-string.
-                footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live [D]ata [L]og [C]apture [M]:Chart/GEX/Drift/CVD/VolDrift/Chain/OptFlow/Markets/Status [K]:back"
-                          + ("  [H]:dash" if dashboard_hidden else "  [H]:hide"))
+                footer = (f"{ts}  [CLIENT] {SYNC_CLIENT_STATUS[0]}  [Q]uit [H]elp [V]iew:{profile_mode}{tab_hint}"
+                          + ("  [S]:dash" if dashboard_hidden else "  [S]:hide"))
             else:
-                risk_hint = f" [P]{PCT:g}%" if RISK_MODE == "pct" else f" [P]${RISK_DOLLARS:,.0f}"
-                bj_hint = f"BJ [1]:{focus_asset}->1R" if BLACKJACK_MODE else "flat"
-                sl_hint = f" [W]SL:{fmt_num(ASSETS[focus_asset]['sl'])}"
-                fee_hint = f" [E]fee:${FEE_QQQ_PER_UNIT:.2f}" if focus_asset == "QQQ" else f" [E]fee:{FEE_ETH_PCT * 100:.4g}%"
-                imb_hint = f" [T]imb:{IMBALANCE_RATIO.get(focus_asset, 3.0):g}x"
-                footer = (f"{ts}  [Q]uit [A]:{focus_asset} {'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'} [V]iew:{profile_mode}"
-                          f" [←→]scroll{x_hint}{tab_hint} [Home]live"
-                          f"{risk_hint}{sl_hint}{fee_hint}{imb_hint} {bj_hint} [N]:{'24H' if NO_SESSION else 'sess'} [D]ata [L]og [C]apture [M]:Chart/GEX/Drift/CVD/VolDrift/Chain/OptFlow/Markets/Status [K]:back"
-                          + ("  [R]eset  [G]o live" if DRY_RUN else "  [G]o sim")
-                          + "  [F]latten"
-                          + ("  [H]:dash" if dashboard_hidden else "  [H]:hide")
+                mode_hint = f" [9]:{TRADING_MODE}"
+                sim_tag = ("[DRY RUN] [G]o live" if DRY_RUN else "[G]o sim")
+                footer = (f"{ts}  [Q]uit [H]elp [A]:{focus_asset}:{'OFF' if not ATHENA_ENABLED[focus_asset] else 'on'}"
+                          f" [V]iew:{profile_mode}{tab_hint}{mode_hint}  {sim_tag}  [F]latten"
+                          + ("  [S]:dash" if dashboard_hidden else "  [S]:hide")
                           + (f"  [SRV:{len(SYNC_CLIENTS)}]" if SERVER_MODE else ""))
             db.puts(footer_row, 0, footer.ljust(cols)[:cols], P_DIM)
 
@@ -22270,6 +23995,33 @@ def curses_main(stdscr):
         key = stdscr.getch()
         if key == -1:
             continue
+
+        # Collapse a same-direction key-repeat burst into one net scroll
+        # step + one redraw — 2026-08-26 user-reported ("the menu broke
+        # towards the end and then froze" scrolling the new [H] help
+        # overlay): each queued repeat key otherwise got its own FULL
+        # redraw (the Trading dashboard's dual-pane OHLC chart underneath
+        # a help box is an expensive one — level lines, sessions overlay,
+        # BTD detection, volume bars, all recomputed every frame), so a
+        # fast key-repeat burst on ↑/↓ could take real, visible time to
+        # drain one key at a time, reading as the UI hanging then
+        # "catching up" once the user let go. Scoped to KEY_UP/KEY_DOWN
+        # only (the two keys any open help menu's own scroll uses) and
+        # only while some menu is actually open, so normal single-key
+        # navigation elsewhere is completely unaffected.
+        key_repeat_n = 1
+        if key in (curses.KEY_UP, curses.KEY_DOWN) and (
+                any(mode_help_open.values()) or CHART_STATE.show_help):
+            stdscr.nodelay(True)
+            while True:
+                nxt = stdscr.getch()
+                if nxt != key:
+                    if nxt != -1:
+                        curses.ungetch(nxt)
+                    break
+                key_repeat_n += 1
+            stdscr.nodelay(False)
+            stdscr.timeout(100)
 
         if reset_armed:
             reset_armed = False
@@ -22307,6 +24059,13 @@ def curses_main(stdscr):
             # Markets/Chain reorder either side of it.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["status"] = not mode_help_open["status"]
+                if not mode_help_open["status"]:
+                    mode_help_scroll["status"] = 0
+            elif key == 27 and mode_help_open["status"]:
+                mode_help_open["status"] = False
+                mode_help_scroll["status"] = 0
             elif key in (ord("m"), ord("M"), 27):
                 status_mode = False
             elif key in (ord("k"), ord("K")):   # [K] — cycle backward: to Markets, the
@@ -22323,6 +24082,10 @@ def curses_main(stdscr):
                 markets_thread[0] = threading.Thread(target=_markets_refresh_loop,
                                                        args=(markets_stop_evt[0],), daemon=True)
                 markets_thread[0].start()
+            elif mode_help_open["status"] and key == curses.KEY_UP:
+                mode_help_scroll["status"] = max(0, mode_help_scroll["status"] - key_repeat_n)
+            elif mode_help_open["status"] and key == curses.KEY_DOWN:
+                mode_help_scroll["status"] = min(mode_help_scroll["status"] + key_repeat_n, _help_menu_max_scroll(len(STATUS_HELP_LINES), rows))
             elif key == curses.KEY_UP:
                 status_scroll = max(0, status_scroll - 1)
             elif key == curses.KEY_DOWN:
@@ -22419,6 +24182,14 @@ def curses_main(stdscr):
             elif key in (ord("v"), ord("V")):
                 with CHART_STATE.lock:
                     CHART_STATE.show_vp = not CHART_STATE.show_vp
+                db.prev = None
+            elif key == ord("4"):
+                # Same [4] toggles the footprint dashboard's own OHLC-view
+                # equivalent (ohlc_vp_historical) — kept on the same
+                # physical key deliberately so it means the same thing in
+                # either mode.
+                with CHART_STATE.lock:
+                    CHART_STATE.vp_historical = not CHART_STATE.vp_historical
                 db.prev = None
             elif key in (ord("b"), ord("B")):
                 with CHART_STATE.lock:
@@ -22675,7 +24446,7 @@ def curses_main(stdscr):
             elif key == curses.KEY_UP:
                 with CHART_STATE.lock:
                     if CHART_STATE.show_help:
-                        CHART_STATE.help_scroll = max(0, CHART_STATE.help_scroll - 1)
+                        CHART_STATE.help_scroll = max(0, CHART_STATE.help_scroll - key_repeat_n)
                     elif CHART_STATE.show_hline_list:
                         CHART_STATE.hline_sel = max(0, CHART_STATE.hline_sel - 1)
                     elif CHART_STATE.show_alert_list:
@@ -22692,7 +24463,8 @@ def curses_main(stdscr):
                         _n_a = len(CHART_STATE.alerts)
                         CHART_STATE.alert_list_sel = min(max(0, _n_a - 1), CHART_STATE.alert_list_sel + 1)
                     elif CHART_STATE.show_help:
-                        CHART_STATE.help_scroll = CHART_STATE.help_scroll + 1
+                        CHART_STATE.help_scroll = min(CHART_STATE.help_scroll + key_repeat_n,
+                                                        _help_menu_max_scroll(len(CHART_HELP_LINES), rows))
                     elif CHART_STATE.show_econ_cal:
                         CHART_STATE.econ_scroll = CHART_STATE.econ_scroll + 1
                     else:
@@ -22793,6 +24565,17 @@ def curses_main(stdscr):
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["gex"] = not mode_help_open["gex"]
+                if not mode_help_open["gex"]:
+                    mode_help_scroll["gex"] = 0
+            elif mode_help_open["gex"] and key == curses.KEY_UP:
+                mode_help_scroll["gex"] = max(0, mode_help_scroll["gex"] - key_repeat_n)
+            elif mode_help_open["gex"] and key == curses.KEY_DOWN:
+                mode_help_scroll["gex"] = min(mode_help_scroll["gex"] + key_repeat_n, _help_menu_max_scroll(len(GEX_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["gex"]:
+                mode_help_open["gex"] = False
+                mode_help_scroll["gex"] = 0
             elif key == 27:
                 gex_mode = False
             elif key in (ord("m"), ord("M")):
@@ -22883,6 +24666,17 @@ def curses_main(stdscr):
             drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["drift"] = not mode_help_open["drift"]
+                if not mode_help_open["drift"]:
+                    mode_help_scroll["drift"] = 0
+            elif mode_help_open["drift"] and key == curses.KEY_UP:
+                mode_help_scroll["drift"] = max(0, mode_help_scroll["drift"] - key_repeat_n)
+            elif mode_help_open["drift"] and key == curses.KEY_DOWN:
+                mode_help_scroll["drift"] = min(mode_help_scroll["drift"] + key_repeat_n, _help_menu_max_scroll(len(DRIFT_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["drift"]:
+                mode_help_open["drift"] = False
+                mode_help_scroll["drift"] = 0
             elif key == 27:
                 drift_mode = False
             elif key in (ord("m"), ord("M")):
@@ -22898,7 +24692,9 @@ def curses_main(stdscr):
                 drift_view_date[drift_asset] = None
                 drift_view_offset[drift_asset] = 0
                 DRIFT_HIST_STATE.pop(drift_asset, None)
-            elif key in (ord("h"), ord("H")):
+            elif key in (ord("y"), ord("Y")):   # 2026-08-26: moved off [H], now the
+                                                   # full-key-menu toggle (same key
+                                                   # everywhere else in the app)
                 raw = _prompt_text(stdscr, [f"{drift_asset} — date to browse MM_DD_YYYY, or 'live' to return"],
                                     prompt="> ")
                 db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
@@ -23036,6 +24832,17 @@ def curses_main(stdscr):
             cvd_state_obj = CVD_STATE[cvd_asset]
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["cvd"] = not mode_help_open["cvd"]
+                if not mode_help_open["cvd"]:
+                    mode_help_scroll["cvd"] = 0
+            elif mode_help_open["cvd"] and key == curses.KEY_UP:
+                mode_help_scroll["cvd"] = max(0, mode_help_scroll["cvd"] - key_repeat_n)
+            elif mode_help_open["cvd"] and key == curses.KEY_DOWN:
+                mode_help_scroll["cvd"] = min(mode_help_scroll["cvd"] + key_repeat_n, _help_menu_max_scroll(len(CVD_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["cvd"]:
+                mode_help_open["cvd"] = False
+                mode_help_scroll["cvd"] = 0
             elif key == 27:
                 cvd_mode = False
             elif key in (ord("m"), ord("M")):
@@ -23135,6 +24942,17 @@ def curses_main(stdscr):
             voldrift_asset = chart_focus if chart_focus in ASSETS else "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["voldrift"] = not mode_help_open["voldrift"]
+                if not mode_help_open["voldrift"]:
+                    mode_help_scroll["voldrift"] = 0
+            elif mode_help_open["voldrift"] and key == curses.KEY_UP:
+                mode_help_scroll["voldrift"] = max(0, mode_help_scroll["voldrift"] - key_repeat_n)
+            elif mode_help_open["voldrift"] and key == curses.KEY_DOWN:
+                mode_help_scroll["voldrift"] = min(mode_help_scroll["voldrift"] + key_repeat_n, _help_menu_max_scroll(len(VOLDRIFT_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["voldrift"]:
+                mode_help_open["voldrift"] = False
+                mode_help_scroll["voldrift"] = 0
             elif key == 27:
                 voldrift_mode = False
             elif key in (ord("m"), ord("M")):
@@ -23158,7 +24976,9 @@ def curses_main(stdscr):
                 voldrift_view_date[voldrift_asset] = None
                 voldrift_view_offset[voldrift_asset] = 0
                 VOLDRIFT_HIST_STATE.pop(voldrift_asset, None)
-            elif key in (ord("h"), ord("H")):
+            elif key in (ord("y"), ord("Y")):   # 2026-08-26: moved off [H], now the
+                                                   # full-key-menu toggle (same key
+                                                   # everywhere else in the app)
                 raw = _prompt_text(stdscr, [f"{voldrift_asset} — date to browse MM_DD_YYYY, or 'live' to return"],
                                     prompt="> ")
                 db.prev = None   # dialog wrote straight to stdscr, bypassing the DoubleBuffer
@@ -23237,10 +25057,22 @@ def curses_main(stdscr):
             # thread to start entering it via [K].
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["markets"] = not mode_help_open["markets"]
+                if not mode_help_open["markets"]:
+                    mode_help_scroll["markets"] = 0
+            elif mode_help_open["markets"] and key == curses.KEY_UP:
+                mode_help_scroll["markets"] = max(0, mode_help_scroll["markets"] - key_repeat_n)
+            elif mode_help_open["markets"] and key == curses.KEY_DOWN:
+                mode_help_scroll["markets"] = min(mode_help_scroll["markets"] + key_repeat_n, _help_menu_max_scroll(len(MARKETS_HELP_LINES), rows))
             elif key == 27:
-                markets_mode = False
-                if markets_stop_evt[0] is not None:
-                    markets_stop_evt[0].set()
+                if mode_help_open["markets"]:
+                    mode_help_open["markets"] = False
+                    mode_help_scroll["markets"] = 0
+                else:
+                    markets_mode = False
+                    if markets_stop_evt[0] is not None:
+                        markets_stop_evt[0].set()
             elif key in (ord("m"), ord("M")):
                 markets_mode = False
                 if markets_stop_evt[0] is not None:
@@ -23273,6 +25105,17 @@ def curses_main(stdscr):
             # around.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["macro_options"] = not mode_help_open["macro_options"]
+                if not mode_help_open["macro_options"]:
+                    mode_help_scroll["macro_options"] = 0
+            elif mode_help_open["macro_options"] and key == curses.KEY_UP:
+                mode_help_scroll["macro_options"] = max(0, mode_help_scroll["macro_options"] - key_repeat_n)
+            elif mode_help_open["macro_options"] and key == curses.KEY_DOWN:
+                mode_help_scroll["macro_options"] = min(mode_help_scroll["macro_options"] + key_repeat_n, _help_menu_max_scroll(len(MACRO_OPTIONS_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["macro_options"]:
+                mode_help_open["macro_options"] = False
+                mode_help_scroll["macro_options"] = 0
             elif key == 27:
                 macro_options_mode = False
             elif key in (ord("m"), ord("M")):
@@ -23313,6 +25156,17 @@ def curses_main(stdscr):
             # needed), [K] goes back to Volatility Drift.
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
+            elif key in (ord("h"), ord("H")):
+                mode_help_open["chain"] = not mode_help_open["chain"]
+                if not mode_help_open["chain"]:
+                    mode_help_scroll["chain"] = 0
+            elif mode_help_open["chain"] and key == curses.KEY_UP:
+                mode_help_scroll["chain"] = max(0, mode_help_scroll["chain"] - key_repeat_n)
+            elif mode_help_open["chain"] and key == curses.KEY_DOWN:
+                mode_help_scroll["chain"] = min(mode_help_scroll["chain"] + key_repeat_n, _help_menu_max_scroll(len(CHAIN_HELP_LINES), rows))
+            elif key == 27 and mode_help_open["chain"]:
+                mode_help_open["chain"] = False
+                mode_help_scroll["chain"] = 0
             elif key == 27:
                 chain_mode = False
                 if chain_stop_evt[0] is not None:
@@ -23413,8 +25267,18 @@ def curses_main(stdscr):
             fn = take_screenshot(db)
             console_log(f"{CYN}Screenshot saved: {os.path.basename(fn)}{RST}")
             log_event("SYSTEM", "screenshot", {"file": fn})
-        elif key in (ord("h"), ord("H")):
+        elif key in (ord("s"), ord("S")):   # 2026-08-26: moved off [H], now the
+                                              # full-key-menu toggle (same key
+                                              # everywhere else in the app)
             dashboard_hidden = not dashboard_hidden
+        elif key in (ord("h"), ord("H")):
+            mode_help_open["trading"] = not mode_help_open["trading"]
+            if not mode_help_open["trading"]:
+                mode_help_scroll["trading"] = 0
+        elif mode_help_open["trading"] and key == curses.KEY_UP:
+            mode_help_scroll["trading"] = max(0, mode_help_scroll["trading"] - key_repeat_n)
+        elif mode_help_open["trading"] and key == curses.KEY_DOWN:
+            mode_help_scroll["trading"] = min(mode_help_scroll["trading"] + key_repeat_n, _help_menu_max_scroll(len(TRADING_HELP_LINES), rows))
         elif key in (ord("n"), ord("N")):
             NO_SESSION = not NO_SESSION
             console_log(f"{YLW}Session requirement {'BYPASSED (24H mode)' if NO_SESSION else 'RE-ENABLED'} (via [N]){RST}")
@@ -23474,6 +25338,12 @@ def curses_main(stdscr):
             _save_blackjack_state()
             console_log(f"{focus_asset}: {GRN}Blackjack progression manually reset to 1R (via [1]){RST}")
             log_event(focus_asset, "blackjack_manually_reset", {})
+        elif key == ord("9"):
+            idx = TRADING_MODES.index(TRADING_MODE)
+            TRADING_MODE = TRADING_MODES[(idx + 1) % len(TRADING_MODES)]
+            _save_trading_mode()
+            console_log(f"{YLW}{BLD}Trading mode: {TRADING_MODE}{RST} (via [9])")
+            log_event("SYSTEM", "trading_mode_changed", {"mode": TRADING_MODE})
         elif key in (ord("w"), ord("W")):
             # 2026-07-28 user request: "Allow the user to set the default SL
             # amount in points for ETH and QQQ" — acts on whichever pane is
@@ -23623,31 +25493,74 @@ def curses_main(stdscr):
             # — only the step size fed into it.
             step = 50 if key in (curses.KEY_PPAGE, ord("{")) else (10 if key in (curses.KEY_SLEFT, ord("[")) else 1)
             asset = chart_focus if both_panes else "ETH"
+            # OHLC view scrolls through LIVE_TAPE's own 1m bars, not
+            # footprint.py's 90s ones — using the footprint count here
+            # (as this used to, unconditionally) silently capped OHLC
+            # scrollback at whatever the 90s history happened to hold,
+            # even though up to OHLC_1M_MAX_BARS of 1m history is
+            # actually seeded and available (2026-08-25 user-reported:
+            # "QQQ only loads back to 15:58 CT" while sitting at
+            # "[SCROLLED 20b back]" — the 1m array itself had 500 bars).
+            bar_count = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
+                         else len(snap["footprint_bars"].get(asset) or []))
             if chart_crosshair_active[asset]:
-                total = len(snap["footprint_bars"].get(asset) or [])
+                total = bar_count
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
                 n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
                 chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
                     chart_crosshair_idx[asset] + step, chart_scroll[asset], total, n_est)
             else:
-                max_back = max(0, len(snap["footprint_bars"].get(asset) or []) - 1)
+                max_back = max(0, bar_count - 1)
                 chart_scroll[asset] = min(max_back, chart_scroll[asset] + step)
         elif key in (curses.KEY_RIGHT, curses.KEY_SRIGHT, ord("]"), curses.KEY_NPAGE, ord("}")):
             step = 50 if key in (curses.KEY_NPAGE, ord("}")) else (10 if key in (curses.KEY_SRIGHT, ord("]")) else 1)
             asset = chart_focus if both_panes else "ETH"
             if chart_crosshair_active[asset]:
-                total = len(snap["footprint_bars"].get(asset) or [])
+                total = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
+                         else len(snap["footprint_bars"].get(asset) or []))
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
                 n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
                 chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
                     max(0, chart_crosshair_idx[asset] - step), chart_scroll[asset], total, n_est)
             else:
                 chart_scroll[asset] = max(0, chart_scroll[asset] - step)
+        elif key == curses.KEY_UP and profile_mode == "ohlc":
+            # Vertical price-axis pan for the OHLC view — same shift-the-
+            # window convention as Chart mode's own [Up]/[Down]/vert_offset
+            # (draw_chart, see CHART_STATE.vert_offset), just per-asset here
+            # instead of Chart mode's single active symbol. KEY_UP/KEY_DOWN
+            # are otherwise unused in this dispatch (every other handler in
+            # the file is gated inside a DIFFERENT mode's own block).
+            asset = chart_focus if both_panes else "ETH"
+            ohlc_vert_offset[asset] += 1
+        elif key == curses.KEY_DOWN and profile_mode == "ohlc":
+            asset = chart_focus if both_panes else "ETH"
+            ohlc_vert_offset[asset] -= 1
+        elif key in (ord("j"), ord("J")) and profile_mode == "ohlc":
+            # Reset vertical pan only — matches Chart mode's own [J], which
+            # does the same thing for CHART_STATE.vert_offset.
+            asset = chart_focus if both_panes else "ETH"
+            ohlc_vert_offset[asset] = 0
+        elif key in (ord("o"), ord("O")) and profile_mode == "ohlc":
+            ohlc_show_sessions = not ohlc_show_sessions
+        elif key == ord("0") and profile_mode == "ohlc":
+            ohlc_line_mode = not ohlc_line_mode
+        elif key == ord("4") and profile_mode == "ohlc":
+            # Same [4] toggles CHART_STATE.vp_historical in full Chart mode
+            # (its own separate dispatch, elif chart_mode: block) — kept on
+            # the same physical key deliberately so it means the same thing
+            # in either mode.
+            ohlc_vp_historical = not ohlc_vp_historical
+        elif key == 27 and mode_help_open["trading"]:
+            mode_help_open["trading"] = False
+            mode_help_scroll["trading"] = 0
         elif key in (curses.KEY_HOME, 27):   # Esc — same reset-to-live convention as footprint.py
             if both_panes:
                 chart_scroll["ETH"] = chart_scroll["QQQ"] = 0
+                ohlc_vert_offset["ETH"] = ohlc_vert_offset["QQQ"] = 0
             else:
                 chart_scroll["ETH"] = 0
+                ohlc_vert_offset["ETH"] = 0
             chart_crosshair_active["ETH"] = chart_crosshair_active["QQQ"] = False
 
 if __name__ == "__main__":

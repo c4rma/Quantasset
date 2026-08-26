@@ -231,7 +231,21 @@ BLACKJACK_STATE_PATH = os.path.join(SCRIPT_DIR, "blackjack_state.json")
 FOOTPRINT_INTERVAL_LABEL = "90s"
 FOOTPRINT_BAR_SECS       = 90   # numeric form of FOOTPRINT_INTERVAL_LABEL, for bucket math
 OHLC_1M_BAR_SECS         = 60   # 1-minute OHLC bars for the BTD trading mode + footprint OHLC view
-OHLC_1M_MAX_BARS         = 500  # in-memory cap per asset
+OHLC_1M_MAX_BARS         = 1500  # in-memory cap per asset — 2026-08-26
+# user-reported ("+/-2sd/VWAP/0.5sd range are not the same in the OHLC
+# chart as they are in Chart"): the OHLC panel's own developing VWAP/VP
+# (see _historical_vwap_map/_ohlc_compute_vp) filter this same retained
+# 1m array down to "since this session's own 19:00 CT open" — but a
+# session can run up to ~24h (1440 minutes), so the old 500-bar (8.3h)
+# cap meant that filter almost never actually reached back to the true
+# session open; it silently computed VWAP/VP over "whatever's retained"
+# instead, drifting away from Chart mode's own CHART_MAX_CANDLES=3000-bar
+# (50h) retention as the retained window rolled forward through the day.
+# 1500 (25h) comfortably covers the worst case (checked right before a
+# 19:00 CT rollover) with margin; Phemex's own kline REST endpoint
+# already supports up to 2000 rows per request (see
+# fetch_status_phemex_recent_candles's own `limit = min(2000, ...)`), so
+# this stays within one REST call at startup.
 GEX_EXPORT_MAX_AGE       = 120   # matches status.py's GEX_STATUS_EXPORT_MAX_AGE
 # 2026-07-27 user request: a resting LIMIT entry order shouldn't wait
 # forever for price to revert to the confirming bar's own VAH/VAL — after
@@ -12267,7 +12281,7 @@ def _ohlc_target_style(t_type):
 
 def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_price, hscroll_bars,
                             position=None, pending=None, levels=None, targets=None, er=None,
-                            vert_offset=0, ui=None):
+                            vert_offset=0, ui=None, crosshair_bar_idx=None, trade_events=None):
     ui = ui or {}
     show_sessions = ui.get("show_sessions", True)
     line_mode = ui.get("line_mode", False)
@@ -12350,6 +12364,24 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
 
     clamp = lambda v: max(chart_top, min(chart_bot_excl - 1, v))
     start_col = chart_r - n_vis
+
+    # 2026-08-26 user-reported ("Crosshair doesn't appear when I press
+    # [X]"): draw_footprint_panel's own [X] crosshair line is drawn
+    # inside its per-level footprint loop, which this panel's own "ohlc"
+    # branch never reaches (draw_footprint_panel returns right after
+    # delegating here) — crosshair_bar_idx was already being computed/
+    # threaded through by the [X] key handler (chart_crosshair_idx, using
+    # the OHLC-specific bar count whenever profile_mode=="ohlc" — see
+    # that handler's own comments), just never actually drawn anywhere
+    # in this view. Same "N bars back from the newest" addressing
+    # hscroll_bars already uses above (right_idx/left_idx).
+    crosshair_col = None
+    crosshair_bar = None
+    if crosshair_bar_idx is not None:
+        _ch_abs = n_all - 1 - crosshair_bar_idx
+        if left_idx <= _ch_abs < right_idx:
+            crosshair_col = start_col + (_ch_abs - left_idx)
+            crosshair_bar = all_candles[_ch_abs]
 
     label_step = max(1, chart_h // 12)
     for r in range(chart_h):
@@ -12802,6 +12834,37 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
                 else:
                     db.put(row_s, col, "#", P_MAGENTA, _rev)
 
+    # ── HISTORICAL TRADE MARKERS ─────────────────────────────────────────
+    # 2026-08-26 user request ("Show previous trades in the OHLC charts")
+    # — ported from draw_footprint_panel's own trade_events loop (short
+    # reverse-video text labels: "ENTRY" at the fill, the actual close
+    # reason at the exit), matched against THIS panel's own 1-minute bars
+    # instead of footprint's 90s ones — a footprint-bar-aligned bar_ts
+    # would almost never equal any 1m bar's own ts. The caller builds a
+    # SEPARATE events list from this same 1m series for exactly that
+    # reason (see build_trade_markers, generic over whatever bar list
+    # it's given), passed in here as `trade_events`.
+    for _i, _bar in enumerate(visible):
+        _col = start_col + _i
+        if not (x0 <= _col < chart_r):
+            continue
+        for _ev in (trade_events or []):
+            if _ev["bar_ts"] != _bar["ts"]:
+                continue
+            _r = clamp(chart_top + p2r(_ev["price"]))
+            db.puts(_r, _col, _ev["label"][:max(1, chart_r - _col)], _ev["pair"], curses.A_BOLD | curses.A_REVERSE)
+
+    # ── CROSSHAIR ────────────────────────────────────────────────────────
+    # 2026-08-26 user-reported ("Crosshair doesn't appear when I press
+    # [X]") — see crosshair_col's own computation above for why this was
+    # silently a no-op before. Same non-destructive "blank cells only"
+    # convention footprint's own crosshair line already uses, drawn LAST
+    # so it's never itself overwritten by anything else in this panel.
+    if crosshair_col is not None and x0 <= crosshair_col < chart_r:
+        for _r in range(chart_top, chart_bot_excl):
+            if db.buf[_r][crosshair_col][0] == " ":
+                db.put(_r, crosshair_col, CROSSHAIR_LINE_CH, P_CYAN)
+
     # ── VOLUME ───────────────────────────────────────────────────────────
     # Ported from draw_chart's own volume histogram (20231-20246).
     db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
@@ -12835,7 +12898,8 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
 def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mode, trade_events,
                           hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False,
                           crosshair_bar_idx=None, ohlc_1m_bars=None, ohlc_1m_live=None,
-                          ohlc_levels=None, ohlc_targets=None, ohlc_er=None, ohlc_vert_offset=0, ohlc_ui=None):
+                          ohlc_levels=None, ohlc_targets=None, ohlc_er=None, ohlc_vert_offset=0, ohlc_ui=None,
+                          ohlc_trade_events=None):
     """One footprint chart pane within rows [y0,y1) / cols [x0,x1) — ported
     rendering from footprint.py's draw(), adapted to (a) write into a
     DoubleBuffer instead of directly to a curses window, (b) a fixed
@@ -12895,11 +12959,35 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # full-width status-bar readout.
     ch_header_bar = None
     if crosshair_bar_idx is not None:
-        ch_abs = len(bars) - 1 - crosshair_bar_idx
-        if 0 <= ch_abs < len(bars):
-            ch_header_bar = bars[ch_abs]
-    ch_tag = (f"  ✛ {datetime.fromtimestamp(ch_header_bar['ts']).strftime('%H:%M:%S')} "
-              f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}") if ch_header_bar else ""
+        if profile_mode == "ohlc":
+            # 2026-08-26 fix (alongside the crosshair-line render fix
+            # below): this used to always index into `bars` (footprint's
+            # own 90s bars) even in ohlc mode, where the addressed index
+            # actually means "N back" within the OHLC 1m array instead
+            # (see the [X]/arrow key handlers' own OHLC-specific bar_count)
+            # — reading the wrong array here just meant this readout tag
+            # quietly showed the wrong bar's time/price, alongside the
+            # crosshair line itself never being drawn at all.
+            _ch_ohlc_bars = list(ohlc_1m_bars or [])
+            if ohlc_1m_live:
+                _ch_ohlc_bars.append(ohlc_1m_live)
+            ch_abs = len(_ch_ohlc_bars) - 1 - crosshair_bar_idx
+            if 0 <= ch_abs < len(_ch_ohlc_bars):
+                ch_header_bar = _ch_ohlc_bars[ch_abs]
+        else:
+            ch_abs = len(bars) - 1 - crosshair_bar_idx
+            if 0 <= ch_abs < len(bars):
+                ch_header_bar = bars[ch_abs]
+    if ch_header_bar and profile_mode == "ohlc":
+        ch_tag = (f"  ✛ {datetime.fromtimestamp(ch_header_bar['ts']).strftime('%H:%M:%S')} "
+                  f"O:{fmt_price(ch_header_bar['o'])} H:{fmt_price(ch_header_bar['h'])} "
+                  f"L:{fmt_price(ch_header_bar['l'])} C:{fmt_price(ch_header_bar['c'])} "
+                  f"V:{ch_header_bar['v']:.1f}")
+    elif ch_header_bar:
+        ch_tag = (f"  ✛ {datetime.fromtimestamp(ch_header_bar['ts']).strftime('%H:%M:%S')} "
+                  f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}")
+    else:
+        ch_tag = ""
     header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
@@ -12909,7 +12997,9 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                                 y0 + 1, y1, x0, x1, live_price, hscroll_bars,
                                 position=inst_snap.get("position"), pending=inst_snap.get("pending"),
                                 levels=ohlc_levels or {}, targets=ohlc_targets or [], er=ohlc_er,
-                                vert_offset=ohlc_vert_offset, ui=ohlc_ui or {})
+                                vert_offset=ohlc_vert_offset, ui=ohlc_ui or {},
+                                crosshair_bar_idx=crosshair_bar_idx,
+                                trade_events=ohlc_trade_events or [])
         return
 
     top = y0 + 1
@@ -23883,7 +23973,10 @@ def curses_main(stdscr):
                                           ohlc_1m_bars=z_1m, ohlc_1m_live=z_1m_live,
                                           ohlc_levels=z_levels, ohlc_targets=inst.get("targets") or [],
                                           ohlc_er=inst.get("er_bands"),
-                                          ohlc_vert_offset=ohlc_vert_offset[zoom_asset], ohlc_ui=ohlc_ui_common)
+                                          ohlc_vert_offset=ohlc_vert_offset[zoom_asset], ohlc_ui=ohlc_ui_common,
+                                          ohlc_trade_events=build_trade_markers(
+                                              zoom_asset, z_1m + ([z_1m_live] if z_1m_live else []),
+                                              inst, snap["trade_pairs"]))
                 else:
                     mid = cols // 2
                     # 2026-08-26 user request: a blank gutter between ETH's
@@ -23902,7 +23995,10 @@ def curses_main(stdscr):
                                           ohlc_1m_bars=eth_1m, ohlc_1m_live=eth_1m_live,
                                           ohlc_levels=eth_levels, ohlc_targets=eth_inst.get("targets") or [],
                                           ohlc_er=eth_inst.get("er_bands"),
-                                          ohlc_vert_offset=ohlc_vert_offset["ETH"], ohlc_ui=ohlc_ui_common)
+                                          ohlc_vert_offset=ohlc_vert_offset["ETH"], ohlc_ui=ohlc_ui_common,
+                                          ohlc_trade_events=build_trade_markers(
+                                              "ETH", eth_1m + ([eth_1m_live] if eth_1m_live else []),
+                                              eth_inst, snap["trade_pairs"]))
                     draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, qqq_x0, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
                                           hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
@@ -23912,7 +24008,10 @@ def curses_main(stdscr):
                                           ohlc_1m_bars=qqq_1m, ohlc_1m_live=qqq_1m_live,
                                           ohlc_levels=qqq_levels, ohlc_targets=qqq_inst.get("targets") or [],
                                           ohlc_er=qqq_inst.get("er_bands"),
-                                          ohlc_vert_offset=ohlc_vert_offset["QQQ"], ohlc_ui=ohlc_ui_common)
+                                          ohlc_vert_offset=ohlc_vert_offset["QQQ"], ohlc_ui=ohlc_ui_common,
+                                          ohlc_trade_events=build_trade_markers(
+                                              "QQQ", qqq_1m + ([qqq_1m_live] if qqq_1m_live else []),
+                                              qqq_inst, snap["trade_pairs"]))
 
             if mode_help_open["trading"]:
                 _draw_key_menu_overlay(db, rows, cols, TRADING_HELP_LINES, TRADING_HELP_BOX_W,

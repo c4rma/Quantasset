@@ -1,8 +1,8 @@
 # Athena
 
-A single-file, terminal-based automated trading dashboard for ETH and QQQ on Phemex. Athena combines a readiness-gated execution engine, real-time footprint charting, options flow analytics, and a multi-mode data visualization suite into one 23,500-line curses application.
+A single-file, terminal-based automated trading dashboard for ETH and QQQ on Phemex. Athena combines a readiness-gated execution engine, real-time footprint charting, options flow analytics, and a multi-mode data visualization suite into one curses application.
 
-Athena implements the **CCCCWIDE/Blackjack** framework — a rules-based system that requires five independent market conditions (Session, Volatility, PCVR, High-Probability Levels, Targets) to align before order-flow confirmation triggers an entry. Positions are sized via a configurable risk model and managed with automatic stop-loss and split take-profit brackets.
+Athena implements the **CCCCWIDE** framework — a rules-based system that requires five independent market conditions (Session, Volatility, PCVR, High-Probability Levels, Targets) to align before order-flow confirmation triggers an entry. Positions are sized via a configurable risk model (Standard or Aggressive), protected by a drawdown de-risking ladder, and managed with automatic stop-loss and split take-profit brackets.
 
 ---
 
@@ -14,8 +14,9 @@ Athena implements the **CCCCWIDE/Blackjack** framework — a rules-based system 
 - [Startup Flow](#startup-flow)
 - [Modes](#modes)
 - [Trading Engine](#trading-engine)
-- [Blackjack Progression](#blackjack-progression)
-- [DVOL Layers](#dvol-layers)
+- [Sizing Modes](#sizing-modes)
+- [Drawdown De-Risking Ladder](#drawdown-de-risking-ladder)
+- [DVOL Layer](#dvol-layer)
 - [Target System](#target-system)
 - [Risk Sizing](#risk-sizing)
 - [Position Management](#position-management)
@@ -126,32 +127,23 @@ python3 athena.py --dry-run --reset-sim --sim-balance 5000
 
 ## Modes
 
-Athena has 10 full-screen modes, cycled with `[M]` (forward) and `[K]` (backward). Two additional overlays (`[D]` Data View, `[L]` Activity Log) are available from any mode.
+Athena has 8 full-screen modes, cycled with `[M]` (forward) and `[K]` (backward). Two additional overlays (`[D]` Data View, `[L]` Activity Log) are available from any mode. Every mode also has its own `[H]` full-key-reference overlay (scrollable, closes with `[H]`/`Esc`) listing everything that mode's own footer can't fit.
+
+**2026-08-27: Chart mode and the standalone Markets mode were both removed.** Chart mode's own free-symbol candlestick tool (VP, VWAP, BT/ST/GEX-Flip, Expected Range, Big Trade Detector, crosshair, historical trade markers) was fully ported into the Trading dashboard's own embedded OHLC panel (`[V]`-cycled) over the course of this project, at which point Chart mode's separate, independent WebSocket feeds became the sole remaining reason its own signals could ever disagree with the dashboard's — removing it removed that class of bug at the root. Markets (an 8-asset macro overview: BTC/ETH/XAUUSD/USDJPY/USOIL/SPX500/NAS100/DXY) is no longer its own mode either — it's a `[Y]` toggle on the QQQ pane specifically of the Trading dashboard's OHLC view, swapping the candle chart for the overview and back.
 
 ### Trading (Default)
 
 Split-pane ETH/QQQ footprint chart with a status dashboard. Shows:
 - Real-time footprint bars (volume, delta, OHLC profile modes via `[V]`)
+- The OHLC profile mode includes Volume Profile, a developing VWAP+SD band, Big Trade Detector signals, a crosshair (`[X]`), and historical trade markers — full parity with the former standalone Chart mode. Draw order (2026-08-27 user-reported fix): VAH/VAL/POC/target/position level-line labels on the price axis now hold their ground against the generic ±σ band labels when both round to the same row (previously the σ labels always won, silently hiding the more specific one); session boundary markers (NDO/Morn/Lunch/PWR/EOD/etc.) now draw *after* candles so they're never painted over by price action, and their vertical left/right edges are now drawn unconditionally too (they used a blank-cell check that made sense back when this overlay drew *before* candles, but once moved to draw last — same fix — almost every cell was already occupied, so the sides were silently dropping out almost every time; only the horizontal top/bottom dash had already been unconditional). The time axis (2026-08-27 user request, ported from charthacker.py's own SESSIONS block) now also shows a solid reverse-video strip in each active session's own color spanning its column range, with the plain `HH:MM` tick labels punched through on top — same layering charthacker.py uses. Vertical scale (2026-08-27 user-reported fix): the chart still auto-extends its price range to keep Entry/SL/every other open TP leg in view, but no longer for an ER 100%/150% leg specifically — an IV-projected daily move routinely sits tens of dollars from price, and letting it dictate the y-axis crushed the actual recent candles into an unreadable sliver; an ER-type TP still exists and is tracked normally, it just scrolls off-screen like anything else out of the visible window instead of forcing the whole chart to zoom out to reach it
+- `[Y]` on the QQQ pane swaps to the Markets macro overview and back
 - 6-light readiness meter per instrument
 - Position PnL, SL/TP levels, margin usage
-- Blackjack ladder status
-- DVOL layer indicators
+- Sizing mode status (Standard/Aggressive) and drawdown de-risking tracker
+- Real-time bid/ask/spread next to each asset's price
+- DVOL layer indicator
 - Funding rate and next accrual countdown
 - Compact activity log
-
-### Chart
-
-Full-screen candlestick chart ported from charthacker.py. Standalone feed layer supporting any ticker (not just ETH/QQQ) via `[E]` symbol switching.
-
-- Volume Profile, VWAP, session markers
-- BT/ST/GEX Flip overlay
-- Expected Range bands
-- Big Trade Detector
-- Horizontal drawing tools and price alerts
-- Read-only position/order monitor (plots live Phemex positions on the chart)
-- Econ calendar overlay with impact filtering
-- Save/load chart state
-- Phemex, Kraken, and Yahoo data feeds with interval switching
 
 ### GEX
 
@@ -192,11 +184,7 @@ Options chain viewer pulling from Deribit (ETH) and CBOE (QQQ).
 
 ### Macro Options Flow
 
-Large-block institutional options flow. Always-on refresh loop with alert muting via `[U]`.
-
-### Markets
-
-Macro market overview dashboard (ported from charthacker.py's Global Mode). Asset prices, indices, sector performance. On-demand.
+Large-block institutional options flow. Always-on refresh loop with alert muting via `[U]`. (The Markets macro overview that used to be its own mode after this one is now a `[Y]` toggle on the Trading dashboard's own QQQ pane instead — see Trading, above.)
 
 ### Status
 
@@ -210,7 +198,7 @@ Full-screen CCCCWIDE framework readiness display. Scrollable sections:
 
 ### Data View (`[D]` overlay)
 
-Equity curve and detailed trade table. Toggle between sim and real trade sources with `[S]`. Shows entry/exit prices, PnL, TP types, Blackjack sequence labels, and per-trade fee attribution.
+Equity curve and detailed trade table. Toggle between sim and real trade sources with `[S]`. Shows entry/exit prices, PnL, TP types, sizing-mode sequence labels (Standard/Aggressive), and per-trade fee attribution.
 
 ### Activity Log (`[L]` overlay)
 
@@ -259,75 +247,97 @@ No new entries are placed between 19:00–19:30 CT (the daily session boundary).
 
 ---
 
-## Blackjack Progression
+## Sizing Modes
 
-An optional position-sizing mode toggled with `[B]`. Instead of flat risk-per-trade, Blackjack uses a loss-recovery ladder:
+**2026-08-27: replaces the old Blackjack loss-progression ladder entirely.** Two user-selectable sizing modes, cycled with `[0]`, both built on the same base risk-per-trade amount (`[P]`, see Risk Sizing below):
 
-**Loss Steps:** `1R → 1R → 2R → 3R → 5R`
+- **Standard** — every trade risks exactly the base amount. No progression.
+- **Aggressive ("1R+W")** — a trade taken at base risk that nets a profit arms a **one-shot boost** for the very next trade: that next trade risks base + the previous winner's own dollar PnL. The boosted trade's own result — win or lose — is never itself examined for a further boost; the trade after a boosted trade always reverts to bare base risk, unconditionally. A new boost only ever arms again from some later trade taken at base risk that wins.
 
-On a loss, the ladder advances one step. At the end (5R), it wraps back to 1R.
-
-On a win, a 2-trade win progression begins: the next trade risks the step-back R-multiple plus the dollar profit from the win. Two consecutive wins fully reset the ladder to 1R.
-
-**Safety Limits:**
+**Safety Limits** (independent of sizing mode):
 - **Daily Loss Limit** — 5 consecutive losses blocks the asset until the next 19:30 CT rollover or a PCVR regime switch.
 - **Max Win Limit** — 5 consecutive wins blocks the asset similarly.
-- **Home Run Rule** — A 5R trade that closes at 3R+ net profit triggers a full reset.
+- **Drawdown De-Risking Ladder** — see below; account-wide, not per-asset.
 
-State is persisted to `blackjack_state.json` and survives restarts.
+State is persisted to `sizing_state.json` and survives restarts. (This file replaces `blackjack_state.json`, which is migrated once on first run after upgrading — only the persisted trading-mode choice is carried over, since it happened to live in the same reserved-key file.)
 
 ---
 
-## DVOL Layers
+## Drawdown De-Risking Ladder
+
+Protects the equity curve independent of whichever sizing mode is active — tracks each account's own **all-time equity high-water mark** (never resets) and scales every new trade's own risk-per-trade dollar amount down as the account's current equity falls further from that peak:
+
+| Drawdown from Peak | Action |
+|---|---|
+| 0–5% | Normal — full base risk (100%) |
+| 5–10% | Reduce base risk 25% (75% sizing) |
+| 10–15% | Reduce base risk 50% (50% sizing) |
+| 15–20% | Reduce base risk 75% ("skeleton size", 25% sizing) |
+| 20%+ | **Full stop** — no new entries, manual review required |
+
+Sim and real accounts are tracked completely independently (own peak, own block state), persisted to `equity_peak_state.json`. The 20%+ tier deliberately does **not** auto-clear the way the Daily Loss Limit does — it's cleared manually with `[1]` once you've reviewed the situation. The dashboard's own ACCOUNT line shows the current drawdown % and tier in real time.
+
+---
+
+## DVOL Layer
 
 Volatility-adjusted risk scaling (ETH only, based on Deribit DVOL):
 
-| DVOL Range | Layer 1 (Base $ Multiplier) | Layer 2 (R-Multiple Cap) |
-|---|---|---|
-| ≤ 60 | 100% | 5R |
-| ≤ 75 | 75% | 3R |
-| ≤ 90 | 50% | 2R |
-| > 90 | 25% | 1R |
+| DVOL Range | Layer 1 (Base $ Multiplier) |
+|---|---|
+| ≤ 60 | 100% |
+| ≤ 75 | 75% |
+| ≤ 90 | 50% |
+| > 90 | 25% |
 
-Layer 1 scales the effective dollar value of 1R. Layer 2 caps the R-multiple actually risked at entry.
+Layer 1 scales the base risk-per-trade dollar amount, applied before sizing. (The old Layer 2 — an R-multiple cap on Blackjack's own escalating ladder — was removed alongside Blackjack itself; it had no meaning without an escalating sequence to cap.)
 
 ---
 
 ## Target System
 
-Targets are ordered by type priority for TP leg allocation:
+Targets are ordered by type priority in `reconstruct_targets`:
 
-| Priority | Type | Source | Top-Tier | Moves Mid-Trade |
-|---|---|---|---|---|
-| 1 | BT / ST | Live options chain (status.py) | Yes | Yes |
-| 2 | Large Cluster | Live gamma (gex.py) | Yes | Yes |
-| 3 | Medium Cluster | Live gamma (gex.py) | No (fallback) | Yes |
-| 4 | Margin Recovered | Computed from fill price + leverage | Yes | No (static) |
-| 5 | ER 100% | Session open + IV | No (fallback) | No (static) |
-| 6 | ER 150% | Session open + IV | No (fallback) | No (static) |
-| 7 | GEX Flip | Live gamma (gex.py) | No (fallback) | Yes |
+| Priority | Type | Source | Direction | Top-Tier | Moves Mid-Trade |
+|---|---|---|---|---|---|
+| 1 | BT / ST | Live options chain (status.py) | Either | Yes | Yes |
+| 2 | VWAP | Session volume profile (CH_STATE, kline_p-fed) | Either | Yes | No (static) |
+| 3 | POC | Session volume profile (CH_STATE, kline_p-fed) | Either | Yes | No (static) |
+| 4 | VAH | Session volume profile (CH_STATE, kline_p-fed) | Long only | Yes | No (static) |
+| 5 | VAL | Session volume profile (CH_STATE, kline_p-fed) | Short only | Yes | No (static) |
+| 6 | Large Cluster | Live gamma (gex.py) | Either | Yes | Yes |
+| 7 | Medium Cluster | Live gamma (gex.py) | Either | No (fallback) | Yes |
+| 8 | Margin Recovered | Computed from fill price + leverage | Either | Yes | No (static) |
+| 9 | ER 100% | Session open + IV | Either | No (fallback) | No (static) |
+| 10 | ER 150% | Session open + IV | Either | No (fallback) | No (static) |
+| 11 | GEX Flip | Live gamma (gex.py) | Either | No (fallback) | Yes |
+
+**VWAP, POC, VAH, VAL** (2026-08-27, added as top-tier targets) are read from the same live `CH_STATE[asset].indicator_levels` numbers the Status screen's own HPL display already shows, so a target line here is always numerically consistent with what's on screen. All four still need to sit on the profit side of current price for the trade's own regime (a VWAP behind price isn't a target) — VAH and VAL carry an *additional* type-based restriction on top of that: VAH (the value area's own ceiling) is only ever a target in a **long**, VAL (the floor) only ever in a **short**, regardless of which side of price it happens to sit on. VWAP/POC have no such restriction — either regime can target either. Unlike BT/ST/Cluster/GEX Flip, none of the four get resynced mid-trade — session VAH/VAL/POC/VWAP drift continuously rather than snapping to a new options-driven level the way the others do, so a TP leg tracking one is left where it was placed at entry (same treatment ER 100%/150% already get).
 
 **Margin Recovered** is the price level where the trade's gross PnL equals the margin used to open the position (`fill_price * (1 + 1/leverage)` for longs, `fill_price * (1 - 1/leverage)` for shorts). Only exists while a position is open.
 
 A **fallback** target may justify entry only when no top-tier target exists anywhere in the target list.
 
-When a position is opened, the two nearest valid targets (at least 1R from fill price) receive TP legs, with qty split 50/50. GEX Flip TPs are offset $3 toward price. Moving targets (GEX Flip, Cluster, BT/ST) are resynced every engine cycle.
+When a position is opened, the two *nearest* valid targets (at least 1R from fill price, sorted by distance to fill price regardless of the priority order above) receive TP legs, with qty split 50/50. GEX Flip TPs are offset $3 toward price. Moving targets (GEX Flip, Cluster, BT/ST) are resynced every engine cycle.
 
 ---
 
 ## Risk Sizing
 
-Two sizing modes, selectable via `[P]`:
+Base risk-per-trade, selectable via `[P]`:
 
-**Percentage Mode** (`pct`): `trade_risk = balance * (pct / 100)`
+**Percentage Mode** (`pct`): `base_risk = balance * (pct / 100)`
 
-**Dollar Mode** (`dollars`): `trade_risk = fixed_dollar_amount`
+**Dollar Mode** (`dollars`): `base_risk = fixed_dollar_amount`
 
-In Blackjack mode, `trade_risk = risked_R * 1R_dollars` (plus win-progression profit if applicable).
+The active [Sizing Mode](#sizing-modes) (`[0]`) then determines the actual `trade_risk`:
+
+- **Standard**: `trade_risk = base_risk`
+- **Aggressive**: `trade_risk = base_risk` (+ the previous winning trade's own PnL, exactly once, per that mode's one-shot boost rule)
+
+DVOL Layer 1 (ETH only) scales `base_risk` before either mode sees it. The [Drawdown De-Risking Ladder](#drawdown-de-risking-ladder) applies a third, independent multiplier last, based on the account's own current drawdown from its all-time equity peak.
 
 Position size: `qty = trade_risk / SL_distance`
-
-DVOL Layer 1 scales the base dollar value. Layer 2 caps the R-multiple.
 
 ---
 
@@ -351,7 +361,7 @@ Athena supports a two-machine setup for monitoring trades away from the primary 
 Binds to the LAN interface (auto-detected) and optionally a WireGuard VPN address (`ATHENA_VPN_IP`). Never binds `0.0.0.0`. Broadcasts the full application state over a WebSocket on port `8765`:
 
 - Status lines, GEX state, footprint bars
-- Position/PnL data, Blackjack state
+- Position/PnL data, sizing mode state
 - DRY_RUN/NO_SESSION/ENABLED flags
 - Data view trade history
 
@@ -388,11 +398,11 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `sim_account.json` | Paper account state (balance, positions, orders) |
 | `sim_logs/YYYY/MM/DD/*.jsonl` | Paper trade ledger (one file per day) |
 | `athena_logs/YYYY/MM/DD/*.jsonl` | Event log (entries, fills, closes, errors) |
-| `blackjack_state.json` | Blackjack ladder position and mode |
+| `sizing_state.json` | Sizing mode, Aggressive mode's pending win-boost per asset, and the persisted trading mode (CCCCWIDE/BTD) |
+| `equity_peak_state.json` | All-time equity high-water mark + drawdown block state, per sim/real account |
 | `daily_loss_state.json` | Consecutive loss tracker per asset |
 | `max_win_state.json` | Consecutive win tracker per asset |
 | `closed_pnl_state.json` | Per-day realized PnL |
-| `chart_state.json` | Saved chart mode state (symbol, interval, drawings) |
 | `status_<ASSET>.json` | VP/VWAP export for status.py integration |
 | `status_<ASSET>_gex.json` | GEX export per asset |
 | `data/footprint/YYYY/MM/DD/*.jsonl` | Footprint bar data |
@@ -422,8 +432,8 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `Tab` | Switch focus between ETH/QQQ |
 | `Z` | Toggle full/split pane |
 | `V` | Cycle footprint profile (volume/delta/OHLC/off) |
-| `X` | Toggle crosshair |
-| `H` | Hide/show dashboard |
+| `X` | Toggle crosshair (also works in the OHLC profile) |
+| `S` | Hide/show dashboard |
 | `Home` | Snap to live edge |
 | `Left/Right` | Scroll footprint bars |
 | `[` / `]` | Scroll by 10 bars |
@@ -433,40 +443,15 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `E` | Set fee per unit |
 | `T` | Set imbalance ratio |
 | `N` | Toggle 24H/session mode |
-| `B` | Toggle Blackjack mode |
-| `1` | Reset focused asset's Blackjack ladder to 1R |
+| `0` | Cycle sizing mode (Standard ↔ Aggressive) — candle/line style toggle instead, while viewing the OHLC profile |
+| `1` | Clear an active Drawdown Full Stop block (manual review) |
+| `9` | Cycle trading mode (CCCCWIDE ↔ BTD) |
+| `Y` | OHLC profile, QQQ pane only — toggle the Markets macro overview |
+| `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode |
 | `F` | Flatten position |
 | `G` | Toggle live/sim mode |
+| `H` | Full key-reference overlay for this mode |
 | `R` (double) | Reset paper account (dry-run only) |
-
-### Chart Mode
-
-| Key | Action |
-|---|---|
-| `E` | Switch symbol (any ticker) |
-| `F` | Cycle data feed (Phemex/Kraken/Yahoo) |
-| `I` | Change candle interval |
-| `V` | Toggle Volume Profile |
-| `W` | Toggle VWAP |
-| `B` | Toggle Expected Range overlay |
-| `;` | Toggle BT/ST/GEX Flip overlay |
-| `T` | Toggle Big Trade Detector |
-| `S` | Toggle session markers |
-| `L` | Toggle candle/line chart mode |
-| `\|` | Add horizontal line + alert |
-| `\\` | Add position planning tool |
-| `A` | Toggle alert list |
-| `N` | Add hline/alert (context-dependent) |
-| `O` | Edit selected hline/alert |
-| `Shift+D` | Delete selected hline/alert |
-| `X` | Toggle econ calendar |
-| `Y` | Econ calendar yesterday range |
-| `1/2/3` | Econ calendar impact filter |
-| `U` | Save chart state |
-| `J` | Reset vertical offset |
-| `G` | Jump to date/time |
-| `R` | Refresh data |
-| `H` / `?` | Help overlay |
 
 ### GEX Mode
 
@@ -477,19 +462,21 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `Tab` | Switch asset |
 | `Arrows` | Pan |
 | `[` / `]` | Zoom |
+| `H` | Full key-reference overlay for this mode |
 
 ### Net Drift / CVD / Volatility Drift
 
 | Key | Action |
 |---|---|
 | `Tab` | Switch asset |
-| `H` | Historical browsing |
+| `Y` | Historical browsing (Net Drift / Volatility Drift only) |
 | `I` | Interval |
 | `B` | Bar interval / BTD toggle |
 | `F` | Filtered/raw toggle |
 | `N` | Net volume toggle |
 | `C` | Color scheme |
 | `X` | Crosshair |
+| `H` | Full key-reference overlay for this mode |
 | `Arrows` | Pan / cursor move |
 
 ### Chain Mode
@@ -498,6 +485,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 |---|---|
 | `Y` | Simple mode toggle |
 | `Tab` | Switch asset |
+| `H` | Full key-reference overlay for this mode |
 
 ---
 

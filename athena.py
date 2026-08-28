@@ -525,8 +525,10 @@ def _reset_max_win_state():
 # [1] (freed up once Blackjack's own per-asset ladder-reset key went
 # away with it).
 def _default_equity_peak_state():
-    return {"sim": {"peak": None, "blocked": False, "blocked_at": None},
-            "real": {"peak": None, "blocked": False, "blocked_at": None}}
+    return {"sim": {"peak": None, "blocked": False, "blocked_at": None,
+                     "tier": 0, "pending_tier": None, "pending_since_day": None},
+            "real": {"peak": None, "blocked": False, "blocked_at": None,
+                      "tier": 0, "pending_tier": None, "pending_since_day": None}}
 
 def _load_equity_peak_state():
     try:
@@ -555,32 +557,64 @@ def _reset_equity_peak_state():
     whatever the old account's own high-water mark was), or it would show
     a huge false "drawdown" the instant the reset balance is first
     published. Only ever touches the "sim" bucket — a sim reset has no
-    bearing on the real account's own tracked peak."""
-    EQUITY_PEAK_STATE["sim"] = {"peak": None, "blocked": False, "blocked_at": None}
+    bearing on the real account's own tracked peak. Resets the de-risk
+    tier/pending-recovery fields too (2026-08-27) — a fresh account
+    starts back at tier 0 (Normal), no upgrade in progress."""
+    EQUITY_PEAK_STATE["sim"] = _default_equity_peak_state()["sim"]
     _save_equity_peak_state()
 
-def drawdown_tier(dd_pct):
-    """(risk_multiplier, label) for a given %-from-peak drawdown — the
-    table in this section's own header comment. dd_pct is expected >= 0
-    (peak - equity, as a % of peak; never negative since peak is a
-    running max of equity itself)."""
-    if dd_pct <= 5.0:
-        return 1.00, "Normal"
-    elif dd_pct <= 10.0:
-        return 0.75, "-25%"
-    elif dd_pct <= 15.0:
-        return 0.50, "-50%"
-    elif dd_pct <= 20.0:
-        return 0.25, "-75% (skeleton)"
-    else:
-        return 0.0, "FULL STOP"
+    # 2026-08-27 user-supplied table: each tier's DOWN-trigger threshold
+    # is unchanged from the original ladder — moving to a WORSE tier is
+    # still immediate, no waiting. Recovering to a BETTER tier now
+    # requires dropping back below a LOWER, tier-specific threshold (not
+    # just re-crossing the same line that triggered the down-move) —
+    # hysteresis so sizing doesn't flicker up/down right at a boundary —
+    # PLUS (2026-08-27 follow-up user request) that lower threshold must
+    # hold for a full CT calendar day before the restoration actually
+    # takes effect ("if the account draws down to -18% and recovers back
+    # up to -12.5%, wait until the NEXT day before restoring... to 50%").
+    # index: (upper_bound_pct, mult, label, recover_below_pct-to-step-up)
+    # recover_below is None for tier 0 (nothing to recover FROM) and tier
+    # 4/Full Stop (manual [1] clear only, never auto-recovers regardless
+    # of how much dd_pct improves).
+DRAWDOWN_TIERS = [
+    (5.0,          1.00, "Normal",              None),
+    (10.0,         0.75, "-25%",                3.0),
+    (15.0,         0.50, "-50%",                8.0),
+    (20.0,         0.25, "-75% (skeleton)",      13.0),
+    (float("inf"), 0.00, "FULL STOP",           None),
+]
+
+def _drawdown_tier_info(tier_idx):
+    """(mult, label) for a tier index — pure lookup, no hysteresis/state
+    of its own (that lives entirely in _update_equity_peak, which is the
+    only thing allowed to ADVANCE the persisted tier)."""
+    tier_idx = max(0, min(len(DRAWDOWN_TIERS) - 1, tier_idx))
+    return DRAWDOWN_TIERS[tier_idx][1], DRAWDOWN_TIERS[tier_idx][2]
+
+def _drawdown_tier_for_pct(dd_pct):
+    """Which tier a bare dd_pct would naturally fall into, ignoring
+    hysteresis entirely — used only to detect a DOWN-move (immediate,
+    unconditional) in _update_equity_peak; a recovery/UP-move never uses
+    this directly, it uses the CURRENT tier's own specific recover_below
+    threshold instead."""
+    for i, (upper, _mult, _label, _recover) in enumerate(DRAWDOWN_TIERS):
+        if dd_pct <= upper:
+            return i
+    return len(DRAWDOWN_TIERS) - 1   # unreachable (last tier's upper is inf) — defensive only
 
 def _update_equity_peak(equity):
     """Called once per AppState.publish() cycle with the CURRENT sim-or-
     real equity (balance + open PnL) — advances that account's own
-    all-time peak if a new high was just reached, and trips the 20%+
-    Full Stop block the first time drawdown crosses that line (never
-    auto-clearing it — see this section's own header comment)."""
+    all-time peak if a new high was just reached, then advances the
+    de-risk ladder's own persisted tier: DOWN immediately on a worse
+    dd_pct (same unconditional trip the 20%+ Full Stop block always had),
+    UP only one tier at a time, only once dd_pct has held below that
+    tier's own specific recovery threshold across a full CT calendar-day
+    boundary — see DRAWDOWN_TIERS' own comment for the exact table.
+    Popping back above the recovery threshold at any point before the
+    day rolls over cancels the pending upgrade; it has to re-qualify
+    fresh from there, not resume a partially-elapsed wait."""
     if equity is None:
         return
     key = "sim" if DRY_RUN else "real"
@@ -589,15 +623,69 @@ def _update_equity_peak(equity):
     if st["peak"] is None or equity > st["peak"]:
         st["peak"] = equity
         changed = True
-    if st["peak"]:
-        dd_pct = max(0.0, (st["peak"] - equity) / st["peak"] * 100.0)
-        if dd_pct > 20.0 and not st["blocked"]:
+    if not st["peak"]:
+        if changed:
+            _save_equity_peak_state()
+        return
+
+    dd_pct = max(0.0, (st["peak"] - equity) / st["peak"] * 100.0)
+    tier = st.get("tier", 0)
+    last_tier_idx = len(DRAWDOWN_TIERS) - 1
+    natural_tier = _drawdown_tier_for_pct(dd_pct)
+
+    if natural_tier > tier:
+        # DOWN-trigger — immediate, unconditional, cancels any pending
+        # recovery in progress (it's moot now; things just got worse).
+        tier = natural_tier
+        st["pending_tier"] = None
+        st["pending_since_day"] = None
+        changed = True
+        _mult, label = _drawdown_tier_info(tier)
+        console_log(f"{RED}Drawdown de-risk — down to {label} ({dd_pct:.1f}% from peak, ${st['peak']:,.2f}){RST}")
+        log_event("ACCOUNT", "drawdown_tier_down", {"tier": tier, "dd_pct": dd_pct, "peak": st["peak"]})
+        if tier == last_tier_idx and not st["blocked"]:
             st["blocked"] = True
             st["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
-            changed = True
             console_log(f"{RED}{BLD}Drawdown Full Stop — {dd_pct:.1f}% from peak (${st['peak']:,.2f}). "
                         f"No new entries on either asset until manually cleared ([1]).{RST}")
             log_event("ACCOUNT", "drawdown_full_stop", {"dd_pct": dd_pct, "peak": st["peak"], "equity": equity})
+    elif not st["blocked"] and tier > 0:
+        # Possible recovery — only when NOT sitting in the manual-clear-
+        # only Full Stop tier (that one never auto-advances, dd_pct
+        # notwithstanding).
+        recover_below = DRAWDOWN_TIERS[tier][3]
+        today_key = _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None
+        if recover_below is not None and dd_pct < recover_below:
+            target_tier = tier - 1
+            if st.get("pending_tier") != target_tier:
+                # Freshly qualified (or qualified for a tier other than
+                # whatever was already pending) — start the 1-day clock.
+                st["pending_tier"] = target_tier
+                st["pending_since_day"] = today_key
+                changed = True
+                _t_mult, target_label = _drawdown_tier_info(target_tier)
+                console_log(f"{YLW}Drawdown recovery observed ({dd_pct:.1f}% < {recover_below:.0f}%) — "
+                            f"sizing restores to {target_label} tomorrow if it holds{RST}")
+            elif today_key is not None and st.get("pending_since_day") not in (None, today_key):
+                # Same recovery has now held across a CT day boundary —
+                # actually restore.
+                tier = target_tier
+                st["tier"] = tier
+                st["pending_tier"] = None
+                st["pending_since_day"] = None
+                changed = True
+                _mult, label = _drawdown_tier_info(tier)
+                console_log(f"{GRN}Drawdown de-risk — restored to {label} "
+                            f"(recovery held overnight, {dd_pct:.1f}% from peak){RST}")
+                log_event("ACCOUNT", "drawdown_tier_restored", {"tier": tier, "dd_pct": dd_pct, "peak": st["peak"]})
+        elif st.get("pending_tier") is not None:
+            # Popped back above the recovery threshold before the wait
+            # completed — cancel; must re-qualify fresh, no partial credit.
+            st["pending_tier"] = None
+            st["pending_since_day"] = None
+            changed = True
+
+    st["tier"] = tier
     if changed:
         _save_equity_peak_state()
 
@@ -625,19 +713,49 @@ def _clear_drawdown_block():
     st = EQUITY_PEAK_STATE[key]
     st["blocked"] = False
     st["blocked_at"] = None
+    # 2026-08-27: re-derive the tier fresh off CURRENT dd_pct (the down-
+    # trigger thresholds, same as any other down-move) rather than
+    # leaving it pinned at Full Stop forever — a human has just reviewed
+    # and chosen to resume, so credit wherever the account naturally
+    # stands right now; any FURTHER improvement from there still has to
+    # earn its way up through the normal hysteresis + 1-day wait, same as
+    # always. No pending recovery survives a manual clear either.
+    equity = APP_STATE.equity
+    dd_pct = _equity_drawdown_pct(equity) if equity is not None else 0.0
+    # Clamped one short of Full Stop (never back to 0% sizing) — a manual
+    # clear is a decision to RESUME trading; still being >20% down at the
+    # moment of clearing gets the worst genuinely-tradeable tier
+    # (skeleton, 25%) rather than landing right back in the contradictory
+    # "unblocked but still 0%-sized" state re-deriving the natural tier
+    # unclamped would produce.
+    st["tier"] = min(_drawdown_tier_for_pct(dd_pct), len(DRAWDOWN_TIERS) - 2)
+    st["pending_tier"] = None
+    st["pending_since_day"] = None
     _save_equity_peak_state()
-    console_log(f"{GRN}Drawdown Full Stop cleared (manual review) — new entries allowed again{RST}")
-    log_event("ACCOUNT", "drawdown_block_cleared", {})
+    _mult, _label = _drawdown_tier_info(st["tier"])
+    console_log(f"{GRN}Drawdown Full Stop cleared (manual review) — new entries allowed again, "
+                f"resuming at {_label} ({dd_pct:.1f}% from peak){RST}")
+    log_event("ACCOUNT", "drawdown_block_cleared", {"resumed_tier": st["tier"], "dd_pct": dd_pct})
 
 def current_drawdown_mult():
     """(risk_multiplier, dd_pct, tier_label) for the CURRENT sim/real
     account — uses APP_STATE.equity, refreshed every publish() cycle,
     same once-per-cycle staleness every other risk gate here (Daily Loss
     Limit, Max Win Limit) already tolerates. Falls back to (1.0, 0.0,
-    "Normal") before the first publish() cycle has ever run."""
+    "Normal") before the first publish() cycle has ever run.
+
+    Reads the PERSISTED tier (EQUITY_PEAK_STATE[key]["tier"]), not a
+    fresh dd_pct->tier lookup — 2026-08-27, hysteresis + the 1-day
+    recovery wait mean the currently-APPLIED sizing tier can legitimately
+    differ from whatever tier the bare instantaneous dd_pct alone would
+    imply (e.g. dd_pct has already recovered enough to qualify for a
+    better tier, but the 1-day hold hasn't elapsed yet) — see
+    _update_equity_peak, the only thing allowed to actually ADVANCE this
+    tier."""
     equity = APP_STATE.equity
     dd_pct = _equity_drawdown_pct(equity)
-    mult, label = drawdown_tier(dd_pct)
+    key = "sim" if DRY_RUN else "real"
+    mult, label = _drawdown_tier_info(EQUITY_PEAK_STATE[key].get("tier", 0))
     return mult, dd_pct, label
 
 # ── "Closed PnL Today" dashboard stat (explicit user request, 2026-07-30) ────
@@ -8786,6 +8904,49 @@ class AthenaInstrument:
                 last_tp_price = d.get("price")
         return last_tp_price
 
+    def _last_fill_ts(self, asset):
+        """Epoch timestamp of the most recent 'filled' athena_logs event
+        for this asset, or None if none is found. 2026-08-27 user-reported
+        ("Duration resets to 00:00 each time Athena is relaunched...
+        should be set from the timestamp of the trade's entry"):
+        reconcile_startup used to stamp a reconciled position's own
+        fill_time as time.time() — "now", the moment of reconciliation —
+        since it had no record of the TRUE original fill time. It does:
+        _check_fill's own 'filled' log_event (athena.py, right after a
+        real fill/reconciliation-independent code path) is written on
+        EVERY fill regardless of DRY_RUN/real (unlike sim_log_event's own
+        'filled', which is sim-only) — so athena_logs alone already holds
+        the true entry timestamp for both modes. Only one position per
+        asset is ever open at a time, so the LATEST 'filled' event for
+        this asset must belong to whatever's currently open — no need to
+        also match symbol/pos_side the way _realized_since_last_fill
+        does (that one has to disambiguate BETWEEN assets sharing one sim
+        log stream; athena_logs' own event already carries `asset`
+        directly)."""
+        pattern = os.path.join(ATHENA_LOG_DIR_BASE, "**", "*.jsonl")
+        last_ts = None
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        d = json.loads(line)
+                        if d.get("asset") != asset or d.get("event") != "filled":
+                            continue
+                        ts = d.get("ts")
+                        if ts and (last_ts is None or ts > last_ts):
+                            last_ts = ts
+            except Exception:
+                continue
+        if last_ts is None:
+            return None
+        try:
+            return datetime.fromisoformat(last_ts).timestamp()
+        except (ValueError, TypeError):
+            return None
+
     async def reconcile_startup(self):
         # CRITICAL: seed the "already evaluated" baseline with whatever bar
         # is CURRENTLY the latest closed one for this asset — otherwise, if
@@ -8914,17 +9075,23 @@ class AthenaInstrument:
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                               "price_decimals": pd, "qty_decimals": qd,
                               "realized_pnl": realized_pnl,
-                              # fill_time: this is a RECONCILED position
-                              # found already open on restart — the real
-                              # original fill time isn't available here
-                              # (Phemex's own position payload doesn't
-                              # carry it), so Duration on the dashboard
-                              # starts counting from reconciliation rather
-                              # than the true original entry in this one
-                              # edge case, same kind of best-effort
-                              # approximation realized_pnl already makes
-                              # on this same restart path.
-                              "fill_time": time.time()}
+                              # fill_time (2026-08-27 user-reported: "Duration
+                              # resets to 00:00 each time Athena is
+                              # relaunched... should be set from the
+                              # timestamp of the trade's entry"): this is a
+                              # RECONCILED position found already open on
+                              # restart — used to always stamp time.time()
+                              # ("now") here, since Phemex's own position
+                              # payload doesn't carry the original fill
+                              # time. _last_fill_ts recovers the TRUE entry
+                              # timestamp from athena_logs' own 'filled'
+                              # event instead (written on every fill,
+                              # DRY_RUN or real) — time.time() is now only
+                              # the last-resort fallback for the one case
+                              # that log entry genuinely isn't there (log
+                              # rotated away, or a position that predates
+                              # this fix).
+                              "fill_time": self._last_fill_ts(self.asset) or time.time()}
             self.state = "IN_POSITION"
             self.lights["Order Flow"] = True
             sl_note = ""
@@ -11183,6 +11350,16 @@ def _build_trade_rows(closed_trades, running_balance):
             "gross_pnl": gross_pnl, "net_pnl": net_pnl, "rr": rr,
             "balance": balance_after, "dd": dd, "dd_pct": dd_pct,
             "sequence": t.get("sequence_label") or "—",
+            # funding (2026-08-27 user request, "Funding" trades-table
+            # column): net funding paid(-)/received(+) while this trade
+            # was open, summed from every 'funding' sim_logs event
+            # correlated to it by scan_all_trades_detailed's own event
+            # loop. None (not just 0.0) when nothing was ever correlated
+            # — real trades (no local funding tracking; Phemex settles
+            # funding directly against the real account with no local
+            # per-trade record) always land here, so the table can show
+            # "n/a" rather than a misleading "$0.00 charged".
+            "funding": t.get("funding_total"),
         })
     return out
 
@@ -11253,6 +11430,11 @@ def _apply_1r_plus_w_recompute(rows, starting_balance):
         new_r_dollars = new_qty * sl_distance
         new_rr = (new_net / new_r_dollars) if new_r_dollars else None
         new_dd = (row["dd"] * k) if row.get("dd") is not None else None
+        # funding (2026-08-27): payment = notional * rate = qty * mark_price
+        # * rate — linear in qty at a fixed mark price/rate, same as
+        # gross/fees/dd above, so it scales by the same k. Stays None if
+        # the real trade never had it tracked in the first place.
+        new_funding = (row["funding"] * k) if row.get("funding") is not None else None
 
         balance_before = balance
         balance += new_net
@@ -11263,7 +11445,7 @@ def _apply_1r_plus_w_recompute(rows, starting_balance):
             "qty": new_qty, "gross_pnl": new_gross, "fees": new_fees,
             "net_pnl": new_net, "r_dollars": new_r_dollars, "rr": new_rr,
             "dd": new_dd, "dd_pct": dd_pct, "balance": balance,
-            "sequence": sequence,
+            "sequence": sequence, "funding": new_funding,
         })
         out.append(new_row)
 
@@ -11376,6 +11558,16 @@ def scan_all_trades_detailed():
             # instead of leaving those columns blank just because they
             # were never actually hit.
             open_trades[key]["planned_tp_legs"] = d.get("tp_legs") or []
+        elif ev == "funding" and key in open_trades:
+            # 2026-08-27 user request ("Funding" trades-table column):
+            # apply_funding_if_due logs one 'funding' event per (symbol,
+            # pos_side) every 8h boundary a position happens to be open
+            # across — summed here onto whichever trade is CURRENTLY
+            # open for that key, exactly the same correlation
+            # _realized_since_last_fill already uses for 'closed' events
+            # (a 'filled' event starts the trade; everything for the same
+            # key until the NEXT 'filled' belongs to it).
+            open_trades[key]["funding_total"] = open_trades[key].get("funding_total", 0.0) + (d.get("payment") or 0.0)
         elif ev == "closed" and key in open_trades:
             t = open_trades[key]
             t["exits"].append({"ts": d.get("ts"), "price": d.get("price"), "qty": d.get("qty"),
@@ -11732,13 +11924,7 @@ def _fmt_ts_short(iso_ts):
     except Exception:
         return "—"
 
-def _fmt_duration(entry_ts, exit_ts):
-    if not entry_ts or not exit_ts:
-        return "—"
-    try:
-        secs = (datetime.fromisoformat(exit_ts) - datetime.fromisoformat(entry_ts)).total_seconds()
-    except Exception:
-        return "—"
+def _fmt_duration_secs(secs):
     secs = max(0, int(secs))
     h, rem = divmod(secs, 3600)
     m, s = divmod(rem, 60)
@@ -11747,6 +11933,58 @@ def _fmt_duration(entry_ts, exit_ts):
     if m:
         return f"{m}m{s:02d}s"
     return f"{s}s"
+
+def _fmt_duration(entry_ts, exit_ts):
+    if not entry_ts or not exit_ts:
+        return "—"
+    try:
+        secs = (datetime.fromisoformat(exit_ts) - datetime.fromisoformat(entry_ts)).total_seconds()
+    except Exception:
+        return "—"
+    return _fmt_duration_secs(secs)
+
+def _avg_trade_duration_secs(trades):
+    """Mean (exit_ts - entry_ts) across every trade with usable
+    timestamps — 2026-08-27 user request ("Add 'Avg Trade Duration' to
+    Data that shows how long a trade typically lasts on average").
+    Shared row shape (_build_trade_rows) means this works identically for
+    sim and real trades. Returns None if there's nothing usable (empty
+    list, or every row missing a timestamp) — the caller shows 'n/a'
+    rather than a misleading 0s."""
+    secs_list = []
+    for t in trades:
+        entry_ts, exit_ts = t.get("entry_ts"), t.get("exit_ts")
+        if not entry_ts or not exit_ts:
+            continue
+        try:
+            secs = (datetime.fromisoformat(exit_ts) - datetime.fromisoformat(entry_ts)).total_seconds()
+        except Exception:
+            continue
+        secs_list.append(max(0, secs))
+    if not secs_list:
+        return None
+    return sum(secs_list) / len(secs_list)
+
+def _fee_drag_pct(trades):
+    """(total trading fees + net funding cost) as a % of total gross
+    profit — 2026-08-27 user request ("Fee Drag... calculates the
+    percentage of gross profits that the total trading & funding rate
+    fees takes up"). "Gross profit" is the sum of gross_pnl across only
+    the WINNING (positive gross_pnl) trades — the standard gross-profit
+    accounting definition (profit side only, never netted against
+    losers), the same convention Profit Factor already uses elsewhere.
+    funding is signed (paid negative, received positive), so a net
+    funding CREDIT slightly reduces total drag and a net funding cost
+    adds to it — real trades contribute 0 funding (never tracked
+    locally), so their own Fee Drag reflects trading fees only. Returns
+    None if there's no gross profit yet to divide by."""
+    total_fees = sum(t.get("fees") or 0.0 for t in trades)
+    total_funding = sum(t.get("funding") or 0.0 for t in trades)
+    total_cost = total_fees - total_funding
+    gross_profit = sum(t["gross_pnl"] for t in trades if t.get("gross_pnl", 0) > 0)
+    if gross_profit <= 0:
+        return None
+    return total_cost / gross_profit * 100.0
 
 # Column order prioritizes the most important fields FIRST — a narrow
 # terminal's [:cols] clip (same convention every other view in this file
@@ -11767,7 +12005,7 @@ def _fmt_duration(entry_ts, exit_ts):
 TRADES_TABLE_COLS = [
     ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 20),
     ("GROSS", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
-    ("REASON", 10), ("FEES", 7), ("NET PNL", 10), ("BALANCE", 11), ("DD", 10),
+    ("REASON", 10), ("FEES", 7), ("FUNDING", 9), ("NET PNL", 10), ("BALANCE", 11), ("DD", 10),
     ("R$", 7), ("TP1", 9), ("TP1 TYPE", 9), ("TP2", 9), ("TP2 TYPE", 9), ("DUR", 7),
 ]
 
@@ -11864,6 +12102,8 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
             (fmt_num(t["exit_price"]), P_DEFAULT),
             (t["reason"], P_DEFAULT),
             (fmt_money(-t["fees"]) if t["fees"] else "$0.00", P_DIM),
+            (fmt_money(t["funding"]) if t.get("funding") is not None else "n/a",
+             pnl_pair(t["funding"]) if t.get("funding") else P_DIM),
             (fmt_money(t["net_pnl"]), pnl_pair(t["net_pnl"])),
             (fmt_money(t["balance"]) if t["balance"] is not None else "—", P_DIM),
             (fmt_money(-t["dd"]) if t.get("dd") is not None else "—", P_RED if t.get("dd") else P_DIM),
@@ -11892,17 +12132,18 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
     tag = "SIM (Paper)" if source == "sim" else "LIVE (Phemex)"
     db.puts(y, 0, f" DATA — {tag} — all-time ".center(cols, "─")[:cols], P_CYAN, curses.A_BOLD)
     y += 1
-    if source == "sim":
-        # 2026-08-27 explicit user request: every sim row here (and the
-        # PnL chart/stats above, which derive from this same recomputed
-        # data — see scan_all_trades_detailed's own comment) is a
-        # retroactive "1R+W had been active the whole time" hypothetical,
-        # not what actually executed — real entry/exit PRICES are
-        # untouched, but qty/PnL/Balance/DD are all resized. Called out
-        # here so this never reads as the literal as-traded record.
-        db.puts_ansi(y, 0, f"  {DIM}{YLW}hypothetical: sized as if Aggressive '1R+W' had been active the whole time{RST}")
-        y += 1
-    y += 1
+    # Live sizing-mode readout (2026-08-27 user-reported: "the win
+    # progression did not kick in" — traced to SIZING_MODE genuinely
+    # being Standard, not a bug; the user was misled by the sim table
+    # just below always showing a 1R+W-boosted HYPOTHETICAL regardless of
+    # the real live mode). SIZING_MODE governs real sizing too (both
+    # DRY_RUN and real trades go through the same _compute_trade_risk_
+    # dollars), so this shows regardless of which source tab is active —
+    # a plain fact check against what the table below might otherwise
+    # imply.
+    mode_note = "flat risk, no progression" if SIZING_MODE == "standard" else "1R+W win-boost active"
+    db.puts_ansi(y, 0, f"  {DIM}Live sizing mode: {YLW}{SIZING_MODE.capitalize()}{RST}{DIM} ({mode_note}){RST}")
+    y += 2
 
     db.puts_ansi(y, 0, f"{BLD}Trades{RST}    Total {stats['count']}   Wins {GRN}{stats['wins']}{RST}   "
                        f"Losses {RED}{stats['losses']}{RST}   Win Rate {stats['win_rate']:.1f}%")
@@ -11931,6 +12172,14 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
                   if stats.get("avg_loss") else "n/a")
     db.puts_ansi(y, 0, f"{BLD}Risk{RST}      Max Drawdown {RED}{fmt_money(-stats['max_drawdown'])}{dd_pct_txt}{RST}   "
                        f"Sharpe {sharpe_txt}   Avg R:R {avg_rr_txt}")
+    y += 1
+    avg_dur_secs = _avg_trade_duration_secs(trades)
+    avg_dur_txt = _fmt_duration_secs(avg_dur_secs) if avg_dur_secs is not None else "n/a"
+    db.puts_ansi(y, 0, f"{BLD}Timing{RST}    Avg Trade Duration {avg_dur_txt}")
+    y += 1
+    fee_drag = _fee_drag_pct(trades)
+    fee_drag_txt = f"{fee_drag:.1f}%" if fee_drag is not None else "n/a"
+    db.puts_ansi(y, 0, f"{BLD}Costs{RST}     Fee Drag {pnl_color(-fee_drag if fee_drag is not None else 0)}{fee_drag_txt}{RST} {DIM}(fees+funding / gross profit){RST}")
     y += 2
 
     remaining_top, remaining_bottom = y, rows - 2
@@ -12654,7 +12903,7 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # candles so candle bodies naturally win over a level line wherever
     # they share a cell (same visual priority the live price line below
     # already gives price action over itself via its own blank-cell check).
-    def _level_line(price_val, tag, pair, attr=curses.A_DIM):
+    def _level_line(price_val, tag, pair, attr=curses.A_DIM, label_attr=None):
         # 2026-08-26 user request: labels belong on the price axis (right
         # side), same as draw_chart's own draw_level_line — not split
         # between a left-edge tag and a right-edge bare price the way this
@@ -12673,7 +12922,15 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
         # this same fix) could write straight past this pane's own right
         # edge into whatever the ADJACENT pane (QQQ, when split) already
         # drew there.
-        db.puts(r, chart_r + 1, lbl[:max(0, x1 - (chart_r + 1))], pair, attr)
+        #
+        # label_attr (2026-08-27 user request: "SL and TP labels ... should
+        # be highlighted in their respective colors just like the ER
+        # levels"): optional separate attrs for JUST the axis label, same
+        # split _er_line already uses (plain in-chart line, reverse-video
+        # label) — defaults to `attr` so every existing caller (VAH/VAL/
+        # POC/ER-fallback/targets/ENTRY, which already passes its own
+        # combined BOLD|REVERSE for both) keeps behaving exactly as before.
+        db.puts(r, chart_r + 1, lbl[:max(0, x1 - (chart_r + 1))], pair, label_attr if label_attr is not None else attr)
 
     levels = levels or {}
 
@@ -12700,7 +12957,23 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # a layer, never replaces" precedent (see the vp_historical block
     # below), so there's no "lighter shading in historical view" to
     # reintroduce here.
-    def _draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p, col_start):
+    def _draw_vp_bars(vp, s_lo, s_hi, poc_p, vah_p, val_p, col_start, col_end=None, dim=False):
+        # col_end/dim (2026-08-27 user-reported: "Previous day is missing
+        # the VAL/VAH/POC values & the VP" — now that the OHLC panel's own
+        # startup backlog fix lets more than one session's worth of
+        # candles actually be visible at once, the PREVIOUS session's own
+        # portion of the chart had no VP histogram / VAH/VAL/POC at all,
+        # only the current one ever got computed): col_end caps how far a
+        # bar can extend right, so the PREVIOUS session's own (often wide)
+        # bars stop at the current session's start column instead of
+        # bleeding into it — the current session's own call leaves this
+        # None (defaults to chart_r, i.e. the live edge, unchanged
+        # behavior). dim forces every bar to A_DIM regardless of POC/VA
+        # membership — the previous session's own context, so it should
+        # read as "past," matching the dimmed treatment
+        # _draw_vwap_session already gives the previous session's own
+        # VWAP+SD band right below.
+        col_end = chart_r if col_end is None else min(chart_r, col_end)
         s_range = s_hi - s_lo
         if s_range <= 0:
             return
@@ -12727,13 +13000,15 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             if not (chart_top <= row < chart_bot_excl):
                 continue
             in_va = (vah_row <= b <= val_row)
-            if b == poc_row:
+            if dim:
+                pair, attrs, char = P_YELLOW, curses.A_DIM, ("=" if b == poc_row else "-")
+            elif b == poc_row:
                 pair, attrs, char = P_YELLOW, curses.A_BOLD, "="
             elif in_va:
                 pair, attrs, char = P_YELLOW, curses.A_NORMAL, "-"
             else:
                 pair, attrs, char = P_YELLOW, curses.A_DIM, "-"
-            for c2 in range(col_start, min(chart_r, col_start + bar_w)):
+            for c2 in range(col_start, min(col_end, col_start + bar_w)):
                 db.put(row, c2, char, pair, attrs)
 
     # 2026-08-27 user-reported ("the lines don't line up" comparing OHLC
@@ -12749,18 +13024,96 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # compute_vp(session_candles) scope) — `_vp_poc`/`_vp_vah`/`_vp_val`
     # feed BOTH the flat line below AND the historical trace's own input,
     # so they can never disagree with each other again.
+    def _session_col_start(_sess_candles):
+        _ts_set = {b["ts"] for b in _sess_candles}
+        for _i, _bar in enumerate(visible):
+            if _bar["ts"] in _ts_set:
+                return start_col + _i
+        return chart_r
+
+    _curr_col_start = _session_col_start(_curr_sess_candles) if _curr_sess_candles else chart_r
+
+    # Previous session's own VP histogram (2026-08-27 user-reported:
+    # "Previous day is missing the VAL/VAH/POC values & the VP") — this
+    # panel's own startup-backlog fix now routinely leaves more than one
+    # session's worth of candles visible at once, but the VP/VAH/VAL/POC
+    # block below this one only ever computed/drew the CURRENT session —
+    # the previous session's own portion of the chart had candles and a
+    # dimmed VWAP+SD band (see _draw_vwap_session just below) but nothing
+    # from its own volume profile at all. Dimmed, and capped at
+    # _curr_col_start so its bars can't bleed into where the current
+    # session's own histogram starts.
+    if _prev_sess_candles:
+        _prev_vp_result = _ohlc_compute_vp([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"])
+                                             for b in _prev_sess_candles])
+        if _prev_vp_result:
+            _pvp, _pvp_slo, _pvp_shi, _pvp_poc, _pvp_vah, _pvp_val = _prev_vp_result
+            _prev_col_start = _session_col_start(_prev_sess_candles)
+            _draw_vp_bars(_pvp, _pvp_slo, _pvp_shi, _pvp_poc, _pvp_vah, _pvp_val,
+                          max(x0, _prev_col_start), col_end=_curr_col_start, dim=True)
+            # VAH/VAL/POC reference for the previous session, scoped to
+            # ITS OWN column range only (not the full chart width the
+            # current session's own line/trace uses below) — a closed
+            # prior session's level isn't a live reference for the
+            # CURRENT one. No axis label, matching _draw_vwap_session's
+            # own established previous-session convention (dimmed
+            # in-chart only, current session is the one that gets
+            # labeled).
+            #
+            # 2026-08-27 user-reported ("Previous day's VAL/VAH/POC/VWAP
+            # ... carrying over into the current day... should stop at
+            # the session break, like TradingView" + "when historical
+            # mode is on, a previous day's lines should show the
+            # historical data, not just a static line"): a flat repeated
+            # value (this block's original approach) can sit at nearly
+            # the SAME row as the current session's own value whenever
+            # the two sessions' levels happen to be close — on a
+            # continuously-traded asset like ETH they usually are —
+            # which reads as one uninterrupted line spanning both days
+            # even though it's mechanically two separately-scoped
+            # segments. A developing STEPPED TRACE (same mechanism the
+            # CURRENT session's own Historical Mode already uses,
+            # _historical_vp_map) doesn't have that problem — it traces
+            # the previous session's OWN evolving VAH/VAL/POC and
+            # necessarily starts fresh, from just its first bar or two,
+            # the instant the current session's own column range begins
+            # — a visible reset, not a coincidentally-aligned flat line.
+            # Only replaces the flat fallback while Historical Mode is
+            # actually on, same "historical trace replaces the flat
+            # line" precedent the current session's own block already
+            # sets below.
+            if vp_historical:
+                _prev_vp_map = _historical_vp_map([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"])
+                                                     for b in _prev_sess_candles])
+                for _i, _bar in enumerate(visible):
+                    _col = start_col + _i
+                    if not (x0 <= _col < _curr_col_start):
+                        continue
+                    _hv = _prev_vp_map.get(_bar["ts"])
+                    if _hv is None:
+                        continue
+                    _poc_p, _vah_p, _val_p = _hv
+                    if lo_p <= _poc_p <= hi_p:
+                        db.put(clamp(chart_top + p2r(_poc_p)), _col, "═", P_YELLOW, curses.A_DIM)
+                    if lo_p <= _vah_p <= hi_p:
+                        db.put(clamp(chart_top + p2r(_vah_p)), _col, "~", P_MAGENTA, curses.A_DIM)
+                    if lo_p <= _val_p <= hi_p:
+                        db.put(clamp(chart_top + p2r(_val_p)), _col, "~", P_MAGENTA, curses.A_DIM)
+            else:
+                for _price, _pair in ((_pvp_vah, P_MAGENTA), (_pvp_val, P_MAGENTA), (_pvp_poc, P_YELLOW)):
+                    if _price is None or not (lo_p <= _price <= hi_p):
+                        continue
+                    _row = clamp(chart_top + p2r(_price))
+                    for _c2 in range(max(x0, _prev_col_start), _curr_col_start):
+                        if db.buf[_row][_c2][0] == " ":
+                            db.put(_row, _c2, "·", _pair, curses.A_DIM)
+
     _vp_poc = _vp_vah = _vp_val = None
     if _curr_sess_candles:
         _vp_result = _ohlc_compute_vp([(b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"])
                                         for b in _curr_sess_candles])
         if _vp_result:
             _vp, _vp_slo, _vp_shi, _vp_poc, _vp_vah, _vp_val = _vp_result
-            _curr_ts_set = {b["ts"] for b in _curr_sess_candles}
-            _curr_col_start = chart_r
-            for _i, _bar in enumerate(visible):
-                if _bar["ts"] in _curr_ts_set:
-                    _curr_col_start = start_col + _i
-                    break
             _draw_vp_bars(_vp, _vp_slo, _vp_shi, _vp_poc, _vp_vah, _vp_val, max(x0, _curr_col_start))
 
     # Colors matched exactly to draw_chart's own convention (2026-08-26
@@ -12962,9 +13315,9 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
 
     if position:
         _level_line(position.get("fill_price"), "ENTRY", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
-        _level_line(position.get("sl_price"), "SL", P_RED, curses.A_BOLD)
+        _level_line(position.get("sl_price"), "SL", P_RED, curses.A_BOLD, label_attr=curses.A_BOLD | curses.A_REVERSE)
         for _tpi, _leg in enumerate(position.get("tp_legs") or [], start=1):
-            _level_line(_leg.get("level"), f"TP{_tpi}", P_GREEN, curses.A_BOLD)
+            _level_line(_leg.get("level"), f"TP{_tpi}", P_GREEN, curses.A_BOLD, label_attr=curses.A_BOLD | curses.A_REVERSE)
     elif pending:
         _level_line(pending.get("entry_price"), "ENTRY", P_YELLOW, curses.A_BOLD)
 
@@ -13125,7 +13478,23 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             cell_ch = db.buf[pr][c2][0] if pr < len(db.buf) and c2 < len(db.buf[pr]) else " "
             if cell_ch in (" ", "-", ".", "·"):
                 db.put(pr, c2, "-", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
-        db.puts(pr, chart_r + 1, fmt_price(live_price).rjust(OHLC_PRICE_W), P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
+        # 2026-08-27 user-reported ("the ENTRY label does not appear on
+        # the chart until after the trade is closed"): this axis-label
+        # write was unconditional, so a fresh fill — where fill_price and
+        # live_price are identical or a fraction of a cent apart, putting
+        # both on the SAME row — had its own ENTRY label silently
+        # replaced by this live-price marker's own plain price text the
+        # very next render. ENTRY only ever became visible once price had
+        # drifted far enough away from fill to land on a different row —
+        # which for a ranging or losing trade could mean never, until the
+        # position finally closed. Same "don't clobber a more specific
+        # bold label" guard the σ-band-vs-VAH/POC axis-label collision
+        # fix already uses (_vwap_axis_lbl) — ENTRY/SL/TP/VAH/VAL/POC/ER/
+        # targets are all drawn bold; the live-price marker yields to any
+        # of them rather than always winning just because it's drawn
+        # last.
+        if not (db.buf[pr][chart_r + 1][2] & curses.A_BOLD):
+            db.puts(pr, chart_r + 1, fmt_price(live_price).rjust(OHLC_PRICE_W), P_YELLOW, curses.A_BOLD | curses.A_REVERSE)
 
     if n_all >= OHLC_BTD_LOOKBACK + 2:
         buy_iv, sell_iv = [], []
@@ -15813,15 +16182,26 @@ def draw_dashboard(db, snap, cols):
     # without needing to read the number: green through the Normal/-25%
     # tiers, yellow through -50%/-75% (skeleton), red once in Full Stop.
     _dd_key = "sim" if DRY_RUN else "real"
-    _dd_peak = EQUITY_PEAK_STATE[_dd_key]["peak"]
+    _dd_st = EQUITY_PEAK_STATE[_dd_key]
+    _dd_peak = _dd_st["peak"]
     dd_txt = ""
     if _dd_peak:
         _dd_pct = _equity_drawdown_pct(equity)
-        _, _dd_label = drawdown_tier(_dd_pct)
+        # 2026-08-27: label reflects the PERSISTED (hysteresis-aware)
+        # tier actually being applied to sizing, not a fresh dd_pct
+        # lookup — see current_drawdown_mult's own docstring for why
+        # those two can legitimately disagree while a recovery is
+        # pending. A pending-but-not-yet-1-day-confirmed recovery gets
+        # its own small tag so it's not mistaken for already restored.
+        _, _dd_label = _drawdown_tier_info(_dd_st.get("tier", 0))
         _dd_pair = GRN if _dd_pct <= 5.0 else (YLW if _dd_pct <= 15.0 else RED)
-        _dd_blocked_tag = f"{BLD} BLOCKED{RST}" if EQUITY_PEAK_STATE[_dd_key]["blocked"] else ""
+        _dd_blocked_tag = f"{BLD} BLOCKED{RST}" if _dd_st["blocked"] else ""
+        _dd_pending_tag = ""
+        if _dd_st.get("pending_tier") is not None:
+            _, _pending_label = _drawdown_tier_info(_dd_st["pending_tier"])
+            _dd_pending_tag = f"{DIM} → {_pending_label} pending{RST}"
         dd_txt = (f"   {DIM}DD {RST}{_dd_pair}-{_dd_pct:.1f}%{RST}{DIM} "
-                  f"({_dd_label}, peak {fmt_money(_dd_peak)}){RST}{_dd_blocked_tag}")
+                  f"({_dd_label}, peak {fmt_money(_dd_peak)}){RST}{_dd_blocked_tag}{_dd_pending_tag}")
     db.puts_ansi(y, 0, f"{BLD}ACCOUNT{RST} ({bal_tag})   Balance {fmt_money(snap['balance'])}   "
                        f"Equity {pnl_color(equity - snap['balance']) if op is not None else DIM}{fmt_money(equity)}{RST}   "
                        f"Available {fmt_money(snap['available'])}   "

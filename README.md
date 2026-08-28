@@ -135,7 +135,7 @@ Athena has 8 full-screen modes, cycled with `[M]` (forward) and `[K]` (backward)
 
 Split-pane ETH/QQQ footprint chart with a status dashboard. Shows:
 - Real-time footprint bars (volume, delta, OHLC profile modes via `[V]`)
-- The OHLC profile mode includes Volume Profile, a developing VWAP+SD band, Big Trade Detector signals, a crosshair (`[X]`), and historical trade markers — full parity with the former standalone Chart mode. Draw order (2026-08-27 user-reported fix): VAH/VAL/POC/target/position level-line labels on the price axis now hold their ground against the generic ±σ band labels when both round to the same row (previously the σ labels always won, silently hiding the more specific one); session boundary markers (NDO/Morn/Lunch/PWR/EOD/etc.) now draw *after* candles so they're never painted over by price action, and their vertical left/right edges are now drawn unconditionally too (they used a blank-cell check that made sense back when this overlay drew *before* candles, but once moved to draw last — same fix — almost every cell was already occupied, so the sides were silently dropping out almost every time; only the horizontal top/bottom dash had already been unconditional). The time axis (2026-08-27 user request, ported from charthacker.py's own SESSIONS block) now also shows a solid reverse-video strip in each active session's own color spanning its column range, with the plain `HH:MM` tick labels punched through on top — same layering charthacker.py uses. Vertical scale (2026-08-27 user-reported fix): the chart still auto-extends its price range to keep Entry/SL/every other open TP leg in view, but no longer for an ER 100%/150% leg specifically — an IV-projected daily move routinely sits tens of dollars from price, and letting it dictate the y-axis crushed the actual recent candles into an unreadable sliver; an ER-type TP still exists and is tracked normally, it just scrolls off-screen like anything else out of the visible window instead of forcing the whole chart to zoom out to reach it
+- The OHLC profile mode includes Volume Profile, a developing VWAP+SD band, Big Trade Detector signals, a crosshair (`[X]`), and historical trade markers — full parity with the former standalone Chart mode. Draw order (2026-08-27 user-reported fix): VAH/VAL/POC/target/position level-line labels on the price axis now hold their ground against the generic ±σ band labels when both round to the same row (previously the σ labels always won, silently hiding the more specific one); session boundary markers (NDO/Morn/Lunch/PWR/EOD/etc.) now draw *after* candles so they're never painted over by price action, and their vertical left/right edges are now drawn unconditionally too (they used a blank-cell check that made sense back when this overlay drew *before* candles, but once moved to draw last — same fix — almost every cell was already occupied, so the sides were silently dropping out almost every time; only the horizontal top/bottom dash had already been unconditional). The time axis (2026-08-27 user request, ported from charthacker.py's own SESSIONS block) now also shows a solid reverse-video strip in each active session's own color spanning its column range, with the plain `HH:MM` tick labels punched through on top — same layering charthacker.py uses. Vertical scale (2026-08-27 user-reported fix): the chart still auto-extends its price range to keep Entry/SL/every other open TP leg in view, but no longer for an ER 100%/150% leg specifically — an IV-projected daily move routinely sits tens of dollars from price, and letting it dictate the y-axis crushed the actual recent candles into an unreadable sliver; an ER-type TP still exists and is tracked normally, it just scrolls off-screen like anything else out of the visible window instead of forcing the whole chart to zoom out to reach it. Startup backlog (2026-08-27 user-reported — "all the previous candles & data disappeared" right after a relaunch): ETH's OHLC panel/BTD reads candles from `CH_STATE`'s own kline_p-fed deque (not `LIVE_TAPE`), which had no startup backfill of its own — a fresh launch showed only the handful of minutes accrued since restart until the live feed slowly refilled it, unlike QQQ's own panel (still reads the already-seeded `LIVE_TAPE`) which never had this gap. `_ch_seed_candles` now backfills `CH_STATE["ETH"]`'s deque from the exact same disk+REST history `_seed_ohlc_1m` already fetches for `LIVE_TAPE` — merged with, not overwriting, anything the live WS feed already delivered by the time it runs, since startup ordering between the two isn't guaranteed.
 - `[Y]` on the QQQ pane swaps to the Markets macro overview and back
 - 6-light readiness meter per instrument
 - Position PnL, SL/TP levels, margin usage
@@ -194,11 +194,13 @@ Full-screen CCCCWIDE framework readiness display. Scrollable sections:
 2. **Volatility** — DVOL (ETH) / VXN (QQQ) with layer classification
 3. **PCVR** — Put/Call Volume Ratio with regime determination
 4. **High-Probability Levels** — VAH, VAL, POC, VWAP, SD bands, Expected Range, BT/ST, gamma clusters
-5. **Targets** — Price-sorted target list (BT/ST, GEX Flip, clusters, ER 100%/150%, Margin Recovered when in position)
+5. **Targets** — Price-sorted target list (BT/ST, GEX Flip, clusters, ER 100%/150%)
 
 ### Data View (`[D]` overlay)
 
 Equity curve and detailed trade table. Toggle between sim and real trade sources with `[S]`. Shows entry/exit prices, PnL, TP types, sizing-mode sequence labels (Standard/Aggressive), and per-trade fee attribution.
+
+**Sim trades are shown as a retroactive "1R+W" hypothetical (2026-08-27 explicit user request):** every sim trade's real entry/exit prices are untouched, but Qty/Sequence/Gross/Fees/Net PnL/Balance/DD/R$ and the PnL chart are all recomputed as if Aggressive's win-boost progression had been active for the entire trade history (it wasn't — sizing mode has been Standard this whole time), sized off today's live PCT/RISK_DOLLARS setting walked forward against the hypothetical balance. R:R comes back numerically identical to the real trade's own R:R — a uniform position-size rescale can't change a reward:risk ratio, so this is expected, not a bug. DVOL Layer 1 and the drawdown ladder are NOT replayed on top of this (no historical record of either to replay from). A `hypothetical:` label appears above the table/chart whenever sim is the active source so this is never mistaken for the literal as-executed record. Real trades are unaffected — always the actual historical record.
 
 ### Activity Log (`[L]` overlay)
 
@@ -307,14 +309,13 @@ Targets are ordered by type priority in `reconstruct_targets`:
 | 5 | VAL | Session volume profile (CH_STATE, kline_p-fed) | Short only | Yes | No (static) |
 | 6 | Large Cluster | Live gamma (gex.py) | Either | Yes | Yes |
 | 7 | Medium Cluster | Live gamma (gex.py) | Either | No (fallback) | Yes |
-| 8 | Margin Recovered | Computed from fill price + leverage | Either | Yes | No (static) |
-| 9 | ER 100% | Session open + IV | Either | No (fallback) | No (static) |
-| 10 | ER 150% | Session open + IV | Either | No (fallback) | No (static) |
-| 11 | GEX Flip | Live gamma (gex.py) | Either | No (fallback) | Yes |
+| 8 | ER 100% | Session open + IV | Either | No (fallback) | No (static) |
+| 9 | ER 150% | Session open + IV | Either | No (fallback) | No (static) |
+| 10 | GEX Flip | Live gamma (gex.py) | Either | No (fallback) | Yes |
 
 **VWAP, POC, VAH, VAL** (2026-08-27, added as top-tier targets) are read from the same live `CH_STATE[asset].indicator_levels` numbers the Status screen's own HPL display already shows, so a target line here is always numerically consistent with what's on screen. All four still need to sit on the profit side of current price for the trade's own regime (a VWAP behind price isn't a target) — VAH and VAL carry an *additional* type-based restriction on top of that: VAH (the value area's own ceiling) is only ever a target in a **long**, VAL (the floor) only ever in a **short**, regardless of which side of price it happens to sit on. VWAP/POC have no such restriction — either regime can target either. Unlike BT/ST/Cluster/GEX Flip, none of the four get resynced mid-trade — session VAH/VAL/POC/VWAP drift continuously rather than snapping to a new options-driven level the way the others do, so a TP leg tracking one is left where it was placed at entry (same treatment ER 100%/150% already get).
 
-**Margin Recovered** is the price level where the trade's gross PnL equals the margin used to open the position (`fill_price * (1 + 1/leverage)` for longs, `fill_price * (1 - 1/leverage)` for shorts). Only exists while a position is open.
+**Margin Recovered — removed entirely (2026-08-27 explicit user request).** It used to be a synthetic fallback TP target (the price where gross PnL equals the margin used to open the position, `fill_price * (1 ± 1/leverage)`) inserted whenever no other valid target existed, or when it sat farther from fill than the nearest real one. That entire mechanism — the fallback insertion in `_check_fill`, the leg-type checks in `_sync_moving_tps` (including the "upgrade to a real BT/ST once one becomes available" behavior), and the TP-type code/display maps — was removed with no replacement; a position with no valid TP target now simply falls through to the existing "nearest dropped candidate anyway" fallback that already handled that case independently of Margin Recovered.
 
 A **fallback** target may justify entry only when no top-tier target exists anywhere in the target list.
 
@@ -349,6 +350,7 @@ Position size: `qty = trade_risk / SL_distance`
 - **PCVR Flip Close** — If PCVR flips to the opposite extreme (long position + PCVR ≥ 1.02, or short + PCVR ≤ 0.98), the position is market-closed immediately.
 - **EOD Flatten** — QQQ positions are closed at market close (15:00 CT).
 - **Funding Rate** — Phemex funding rates are fetched and displayed. In `--dry-run` mode, funding is accrued to the SimAccount every 8 hours.
+- **Duration** (2026-08-27) — shown on the dashboard's Position line next to Realized, `HH:MM:SS` elapsed since fill, recomputed live every render (started as `HH:MM`-only, switched to include seconds since a fresh position under a minute old otherwise reads as stuck at "00:00" with no visible movement). On a real position reconciled from the exchange after a restart, this counts from the moment of reconciliation rather than the true original fill time (Phemex's own position payload doesn't carry the original fill timestamp) — same best-effort approximation Realized PnL already makes on that same restart path.
 
 ---
 
@@ -398,7 +400,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `sim_account.json` | Paper account state (balance, positions, orders) |
 | `sim_logs/YYYY/MM/DD/*.jsonl` | Paper trade ledger (one file per day) |
 | `athena_logs/YYYY/MM/DD/*.jsonl` | Event log (entries, fills, closes, errors) |
-| `sizing_state.json` | Sizing mode, Aggressive mode's pending win-boost per asset, and the persisted trading mode (CCCCWIDE/BTD) |
+| `sizing_state.json` | Sizing mode, Aggressive mode's pending win-boost per asset, and the persisted trading mode (Order Flow/BTD) |
 | `equity_peak_state.json` | All-time equity high-water mark + drawdown block state, per sim/real account |
 | `daily_loss_state.json` | Consecutive loss tracker per asset |
 | `max_win_state.json` | Consecutive win tracker per asset |
@@ -445,9 +447,9 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `N` | Toggle 24H/session mode |
 | `0` | Cycle sizing mode (Standard ↔ Aggressive) — candle/line style toggle instead, while viewing the OHLC profile |
 | `1` | Clear an active Drawdown Full Stop block (manual review) |
-| `9` | Cycle trading mode (CCCCWIDE ↔ BTD) |
+| `9` | Cycle trading mode (Order Flow ↔ BTD) — renamed 2026-08-27, was "CCCCWIDE" |
 | `Y` | OHLC profile, QQQ pane only — toggle the Markets macro overview |
-| `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode |
+| `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27) |
 | `F` | Flatten position |
 | `G` | Toggle live/sim mode |
 | `H` | Full key-reference overlay for this mode |

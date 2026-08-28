@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# athena.py — Blackjack/CCCCWIDE automated execution engine
+# athena.py — Order Flow/BTD automated execution engine
 #
 # Watches status.py's daily snapshot log + gex.py's live export for 5 of the
 # framework's 6 conditions (Session, Volatility, PCVR, HPLs, Targets) and
@@ -237,7 +237,7 @@ def _migrate_legacy_blackjack_file():
     unrelated to Blackjack itself (see _load_trading_mode's own
     docstring). Carry ONLY that value over to the new sizing_state.json
     so switching to Standard/Aggressive sizing doesn't silently reset the
-    user's own CCCCWIDE/BTD trading-mode choice back to the default on
+    user's own Order Flow/BTD trading-mode choice back to the default on
     the first restart after this change. No-ops immediately once
     sizing_state.json exists — this only ever does anything on the very
     first run after upgrading."""
@@ -747,8 +747,6 @@ def _next_1930_ct_after(dt_ct):
 # recompute it continuously.
 GEX_FLIP_TP_BUFFER = 3.00
 
-_MARGIN_RECOVERED = {}
-
 # Best-effort qty-step fallback if Phemex's /public/products response shape
 # doesn't match what we expect — always used as a floor (never sized up), so
 # a wrong guess here means a smaller/rougher order, never an oversized one.
@@ -861,17 +859,26 @@ def _load_trading_mode():
     name or the "_sizing_mode" key that uses the same file) — 2026-08-26
     user request ("Athena should remember the trading mode it was last in
     and load into that upon relaunch"): TRADING_MODE was never persisted
-    at all before this, so every restart silently reset it to "CCCCWIDE"
-    regardless of what the user had it set to."""
+    at all before this, so every restart silently reset it to "Order
+    Flow" regardless of what the user had it set to.
+
+    2026-08-27 user request ("[9]'s 'CCCCWIDE' should be renamed to
+    'Order Flow'"): the mode's own VALUE was renamed, not just how it's
+    displayed — "CCCCWIDE" is normalized to "Order Flow" here so a file
+    persisted before this rename still loads correctly instead of
+    silently falling through to the `mode in TRADING_MODES` check
+    failing and resetting to the default."""
     try:
         with open(SIZING_STATE_PATH, encoding="utf-8") as f:
             data = json.load(f)
         mode = data.get("_trading_mode")
+        if mode == "CCCCWIDE":
+            mode = "Order Flow"
         if mode in TRADING_MODES:
             return mode
     except Exception:
         pass
-    return "CCCCWIDE"
+    return "Order Flow"
 
 def _save_trading_mode():
     try:
@@ -886,7 +893,7 @@ def _save_trading_mode():
     except Exception:
         pass
 
-TRADING_MODES = ("CCCCWIDE", "BTD")
+TRADING_MODES = ("Order Flow", "BTD")
 TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
 BTD_ENTRY_LOOKBACK = 10
 BTD_ENTRY_SIGMA    = 3.0
@@ -1944,6 +1951,11 @@ def _seed_ohlc_1m(asset):
     candles = [merged[ts] for ts in sorted(merged)]
     if candles:
         LIVE_TAPE.seed_1m(asset, candles)
+        if asset == "ETH":
+            # See _ch_seed_candles' own docstring — ETH's OHLC panel/BTD
+            # reads CH_STATE's candle deque, not LIVE_TAPE, and that deque
+            # had no startup backlog of its own until this.
+            _ch_seed_candles(asset, candles)
         console_log(f"{asset}: seeded {len(candles)} 1m OHLC bars "
                     f"({len(disk_bars)} from disk, {len(rest_candles)} from REST)")
 
@@ -3348,6 +3360,44 @@ class CH_Candle:
 
 CH_STATE = {"ETH": CH_AssetState(), "QQQ": CH_AssetState()}
 
+def _ch_seed_candles(asset, candles):
+    """Backfills CH_STATE[asset]'s own candle deque with the SAME merged
+    disk+REST history _seed_ohlc_1m just assembled for LIVE_TAPE —
+    2026-08-27 user-reported ("OHLC should always load the full backlog
+    upon launch... all the previous candles & data disappeared" right
+    after a restart): ch_snapshot_1m (ETH's own OHLC panel/BTD candle
+    source since the earlier 2026-08-27 data-source fix) reads straight
+    from CH_STATE[asset].candles, which — unlike LIVE_TAPE — had NO
+    startup seeding of its own. A fresh launch left it empty until the
+    kline_p WS feed's own snapshot burst (or plain incremental accrual
+    over the following minutes) slowly refilled it — nowhere near
+    LIVE_TAPE's full ~25h backlog, which is exactly why the chart showed
+    almost nothing right after relaunch. Only ETH actually uses
+    ch_snapshot_1m for its OHLC panel (QQQ's own panel still reads
+    LIVE_TAPE, already correctly seeded, so it never had this gap) — this
+    is called for ETH only, from the exact same call site that seeds
+    LIVE_TAPE, reusing the SAME already-fetched candle list rather than a
+    second redundant REST call.
+
+    Startup ordering between this (runs on the backfill thread) and
+    _ch_engine_thread_eth's own WS connect is NOT guaranteed — merges
+    rather than overwrites, with whatever's ALREADY in ch_state.candles
+    (live WS data, if it got there first) winning on any overlapping
+    timestamp, since that's the freshest read of anything recent; this
+    REST backfill's only job is filling in the OLDER history live data
+    could never have covered yet."""
+    ch_state = CH_STATE[asset]
+    with ch_state.lock:
+        merged = {c.ts: c for c in ch_state.candles}   # live WS data, if any, wins on overlap
+        for ts, o, h, l, c, v in candles:
+            if ts not in merged:
+                merged[ts] = CH_Candle(ts=ts, o=o, h=h, l=l, c=c, v=v, closed=True)
+        ordered = [merged[ts] for ts in sorted(merged)]
+        ch_state.candles.clear()
+        ch_state.candles.extend(ordered)
+        if ch_state.candles:
+            ch_state.last_price = ch_state.candles[-1].c
+
 def ch_snapshot_1m(asset):
     """Same (closed, live) shape as LiveTape.snapshot_1m — a list of
     oldest-first {"ts","o","h","l","c","v"} dicts plus a single
@@ -4412,9 +4462,6 @@ def _status_build_render_lines(display_data):
             if er:
                 targets.append((er["upper"][100], f"ER 100% {GRN}{BLD}${er['upper'][100]:,.2f}{RST} ({target_rel(er['upper'][100])})"))
                 targets.append((er["upper"][150], f"ER 150% {GRN}{BLD}${er['upper'][150]:,.2f}{RST} ({target_rel(er['upper'][150])})"))
-            mr = _MARGIN_RECOVERED.get(inst_name)
-            if mr is not None:
-                targets.append((mr, f"Margin Recovered {GRN}{BLD}${mr:,.2f}{RST} ({target_rel(mr)})"))
         elif ratio > 1.02:
             _bt, st = compute_bt_st(chain["strikes"], is_crypto, price, ratio)
             if st is not None:
@@ -4427,9 +4474,6 @@ def _status_build_render_lines(display_data):
             if er:
                 targets.append((er["lower"][100], f"ER 100% {GRN}{BLD}${er['lower'][100]:,.2f}{RST} ({target_rel(er['lower'][100])})"))
                 targets.append((er["lower"][150], f"ER 150% {GRN}{BLD}${er['lower'][150]:,.2f}{RST} ({target_rel(er['lower'][150])})"))
-            mr = _MARGIN_RECOVERED.get(inst_name)
-            if mr is not None:
-                targets.append((mr, f"Margin Recovered {GRN}{BLD}${mr:,.2f}{RST} ({target_rel(mr)})"))
         targets.sort(key=lambda t: t[0])
         targets = [s for _, s in targets]
         has_targets[inst_name] = bool(targets)
@@ -5734,7 +5778,7 @@ async def place_sl(symbol, pos_side, sl_price, price_decimals):
 # owns that whole data structure; a real Phemex order has no such custom
 # field, so the clOrdID itself is the only place to carry this).
 _TP_TYPE_CODES = {"BT": "BT", "ST": "ST", "GEX Flip": "GF", "Cluster": "CL",
-                   "ER 100%": "E1", "ER 150%": "E2", "Margin Recovered": "MR"}
+                   "ER 100%": "E1", "ER 150%": "E2"}
 _TP_TYPE_CODES_REV = {v: k for k, v in _TP_TYPE_CODES.items()}
 
 def _tp_type_code(target_type):
@@ -5747,7 +5791,7 @@ def _tp_type_from_code(code):
 # BT/ST into one combined label per explicit user request ("GEXFLIP,
 # CLUSTER, or BT/ST"), rather than showing BT and ST as two separate values.
 _TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluster": "CLUSTER",
-                     "ER 100%": "ER100", "ER 150%": "ER150", "Margin Recovered": "MARGIN"}
+                     "ER 100%": "ER100", "ER 150%": "ER150"}
 
 def _tp_type_display(target_type):
     return _TP_TYPE_DISPLAY.get(target_type, "—")
@@ -8864,16 +8908,23 @@ class AthenaInstrument:
             realized_pnl = -fee_for_leg(self.asset, size, fill_price)
             if DRY_RUN:
                 realized_pnl += already_realized
-            leverage = self.cfg["leverage"]
-            mr_level = fill_price * (1.0 + 1.0 / leverage) if pos_side == "Long" \
-                else fill_price * (1.0 - 1.0 / leverage)
-            _MARGIN_RECOVERED[self.asset] = mr_level
 
             self.position = {"pos_side": pos_side, "qty": size, "orig_qty": size, "fill_price": fill_price,
                               "sl_price": sl_price, "sl_order_id": sl_order_id, "tp_legs": tp_legs,
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                               "price_decimals": pd, "qty_decimals": qd,
-                              "realized_pnl": realized_pnl}
+                              "realized_pnl": realized_pnl,
+                              # fill_time: this is a RECONCILED position
+                              # found already open on restart — the real
+                              # original fill time isn't available here
+                              # (Phemex's own position payload doesn't
+                              # carry it), so Duration on the dashboard
+                              # starts counting from reconciliation rather
+                              # than the true original entry in this one
+                              # edge case, same kind of best-effort
+                              # approximation realized_pnl already makes
+                              # on this same restart path.
+                              "fill_time": time.time()}
             self.state = "IN_POSITION"
             self.lights["Order Flow"] = True
             sl_note = ""
@@ -9714,11 +9765,6 @@ class AthenaInstrument:
         symbol = self.cfg["phemex_symbol"]
         await self._place_sl_with_retry(symbol, p["pos_side"], sl_price, p["price_decimals"])
 
-        leverage = self.cfg["leverage"]
-        mr_level = fill_price * (1.0 + 1.0 / leverage) if p["pos_side"] == "Long" \
-            else fill_price * (1.0 - 1.0 / leverage)
-        _MARGIN_RECOVERED[self.asset] = mr_level
-
         targets = list(p["targets"])
         qd = p["qty_decimals"]
         step = 10 ** (-qd) if qd else 1.0
@@ -9737,13 +9783,6 @@ class AthenaInstrument:
         valid.sort(key=lambda lt: abs(lt[0] - fill_price))
         dropped = [t for lvl, t in candidates if not _valid_tp(lvl)]
 
-        mr_dist = abs(mr_level - fill_price)
-        if valid:
-            nearest_dist = abs(valid[0][0] - fill_price)
-            if nearest_dist > mr_dist and _valid_tp(mr_level):
-                valid.insert(0, (mr_level, {"type": "Margin Recovered", "level": mr_level}))
-        elif _valid_tp(mr_level):
-            valid.insert(0, (mr_level, {"type": "Margin Recovered", "level": mr_level}))
         if dropped:
             console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
             log_event(self.asset, "tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
@@ -9830,7 +9869,13 @@ class AthenaInstrument:
                           # the only reader of "boosted" once the trade is
                           # open.
                           "sequence_label": p.get("sequence_label"), "trade_risk_dollars": p.get("trade_risk_dollars"),
-                          "boosted": p.get("boosted", False)}
+                          "boosted": p.get("boosted", False),
+                          # fill_time (2026-08-27, dashboard Duration
+                          # field): wall-clock epoch at the moment of fill
+                          # — read fresh every render by the dashboard, no
+                          # caching, same "always tracks the real state"
+                          # approach as everything else on this line.
+                          "fill_time": time.time()}
         self._tp1_lock_done = False
         self.pending = None
         self.state = "IN_POSITION"
@@ -9973,7 +10018,6 @@ class AthenaInstrument:
             self._update_sizing_progression(net_pnl)
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
-            _MARGIN_RECOVERED.pop(self.asset, None)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -10167,7 +10211,6 @@ class AthenaInstrument:
             self._update_sizing_progression(net_pnl)
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
-            _MARGIN_RECOVERED.pop(self.asset, None)
             self.position = None
             self.state = "WATCHING"
             self.lights["Order Flow"] = False
@@ -10225,7 +10268,7 @@ class AthenaInstrument:
         "refresh" it in the first place, since its price never changes
         here."""
         tp_legs = self.position.get("tp_legs") or []
-        if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST", "Margin Recovered") for leg in tp_legs):
+        if not any(leg.get("tracks_gex_flip") or leg.get("type") in ("Cluster", "BT", "ST") for leg in tp_legs):
             return
 
         fill_price = self.position.get("fill_price")
@@ -10360,15 +10403,6 @@ class AthenaInstrument:
                     if self._tp_skip_warned.get(warn_key) is None or abs(self._tp_skip_warned[warn_key] - new_bt_st_level) > 0.01:
                         console_log(f"{self.asset}: {YLW}{leg['type']} too close to fill (${fmt_num(new_bt_st_level)}) — TP refresh skipped this cycle{RST}")
                         self._tp_skip_warned[warn_key] = new_bt_st_level
-            elif leg.get("type") == "Margin Recovered" and new_bt_st_level is not None:
-                tracked = True
-                if _safe(new_bt_st_level):
-                    level, leg_changed = new_bt_st_level, True
-                    leg = dict(leg, type=bt_st_type)
-                    console_log(f"{self.asset}: {GRN}MR leg replaced with {bt_st_type} ${fmt_num(new_bt_st_level)}{RST}")
-                    log_event(self.asset, "mr_leg_replaced", {"old_level": leg.get("level"), "new_level": new_bt_st_level, "new_type": bt_st_type})
-                else:
-                    pinned = True
             new_legs.append({"level": level, "qty": leg["qty"],
                               "tracks_gex_flip": leg.get("tracks_gex_flip", False),
                               "type": leg.get("type", "?"),
@@ -10688,7 +10722,6 @@ class AthenaInstrument:
         else:
             log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
 
-        _MARGIN_RECOVERED.pop(self.asset, None)
         self.pending = None
         self.position = None
         self.state = "WATCHING"
@@ -11153,6 +11186,94 @@ def _build_trade_rows(closed_trades, running_balance):
         })
     return out
 
+def _apply_1r_plus_w_recompute(rows, starting_balance):
+    """Retroactive "what if Aggressive's '1R+W' win-boost had been active
+    for every one of these sim trades" replay — 2026-08-27 explicit user
+    request ("recalculate the Qty/Sequence/Gross/R:R/Fees/Net PnL/
+    Balance/DD/R$ values and the PnL chart to reflect what they should be
+    with the '1R+W' win progression in effect"). None of these trades
+    actually ran under Aggressive (SIZING_MODE has been "standard" this
+    whole time) — this is a hypothetical replay, not a bug fix. Every
+    trade's real entry/exit prices are untouched (only real market fills
+    — nothing here is invented); what changes is how big each trade WOULD
+    have been sized, and everything downstream of size.
+
+    Base risk basis (explicit user answer, since there's no historical
+    per-trade PCT/DVOL record to replay): today's live RISK_MODE/PCT/
+    RISK_DOLLARS settings, applied against the WALKED-FORWARD hypothetical
+    balance at each point in the sequence — the same %-of-equity
+    convention _compute_trade_risk_dollars already uses for real entries
+    — NOT each trade's own actual historical qty. DVOL Layer 1 and the
+    drawdown de-risking ladder are deliberately NOT replayed on top of
+    this (neither has a historical record either, and the ask was
+    specifically to layer 1R+W onto a flat base risk — nothing else is
+    being hypothesized here).
+
+    Every dollar figure a trade produces scales EXACTLY linearly with its
+    own qty at fixed entry/exit prices — both fee models (fee_for_leg)
+    and the MAE-based DD figure (_trade_worst_adverse_dollars, itself
+    linear in the position size open at each moment) are linear in qty —
+    so rather than re-deriving fees/pnl/DD from scratch against a
+    rescaled position, each row's ALREADY-computed real gross_pnl/fees/
+    dd are simply rescaled by k = new_qty / original_qty. net_pnl,
+    r_dollars, rr, balance and dd_pct are then recomputed fresh from
+    those rescaled figures (rr comes back mathematically identical to
+    the original per-trade — a uniform size rescale can't change a
+    reward:risk RATIO — which is expected, not a bug). sequence is
+    replaced with whichever "Aggressive"/"Aggressive (W+$X)" label this
+    walk itself produces — see _compute_trade_risk_dollars/
+    _update_sizing_progression for the exact same one-shot-boost rule
+    being replayed here, trade-by-trade, in chronological order."""
+    out = []
+    balance = starting_balance
+    pending_boost = None
+    for row in rows:
+        asset = row.get("asset")
+        sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
+        original_qty = row.get("qty") or 0.0
+
+        base_dollars = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) \
+            else balance * (PCT / 100.0)
+        boost = pending_boost
+        if boost:
+            trade_risk_dollars = base_dollars + boost
+            sequence = f"Aggressive (W+${boost:,.2f})"
+        else:
+            trade_risk_dollars = base_dollars
+            sequence = "Aggressive"
+        pending_boost = None   # consumed either way, same as the live rule
+
+        raw_qty = (trade_risk_dollars / sl_distance) if sl_distance else 0.0
+        new_qty = floor_to_step(max(0.0, raw_qty), DEFAULT_QTY_STEP.get(asset, 0.01))
+        k = (new_qty / original_qty) if original_qty else 0.0
+
+        new_gross = row["gross_pnl"] * k
+        new_fees = row["fees"] * k
+        new_net = new_gross - new_fees
+        new_r_dollars = new_qty * sl_distance
+        new_rr = (new_net / new_r_dollars) if new_r_dollars else None
+        new_dd = (row["dd"] * k) if row.get("dd") is not None else None
+
+        balance_before = balance
+        balance += new_net
+        dd_pct = (new_dd / balance_before * 100.0) if (new_dd is not None and balance_before) else None
+
+        new_row = dict(row)
+        new_row.update({
+            "qty": new_qty, "gross_pnl": new_gross, "fees": new_fees,
+            "net_pnl": new_net, "r_dollars": new_r_dollars, "rr": new_rr,
+            "dd": new_dd, "dd_pct": dd_pct, "balance": balance,
+            "sequence": sequence,
+        })
+        out.append(new_row)
+
+        # Was THIS trade itself the boosted one? If so its own result
+        # never re-arms anything, win or lose — matches
+        # _update_sizing_progression's own rule on live trades exactly.
+        if not boost and new_net > 0:
+            pending_boost = new_net
+    return out
+
 def scan_all_trades_detailed():
     """Full per-trade records (entry+every closing leg+fees+duration+R:R),
     reconstructed from ALL sim_logs across every day — DRY_RUN. See
@@ -11265,6 +11386,13 @@ def scan_all_trades_detailed():
 
     out = _build_trade_rows(closed_trades, running_balance)
     out.sort(key=lambda t: t["exit_ts"] or "")
+    # 2026-08-27 explicit user request: the sim trading log (this table
+    # AND the PnL chart/stats header, which both derive their own data
+    # from this exact return value — see draw_data_view's caller) shows
+    # the retroactive "1R+W had been active the whole time" hypothetical
+    # instead of what was actually executed — see
+    # _apply_1r_plus_w_recompute's own docstring for the full rationale.
+    out = _apply_1r_plus_w_recompute(out, reset_balance)
     return out
 
 def scan_real_trades_detailed(current_balance=None):
@@ -11763,7 +11891,18 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
     y = 0
     tag = "SIM (Paper)" if source == "sim" else "LIVE (Phemex)"
     db.puts(y, 0, f" DATA — {tag} — all-time ".center(cols, "─")[:cols], P_CYAN, curses.A_BOLD)
-    y += 2
+    y += 1
+    if source == "sim":
+        # 2026-08-27 explicit user request: every sim row here (and the
+        # PnL chart/stats above, which derive from this same recomputed
+        # data — see scan_all_trades_detailed's own comment) is a
+        # retroactive "1R+W had been active the whole time" hypothetical,
+        # not what actually executed — real entry/exit PRICES are
+        # untouched, but qty/PnL/Balance/DD are all resized. Called out
+        # here so this never reads as the literal as-traded record.
+        db.puts_ansi(y, 0, f"  {DIM}{YLW}hypothetical: sized as if Aggressive '1R+W' had been active the whole time{RST}")
+        y += 1
+    y += 1
 
     db.puts_ansi(y, 0, f"{BLD}Trades{RST}    Total {stats['count']}   Wins {GRN}{stats['wins']}{RST}   "
                        f"Losses {RED}{stats['losses']}{RST}   Win Rate {stats['win_rate']:.1f}%")
@@ -12451,8 +12590,8 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # other target type typically sits — so including it here could blow
     # the visible range out so far that the actual recent candles got
     # crushed into a sliver at the bottom of the chart. Entry/SL/every
-    # OTHER TP type (BT/ST/Cluster/GEX Flip/Margin Recovered/VWAP/POC/
-    # VAH/VAL) still gets included — those stay close enough to price
+    # OTHER TP type (BT/ST/Cluster/GEX Flip/VWAP/POC/VAH/VAL) still gets
+    # included — those stay close enough to price
     # that showing them doesn't cost chart readability the way ER does.
     _pos_prices = []
     if position:
@@ -15776,7 +15915,7 @@ def draw_dashboard(db, snap, cols):
                 sizing_txt = f"   {DIM}Sizing: Aggressive (next: base+${boost:,.2f}){RST}"
             else:
                 sizing_txt = f"   {DIM}Sizing: Aggressive{RST}"
-        mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "CCCCWIDE" else ""
+        mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "Order Flow" else ""
         db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}")
         y += 1
         detail = "  " + "  ".join(
@@ -15825,8 +15964,23 @@ def draw_dashboard(db, snap, cols):
             # changed across the position's lifetime.
             realized = p.get("realized_pnl")
             realized_tag = f"   Realized {pnl_color(realized)}{fmt_money(realized)}{RST}"
+            # Duration (2026-08-27 user request): HH:MM:SS elapsed since
+            # fill, recomputed fresh every render from fill_time (no
+            # caching) — same "always live" convention uPnL/Realized
+            # already use on this line. Originally HH:MM-only — user-
+            # reported "showing 00:00" was a fresh position genuinely
+            # under a minute old reading as stuck, since MM-only gives no
+            # visible movement for the better part of a minute; HH:MM:SS
+            # ticks visibly every render instead.
+            dur_tag = ""
+            fill_time = p.get("fill_time")
+            if fill_time is not None:
+                dur_secs = max(0, int(time.time() - fill_time))
+                dur_h, _rem = divmod(dur_secs, 3600)
+                dur_m, dur_s = divmod(_rem, 60)
+                dur_tag = f"   Duration {DIM}{dur_h:02d}:{dur_m:02d}:{dur_s:02d}{RST}"
             line3 = (f"  {YLW}Position: {p['pos_side']} {fmt_num(p['qty'], 2)} @ {fmt_num(p['fill_price'])}   "
-                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}{realized_tag}")
+                     f"SL {fmt_num(p.get('sl_price'))}{sl_dist_tag}   uPnL {pnl_color(pnl)}{fmt_money(pnl)}{RST}{sl_warn}{realized_tag}{dur_tag}")
         if line3:
             db.puts_ansi(y, 0, line3)
         y += 1
@@ -19305,7 +19459,7 @@ TRADING_HELP_SECTIONS = [
         ("[1]",        "Clear an active Drawdown Full Stop block (manual review)"),
     ]),
     ("TRADING CONTROLS", [
-        ("[9]",        "Cycle trading mode  (CCCCWIDE order-flow  <->  BTD candle-close)"),
+        ("[9]",        "Cycle trading mode  (Order Flow  <->  BTD candle-close)"),
         ("[A]",        "Pause/resume new entries for the focused asset"),
         ("[N]",        "Toggle 24H mode  (bypass the Session gate)"),
         ("[F]",        "Flatten — close any open position immediately"),
@@ -19919,10 +20073,11 @@ def curses_main(stdscr):
     ohlc_vert_offset = {"ETH": 0, "QQQ": 0}
     ohlc_show_sessions = True   # shared (not per-asset) view prefs, same as
     ohlc_line_mode = False       # profile_mode/chart_zoom already are
-    ohlc_vp_historical = False   # [4] — VAH/VAL/POC "Historical Mode"
+    ohlc_vp_historical = True    # [4] — VAH/VAL/POC "Historical Mode"
                                    # (stepped developing trace) vs today's
                                    # only "Normal Mode" (flat current-value
-                                   # line)
+                                   # line). 2026-08-27 user request: on by
+                                   # default.
     ohlc_show_markets_qqq = False   # [Y] — QQQ pane ONLY: swap the candle
                                    # chart for the Markets overview (2026-08-27,
                                    # folded in once the standalone Markets mode

@@ -2056,14 +2056,49 @@ def _seed_ohlc_1m(asset):
     candles' own docstrings: a restart used to only ever see whatever
     REST's own (previously session-bounded, now fixed-lookback) window
     covered, silently losing anything the disk log would otherwise add on
-    top of that."""
+    top of that.
+
+    2026-08-28 user-reported ("QQQ's VWAP+SD/VAH/VAL/POC start at 08:30
+    instead of 03:00 CT, causing those values to be incorrect"): traced to
+    Yahoo's own free intraday API reporting ZERO volume for every
+    pre-market bar (confirmed live: 08:30:00 CT — exactly the regular
+    open — is the first minute with any nonzero volume at all today).
+    VWAP/Volume Profile are inherently volume-weighted, so a v=0 bar
+    can't move them regardless of what session window it's in — the
+    ACTUAL fix isn't the session boundary, it's the volume figure itself.
+    _run_footprint_backfill runs immediately before this (same
+    _backfill_then_feeds call), replaying Alpaca's own REAL historical
+    trades for QQQ through LIVE_TAPE.ingest() — which already updates
+    THIS SAME 1m buffer as a side effect (LiveTape._ingest_1m) — with
+    genuine executed-trade volume, including pre-market (IEX itself
+    trades extended hours). The "REST wins on overlap" rule above was
+    then unconditionally overwriting those already-correct, already-
+    real-volume bars with Yahoo's own (frequently zero) figure for the
+    exact same timestamps a moment later. Fixed for QQQ specifically:
+    Yahoo's own candle only gets used at a timestamp where LIVE_TAPE's
+    already-ingested bar (if any) has NO real volume of its own to lose —
+    filling genuine gaps, never overwriting real Alpaca-trade volume with
+    Yahoo's own unreliable pre-market figure. ETH is untouched — its own
+    "REST wins" rule (Phemex, not Yahoo) was never the problem."""
     cfg = ASSETS[asset]
+    disk_bars = read_last_n_ohlc_1m_bars(asset, OHLC_1M_MAX_BARS)
+    merged = {b["ts"]: (b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"]) for b in disk_bars}
     if asset == "ETH":
         rest_candles = fetch_status_phemex_recent_candles(cfg["phemex_symbol"], 60, OHLC_1M_MAX_BARS)
     else:
         rest_candles = fetch_status_yahoo_candles("QQQ", interval="1m")
-    disk_bars = read_last_n_ohlc_1m_bars(asset, OHLC_1M_MAX_BARS)
-    merged = {b["ts"]: (b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"]) for b in disk_bars}
+        # A real-volume bar can come from EITHER the disk-persisted log
+        # (a previous run's own live-ingested bar) or LIVE_TAPE's current
+        # in-memory buffer (THIS run's _run_footprint_backfill, which just
+        # replayed Alpaca's real trades through it moments ago, in the
+        # same _backfill_then_feeds call) — checked against both, since
+        # either one already being real beats Yahoo's own figure.
+        _already_closed, _already_live = LIVE_TAPE.snapshot_1m(asset)
+        _real_vol_ts = {b["ts"] for b in _already_closed if b.get("v", 0) > 0}
+        if _already_live and _already_live.get("v", 0) > 0:
+            _real_vol_ts.add(_already_live["ts"])
+        _real_vol_ts.update(ts for ts, bar in merged.items() if bar[5] > 0)
+        rest_candles = [c for c in rest_candles if c[0] not in _real_vol_ts]
     for c in rest_candles:
         merged[c[0]] = c   # REST overwrites disk on any overlapping ts
     candles = [merged[ts] for ts in sorted(merged)]
@@ -13305,13 +13340,25 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
         _er_line(er.get("l150"), P_MAGENTA, curses.A_BOLD, "-150%")
         _level_line(er.get("open"), "EOpen", P_DEFAULT, curses.A_DIM)
 
-    for _t in (targets or []):
-        if _t.get("type") in ("ER 100%", "ER 150%"):
-            continue   # already drawn as the real ER fill+lines above —
-                         # a second thin target line at the same price
-                         # would just be redundant clutter
-        _pair, _attr = _ohlc_target_style(_t.get("type"))
-        _level_line(_t.get("level"), _t.get("type") or "", _pair, _attr)
+    # 2026-08-28 user-reported ("TP labels in OHLC should be labeled
+    # either 'TP1' or 'TP2'"): with a position open, its own two real TP
+    # legs are drawn below labeled "TP1"/"TP2" — this loop used to ALSO
+    # keep drawing every OTHER candidate target from the full list (a
+    # Cluster/BT/ST/VWAP/etc. that wasn't actually chosen as either TP
+    # leg), labeled by its raw type name. Visually those look just like
+    # another take-profit level, but aren't live/actionable ones — confusing
+    # next to the real TP1/TP2. Suppressed entirely once a position is
+    # open; still shown while only PENDING (no real TP legs exist yet to
+    # replace them with — these candidates ARE what TP1/TP2 will become
+    # once it fills).
+    if not position:
+        for _t in (targets or []):
+            if _t.get("type") in ("ER 100%", "ER 150%"):
+                continue   # already drawn as the real ER fill+lines above —
+                             # a second thin target line at the same price
+                             # would just be redundant clutter
+            _pair, _attr = _ohlc_target_style(_t.get("type"))
+            _level_line(_t.get("level"), _t.get("type") or "", _pair, _attr)
 
     if position:
         _level_line(position.get("fill_price"), "ENTRY", P_YELLOW, curses.A_BOLD | curses.A_REVERSE)

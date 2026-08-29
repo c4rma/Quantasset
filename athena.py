@@ -13736,6 +13736,16 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # user reported. Building it into one single header string avoids any
     # possibility of two separate draws colliding on the same row.
     closed_tag = "  [MARKET CLOSED]" if market_closed else ""
+    # 2026-08-28 user request ("OHLC should have a status informing the
+    # user when the VAL/VAH/POC values are in normal or historical
+    # mode"): [4] toggles ohlc_vp_historical with no on-screen indicator
+    # of which one is currently active — same header-string convention
+    # every other OHLC-specific tag on this line already uses (folded
+    # into the one string, never a separate overlay draw — see
+    # closed_tag's own comment for why that matters).
+    vp_mode_tag = ""
+    if profile_mode == "ohlc":
+        vp_mode_tag = f"  VP:{'Historical' if (ohlc_ui or {}).get('vp_historical') else 'Normal'}"
     # Compact crosshair readout — folded into the SAME header string for
     # the same reason closed_tag is (see the comment block above): a
     # second db.puts() overlay on this row is exactly what caused the
@@ -13776,7 +13786,7 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                   f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}")
     else:
         ch_tag = ""
-    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
+    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{vp_mode_tag}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
 

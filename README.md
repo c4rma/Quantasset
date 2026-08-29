@@ -460,7 +460,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `1` | Clear an active Drawdown Full Stop block (manual review) |
 | `9` | Cycle trading mode (Order Flow ↔ BTD) — renamed 2026-08-27, was "CCCCWIDE" |
 | `Y` | OHLC profile, QQQ pane only — toggle the Markets macro overview |
-| `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27) |
+| `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27). Current state (`VP:Normal`/`VP:Historical`) shows right in the pane's own header (2026-08-28) |
 | `F` | Flatten position |
 | `G` | Toggle live/sim mode |
 | `H` | Full key-reference overlay for this mode |

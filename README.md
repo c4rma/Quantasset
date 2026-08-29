@@ -194,7 +194,7 @@ Full-screen CCCCWIDE framework readiness display. Scrollable sections:
 1. **Session** — Current session state
 2. **Volatility** — DVOL (ETH) / VXN (QQQ) with layer classification
 3. **PCVR** — Put/Call Volume Ratio with regime determination
-4. **High-Probability Levels** — VAH, VAL, POC, VWAP, SD bands, Expected Range, BT/ST, gamma clusters
+4. **High-Probability Levels** — VAH, VAL, POC, VWAP, SD bands, Expected Range, BT/ST, gamma clusters. BT/ST and (2026-08-28, explicit user request) POC are shown here for information but never gate an entry on their own — `hpl_any_active` excludes them the same way, since they're directional profit-take TARGETS ("price is near POC" isn't itself a "key level" condition that should arm a trade), not a standalone HPL condition. VAH/VAL/VWAP are unaffected — still both HPL-gating conditions and top-tier targets.
 5. **Targets** — Price-sorted target list (BT/ST, GEX Flip, clusters, ER 100%/150%)
 
 ### Data View (`[D]` overlay)

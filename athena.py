@@ -1016,6 +1016,63 @@ TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
 BTD_ENTRY_LOOKBACK = 10
 BTD_ENTRY_SIGMA    = 3.0
 
+# ── Profit ratchet ([2] toggle) ────────────────────────────────────────────
+# Opt-in extension of the TP1 breakeven-lock (_apply_tp1_breakeven_lock).
+# Where the breakeven-lock fires exactly once — on the TP1 partial fill —
+# and locks a small fixed $1.00/unit of net profit, the profit ratchet runs
+# on _manage_position's normal per-cycle path: each time open profit on the
+# STILL-OPEN quantity reaches a fresh +N*R milestone (N = 2, 3, 4, …, where R
+# is the asset's own fixed SL distance, ASSETS[asset]["sl"] — $10 ETH /
+# $1 QQQ), the resting stop is moved to lock in (N-1)*R of net profit on the
+# remaining quantity. Reuses the exact same primitives the breakeven-lock
+# does: _new_sl_for_target_net (per-asset, fee-aware SL solver), the
+# guaranteed-on-the-remaining-leg's-own-economics framing, protective-
+# direction rounding, and the tighten-only guard — it only ever moves the
+# stop in the protective direction, never loosens it.
+#
+# Persisted as a reserved top-level key in sizing_state.json, exactly like
+# "_trading_mode" / "_sizing_mode" — survives a paper-account [R]eset the
+# same way those two do (it's a strategy preference, not per-account state).
+# Default OFF. Toggled live via [2] in curses_main.
+PROFIT_RATCHET_MIN_MILESTONE  = 2     # first +N*R that arms a ratchet (spec: N>=2)
+PROFIT_RATCHET_MIN_HEADROOM_R = 0.5   # the ratcheted stop must sit at least this
+                                      # many R below live (Long) / above live
+                                      # (Short) — a computed lock level closer
+                                      # than that to price is skipped this cycle
+                                      # rather than placed. Guards against an
+                                      # instant stop-out, and is also why the
+                                      # ratchet is inert by design on any asset
+                                      # whose per-side fee approaches ~1R (QQQ:
+                                      # 2 x $0.85 round-trip vs R $1.00 — the
+                                      # "(N-1)R net" level never clears live
+                                      # there); ETH (fee ~$1.50 on a ~$2,500
+                                      # notional vs R $10) clears from N=2 on.
+
+def _load_profit_ratchet():
+    """Reserved-key load — mirrors _load_trading_mode / _load_sizing_mode."""
+    try:
+        with open(SIZING_STATE_PATH, encoding="utf-8") as f:
+            return bool(json.load(f).get("_profit_ratchet", False))
+    except Exception:
+        return False
+
+def _save_profit_ratchet():
+    """Read-modify-write, same discipline _save_trading_mode uses — never
+    truncate the file, since "_trading_mode"/"_sizing_mode" share it."""
+    try:
+        try:
+            with open(SIZING_STATE_PATH, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            payload = {}
+        payload["_profit_ratchet"] = PROFIT_RATCHET_ENABLED
+        with open(SIZING_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+PROFIT_RATCHET_ENABLED = _load_profit_ratchet()   # [2] in curses_main toggles + persists it
+
 STATUS_LIGHT_NAMES = ["Session", "Volatility", "PCVR", "HPLs", "Targets"]
 
 def required_status_lights():
@@ -4300,10 +4357,19 @@ def hpl_any_active(rows, closed):
     """Ported verbatim from status.py's own hpl_any_active — True if at
     least one HPL row is green this cycle, EXCLUDING BT/ST (they're
     directional profit-take TARGETS, not a 'price is near a key level'
-    condition that should itself gate a new entry)."""
+    condition that should itself gate a new entry).
+
+    POC excluded too as of 2026-08-28, explicit user request ("POC
+    should only be used as a target, not an HPL for entries") — same
+    exact reasoning BT/ST already got: POC became a top-tier TARGET
+    (reconstruct_targets, 2026-08-27) alongside VWAP/VAH/VAL, but unlike
+    those three it should never by itself have counted as a "price is
+    near a key level" condition gating a new entry either — this HPL row
+    still shows on the Status screen (informational), it just no longer
+    contributes to any_active."""
     if closed:
         return False
-    return any(ok for label_, _v, ok in rows if label_ not in ("BT", "ST"))
+    return any(ok for label_, _v, ok in rows if label_ not in ("BT", "ST", "POC"))
 
 def compute_dashboard_snapshot(data):
     """Ported from status.py's own compute_dashboard_snapshot — the exact
@@ -8783,6 +8849,12 @@ class AthenaInstrument:
         self._tp1_lock_done = False   # 2026-07-28 — see _apply_tp1_breakeven_lock;
                                         # reset to False on every new fill (_check_fill)
                                         # so it fires exactly once per trade's own TP1.
+        self._ratchet_milestone = 0   # 2026-08-28 — highest +N*R milestone the
+                                        # profit ratchet has already acted on for
+                                        # the current trade (see _apply_profit_
+                                        # ratchet). 0 = none yet; reset on every
+                                        # new fill / restart-reconcile alongside
+                                        # _tp1_lock_done.
         self._sl_order_id = None   # real mode only — the CURRENT resting SL's own
                                      # exchange orderID, kept in sync alongside
                                      # self.position["sl_order_id"] (see _place_sl_
@@ -9079,6 +9151,13 @@ class AthenaInstrument:
             # already-done rather than risk computing a WRONG lock price
             # off an assumed orig_qty that's actually too small.
             self._tp1_lock_done = len(tp_legs) < 2
+            # Profit ratchet (see _apply_profit_ratchet): a position
+            # resurrected on restart has no record of which milestones it
+            # already locked — start from 0 and let the tighten-only guard
+            # make any already-locked milestone a harmless no-op, rather
+            # than guess. Same "approximate rather than drop" trade-off
+            # _tp1_lock_done above already accepts for this scenario.
+            self._ratchet_milestone = 0
 
             # entry_day_ct (see _update_closed_pnl_today): a reconciled
             # position surviving a restart has no persisted record of its
@@ -10079,6 +10158,7 @@ class AthenaInstrument:
                           # approach as everything else on this line.
                           "fill_time": time.time()}
         self._tp1_lock_done = False
+        self._ratchet_milestone = 0   # fresh trade — see _apply_profit_ratchet
         self.pending = None
         self.state = "IN_POSITION"
         tag = " (sim)" if DRY_RUN else ""
@@ -10419,6 +10499,10 @@ class AthenaInstrument:
             return
 
         await self._sync_moving_tps(symbol, pos_side)
+        # Profit ratchet (2026-08-28) — after TP legs are settled for this
+        # cycle so its own DRY_RUN bracket refresh re-places the current
+        # leg set. No-op unless [2] is on (PROFIT_RATCHET_ENABLED).
+        await self._apply_profit_ratchet(symbol, pos_side)
 
     async def _sync_moving_tps(self, symbol, pos_side):
         """Refreshes any TP leg tracking a MOVING target — GEX Flip (a
@@ -10818,6 +10902,143 @@ class AthenaInstrument:
                     f"gross gain (SL -> {fmt_num(new_sl)}){RST}")
         log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price, "tp1_qty": tp1_qty,
                                                         "rem_qty": rem_qty, "target_remaining_net": target_remaining_net})
+
+    async def _apply_profit_ratchet(self, symbol, pos_side):
+        """Profit ratchet (2026-08-28) — opt-in extension of the TP1
+        breakeven-lock, gated on the [2] toggle (PROFIT_RATCHET_ENABLED,
+        default OFF). See that constant's own module-level comment for the
+        rationale; this is the per-cycle mechanism.
+
+        Called at the tail of _manage_position on every IN_POSITION cycle
+        (unlike _apply_tp1_breakeven_lock, which fires exactly once). Each
+        time open profit per unit — measured against the live price — first
+        crosses a fresh +N*R milestone (N = 2, 3, 4, …; R = self.cfg["sl"]),
+        it moves the resting stop to lock in (N-1)*R of NET profit on the
+        remaining quantity, guaranteed on that leg's own economics with no
+        credit taken for anything TP1 already banked (the same second-
+        independent-layer framing as the rescoped breakeven-lock — see its
+        docstring).
+
+        Every price/fee primitive is shared with _apply_tp1_breakeven_lock:
+          * _new_sl_for_target_net — the per-asset, fee-aware "SL price for
+            a target net $" solver (ETH's %-of-notional exit fee isolated by
+            division; QQQ's flat $/unit fee drops out as a constant).
+          * protective-direction rounding to the price step (Long rounds UP,
+            Short DOWN — a rounding error can then only ever help the
+            guarantee, never undershoot it).
+          * the tighten-only guard — a computed level no better than the
+            resting SL is discarded; protection is never loosened.
+
+        Two guards beyond the breakeven-lock's:
+          * self._ratchet_milestone — highest N already acted on for this
+            trade (reset to 0 on every fill / restart-reconcile). A milestone
+            is processed once; later cycles still at that milestone return
+            before any order work.
+          * PROFIT_RATCHET_MIN_HEADROOM_R — the new stop must sit at least
+            that many R below live (Long) / above live (Short) or the move
+            is skipped this cycle, so the "(N-1)*R net" level can never be
+            placed at/through live and trigger an instant stop-out. On an
+            asset whose per-side fee approaches ~1R (QQQ) this is never
+            satisfied and the ratchet stays inert by design.
+
+        Real mode: cancel the current SL by its own orderID, place the new
+        one, TP legs untouched. DRY_RUN: the same full-bracket refresh the
+        breakeven-lock uses (SimAccount cancel/replace is free and instant).
+        Both mirror _apply_tp1_breakeven_lock exactly."""
+        if not PROFIT_RATCHET_ENABLED or not self.position:
+            return
+        entry = self.position.get("fill_price")
+        rem_qty = self.position.get("qty") or 0.0
+        R = self.cfg["sl"]
+        if not entry or rem_qty <= 0 or not R or R <= 0:
+            return
+
+        live = await live_price_for_symbol(symbol)
+        if live is None:
+            return
+
+        # Open profit per unit, in R, measured on the live price. GROSS on
+        # purpose — milestone detection shouldn't wobble with the fee model;
+        # the LOCKED amount below is fee-aware via _new_sl_for_target_net.
+        move_per_unit = (live - entry) if pos_side == "Long" else (entry - live)
+        milestone = int(math.floor(move_per_unit / R))
+        if milestone < PROFIT_RATCHET_MIN_MILESTONE or milestone <= self._ratchet_milestone:
+            return
+
+        lock_r = milestone - 1
+        target_remaining_net = rem_qty * lock_r * R
+        entry_fee_share = fee_for_leg(self.asset, rem_qty, entry)
+        needed_remaining_net = target_remaining_net + entry_fee_share
+        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
+
+        pd = self.position.get("price_decimals", 2)
+        qd = self.position.get("qty_decimals", 2)
+        price_step = 10 ** (-pd) if pd else 1.0
+        if pos_side == "Long":
+            new_sl = math.ceil(new_sl_raw / price_step - 1e-9) * price_step
+        else:
+            new_sl = math.floor(new_sl_raw / price_step + 1e-9) * price_step
+        new_sl = round(new_sl, pd)
+
+        # Headroom guard — never rest the stop on top of the live price.
+        headroom = PROFIT_RATCHET_MIN_HEADROOM_R * R
+        if pos_side == "Long" and new_sl >= live - headroom:
+            return
+        if pos_side == "Short" and new_sl <= live + headroom:
+            return
+
+        # Tighten-only guard — identical in intent to _apply_tp1_breakeven_
+        # lock's own (search "Safety guard" in that method). If the new
+        # level wouldn't actually improve protection, record the milestone
+        # as processed (so we don't recompute it every cycle) and leave the
+        # resting SL untouched.
+        cur_sl = self.position.get("sl_price")
+        if cur_sl is not None:
+            if pos_side == "Long" and new_sl <= cur_sl:
+                self._ratchet_milestone = milestone
+                return
+            if pos_side == "Short" and new_sl >= cur_sl:
+                self._ratchet_milestone = milestone
+                return
+
+        tp_legs = self.position.get("tp_legs") or []
+        label = f"profit ratchet +{milestone}R"
+
+        if DRY_RUN:
+            try:
+                cancel_result = await cancel_all(symbol)
+            except Exception as e:
+                console_log(f"{self.asset}: {label} — cancel failed ({e})")
+                return
+            if not _order_ok(cancel_result):
+                console_log(f"{self.asset}: {RED}{label} — cancel failed ({cancel_result}), aborting{RST}")
+                log_event(self.asset, "profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
+                return
+            await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
+            for i, leg in enumerate(tp_legs, start=1):
+                await self._place_tp_leg_checked(symbol, pos_side, f"{leg['qty']:.{qd}f}", leg["level"], pd, str(i), leg.get("type", "?"))
+        else:
+            old_sl_order_id = self.position.get("sl_order_id")
+            if old_sl_order_id:
+                try:
+                    cancel_result = await cancel_order(symbol, pos_side, old_sl_order_id)
+                except Exception as e:
+                    cancel_result = {"code": -1, "msg": str(e)}
+                if not _order_ok(cancel_result):
+                    console_log(f"{self.asset}: {RED}{label} — SL cancel failed ({cancel_result}), aborting{RST}")
+                    log_event(self.asset, "profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
+                    return
+            await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
+            self.position["sl_order_id"] = self._sl_order_id
+
+        self.position["sl_price"] = new_sl
+        self._ratchet_milestone = milestone
+        console_log(f"{self.asset}: {GRN}{BLD}+{milestone}R open — stop ratcheted to lock "
+                    f"{fmt_money(target_remaining_net)} net (+{lock_r}R) on the open "
+                    f"{fmt_num(rem_qty, 2)} (SL -> {fmt_num(new_sl)}){RST}")
+        log_event(self.asset, "profit_ratchet", {"milestone": milestone, "lock_r": lock_r,
+                                                  "new_sl": new_sl, "old_sl": cur_sl, "rem_qty": rem_qty,
+                                                  "target_remaining_net": target_remaining_net, "live": live})
 
     async def _flatten_now(self, reason):
         """Force-flat regardless of state/regime — cancels any resting
@@ -14435,7 +14656,7 @@ def _apply_wire_control_flags(data):
     shared for anyone to see." Called only by _sync_client_connect_loop,
     once per received app_state message (every message carries a
     "control" section — see _sync_broadcast_app_state)."""
-    global DRY_RUN, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, SIZING_STATE
+    global DRY_RUN, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, SIZING_STATE, PROFIT_RATCHET_ENABLED
     control = data.get("control")
     if not control:
         return
@@ -14444,6 +14665,7 @@ def _apply_wire_control_flags(data):
     if "athena_enabled" in control:
         ATHENA_ENABLED = control["athena_enabled"]
     SIZING_MODE = control.get("sizing_mode", SIZING_MODE)
+    PROFIT_RATCHET_ENABLED = control.get("profit_ratchet", PROFIT_RATCHET_ENABLED)
     if "sizing_state" in control:
         SIZING_STATE = control["sizing_state"]
 
@@ -14595,7 +14817,7 @@ SYNC_DATA_VIEW = {"sim": {"trades": [], "events": [], "stats": compute_trade_sta
 # — it's a read-only view backed by the sync layer above, safe in Client
 # Mode like every other view-only key.
 CLIENT_BLOCKED_KEYS = {ord("r"), ord("R"), ord("f"), ord("F"), ord("n"), ord("N"),
-                        ord("a"), ord("A"), ord("b"), ord("B"), ord("1"),
+                        ord("a"), ord("A"), ord("b"), ord("B"), ord("1"), ord("2"),
                         ord("w"), ord("W"), ord("e"), ord("E"), ord("p"), ord("P"),
                         ord("g"), ord("G")}
 
@@ -14897,6 +15119,7 @@ def _sync_broadcast_app_state(include_footprint=True):
             "dry_run": DRY_RUN, "no_session": NO_SESSION,
             "athena_enabled": dict(ATHENA_ENABLED),
             "sizing_mode": SIZING_MODE,
+            "profit_ratchet": PROFIT_RATCHET_ENABLED,
             "sizing_state": {a: dict(s) for a, s in SIZING_STATE.items()},
         }
         _sync_broadcast({"type": "app_state", "data": data})
@@ -16353,7 +16576,8 @@ def draw_dashboard(db, snap, cols):
             else:
                 sizing_txt = f"   {DIM}Sizing: Aggressive{RST}"
         mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "Order Flow" else ""
-        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}")
+        ratchet_tag = f"   {DIM}trail: +(N-1)R lock{RST}" if PROFIT_RATCHET_ENABLED else ""
+        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}{ratchet_tag}")
         y += 1
         detail = "  " + "  ".join(
             (GRN if lights.get(n) else RED) + ("BTD" if n == "Order Flow" and TRADING_MODE == "BTD" else n) + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
@@ -19894,6 +20118,7 @@ TRADING_HELP_SECTIONS = [
         ("[T]",        "Set the order-flow imbalance ratio threshold"),
         ("[0]",        "Cycle sizing mode  (Standard  <->  Aggressive/1R+W)"),
         ("[1]",        "Clear an active Drawdown Full Stop block (manual review)"),
+        ("[2]",        "Toggle the profit ratchet  (trail an open stop to lock +(N-1)R at each +NR)"),
     ]),
     ("TRADING CONTROLS", [
         ("[9]",        "Cycle trading mode  (Order Flow  <->  BTD candle-close)"),
@@ -20309,7 +20534,7 @@ def draw_loading_screen(db, rows, cols, steps, tick):
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global PCT, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE
-    global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE
+    global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE, PROFIT_RATCHET_ENABLED
     curses.curs_set(0)
     stdscr.keypad(True)
     curses.mousemask(0)
@@ -21808,6 +22033,18 @@ def curses_main(stdscr):
             _save_sizing_state()
             console_log(f"{YLW}{BLD}Sizing mode: {SIZING_MODE.capitalize()}{RST} (via [0])")
             log_event("SYSTEM", "sizing_mode_changed", {"mode": SIZING_MODE})
+        elif key == ord("2") and profile_mode != "ohlc":
+            # 2026-08-28: toggles the profit ratchet (see PROFIT_RATCHET_
+            # ENABLED / _apply_profit_ratchet). Persisted as a reserved key
+            # in sizing_state.json, same as [0]/[9]. Guarded against
+            # profile_mode=="ohlc" for the same "same key, different meaning
+            # per view" reason [0] is (the OHLC panel owns the digit keys in
+            # that view). Only affects how an OPEN position's stop is
+            # trailed — never sizing, never entries.
+            PROFIT_RATCHET_ENABLED = not PROFIT_RATCHET_ENABLED
+            _save_profit_ratchet()
+            console_log(f"{YLW}{BLD}Profit ratchet: {'ON' if PROFIT_RATCHET_ENABLED else 'OFF'}{RST} (via [2])")
+            log_event("SYSTEM", "profit_ratchet_toggled", {"enabled": PROFIT_RATCHET_ENABLED})
         elif key == ord("1"):
             # 2026-08-27: replaces Blackjack's own per-asset ladder-reset
             # [1] — the drawdown de-risking ladder's 20%+ Full Stop tier

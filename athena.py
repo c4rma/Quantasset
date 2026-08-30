@@ -12998,6 +12998,136 @@ OHLC_VOL_H        = 4   # smaller than draw_chart's own VOL_H=6 — this panel
                           # is one of two side-by-side halves, not a full-
                           # screen chart, so it gives up less vertical room
 
+# ── VolEffort — ported from vol-effort.py (2026-08-29 user request) ────────
+# "Import vol-effort.py into the OHLC charts as a toggle-able indicator
+# called 'VolEffort'. When activated, the bottom volume panel is replaced
+# by the z-score chart. Do not import the BTD function since it is
+# already separately built into the OHLC charts." Only compute_bar_
+# records' own z-score half is ported (bar_direction/effort-ratio/
+# classify/the rolling-baseline z) — vol-effort.py's own compute_btd_
+# signals is deliberately NOT ported; this panel's existing BTD overlay
+# (OHLC_BTD_LOOKBACK/SIGMA just above, and _draw_ohlc_chart_panel's own
+# BTD block) already covers that, independently, with its own (identical,
+# since vol-effort.py's own BTD was itself ported FROM this panel)
+# candle-shape math — importing a second copy here would just be a
+# redundant, easy-to-drift duplicate of the same signal.
+#
+# What VolEffort actually measures: how much VOLUME a bar took to cover
+# its own price RANGE — high volume for a small range ("effort" without
+# "result") reads as ABSORPTION; a big range on ordinary volume reads as
+# a CLEAN, unresisted move. Per-bar log(volume / max(range, tick)) is
+# z-scored against a trailing baseline of the last `window` ELIGIBLE
+# (closed, non-dead, session-appropriate) bars strictly BEFORE it — a bar
+# never contributes to its own z, matching how vol-effort.py itself
+# scores live. window/hi_z/lo_z are calibrated PER ASSET (see vol-effort.py's
+# own ASSET_CONFIG / vol-effort_calibration.md) — ETH's distribution is
+# near-symmetric, QQQ's is right-skewed, so the two assets' own thresholds
+# are deliberately not the same numbers.
+VOL_EFFORT_CONFIG = {
+    "ETH": {"window": 45, "hi_z": 1.9, "lo_z": -1.75},
+    "QQQ": {"window": 60, "hi_z": 2.5, "lo_z": -1.10},
+}
+VOL_EFFORT_DOJI_BODY_FRAC = 0.10   # matches vol-effort.py's own DOJI_BODY_FRAC
+VOL_EFFORT_ABSORPTION = "absorption"
+VOL_EFFORT_CLEAN = "clean"
+VOL_EFFORT_NEUTRAL = "neutral"
+
+def _vol_effort_bar_direction(o, c, hi, lo):
+    """+1 up, -1 down, 0 doji (body < VOL_EFFORT_DOJI_BODY_FRAC of range) —
+    ported verbatim from vol-effort.py's own bar_direction."""
+    rng = hi - lo
+    if rng > 0 and abs(c - o) < VOL_EFFORT_DOJI_BODY_FRAC * rng:
+        return 0
+    return 1 if c > o else (-1 if c < o else 0)
+
+def _vol_effort_is_session_eligible(ts, is_crypto):
+    """Whether this bar's own 1m bucket counts toward the z-score
+    baseline at all — crypto trades 24/7 (always eligible); QQQ is
+    restricted to regular trading hours (9:30am-4:00pm ET = 8:30am-3:00pm
+    CT, Mon-Fri) — ported verbatim from vol-effort.py's own is_rth_et,
+    just re-anchored to this app's own local-time-is-CT convention
+    (status_qqq_market_closed's own STATUS_QQQ_OPEN_CT_MIN/CLOSE_CT_MIN
+    use a slightly narrower 8:45-15:00 CT trading-eligibility window — a
+    DIFFERENT, deliberately tighter concept for gating new entries, not
+    this baseline's own eligibility test; vol-effort_calibration.md's own
+    window/hi_z/lo_z were calibrated against the wider RTH boundary
+    ported here, so keeping it as-is rather than reusing the narrower
+    gate avoids silently invalidating that calibration)."""
+    if is_crypto:
+        return True
+    dt = datetime.fromtimestamp(ts)
+    if dt.weekday() >= 5:
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    return 8 * 60 + 30 <= minutes < 15 * 60
+
+def _vol_effort_classify(z, direction, hi_z, lo_z):
+    """(klass, bias) — bias is the tool's directional READ of the bar
+    (absorption cuts against the bar's own direction, a clean move runs
+    with it), NOT the bar's own up/down — ported verbatim from
+    vol-effort.py's own classify (its "read" text string is dropped here;
+    nothing in this panel currently surfaces it, and it's trivially
+    re-derivable from klass+direction if that ever changes)."""
+    if z is None:
+        return None, 0
+    if z >= hi_z:
+        if direction < 0:
+            return VOL_EFFORT_ABSORPTION, +1
+        if direction > 0:
+            return VOL_EFFORT_ABSORPTION, -1
+        return VOL_EFFORT_ABSORPTION, 0
+    if z <= lo_z:
+        if direction > 0:
+            return VOL_EFFORT_CLEAN, +1
+        if direction < 0:
+            return VOL_EFFORT_CLEAN, -1
+        return VOL_EFFORT_CLEAN, 0
+    return VOL_EFFORT_NEUTRAL, 0
+
+def _vol_effort_records(bars, asset, now_ts=None):
+    """oldest->newest list of {"ts","z","klass","direction","dead","live"}
+    for this panel's own 1m bars — ported from vol-effort.py's own
+    compute_bar_records, MINUS its own btd field/compute_btd_signals call
+    (see this section's own header comment for why that's deliberately
+    not ported). bars: oldest->newest {"ts","o","h","l","c","v"} dicts —
+    this panel's own shape (ch_snapshot_1m/LIVE_TAPE.snapshot_1m), not
+    vol-effort.py's own raw tuples, so this is a re-typed port, not a
+    verbatim copy, but the actual baseline/z-score arithmetic is
+    unchanged. The most recent bar is treated as still-forming (live,
+    unclassified) if its own minute bucket is the current wall-clock
+    minute, same rule vol-effort.py itself uses."""
+    if now_ts is None:
+        now_ts = time.time()
+    cur_minute = int(now_ts) // 60 * 60
+    cfg = VOL_EFFORT_CONFIG.get(asset, VOL_EFFORT_CONFIG["ETH"])
+    window, hi_z, lo_z = cfg["window"], cfg["hi_z"], cfg["lo_z"]
+    tick = ASSETS.get(asset, {}).get("tick", 0.01)
+    is_crypto = (asset == "ETH")
+    baseline = []   # ln(ratio) of eligible closed bars, oldest->newest
+    out = []
+    for bar in bars:
+        ts, o, h, l, c, v = bar["ts"], bar["o"], bar["h"], bar["l"], bar["c"], bar["v"]
+        live = ts >= cur_minute
+        dead = v <= 0
+        eligible = (not live) and (not dead) and _vol_effort_is_session_eligible(ts, is_crypto)
+        rng = h - l
+        ratio = (v / max(rng, tick)) if not dead else None
+        value = math.log(ratio) if (ratio is not None and ratio > 0) else None
+        direction = _vol_effort_bar_direction(o, c, h, l)
+        z = None
+        if eligible and value is not None and len(baseline) >= window:
+            w = baseline[-window:]
+            m = sum(w) / len(w)
+            sd = statistics.pstdev(w)
+            if sd > 0:
+                z = (value - m) / sd
+        klass, bias = (_vol_effort_classify(z, direction, hi_z, lo_z) if eligible else (None, 0))
+        out.append({"ts": ts, "z": z, "klass": klass, "direction": direction,
+                     "bias": bias, "dead": dead, "live": live})
+        if eligible and value is not None:
+            baseline.append(value)
+    return out
+
 def _ohlc_target_style(t_type):
     """Color/weight per Athena target type — this panel's own analogue of
     draw_chart's BT/ST/GEX-Flip overlay (_chart_draw_bt_st_gex), just
@@ -13049,13 +13179,27 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # scaled to this panel's own smaller geometry instead of full-terminal.
     TIME_H = 1
     chart_top = top
-    chart_bot_excl = y1 - 1 - TIME_H - OHLC_VOL_H
+    # 2026-08-29 user-reported ("Make the z-score window big enough to fit
+    # the whole chart"): OHLC_VOL_H's own 4 rows is enough for the plain
+    # volume histogram (one bar-height reading per column is all that
+    # needs), but nowhere near enough room for a genuinely readable
+    # signed z-score histogram (a zero line plus both an absorption
+    # DIRECTION and a clean DIRECTION need real vertical room to read as
+    # anything but a sliver) — VolEffort gets a substantially taller
+    # bottom band instead, sized as a fraction of this pane's own total
+    # height rather than a fixed row count so it scales with whatever
+    # split/zoom layout is currently active, capped so candles always
+    # keep a usable minimum of their own.
+    _vol_h = OHLC_VOL_H
+    if ui.get("vol_effort"):
+        _vol_h = max(OHLC_VOL_H, min(int((y1 - top) * 0.35), (y1 - top) - 15))
+    chart_bot_excl = y1 - 1 - TIME_H - _vol_h
     chart_h = max(1, chart_bot_excl - chart_top)
     chart_r = x0 + cols - OHLC_PRICE_W - 1
     chart_w = max(1, chart_r - x0)
     time_row = chart_bot_excl + 1
     vol_top = time_row + 1
-    vol_bot_excl = vol_top + OHLC_VOL_H
+    vol_bot_excl = vol_top + _vol_h
 
     all_candles = list(bars_1m)
     if live_1m:
@@ -13589,6 +13733,13 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     elif pending:
         _level_line(pending.get("entry_price"), "ENTRY", P_YELLOW, curses.A_BOLD)
 
+    # VolEffort records — computed once, up here, so both the candle
+    # overlay just below and the VOLUME/VOLEFFORT panel further down
+    # share the exact same pass rather than scoring every bar twice.
+    _ve_by_ts = {}
+    if ui.get("vol_effort"):
+        _ve_by_ts = {r["ts"]: r for r in _vol_effort_records(all_candles, asset)}
+
     # ── CANDLES / LINE CHART ─────────────────────────────────────────────
     if line_mode:
         _prev_row = None
@@ -13629,6 +13780,26 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             else:
                 for r in range(r_top, r_bot + 1):
                     db.put(r, col, "█", body_pair)
+
+            # VolEffort bias marker (2026-08-29 user request — the flag
+            # outline this used to also draw, adapted from vol-effort.py's
+            # own _flag_box, was removed the same day per explicit user
+            # request: "remove the bar outlines but leave the markers").
+            # Only the directional bias glyph remains — the tool's own
+            # READ on the bar (▲ green bullish lean / ▼ red bearish lean /
+            # ◆ dim no lean), NOT the candle's own up/down — placed one
+            # row above the bar's own high, no outline/recoloring of the
+            # bar itself.
+            if ui.get("vol_effort"):
+                _ve_rec = _ve_by_ts.get(bar["ts"])
+                if _ve_rec and _ve_rec["klass"] in (VOL_EFFORT_ABSORPTION, VOL_EFFORT_CLEAN):
+                    if _ve_rec["bias"] > 0:
+                        _ve_glyph, _ve_gpair = "▲", P_GREEN
+                    elif _ve_rec["bias"] < 0:
+                        _ve_glyph, _ve_gpair = "▼", P_RED
+                    else:
+                        _ve_glyph, _ve_gpair = "◆", P_DIM
+                    db.put(clamp(r_hi - 1), col, _ve_glyph, _ve_gpair, curses.A_BOLD | curses.A_REVERSE)
 
     # ── SESSIONS OVERLAY ─────────────────────────────────────────────────
     # Ported from draw_chart's own sessions indicator (19952-20030),
@@ -13872,23 +14043,91 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             if db.buf[_r][crosshair_col][0] == " ":
                 db.put(_r, crosshair_col, CROSSHAIR_LINE_CH, P_CYAN)
 
-    # ── VOLUME ───────────────────────────────────────────────────────────
+    # ── VOLUME / VOLEFFORT ─────────────────────────────────────────────────
     # Ported from draw_chart's own volume histogram (20231-20246).
-    db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
-    for r in range(vol_top, vol_bot_excl):
-        db.put(r, chart_r, "│", P_DIM)
-    max_vol = max((b["v"] for b in visible), default=1) or 1
-    for i, bar in enumerate(visible):
-        col = start_col + i
-        if col < x0 or col >= chart_r:
-            continue
-        bull = bar["c"] >= bar["o"]
-        vol_pair = P_DEFAULT if bull else P_BLUE   # see the candle body's own
-                                                     # 2026-08-27 comment above —
-                                                     # same inlined default scheme
-        bar_h = max(1, int(bar["v"] / max_vol * OHLC_VOL_H))
-        for r in range(vol_bot_excl - bar_h, vol_bot_excl):
-            db.put(r, col, "#", vol_pair)
+    # 2026-08-29 user request: "[VolEffort] toggle-able indicator...
+    # activated, the bottom volume panel is replaced by the z-score
+    # chart" — ui["vol_effort"] swaps this whole section for a z-score
+    # histogram (see VOL_EFFORT_CONFIG's own header comment) instead of
+    # the plain per-bar volume bars, same vol_top..vol_bot_excl footprint,
+    # nothing else in the panel changes.
+    if ui.get("vol_effort"):
+        db.puts(vol_top, x0, "VolEffort", P_DIM, curses.A_DIM)
+        for r in range(vol_top, vol_bot_excl):
+            db.put(r, chart_r, "│", P_DIM)
+        # _ve_by_ts already computed once, up in the candle-drawing block
+        # above (shared with its own bias-marker overlay) — no need to
+        # score every bar a second time here.
+        _ve_cfg = VOL_EFFORT_CONFIG.get(asset, VOL_EFFORT_CONFIG["ETH"])
+        _ve_hi_z, _ve_lo_z = _ve_cfg["hi_z"], _ve_cfg["lo_z"]
+        _ve_zs = [r["z"] for r in _ve_by_ts.values() if r["z"] is not None]
+        _ve_zmax = max([abs(z) for z in _ve_zs] + [abs(_ve_hi_z), abs(_ve_lo_z), 3.0])
+        # 2026-08-29 user-reported ("make the z-score window big enough to
+        # fit the whole chart"): with _vol_h now a real, substantial band
+        # (see that variable's own comment above) instead of a fixed 4
+        # rows, this can finally match vol-effort.py's own draw_zpane
+        # faithfully — a proper zero line at the vertical MIDDLE of the
+        # band, absorption (+z) growing UP toward the top, clean (-z)
+        # growing DOWN toward the bottom, plus guide lines/labels at 0,
+        # +hi_z and lo_z, same as the original.
+        _ve_mid = (vol_top + vol_bot_excl - 1) // 2
+        _ve_up_room = _ve_mid - vol_top
+        _ve_down_room = (vol_bot_excl - 1) - _ve_mid
+
+        def _ve_row(zval):
+            if zval >= 0:
+                return max(vol_top, _ve_mid - int(round(zval / _ve_zmax * _ve_up_room)))
+            return min(vol_bot_excl - 1, _ve_mid + int(round(-zval / _ve_zmax * _ve_down_room)))
+
+        for c2 in range(x0, chart_r):
+            db.put(_ve_mid, c2, "·", P_DIM, curses.A_DIM)
+        _ve_hi_row, _ve_lo_row = _ve_row(_ve_hi_z), _ve_row(_ve_lo_z)
+        for c2 in range(x0, chart_r):
+            if db.buf[_ve_hi_row][c2][0] == " ":
+                db.put(_ve_hi_row, c2, "╌", P_MAGENTA, curses.A_DIM)
+            if db.buf[_ve_lo_row][c2][0] == " ":
+                db.put(_ve_lo_row, c2, "╌", P_CYAN, curses.A_DIM)
+        db.puts(_ve_hi_row, chart_r + 1, f"{_ve_hi_z:+.1f}"[:OHLC_PRICE_W], P_MAGENTA, curses.A_DIM)
+        db.puts(_ve_lo_row, chart_r + 1, f"{_ve_lo_z:+.1f}"[:OHLC_PRICE_W], P_CYAN, curses.A_DIM)
+
+        for i, bar in enumerate(visible):
+            col = start_col + i
+            if col < x0 or col >= chart_r:
+                continue
+            rec = _ve_by_ts.get(bar["ts"])
+            if not rec or rec["z"] is None:
+                continue
+            if rec["klass"] == VOL_EFFORT_ABSORPTION:
+                ve_pair = P_MAGENTA
+            elif rec["klass"] == VOL_EFFORT_CLEAN:
+                ve_pair = P_CYAN
+            elif rec["direction"] > 0:
+                ve_pair = P_DEFAULT   # matches the candle body's/plain volume
+                                        # bar's own bull color one row up
+            elif rec["direction"] < 0:
+                ve_pair = P_BLUE      # ditto, bear
+            else:
+                ve_pair = P_DIM
+            r_end = _ve_row(rec["z"])
+            r_lo2, r_hi2 = sorted((_ve_mid, r_end))
+            for r in range(r_lo2, r_hi2 + 1):
+                db.put(r, col, "█", ve_pair, curses.A_BOLD)
+    else:
+        db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
+        for r in range(vol_top, vol_bot_excl):
+            db.put(r, chart_r, "│", P_DIM)
+        max_vol = max((b["v"] for b in visible), default=1) or 1
+        for i, bar in enumerate(visible):
+            col = start_col + i
+            if col < x0 or col >= chart_r:
+                continue
+            bull = bar["c"] >= bar["o"]
+            vol_pair = P_DEFAULT if bull else P_BLUE   # see the candle body's own
+                                                         # 2026-08-27 comment above —
+                                                         # same inlined default scheme
+            bar_h = max(1, int(bar["v"] / max_vol * OHLC_VOL_H))
+            for r in range(vol_bot_excl - bar_h, vol_bot_excl):
+                db.put(r, col, "#", vol_pair)
 
     # ── TIME AXIS ────────────────────────────────────────────────────────
     db.put(time_row, chart_r, "│", P_DIM)
@@ -13967,6 +14206,14 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     vp_mode_tag = ""
     if profile_mode == "ohlc":
         vp_mode_tag = f"  VP:{'Historical' if (ohlc_ui or {}).get('vp_historical') else 'Normal'}"
+        # 2026-08-29 — VolEffort ([6]) only shown when it's actually on,
+        # unlike VP's own always-shown tag: VP always has SOME active
+        # mode (Normal or Historical) worth naming, but VolEffort is an
+        # optional replacement for the plain VOL histogram — silent when
+        # off is the same "nothing to say" convention closed_tag/focus_tag
+        # already use elsewhere on this line.
+        if (ohlc_ui or {}).get("vol_effort"):
+            vp_mode_tag += "  VolEffort:On"
     # Compact crosshair readout — folded into the SAME header string for
     # the same reason closed_tag is (see the comment block above): a
     # second db.puts() overlay on this row is exactly what caused the
@@ -15978,6 +16225,32 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
     lo = max(0, hi - n_strike_cols)
     visible_strikes = grid_sorted[lo:hi]
 
+    # [X] crosshair (2026-08-28 user request) — "N strikes back from the
+    # rightmost strike that actually HAS a value," resolved fresh here
+    # against whatever's actually visible this render (self-clamping —
+    # the key handler doesn't need to know n_strike_cols in advance).
+    #
+    # 2026-08-29 user-reported ("the crosshair begins too far away — it
+    # should start/stop at the last strike with a value in either
+    # direction"): visible_strikes is every strike in the fetched grid
+    # within the pan window, which routinely extends well past where the
+    # chain actually has any nonzero gamma exposure (deep OTM strikes
+    # with $0 both sides) — activating at "rightmost VISIBLE" landed the
+    # crosshair out in that dead space, nowhere near an actual bar.
+    # Restricted to strikes with a genuinely nonzero value on the side(s)
+    # this mode actually plots, so index 0 always lands on real data and
+    # movement can never wander into the empty padding.
+    if net_mode:
+        _ch_candidates = [s for s in visible_strikes if ref_col["gex"].get(s, 0.0) != 0.0]
+    else:
+        _ch_candidates = [s for s in visible_strikes
+                           if gex_by_type.get(s, {}).get("call", 0.0) != 0.0
+                           or gex_by_type.get(s, {}).get("put", 0.0) != 0.0]
+    ch_strike = None
+    if ui.get("crosshair_active") and _ch_candidates:
+        ch_idx = max(0, min(len(_ch_candidates) - 1, ui.get("crosshair_idx") or 0))
+        ch_strike = _ch_candidates[len(_ch_candidates) - 1 - ch_idx]
+
     scale = 0.0
     if net_mode:
         for strike in visible_strikes:
@@ -16011,6 +16284,19 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
         if flip_col is not None:
             for ry in range(top, y1 - bottom_reserved):
                 db.put(ry, flip_col, "|", P_DEFAULT, curses.A_BOLD)
+
+    if ch_strike is not None:
+        # Non-destructive — drawn into blank cells only, same technique
+        # every other chart's own [X] crosshair uses, so it never
+        # overwrites the flip/price marker lines just above or (once
+        # drawn, further below) an actual GEX bar; the selected strike is
+        # already distinguished separately via its own highlighted label
+        # and the readout in the info line.
+        ch_col = col_of.get(ch_strike)
+        if ch_col is not None:
+            for ry in range(top, y1 - bottom_reserved):
+                if db.buf[ry][ch_col][0] == " ":
+                    db.put(ry, ch_col, CROSSHAIR_LINE_CH, P_CYAN)
 
     price_lo, price_hi = gex_bounding_strikes(grid_sorted, spot)
     price_col = gex_resolve_marker_col(price_lo, price_hi, col_of)
@@ -16056,6 +16342,16 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
                 lbl_pair, lbl_attrs = P_DIM, 0
             db.puts(y1 - bottom_reserved, max(x0, cx - 1), fstrike(strike, is_crypto), lbl_pair, lbl_attrs)
 
+    if ch_strike is not None:
+        # Dedicated, highlighted strike label AT the crosshair's own
+        # column — drawn after the regular sparse labels above so it's
+        # never hidden by one landing nearby, same "own label wins"
+        # convention Net Drift's own [X] crosshair uses.
+        _ch_cx = col_of.get(ch_strike)
+        if _ch_cx is not None:
+            _ch_lbl = fstrike(ch_strike, is_crypto)
+            db.puts(y1 - bottom_reserved, max(x0, _ch_cx - 1), _ch_lbl, P_CYAN, curses.A_BOLD | curses.A_REVERSE)
+
     mp_str = fstrike(max_pain, is_crypto) if max_pain is not None else "N/A"
     net_gex_str = fdollars_compact(net_gex)
     net_gex_pair = P_GREEN if net_gex >= 0 else P_RED
@@ -16071,12 +16367,31 @@ def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
         ("    Zero Gamma/GEX Flip ", P_DIM, 0), (flip_str, P_CYAN, curses.A_BOLD),
         (f"    (Max Pain/Flip smoothed over last {GEX_SMOOTH_N})", P_DIM, 0),
     ]
+    if ch_strike is not None:
+        # [X] crosshair readout — replaces nothing, just appended, since
+        # this info line already has room and the strike/value pairing is
+        # exactly what "which strike, what's its GEX" needs (same
+        # "readout supplements the existing info line" choice Net Drift's
+        # own crosshair makes when the line isn't otherwise full).
+        if net_mode:
+            _ch_val = ref_col["gex"].get(ch_strike, 0.0)
+            _ch_pair = P_GREEN if _ch_val >= 0 else P_RED
+            _ch_readout = [("    ✛ Strike ", P_DIM, 0), (fstrike(ch_strike, is_crypto), P_CYAN, curses.A_BOLD),
+                            (" Net GEX ", P_DIM, 0), (fdollars_compact(_ch_val), _ch_pair, curses.A_BOLD)]
+        else:
+            _ch_entry = gex_by_type.get(ch_strike, {})
+            _ch_call, _ch_put = _ch_entry.get("call", 0.0), _ch_entry.get("put", 0.0)
+            _ch_readout = [("    ✛ Strike ", P_DIM, 0), (fstrike(ch_strike, is_crypto), P_CYAN, curses.A_BOLD),
+                            (" Call ", P_DIM, 0), (fdollars_compact(_ch_call), P_BLUE, curses.A_BOLD),
+                            (" Put ", P_DIM, 0), (fdollars_compact(_ch_put), P_YELLOW, curses.A_BOLD)]
+        info_pieces = info_pieces + _ch_readout
     _gex_draw_pieces(db, y1 - bottom_reserved + 1, x0, info_pieces, x1)
 
     bot = y1 - 1
     other_asset = "QQQ" if asset == "ETH" else "ETH"
     vert_tag = "" if ui["vert_follow"] else "[scrolled]"
-    hint = (f" [H]elp  q=quit  Esc=dashboard  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
+    ch_hint = "  [X]:crosshair on, ←/→ move" if ch_strike is not None else "  [X]:crosshair"
+    hint = (f" [H]elp  q=quit  Esc=dashboard  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}{ch_hint}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
 
 FAST_MATCH_STEP = 0.5   # DRY_RUN only — see _fast_match_wait
@@ -20109,6 +20424,7 @@ TRADING_HELP_SECTIONS = [
         ("[O]",        "Toggle the Sessions overlay"),
         ("[0]",        "Toggle candle vs. line chart style"),
         ("[4]",        "Toggle VAH/VAL/POC Historical Mode (developing trace) vs. Normal"),
+        ("[6]",        "Toggle VolEffort — replaces the VOL histogram with a volume-effort z-score chart"),
         ("[Y]",        "QQQ pane only — swap the candle chart for the Markets overview"),
     ]),
     ("RISK & SIZING", [
@@ -20148,10 +20464,11 @@ GEX_HELP_SECTIONS = [
         ("[Tab]",      "Switch asset focus  (ETH/QQQ)"),
         ("[G]",        "Toggle view  (time-series dot map  <->  GEX by strike)"),
         ("[N]",        "Toggle net vs. separate call/put bars  (by-strike view only)"),
+        ("[X]",        "Toggle crosshair  (by-strike view only) — [←]/[→] move it while on"),
         ("[z] / [End]",  "Reset to live-follow  (time + vertical)"),
     ]),
     ("PANNING", [
-        ("[←] [→]",    "Pan time back/forward  (by-strike: shift strikes down/up)"),
+        ("[←] [→]",    "Pan time back/forward  (by-strike: shift strikes down/up; moves the crosshair instead if it's on)"),
         ("[PgUp] [PgDn]", "Page time back/forward  (by-strike: page strikes down/up)"),
         ("[↑] [↓]",    "Step the strike window up/down  (by-strike view)"),
         ("[[] []]",    "Page the strike window up/down"),
@@ -20740,6 +21057,13 @@ def curses_main(stdscr):
                                    # only "Normal Mode" (flat current-value
                                    # line). 2026-08-27 user request: on by
                                    # default.
+    ohlc_vol_effort = False   # [6] — VolEffort (ported from vol-effort.py,
+                                # 2026-08-29 user request): replaces the
+                                # bottom VOL histogram with a z-score
+                                # histogram of volume-per-range effort. Off
+                                # by default — this is a NEW indicator, not
+                                # an established convention like [4]'s own
+                                # default-on.
     ohlc_show_markets_qqq = False   # [Y] — QQQ pane ONLY: swap the candle
                                    # chart for the Markets overview (2026-08-27,
                                    # folded in once the standalone Markets mode
@@ -20787,6 +21111,16 @@ def curses_main(stdscr):
     gex_view_end_idx = {"ETH": 0, "QQQ": 0}           # frozen time-axis index when panned
     gex_vert_follow = {"ETH": True, "QQQ": True}      # strike-axis auto-center
     gex_vert_center_idx = {"ETH": 0, "QQQ": 0}        # frozen strike-axis index when scrolled
+    # [X] within gex_mode's by-strike view (2026-08-28 user request, "Add
+    # a crosshair to the Net GEX distribution in GEX") — same toggle-then-
+    # arrow-keys convention every other chart's own [X] crosshair already
+    # uses. "N strikes back from the rightmost VISIBLE one," same relative
+    # convention chart_crosshair_idx uses for bars — resolved fresh inside
+    # draw_gex_by_strike itself against whatever's actually visible that
+    # render, so this stays valid across a resize/re-pan with no extra
+    # bookkeeping here.
+    gex_by_strike_crosshair_active = {"ETH": False, "QQQ": False}
+    gex_by_strike_crosshair_idx = {"ETH": 0, "QQQ": 0}
     status_mode = False   # full-screen Status mode (Phase 3c) — the [M]
                             # cycle's next stop after GEX; see gex_mode above
     status_scroll = 0
@@ -20991,7 +21325,9 @@ def curses_main(stdscr):
             gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
             gex_ui = {"live_follow": gex_live_follow[gex_asset], "view_end_idx": gex_view_end_idx[gex_asset],
                       "vert_follow": gex_vert_follow[gex_asset], "vert_center_idx": gex_vert_center_idx[gex_asset],
-                      "by_strike_net": gex_by_strike_net}
+                      "by_strike_net": gex_by_strike_net,
+                      "crosshair_active": gex_by_strike_crosshair_active[gex_asset],
+                      "crosshair_idx": gex_by_strike_crosshair_idx[gex_asset]}
             if gex_by_strike:
                 draw_gex_by_strike(db, gex_asset, 0, rows, 0, cols, gex_ui)
             else:
@@ -21082,7 +21418,7 @@ def curses_main(stdscr):
                 with CH_STATE["QQQ"].lock:
                     qqq_levels = dict(CH_STATE["QQQ"].indicator_levels)
                 ohlc_ui_common = dict(show_sessions=ohlc_show_sessions, line_mode=ohlc_line_mode,
-                                       vp_historical=ohlc_vp_historical)
+                                       vp_historical=ohlc_vp_historical, vol_effort=ohlc_vol_effort)
                 if chart_zoom:
                     # [Z] fullscreen — whichever pane [Tab] currently has
                     # focused gets the ENTIRE chart width, same panel-
@@ -21363,13 +21699,24 @@ def curses_main(stdscr):
                 gex_by_strike = not gex_by_strike
             elif key in (ord("n"), ord("N")) and gex_by_strike:
                 gex_by_strike_net = not gex_by_strike_net
+            elif key in (ord("x"), ord("X")) and gex_by_strike:
+                # 2026-08-28 user request ("Add a crosshair to the Net GEX
+                # distribution in GEX") — same toggle-then-arrow-keys
+                # convention every other chart's own [X] crosshair uses.
+                # Activates at the rightmost visible strike, same
+                # first-press behavior chart_crosshair_active's own [X] has.
+                gex_by_strike_crosshair_active[gex_asset] = not gex_by_strike_crosshair_active[gex_asset]
+                if gex_by_strike_crosshair_active[gex_asset]:
+                    gex_by_strike_crosshair_idx[gex_asset] = 0
             elif key == 9:   # Tab — switch asset, same convention as the footprint charts
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("z"), ord("Z"), curses.KEY_END):
                 gex_live_follow[gex_asset] = True
                 gex_vert_follow[gex_asset] = True
             elif key == curses.KEY_LEFT:
-                if gex_by_strike:
+                if gex_by_strike and gex_by_strike_crosshair_active[gex_asset]:
+                    gex_by_strike_crosshair_idx[gex_asset] += 1   # further back = further LEFT (older/lower strike)
+                elif gex_by_strike:
                     _gex_vert_step(gex_asset, -GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
                 else:
                     n_hist = len(GEX_HISTORY[gex_asset])
@@ -21378,7 +21725,9 @@ def curses_main(stdscr):
                     gex_live_follow[gex_asset] = False
                     gex_view_end_idx[gex_asset] = max(1, gex_view_end_idx[gex_asset] - GEX_ARROW_STEP)
             elif key == curses.KEY_RIGHT:
-                if gex_by_strike:
+                if gex_by_strike and gex_by_strike_crosshair_active[gex_asset]:
+                    gex_by_strike_crosshair_idx[gex_asset] = max(0, gex_by_strike_crosshair_idx[gex_asset] - 1)
+                elif gex_by_strike:
                     _gex_vert_step(gex_asset, GEX_VERT_STEP, gex_vert_follow, gex_vert_center_idx)
                 elif not gex_live_follow[gex_asset]:
                     n_hist = len(GEX_HISTORY[gex_asset])
@@ -22224,7 +22573,23 @@ def curses_main(stdscr):
             if chart_crosshair_active[asset]:
                 total = bar_count
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
-                n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
+                # 2026-08-29 user-reported ("crosshair locks after a few
+                # candles from the right end, then scrolls the whole chart
+                # back"): CHART_AXIS_W/CHART_COL_W are footprint.py's own
+                # geometry (a wide multi-char price/volume cell per bar,
+                # CELL_TXT_W=15) — using them here for OHLC mode massively
+                # UNDERCOUNTED how many bars actually fit on screen, since
+                # _draw_ohlc_chart_panel packs exactly ONE column per 1m
+                # bar (chart_w = pane_cols - OHLC_PRICE_W - 1, no per-bar
+                # text cell at all). That undercount made
+                # _footprint_crosshair_clamp think the visible window was
+                # only ~10-15 bars wide when it was actually 100+, so it
+                # started auto-scrolling the crosshair's underlying window
+                # far short of the real left edge. Mirror the OHLC panel's
+                # own chart_w formula exactly instead, so "how many bars
+                # fit" here always matches what's actually drawn.
+                n_est = (max(1, pane_cols - OHLC_PRICE_W - 1) if profile_mode == "ohlc"
+                         else max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0)))
                 chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
                     chart_crosshair_idx[asset] + step, chart_scroll[asset], total, n_est)
             else:
@@ -22237,7 +22602,10 @@ def curses_main(stdscr):
                 total = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
                          else len(snap["footprint_bars"].get(asset) or []))
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
-                n_est = max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0))
+                # See the matching KEY_LEFT handler's own comment just above
+                # for why OHLC mode needs its own n_est formula here.
+                n_est = (max(1, pane_cols - OHLC_PRICE_W - 1) if profile_mode == "ohlc"
+                         else max(1, (pane_cols - CHART_AXIS_W) // CHART_COL_W - (1 if chart_scroll[asset] == 0 else 0)))
                 chart_crosshair_idx[asset], chart_scroll[asset] = _footprint_crosshair_clamp(
                     max(0, chart_crosshair_idx[asset] - step), chart_scroll[asset], total, n_est)
             else:
@@ -22264,6 +22632,11 @@ def curses_main(stdscr):
             # Toggles VAH/VAL/POC "Historical Mode" (stepped developing
             # trace) vs. "Normal Mode" (flat current-value line).
             ohlc_vp_historical = not ohlc_vp_historical
+        elif key == ord("6") and profile_mode == "ohlc":
+            # 2026-08-29 user request — VolEffort (ported from
+            # vol-effort.py): swaps the bottom VOL histogram for a
+            # z-score histogram of volume-per-range effort.
+            ohlc_vol_effort = not ohlc_vol_effort
         elif key in (ord("y"), ord("Y")) and profile_mode == "ohlc":
             # 2026-08-27 — QQQ pane ONLY: swap the candle chart for the
             # Markets overview (folded in once the standalone Markets

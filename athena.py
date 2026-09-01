@@ -1014,7 +1014,14 @@ def _save_trading_mode():
 TRADING_MODES = ("Order Flow", "BTD")
 TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
 BTD_ENTRY_LOOKBACK = 10
-BTD_ENTRY_SIGMA    = 3.0
+# 2026-08-31 user-reported ("Reduce QQQ's BTD sensitivity to 2.5 from 3.0.
+# There are too few signals and they often miss the big moves."): per-asset
+# now instead of one shared constant — btd_confirmation fires when the
+# current bar's buy/sell imbalance volume exceeds mean + sigma*stdev over
+# the trailing window, so a LOWER sigma is a LOWER bar to clear, i.e. MORE
+# sensitive (more signals, including ones a 3.0 threshold was missing).
+# ETH stays at the original 3.0 — only QQQ's own threshold changed.
+BTD_ENTRY_SIGMA = {"ETH": 3.0, "QQQ": 2.5}
 
 # ── Profit ratchet ([2] toggle) ────────────────────────────────────────────
 # Opt-in extension of the TP1 breakeven-lock (_apply_tp1_breakeven_lock).
@@ -1227,16 +1234,18 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None,
     """[{'type','level'}, ...]: BT/ST, then VWAP/POC/VAH-or-VAL (whichever
     matches the regime — see below), then every qualifying gamma Cluster
     (Large before Medium — explicit user request 2026-07-23), then ER
-    100%/150%, then GEX Flip last.
+    40/80/100/150%, then GEX Flip last.
 
     vwap_level/poc_level/vah_level/val_level (2026-08-27, explicit user
     request "add VWAP & POC to the target list as top-tier targets", then
     "VAH is a valid target for longs but not shorts, VAL is a valid target
     for shorts but not longs, POC & VWAP are valid target for both longs &
-    shorts") come from CH_STATE[asset].indicator_levels — the same live,
-    kline_p-fed numbers evaluate_hpls itself prefers for the Status
-    screen's own VAH/VAL/POC/VWAP display, so the target list stays
-    numerically consistent with what the user already sees there.
+    shorts") come from instrument_lights' own caller-side resolution:
+    CH_STATE[asset].indicator_levels (live-WS-fed) when it has a fresh
+    number, falling back to evaluate_hpls' own REST-computed vp_levels
+    when it doesn't (2026-08-31 fix — see instrument_lights' own comment
+    for why the live-WS source alone left this gap unfilled on roughly
+    half of all entries).
 
     VAH/VAL carry an extra TYPE-based directional restriction on top of
     the usual profit-side-of-price filter every other target type here
@@ -1270,24 +1279,27 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None,
     "l80","u100","l100","u150","l150","open"} dict compute_dashboard_
     snapshot's own inst_snap["er_bands"] stores (renamed from "er_targets"
     2026-08-25 once it grew past just the two TP tiers — see evaluate_hpls'
-    own `er` return value) — only the "u100"/"l100"/"u150"/"l150" keys are
-    used here as TP levels; the rest feeds the OHLC chart panel's own ER
-    fill overlay instead. The Expected Range's 100%/150% levels are
-    derived once per session from session-open
-    + IV. Placed AFTER every Cluster but BEFORE GEX Flip: a Cluster is a
-    real, live options-flow-driven wall (top-tier per _check_confirmation's
-    own _is_top_tier), ER 100%/150% are a static vol-projection boundary
-    computed once at session open — more concrete than GEX Flip's
-    continuously-recomputed synthetic level, but not treated as top-tier
-    either (same fallback-only bucket _is_top_tier already puts GEX Flip
-    and Medium clusters in, until/unless the user asks otherwise). Only
-    the side matching `regime` is used (upper levels for a long, lower for
-    a short) — the OTHER side is never a valid profit target for this
-    trade's own direction. Unlike GEX Flip/Cluster, an ER level never
-    moves once a position is open (_sync_moving_tps only refreshes
-    "GEX Flip"/"Cluster"/"BT"/"ST"-typed legs by name — an "ER 100%"/
-    "ER 150%" leg simply falls through untouched, which is correct: ER
-    is fixed for the session, there's nothing to resync).
+    own `er` return value) — the "open" key isn't a target itself, only the
+    OHLC chart panel's own ER fill overlay uses it; all four size tiers
+    (40/80/100/150%) are usable TP levels here as of 2026-08-31 (2026-08-22
+    through 2026-08-30 only offered the 100/150% pair — 40/80% existed only
+    as chart-overlay boundaries until the user asked for them as targets
+    too). The Expected Range's levels are derived once per session from
+    session-open + IV. Placed AFTER every Cluster but BEFORE GEX Flip: a
+    Cluster is a real, live options-flow-driven wall, ER is a static
+    vol-projection boundary computed once at session open — more concrete
+    than GEX Flip's continuously-recomputed synthetic level. All four ER
+    tiers are top-tier (2026-08-31, explicit user request — see
+    _check_confirmation's own _is_top_tier, which now excludes only a
+    Medium cluster; ER used to sit in the same fallback-only bucket as
+    Medium clusters and GEX Flip). Only the side matching `regime` is used
+    (upper levels for a long, lower for a short) — the OTHER side is never
+    a valid profit target for this trade's own direction. Unlike GEX Flip/
+    Cluster, an ER level never moves once a position is open
+    (_sync_moving_tps only refreshes "GEX Flip"/"Cluster"/"BT"/"ST"-typed
+    legs by name — an "ER 40%"/"80%"/"100%"/"150%" leg simply falls through
+    untouched, which is correct: ER is fixed for the session, there's
+    nothing to resync).
 
     GEX Flip is placed LAST, after every cluster (explicit user request
     2026-07-24, following from 'medium clusters are not ignored' — a real
@@ -1296,10 +1308,15 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None,
     (_check_fill takes candidates[0]/[1]), GEX Flip sitting in the fixed
     2nd slot ahead of every cluster meant a cluster could get entered as
     the position's own primary target and then STILL never receive a TP
-    leg. GEX Flip is the fallback target now, not the priority one — it
-    already gets refreshed every cycle regardless (_sync_moving_tps), so
-    losing a guaranteed slot doesn't make it any less trackable, just
-    lower priority when a real cluster is also available)."""
+    leg. GEX Flip is the LOWEST-priority target now (last in this list),
+    not the highest — it already gets refreshed every cycle regardless
+    (_sync_moving_tps), so losing a guaranteed slot doesn't make it any
+    less trackable, just lower priority when a real cluster is also
+    available. This is priority ORDER only, not the top-tier/fallback
+    gating distinction _check_confirmation's own _is_top_tier makes — GEX
+    Flip is top-tier as of 2026-08-31, same as everything here except a
+    Medium cluster; it can still justify entry on its own with nothing
+    else present, it's just picked last among equally-valid candidates)."""
     log_targets = log_targets or []
     full = []
     if log_targets and log_targets[0].get("type") in ("BT", "ST"):
@@ -1334,11 +1351,17 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None,
             full.append({"type": "Cluster", "level": strike, "tier": tier})
 
     if er_targets and regime in ("long", "short"):
-        near_key, far_key = ("u100", "u150") if regime == "long" else ("l100", "l150")
-        if er_targets.get(near_key) is not None:
-            full.append({"type": "ER 100%", "level": float(er_targets[near_key])})
-        if er_targets.get(far_key) is not None:
-            full.append({"type": "ER 150%", "level": float(er_targets[far_key])})
+        # 2026-08-31 user request ("Add ER 40/80% levels as top-tier
+        # targets"): the 100%/150% tiers were the only two of the four ER
+        # bands ever offered as a target — 40%/80% existed only as OHLC
+        # chart fill-overlay boundaries. Same tier-by-tier loop now covers
+        # all four, nearest-to-farthest, still only the side matching this
+        # trade's own regime (u* for a long, l* for a short).
+        side = "u" if regime == "long" else "l"
+        for tier in (40, 80, 100, 150):
+            level = er_targets.get(f"{side}{tier}")
+            if level is not None:
+                full.append({"type": f"ER {tier}%", "level": float(level)})
 
     gex_flip = gex_export.get("gex_flip") if gex_export else None
     if gex_flip is not None:
@@ -1399,14 +1422,38 @@ def instrument_lights(snapshot, asset):
     gex_export = read_gex_export(asset)
     er_bands = inst.get("er_bands")
     # 2026-08-27: VWAP/POC target source — same live CH_STATE indicator_
-    # levels dict the OHLC panel's own fallback levels and evaluate_hpls'
-    # own preferred numbers already come from (see reconstruct_targets'
-    # own docstring).
+    # levels dict the OHLC panel's own fallback levels already come from.
+    #
+    # 2026-08-31 user-reported (a live long whose TP legs ended up BT/
+    # GEX-Flip/ER-only — "VAH never appeared as a target"): CH_STATE's own
+    # indicator_levels is live-WS-fed (_ch_compute_vp/_ch_build_vwap_map,
+    # off CH_STATE[asset].candles) and starts out empty on every restart,
+    # repopulating only once that feed has accrued enough fresh data — a
+    # gap that can outlast a single entry decision. Log evidence (2026-08-
+    # 27 through 2026-08-31) showed this hit roughly half of all logged
+    # entries, this one included. evaluate_hpls computes the exact same
+    # numbers a second, independent way — off REST-polled session_candles,
+    # already proven reliable (it's what the Data view's own High-
+    # Probability Levels always shows correctly) — and now returns them
+    # (inst["vp_levels"], set in compute_dashboard_snapshot). CH_STATE
+    # stays the PREFERRED source when it has a fresher number; this only
+    # fills the gap when it doesn't, rather than leaving the target
+    # silently missing.
+    vp_fallback = inst.get("vp_levels") or {}
     with CH_STATE[asset].lock:
-        vwap_level = CH_STATE[asset].indicator_levels.get("vwap")
-        poc_level = CH_STATE[asset].indicator_levels.get("poc")
-        vah_level = CH_STATE[asset].indicator_levels.get("vah")
-        val_level = CH_STATE[asset].indicator_levels.get("val")
+        ch_levels = dict(CH_STATE[asset].indicator_levels)
+    vwap_level = ch_levels.get("vwap")
+    if vwap_level is None:
+        vwap_level = vp_fallback.get("vwap")
+    poc_level = ch_levels.get("poc")
+    if poc_level is None:
+        poc_level = vp_fallback.get("poc")
+    vah_level = ch_levels.get("vah")
+    if vah_level is None:
+        vah_level = vp_fallback.get("vah")
+    val_level = ch_levels.get("val")
+    if val_level is None:
+        val_level = vp_fallback.get("val")
     targets_full = reconstruct_targets(log_targets, gex_export, price, regime, er_targets=er_bands,
                                         vwap_level=vwap_level, poc_level=poc_level,
                                         vah_level=vah_level, val_level=val_level)
@@ -2893,13 +2940,15 @@ STATUS_KILL_ZONES = [
     ('Lunchtime',   690,  810,  'YLW'),
     ('Power Hour',  840,  900,  'YLW'),
     ('EOD',         960,  1080, 'YLW'),
-    ('EEOD',        1110, 1440, 'YLW'),
+    ('EEOD',        1170, 1440, 'YLW'),
 ]
 STATUS_EXCL_DAYS_09    = {2, 3}
 STATUS_EXCL_START      = 540
 STATUS_EXCL_END        = 600
 STATUS_EXCL_SUN        = 6
-STATUS_EXCL_EEOD_START = 1110
+STATUS_EXCL_EEOD_START = 1170   # 2026-08-30 user-reported ("EEOD should begin
+                                  # at 19:30 CT, not 18:30 CT"): was 1110
+                                  # (18:30 CT) — moved to 1170 (19:30 CT).
 STATUS_TLT_WINDOW_START = 8 * 60 + 45
 STATUS_TLT_WINDOW_END   = 15 * 60
 STATUS_QQQ_OPEN_CT_MIN  = 8 * 60 + 45
@@ -4351,7 +4400,23 @@ def evaluate_hpls(name, price, chain, session_candles, prev_close, iv, tol, gamm
     # (upper/lower 40/80/100/150, or None if ER wasn't computable) lets
     # callers pull the numeric 100%/150% levels without recomputing
     # session_open/status_compute_er a second time themselves.
-    return rows, er
+    #
+    # 2026-08-31 user-reported ("Athena is currently in a long position
+    # and VAH never appeared as a target"): same reasoning, one step
+    # further — the raw poc/vah/val/vwap floats computed just above (via
+    # status_compute_vp/status_compute_vwap_sd on this call's own REST-
+    # sourced `session_candles`) used to be thrown away once folded into
+    # `rows`' pre-formatted display strings; reconstruct_targets's own
+    # vwap_level/poc_level/vah_level/val_level instead read
+    # CH_STATE[asset].indicator_levels — a SEPARATE, live-WS-fed
+    # computation (_ch_compute_vp/_ch_build_vwap_map) that starts empty on
+    # every restart and can lag behind briefly on a feed gap, with no
+    # fallback. Log evidence across 2026-08-27 through 2026-08-31 showed
+    # this gap hit roughly half of all entries, including the one that
+    # prompted this fix. Returning these numbers lets instrument_lights
+    # fall back to them instead of silently omitting VWAP/POC/VAH/VAL for
+    # that entry entirely — see instrument_lights' own comment.
+    return rows, er, {"poc": poc, "vah": vah, "val": val, "vwap": vwap}
 
 def hpl_any_active(rows, closed):
     """Ported verbatim from status.py's own hpl_any_active — True if at
@@ -4413,9 +4478,9 @@ def compute_dashboard_snapshot(data):
 
         export = read_status_charthacker_export(inst_name)
         gex_export = read_gex_export(inst_name)
-        rows, er = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
-                                  export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
-                                  ratio=(pcvr["ratio"] if pcvr else None))
+        rows, er, vp_levels = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
+                                             export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                                             ratio=(pcvr["ratio"] if pcvr else None))
         closed = inst_name == "QQQ" and status_qqq_market_closed()
         inst_snap["market_closed"] = closed
         # 2026-08-22: raw ER levels, stored under string keys (not
@@ -4434,6 +4499,13 @@ def compute_dashboard_snapshot(data):
                                    "u150": er["upper"][150], "l150": er["lower"][150],
                                    "open": er.get("open")}
                                   if er else None)
+        # 2026-08-31 user-reported ("VAH never appeared as a target" on a
+        # live long): raw poc/vah/val/vwap, straight from evaluate_hpls'
+        # own REST-candle-based computation — see instrument_lights for
+        # why reconstruct_targets now falls back to these when
+        # CH_STATE[asset].indicator_levels' own live-WS-fed numbers
+        # haven't populated yet (e.g. right after a restart).
+        inst_snap["vp_levels"] = vp_levels
 
         hpl = {}
         for label_, level_str, ok in rows:
@@ -4598,9 +4670,9 @@ def _status_build_render_lines(display_data):
             active_status[inst_name] = False
             continue
         p(f"        {STATUS_LIGHT_BLANK}  {'Live Price':<26}{CYN}{BLD}${price:,.2f}{RST}")
-        rows, er = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
-                                  export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
-                                  ratio=(pcvr["ratio"] if pcvr else None))
+        rows, er, _vp_levels = evaluate_hpls(inst_name, price, chain, candles, prev_close, iv, tol, gtol, is_crypto,
+                                              export=export, gamma_yellow_tol=gyellow, gex_export=gex_export,
+                                              ratio=(pcvr["ratio"] if pcvr else None))
         er_by_inst[inst_name] = er
         closed = inst_name == "QQQ" and status_qqq_market_closed()
         rows_by_label = {label_: (level_str, ok) for label_, level_str, ok in rows}
@@ -5401,7 +5473,7 @@ def footprint_confirmation(prev_bar, new_bar, regime):
         return ok, new_vah, new_val
     return False, new_vah, new_val
 
-def btd_confirmation(bars_1m, regime, lookback=BTD_ENTRY_LOOKBACK, sigma=BTD_ENTRY_SIGMA):
+def btd_confirmation(bars_1m, regime, lookback=BTD_ENTRY_LOOKBACK, sigma=3.0):
     """Check if the most recent CLOSED 1m candle has a Big Buy (for longs)
     or Big Sell (for shorts) signal. Returns (confirmed, entry_price) where
     entry_price is the candle close (market order entry)."""
@@ -9749,7 +9821,18 @@ class AthenaInstrument:
             # Volume Profile levels) join BT/ST/Large-cluster as top-tier
             # — see reconstruct_targets' own docstring for where these
             # come from and VAH/VAL's own regime-direction restriction.
-            return t["type"] in ("BT", "ST", "VWAP", "POC", "VAH", "VAL") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+            #
+            # 2026-08-31, explicit user request ("Add ER 40/80% levels as
+            # top-tier targets. Cluster (Medium) is the only target that is
+            # not a top-tier target" + "ER 100/150% levels should also be
+            # considered top-tier targets"): every target type is now
+            # top-tier EXCEPT a Medium cluster — ER 40/80/100/150% and GEX
+            # Flip (previously fallback-only alongside Medium clusters)
+            # are promoted too, since the user's own wording names Medium
+            # clusters as the ONLY exception. Written as an exclusion
+            # rather than an inclusion list so any future new target type
+            # defaults to top-tier without needing to be added here.
+            return not (t["type"] == "Cluster" and t.get("tier") == "Medium")
 
         top_tier_present = any(_is_top_tier(t) for t in targets_full)
         usable_target = None
@@ -9897,7 +9980,7 @@ class AthenaInstrument:
         log_event(self.asset, "entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
 
     async def _check_btd_confirmation(self, bars_1m, regime, live_price_fallback, targets_full):
-        confirmed, entry_price = btd_confirmation(bars_1m, regime)
+        confirmed, entry_price = btd_confirmation(bars_1m, regime, sigma=BTD_ENTRY_SIGMA[self.asset])
         if not confirmed:
             return
         if entry_price is None:
@@ -9913,7 +9996,18 @@ class AthenaInstrument:
             # Volume Profile levels) join BT/ST/Large-cluster as top-tier
             # — see reconstruct_targets' own docstring for where these
             # come from and VAH/VAL's own regime-direction restriction.
-            return t["type"] in ("BT", "ST", "VWAP", "POC", "VAH", "VAL") or (t["type"] == "Cluster" and t.get("tier") == "Large")
+            #
+            # 2026-08-31, explicit user request ("Add ER 40/80% levels as
+            # top-tier targets. Cluster (Medium) is the only target that is
+            # not a top-tier target" + "ER 100/150% levels should also be
+            # considered top-tier targets"): every target type is now
+            # top-tier EXCEPT a Medium cluster — ER 40/80/100/150% and GEX
+            # Flip (previously fallback-only alongside Medium clusters)
+            # are promoted too, since the user's own wording names Medium
+            # clusters as the ONLY exception. Written as an exclusion
+            # rather than an inclusion list so any future new target type
+            # defaults to top-tier without needing to be added here.
+            return not (t["type"] == "Cluster" and t.get("tier") == "Medium")
 
         top_tier_present = any(_is_top_tier(t) for t in targets_full)
         usable_target = None
@@ -13185,14 +13279,22 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # needs), but nowhere near enough room for a genuinely readable
     # signed z-score histogram (a zero line plus both an absorption
     # DIRECTION and a clean DIRECTION need real vertical room to read as
-    # anything but a sliver) — VolEffort gets a substantially taller
-    # bottom band instead, sized as a fraction of this pane's own total
-    # height rather than a fixed row count so it scales with whatever
-    # split/zoom layout is currently active, capped so candles always
-    # keep a usable minimum of their own.
+    # anything but a sliver) — VolEffort gets a taller bottom band instead,
+    # sized as a fraction of this pane's own total height rather than a
+    # fixed row count so it scales with whatever split/zoom layout is
+    # currently active, capped so candles always keep a usable minimum of
+    # their own.
+    #
+    # 2026-09-01 user-reported ("too big and there is more empty space
+    # than what's needed"): 35% of the pane gave a genuinely readable
+    # panel but z-scores rarely swing past +-3 even at the hi_z/lo_z
+    # guide lines, so most of that height sat empty above/below the
+    # actual bars every render — condensed to 20%, roughly half the
+    # previous band, which is still well past the original 4-row sliver
+    # this whole feature started from.
     _vol_h = OHLC_VOL_H
     if ui.get("vol_effort"):
-        _vol_h = max(OHLC_VOL_H, min(int((y1 - top) * 0.35), (y1 - top) - 15))
+        _vol_h = max(OHLC_VOL_H, min(int((y1 - top) * 0.20), (y1 - top) - 20))
     chart_bot_excl = y1 - 1 - TIME_H - _vol_h
     chart_h = max(1, chart_bot_excl - chart_top)
     chart_r = x0 + cols - OHLC_PRICE_W - 1
@@ -13234,21 +13336,30 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # (a breakeven-lock move, a moving-TP resync, etc.) with no extra work.
     #
     # 2026-08-27 user-reported ("The OHLC chart should scale solely to the
-    # candles, not the ER"): an ER 100%/150% leg is an IV-projected daily
-    # move — routinely tens of dollars from price, far past where any
-    # other target type typically sits — so including it here could blow
-    # the visible range out so far that the actual recent candles got
-    # crushed into a sliver at the bottom of the chart. Entry/SL/every
-    # OTHER TP type (BT/ST/Cluster/GEX Flip/VWAP/POC/VAH/VAL) still gets
-    # included — those stay close enough to price
-    # that showing them doesn't cost chart readability the way ER does.
+    # candles, not the ER"): an ER leg is an IV-projected daily move —
+    # routinely tens of dollars from price, far past where any other
+    # target type typically sits — so including it here could blow the
+    # visible range out so far that the actual recent candles got crushed
+    # into a sliver at the bottom of the chart. Entry/SL/every OTHER TP
+    # type (BT/ST/Cluster/GEX Flip/VWAP/POC/VAH/VAL) still gets included —
+    # those stay close enough to price that showing them doesn't cost
+    # chart readability the way ER does.
+    #
+    # 2026-09-01 user-reported (a screenshot showing candles crushed into
+    # the bottom half of the pane, "scale to the highest high and lowest
+    # low of all of the candles visible... the scaling is too small
+    # here"): this exclusion only ever listed ER 100%/150% — it predates
+    # ER 40%/80% joining the target list as their own TP types (same day,
+    # earlier turn), so a TP leg landing on either of those two newer
+    # tiers was still blowing the range out exactly like ER 100%/150%
+    # used to. All four ER tiers are excluded now.
     _pos_prices = []
     if position:
         for _k in ("fill_price", "sl_price"):
             if position.get(_k) is not None:
                 _pos_prices.append(position[_k])
         for _leg in (position.get("tp_legs") or []):
-            if _leg.get("level") is not None and _leg.get("type") not in ("ER 100%", "ER 150%"):
+            if _leg.get("level") is not None and _leg.get("type") not in ("ER 40%", "ER 80%", "ER 100%", "ER 150%"):
                 _pos_prices.append(_leg["level"])
     elif pending and pending.get("entry_price") is not None:
         _pos_prices.append(pending["entry_price"])
@@ -13739,6 +13850,17 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     _ve_by_ts = {}
     if ui.get("vol_effort"):
         _ve_by_ts = {r["ts"]: r for r in _vol_effort_records(all_candles, asset)}
+    # 2026-09-01 user-reported (a screenshot circling a bar where the
+    # VolEffort bias marker disappeared): the marker's own placement below
+    # was drawn immediately, one row above the bar's own high — but the
+    # BTD overlay (drawn later, well after this whole candle loop finishes
+    # — see that section's own comment) draws its SELL marker at the exact
+    # same spot (one row above the bar's high) completely unconditionally,
+    # silently painting over any VolEffort marker already sitting there
+    # whenever both fire on the same bar. Collected here instead of drawn
+    # immediately so the actual placement can happen AFTER BTD, once it's
+    # possible to see whether that cell is already taken.
+    _ve_markers = []
 
     # ── CANDLES / LINE CHART ─────────────────────────────────────────────
     if line_mode:
@@ -13799,7 +13921,10 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
                         _ve_glyph, _ve_gpair = "▼", P_RED
                     else:
                         _ve_glyph, _ve_gpair = "◆", P_DIM
-                    db.put(clamp(r_hi - 1), col, _ve_glyph, _ve_gpair, curses.A_BOLD | curses.A_REVERSE)
+                    # Placement deferred — see _ve_markers' own comment
+                    # above for why (the BTD overlay, drawn later, can
+                    # otherwise silently paint over this exact cell).
+                    _ve_markers.append((col, r_hi, r_lo, _ve_glyph, _ve_gpair))
 
     # ── SESSIONS OVERLAY ─────────────────────────────────────────────────
     # Ported from draw_chart's own sessions indicator (19952-20030),
@@ -13828,7 +13953,9 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             ("Lunch", (11,30), (13,30), P_YELLOW,  None),
             ("PWR",   (14, 0), (15, 0), P_MAGENTA,   None),
             ("EOD",   (16, 0), (18, 0), P_GREEN, None),
-            ("EEOD",  (18,30), (23,59), P_RED,   None),
+            # 2026-08-30 user-reported ("EEOD should begin at 19:30 CT, not
+            # 18:30 CT"): was (18,30) — moved to (19,30).
+            ("EEOD",  (19,30), (23,59), P_RED,   None),
         ]
         from itertools import groupby as _groupby
         def _sess_date_key(_pair):
@@ -14012,6 +14139,20 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
                 else:
                     db.put(row_s, col, "#", P_MAGENTA, _rev)
 
+    # ── VOLEFFORT BIAS MARKERS (deferred — see _ve_markers' own comment) ──
+    # Now that BTD's own signal markers above are already drawn, each
+    # VolEffort marker can actually check whether its usual spot (one row
+    # above the bar's high) is free. A "large" BTD signal draws BOTH the
+    # row right at the wick and the row just past it (see t3b/t3s above),
+    # so this can collide even on a bar with plenty of headroom — falls
+    # back to one row below the bar's own low (mirroring BTD's own
+    # buy-marker placement) rather than disappearing underneath it.
+    for _ve_col, _ve_r_hi, _ve_r_lo, _ve_glyph, _ve_gpair in _ve_markers:
+        _ve_above = clamp(_ve_r_hi - 1)
+        _ve_below = clamp(_ve_r_lo + 1)
+        _ve_target = _ve_above if db.buf[_ve_above][_ve_col][0] == " " else _ve_below
+        db.put(_ve_target, _ve_col, _ve_glyph, _ve_gpair, curses.A_BOLD | curses.A_REVERSE)
+
     # ── HISTORICAL TRADE MARKERS ─────────────────────────────────────────
     # 2026-08-26 user request ("Show previous trades in the OHLC charts")
     # — ported from draw_footprint_panel's own trade_events loop (short
@@ -14031,17 +14172,6 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
                 continue
             _r = clamp(chart_top + p2r(_ev["price"]))
             db.puts(_r, _col, _ev["label"][:max(1, chart_r - _col)], _ev["pair"], curses.A_BOLD | curses.A_REVERSE)
-
-    # ── CROSSHAIR ────────────────────────────────────────────────────────
-    # 2026-08-26 user-reported ("Crosshair doesn't appear when I press
-    # [X]") — see crosshair_col's own computation above for why this was
-    # silently a no-op before. Same non-destructive "blank cells only"
-    # convention footprint's own crosshair line already uses, drawn LAST
-    # so it's never itself overwritten by anything else in this panel.
-    if crosshair_col is not None and x0 <= crosshair_col < chart_r:
-        for _r in range(chart_top, chart_bot_excl):
-            if db.buf[_r][crosshair_col][0] == " ":
-                db.put(_r, crosshair_col, CROSSHAIR_LINE_CH, P_CYAN)
 
     # ── VOLUME / VOLEFFORT ─────────────────────────────────────────────────
     # Ported from draw_chart's own volume histogram (20231-20246).
@@ -14142,6 +14272,33 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             continue
         lbl = datetime.fromtimestamp(bar["ts"]).strftime("%H:%M")
         db.puts(time_row, col, lbl, P_DIM)
+
+    # ── CROSSHAIR ────────────────────────────────────────────────────────
+    # 2026-08-26 user-reported ("Crosshair doesn't appear when I press
+    # [X]") — see crosshair_col's own computation above for why this was
+    # silently a no-op before. Same non-destructive "blank cells only"
+    # convention footprint's own crosshair line already uses, drawn LAST
+    # so it's never itself overwritten by anything else in this panel.
+    #
+    # 2026-08-30 user-reported ("I would like the crosshair to come all the
+    # way through the z-score window as well"): this used to be drawn right
+    # after the level-lines/candles section and only spanned chart_top..
+    # chart_bot_excl (the candle area), well BEFORE the VOLUME/VOLEFFORT
+    # section below it ever ran — and that section's own zero-line/guide-
+    # line/bar draws are unconditional (no blank-cell check, unlike this
+    # line's own), so even if the range had included that band the crosshair
+    # would've been silently painted over the instant VolEffort's own
+    # zero-line swept across the same column. Moved to the true end of the
+    # panel (after TIME AXIS, everything else already drawn) and extended
+    # down through vol_top..vol_bot_excl so it now reaches the actual
+    # bottom of the chart — including the VolEffort z-score band OR the
+    # plain volume histogram, whichever is active — the same "fill blank
+    # cells only" rule naturally leaves candle bodies, VolEffort bars, and
+    # guide-line labels all readable right through it.
+    if crosshair_col is not None and x0 <= crosshair_col < chart_r:
+        for _r in range(chart_top, vol_bot_excl):
+            if db.buf[_r][crosshair_col][0] == " ":
+                db.put(_r, crosshair_col, CROSSHAIR_LINE_CH, P_CYAN)
 
 def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mode, trade_events,
                           hscroll_bars=0, live_price=None, live_bar=None, focused=False, market_closed=False,
@@ -16156,6 +16313,52 @@ def draw_gex_map(db, asset, y0, y1, x0, x1, ui):
     vert_tag = "" if ui["vert_follow"] else "[↕scrolled]"
     hint = (f" [H]elp  q=quit  Esc=dashboard  Tab={other_asset}  {vert_tag} [{asset}] {GEX_STATUS[asset]}")
     db.puts(bot, x0, hint.ljust(w)[:w], P_STATUS)
+
+def _gex_by_strike_spot_ch_idx(asset, net_mode, vert_follow, vert_center_idx, cols_w):
+    """[X] crosshair activation helper (2026-08-30 user-reported — "Net GEX
+    crosshair still starts at the farthest end of the graph. Have it begin
+    where the current price is."): draw_gex_by_strike's own crosshair_idx
+    means "N candidates back from the RIGHTMOST strike with a nonzero
+    value" (see that function's own 2026-08-28/29 crosshair comments) —
+    activating always stored 0, landing on that rightmost strike, which is
+    NOT generally near the current price (with vert_follow on, spot sits
+    near the MIDDLE of the visible window, not its right edge). This
+    replicates just enough of draw_gex_by_strike's own visible-window/
+    candidate-list math to find which candidate sits nearest spot, then
+    expresses ITS position using that same "N back from rightmost"
+    convention — so activation lands there instead, while the existing
+    LEFT/RIGHT handlers (unchanged) keep walking away from/back toward the
+    edge exactly like before, just from a different starting point."""
+    history, grid, scale_max, meta = _gex_snapshot_state(asset)
+    if not history or not grid:
+        return 0
+    ref_col = history[-1]
+    spot = ref_col["spot"]
+    gex_by_type = ref_col.get("gex_by_type") or {}
+    grid_sorted = sorted(grid)
+    strike_col_w = 3
+    y_axis_w = 10
+    usable_w = max(0, cols_w - y_axis_w - 1)
+    n_strike_cols = max(1, usable_w // strike_col_w)
+    if vert_follow:
+        center_idx = min(range(len(grid_sorted)), key=lambda i: abs(grid_sorted[i] - spot))
+    else:
+        center_idx = max(0, min(len(grid_sorted) - 1, vert_center_idx))
+    half = n_strike_cols // 2
+    lo = max(0, center_idx - half)
+    hi = min(len(grid_sorted), lo + n_strike_cols)
+    lo = max(0, hi - n_strike_cols)
+    visible_strikes = grid_sorted[lo:hi]
+    if net_mode:
+        ch_candidates = [s for s in visible_strikes if ref_col["gex"].get(s, 0.0) != 0.0]
+    else:
+        ch_candidates = [s for s in visible_strikes
+                          if gex_by_type.get(s, {}).get("call", 0.0) != 0.0
+                          or gex_by_type.get(s, {}).get("put", 0.0) != 0.0]
+    if not ch_candidates:
+        return 0
+    spot_pos = min(range(len(ch_candidates)), key=lambda i: abs(ch_candidates[i] - spot))
+    return len(ch_candidates) - 1 - spot_pos
 
 def draw_gex_by_strike(db, asset, y0, y1, x0, x1, ui):
     """Ported from gex.py's own draw_by_strike() — GEX BY STRIKE bar
@@ -18852,6 +19055,16 @@ MARKETS_ASSETS = [
     ("SPX500", "SP500USDT",   None,       "^GSPC",     P_GREEN),
     ("NAS100", "NAS100USDT",  None,       "^NDX",      P_DEFAULT),
     ("DXY",    "uDXYUSDT",    None,       "DX-Y.NYB",  P_DIM),
+    # 2026-09-01 user request ("Add TLT to the list of assets monitored in
+    # Markets"): a plain US-listed bond ETF, no Phemex/Kraken crypto
+    # equivalent exists — phemex_sym/kraken_pair both None so _fetch_one
+    # skips straight to the Yahoo leg of the fallback chain, same as every
+    # other non-crypto instrument here effectively ends up doing once its
+    # own Phemex attempt fails. Reuses P_BLUE (USDJPY) — this file's own 8
+    # base-curses colors are already all individually claimed above (see
+    # the "no true orange in base 8-color curses" precedent elsewhere in
+    # this file); no further distinct color exists to give it.
+    ("TLT",    None,          None,       "TLT",       P_BLUE),
 ]
 MARKETS_PHEMEX_URL  = "https://api.phemex.com/exchange/public/md/v2/kline/last"
 MARKETS_KRAKEN_URL  = "https://api.kraken.com/0/public/OHLC"
@@ -19228,13 +19441,15 @@ OPTFLOW_KILL_ZONES = [
     ('Lunchtime',   690,  810,  'YLW'),
     ('Power Hour',  840,  900,  'YLW'),
     ('EOD',         960,  1080, 'YLW'),
-    ('EEOD',        1110, 1440, 'YLW'),
+    ('EEOD',        1170, 1440, 'YLW'),
 ]
 OPTFLOW_EXCL_DAYS_09    = {2, 3}
 OPTFLOW_EXCL_START      = 540
 OPTFLOW_EXCL_END        = 600
 OPTFLOW_EXCL_SUN        = 6
-OPTFLOW_EXCL_EEOD_START = 1110
+OPTFLOW_EXCL_EEOD_START = 1170   # 2026-08-30 user-reported ("EEOD should
+                                   # begin at 19:30 CT, not 18:30 CT"): was
+                                   # 1110 (18:30 CT) — moved to 1170 (19:30 CT).
 
 def _optflow_session_status():
     now_ct = datetime.now(timezone.utc) + OPTFLOW_CT_OFFSET
@@ -21057,13 +21272,14 @@ def curses_main(stdscr):
                                    # only "Normal Mode" (flat current-value
                                    # line). 2026-08-27 user request: on by
                                    # default.
-    ohlc_vol_effort = False   # [6] — VolEffort (ported from vol-effort.py,
+    ohlc_vol_effort = True    # [6] — VolEffort (ported from vol-effort.py,
                                 # 2026-08-29 user request): replaces the
                                 # bottom VOL histogram with a z-score
-                                # histogram of volume-per-range effort. Off
-                                # by default — this is a NEW indicator, not
-                                # an established convention like [4]'s own
-                                # default-on.
+                                # histogram of volume-per-range effort.
+                                # Started OFF by default at first; 2026-08-30
+                                # user request ("Athena should have VolEffort
+                                # toggled on by default") switched this to
+                                # on, same as [4]'s own default-on.
     ohlc_show_markets_qqq = False   # [Y] — QQQ pane ONLY: swap the candle
                                    # chart for the Markets overview (2026-08-27,
                                    # folded in once the standalone Markets mode
@@ -21703,11 +21919,18 @@ def curses_main(stdscr):
                 # 2026-08-28 user request ("Add a crosshair to the Net GEX
                 # distribution in GEX") — same toggle-then-arrow-keys
                 # convention every other chart's own [X] crosshair uses.
-                # Activates at the rightmost visible strike, same
-                # first-press behavior chart_crosshair_active's own [X] has.
+                # 2026-08-30 user-reported ("still starts at the farthest
+                # end of the graph. Have it begin where the current price
+                # is."): used to always activate at idx 0 (the rightmost
+                # strike with a nonzero value) — now resolves to whichever
+                # candidate sits nearest the live spot price instead, via
+                # the same visible-window math draw_gex_by_strike's own
+                # crosshair uses (see _gex_by_strike_spot_ch_idx).
                 gex_by_strike_crosshair_active[gex_asset] = not gex_by_strike_crosshair_active[gex_asset]
                 if gex_by_strike_crosshair_active[gex_asset]:
-                    gex_by_strike_crosshair_idx[gex_asset] = 0
+                    gex_by_strike_crosshair_idx[gex_asset] = _gex_by_strike_spot_ch_idx(
+                        gex_asset, gex_by_strike_net, gex_vert_follow[gex_asset],
+                        gex_vert_center_idx[gex_asset], cols)
             elif key == 9:   # Tab — switch asset, same convention as the footprint charts
                 chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("z"), ord("Z"), curses.KEY_END):

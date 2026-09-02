@@ -271,6 +271,18 @@ In **BTD** trading mode (`[9]` toggle), entries fire off `btd_confirmation` inst
 
 `BTD_ENTRY_SIGMA` is **per-asset** (2026-08-31 user-reported — "Reduce QQQ's BTD sensitivity to 2.5 from 3.0. There are too few signals and they often miss the big moves"): `{"ETH": 3.0, "QQQ": 2.5}`. ETH's threshold is unchanged; QQQ's own is now easier to clear, so it should fire more often — including on moves that a flat 3.0 bar was missing entirely.
 
+### NV Confirmation
+
+**NV** (2026-09-01 user request) is a third trading mode, `[9]`-cycled alongside Order Flow and BTD: `Order Flow → BTD → NV → Order Flow`. It shares BTD's *exact* candle-close confirmation mechanism (same `btd_confirmation` call, same entry/target/sizing/risk-management pipeline downstream — none of that changed) — the only thing NV changes is where `regime` (the long/short directional bias) comes from. Every other mode derives it from PCVR (a single TLT-based ratio shared by both ETH and QQQ); NV derives it **per-asset**, independently, from that asset's own **Net Volume** status (see below) — ETH always reads ETH's own Net Volume, QQQ always reads QQQ's own, with no cross-asset or TLT influence at all. Entry-placement events log the actual mode (`"trigger": "BTD"` or `"trigger": "NV"`) instead of always saying "BTD", so trade-log/backtest analysis can tell the two apart.
+
+**Immediate close on a Net Volume flip (2026-09-01 same-day follow-up):** needed no new code. The existing PCVR-flip emergency-close (`_manage_position`'s own `flipped` check, and the analogous `pending_flipped` check for a still-resting entry) already just compares the open position's side against whatever `regime` the CURRENT cycle's `instrument_lights` call produced — and under NV that's already Net-Volume-derived. A Positive→Negative (or Negative→Positive) flip trips it exactly like a PCVR flip always has, market-closes the position, and logs `pcvr_flip_close` (event name unchanged — it's the same mechanism, just fed by a different regime source under NV). Merely moving to Neutral does **not** trigger this — `regime` becomes `None`, which matches neither side of the `flipped` check, same as PCVR's own dead-zone never force-closing a position on its own.
+
+The compact per-instrument readiness row on the Trading dashboard relabels two of its six lights based on the active mode — **independently**, not as one shared substitution: the `Order Flow` light reads **BTD** whenever BTD *or* NV is active (both share the identical candle-close trigger mechanism), while the `PCVR` light reads **NV** only when NV itself is active (its data source is what actually changed) and stays `PCVR` under BTD. An NV-mode row therefore shows `NV` and `BTD` side by side, never `NV` twice.
+
+### Net Volume
+
+**Net Volume** (2026-09-01 user request) is a lightweight directional-bias readout, sampled every 15s (`NET_VOLUME_POLL_SECS`) off Net Drift (Premium)'s own already-live engine — specifically its **filtered** (OTM-only) cumulative net volume (`net_vol_cum_f`, the same field `[F]` toggles into view in Net Drift mode), not the standard one. Reads as **Positive** (`net_vol_cum_f > 0`), **Negative** (`< 0`), or **Neutral** (exactly `0` — added same-day follow-up, "if Net Volume is 0, its status should be 'Neutral'. When Neutral, no trades are to be taken"; a bare `> 0`/`<= 0` split had silently folded an exact-zero reading into Negative). Neutral (like the `None`/not-yet-available state) maps to `regime = None` under NV, the same "can't arm" value PCVR's own 0.98–1.02 dead-zone already produces — no separate gating needed. ETH samples continuously; QQQ only within its own 08:30–15:00 CT window (a dedicated window, not a reuse of the 08:45–15:00 CT gate used elsewhere — the two nearly coincide, and QQQ is already market-closed-gated outside 08:45–15:00 anyway) — outside that window QQQ's status is `None` (shown as `n/a`). Displayed in the Data view's own Status screen, section **4. Options** (renamed from "PCVR" the same request), each status followed by the raw value it was classified from (e.g. `Positive (+142.30)`) sourced from the exact same 15s snapshot, never a second, possibly-inconsistent read — and consumed directly by NV mode's own regime derivation, so the display and the trading decision never disagree mid-tick.
+
 ### Entry Blackout
 
 No new entries are placed between 19:00–19:30 CT (the daily session boundary).
@@ -487,7 +499,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `N` | Toggle 24H/session mode |
 | `0` | Cycle sizing mode (Standard ↔ Aggressive) — candle/line style toggle instead, while viewing the OHLC profile |
 | `1` | Clear an active Drawdown Full Stop block (manual review) |
-| `9` | Cycle trading mode (Order Flow ↔ BTD) — renamed 2026-08-27, was "CCCCWIDE" |
+| `9` | Cycle trading mode (Order Flow → BTD → NV → Order Flow) — renamed 2026-08-27, was "CCCCWIDE"; NV added 2026-09-01 (see Trading Engine's own NV Confirmation section) |
 | `Y` | OHLC profile, QQQ pane only — toggle the Markets macro overview |
 | `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27). Current state (`VP:Normal`/`VP:Historical`) shows right in the pane's own header (2026-08-28) |
 | `6` | OHLC profile — toggle **VolEffort** (2026-08-29), ported from `vol-effort.py`. Replaces the bottom VOL histogram with a z-score histogram of volume-per-range "effort" — off by default. Header shows `VolEffort:On` when active |

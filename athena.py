@@ -1011,7 +1011,7 @@ def _save_trading_mode():
     except Exception:
         pass
 
-TRADING_MODES = ("Order Flow", "BTD")
+TRADING_MODES = ("Order Flow", "BTD", "NV")
 TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
 BTD_ENTRY_LOOKBACK = 10
 # 2026-08-31 user-reported ("Reduce QQQ's BTD sensitivity to 2.5 from 3.0.
@@ -1405,15 +1405,34 @@ def instrument_lights(snapshot, asset):
     else:
         lights["Volatility"] = snapshot.get("vxn") is not None
 
-    pcvr = snapshot.get("pcvr") or {}
-    ratio = pcvr.get("ratio")
-    regime = None
-    if ratio is not None:
-        if ratio <= 0.98:
-            regime = "long"
-        elif ratio >= 1.02:
-            regime = "short"
-    lights["PCVR"] = bool(ratio is not None and (ratio <= 0.98 or ratio >= 1.02))
+    # 2026-09-01 user request ("Create a new trading mode called 'NV'...
+    # it will use the Net Volume statuses to determine directional bias
+    # instead of using PCVR... each asset is traded independently
+    # according to its respective Net Volume data"): in 'NV' mode, regime
+    # comes from this asset's OWN NET_VOLUME_STATUS sample (Positive/
+    # Negative, off Net Drift's filtered net volume — see
+    # _net_volume_poll_loop) instead of the shared TLT-derived PCVR ratio.
+    # Every other mode (Order Flow, BTD) is completely untouched — this is
+    # the ONLY branch point 'NV' needed; everything downstream of `regime`
+    # (targets, gating, HPLs, sizing, risk management) is already fully
+    # mode-agnostic. The `lights["PCVR"]` KEY stays the same either way —
+    # only the Status screen's own section title was asked to change, not
+    # this internal light name used throughout the rest of the gate.
+    if TRADING_MODE == "NV":
+        with NET_VOLUME_STATUS_LOCK:
+            nv_status = NET_VOLUME_STATUS.get(asset)
+        regime = "long" if nv_status == "Positive" else "short" if nv_status == "Negative" else None
+        lights["PCVR"] = regime is not None
+    else:
+        pcvr = snapshot.get("pcvr") or {}
+        ratio = pcvr.get("ratio")
+        regime = None
+        if ratio is not None:
+            if ratio <= 0.98:
+                regime = "long"
+            elif ratio >= 1.02:
+                regime = "short"
+        lights["PCVR"] = bool(ratio is not None and (ratio <= 0.98 or ratio >= 1.02))
 
     lights["HPLs"] = bool(inst.get("any_active"))
     log_targets = inst.get("targets") or []
@@ -4634,7 +4653,29 @@ def _status_build_render_lines(display_data):
     p()
 
     pcvr = display_data.get("pcvr")
-    p(f"  {BLD}4. PCVR{RST}")
+    p(f"  {BLD}4. Options{RST}")
+    # Net Volume (2026-09-01 user request) — sampled off Net Drift
+    # (Premium)'s own FILTERED (OTM-only) cumulative net volume, not the
+    # standard one — see _net_volume_poll_loop's own header comment.
+    # Positioned above the PCVR value itself, per that request.
+    with NET_VOLUME_STATUS_LOCK:
+        _nv_eth, _nv_qqq = NET_VOLUME_STATUS.get("ETH"), NET_VOLUME_STATUS.get("QQQ")
+        _nv_eth_val, _nv_qqq_val = NET_VOLUME_VALUE.get("ETH"), NET_VOLUME_VALUE.get("QQQ")
+    for _nv_label, _nv_status, _nv_val in (("Net Volume - ETH", _nv_eth, _nv_eth_val),
+                                             ("Net Volume - QQQ", _nv_qqq, _nv_qqq_val)):
+        # 2026-09-01 follow-up: the raw value next to each status, straight
+        # from the same 15s snapshot the status itself was classified from
+        # (NET_VOLUME_VALUE — see _net_volume_poll_loop) — never re-derived
+        # from a second, possibly-newer read of DRIFT_STATE.
+        _nv_val_str = f" {DIM}({_nv_val:+,.2f}){RST}" if _nv_val is not None else ""
+        if _nv_status == "Positive":
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{_nv_label:<18}{RST}{GRN}{BLD}Positive{RST}{_nv_val_str}")
+        elif _nv_status == "Negative":
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{_nv_label:<18}{RST}{RED}{BLD}Negative{RST}{_nv_val_str}")
+        elif _nv_status == "Neutral":
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{_nv_label:<18}{RST}{YLW}{BLD}Neutral{RST}{_nv_val_str}")
+        else:
+            p(f"     {STATUS_LIGHT_BLANK}  {DIM}{_nv_label:<18}{RST}{DIM}n/a{RST}")
     if pcvr:
         ratio = pcvr["ratio"]
         col = RED if ratio >= 1.02 else (GRN if ratio <= 0.98 else YLW)
@@ -6938,6 +6979,82 @@ DRIFT_MIN_TRADE_USD = {asset: DRIFT_DEFAULT_MIN_TRADE_USD for asset in DRIFT_ASS
 DRIFT_CONFIDENCE_DEADZONE = {asset: DRIFT_DEFAULT_CONFIDENCE_DEADZONE for asset in DRIFT_ASSETS}  # [C], QQQ only
 DRIFT_REFRESH_EVENT = {asset: threading.Event() for asset in DRIFT_ASSETS}   # [R] refresh-now
 DRIFT_NEXT_POLL_TS = {asset: time.time() for asset in DRIFT_ASSETS}          # for the UI countdown
+
+# ── Net Volume (2026-09-01 user request) ────────────────────────────────────
+# A lightweight directional-bias snapshot sampled off Net Drift (Premium)'s
+# own already-live, always-on engine (DRIFT_STATE above) — NOT a separate
+# data fetch of its own. "the FILTERED version, not the standard one" means
+# DRIFT_STATE[asset].net_vol_cum_f specifically (OTM-only cumulative net
+# volume, the same field [F] toggles into view in Net Drift mode) rather
+# than net_vol_cum (all strikes). Sampled every NET_VOLUME_POLL_SECS instead
+# of read live-on-demand so both the Status screen's own readout and 'NV'
+# trading mode's regime derivation (see instrument_lights) see the exact
+# same, non-flickering value at any given moment — two consumers of one
+# snapshot, not two independent reads that could disagree mid-tick.
+NET_VOLUME_POLL_SECS = 15
+NET_VOLUME_STATUS_LOCK = threading.Lock()
+NET_VOLUME_STATUS = {"ETH": None, "QQQ": None}   # "Positive" / "Negative" / "Neutral" / None (not yet available)
+# 2026-09-01 follow-up: the raw net_vol_cum_f each status above was derived
+# from, sampled at the exact same instant — kept alongside the status so
+# the Status screen can show both ("Positive (+142.30)") without a second,
+# possibly-inconsistent read of DRIFT_STATE.
+NET_VOLUME_VALUE = {"ETH": None, "QQQ": None}
+# QQQ-only eligibility window, explicit user spec (2026-09-01): 08:30-15:00
+# CT — deliberately its OWN window, not a reuse of STATUS_QQQ_OPEN_CT_MIN
+# (08:45) elsewhere in this file; the two happen to nearly coincide, but
+# outside 08:45-15:00 QQQ is already market_closed-gated everywhere that
+# matters, so the extra 15 minutes here is harmless. ETH has no such
+# window — crypto trades continuously.
+NET_VOLUME_QQQ_OPEN_CT_MIN = 8 * 60 + 30
+NET_VOLUME_QQQ_CLOSE_CT_MIN = 15 * 60
+
+def _net_volume_qqq_window_active():
+    n = _status_now_ct()
+    minutes = n.hour * 60 + n.minute
+    return n.weekday() < 5 and NET_VOLUME_QQQ_OPEN_CT_MIN <= minutes < NET_VOLUME_QQQ_CLOSE_CT_MIN
+
+def _net_volume_classify(netvol):
+    # 2026-09-01 follow-up ("If Net Volume is 0, its status should be
+    # 'Neutral'. When Neutral, no trades are to be taken."): a bare
+    # `> 0`/`<= 0` split silently folded an exact-zero reading into
+    # "Negative", which would happily arm a short — Neutral is a third,
+    # genuine value now, not a rounding artifact of "Negative". A Neutral
+    # (or None/unavailable) regime already can't arm anything on its own —
+    # instrument_lights' own NV branch maps anything other than literal
+    # "Positive"/"Negative" to `regime = None`, the same "nothing to do"
+    # value PCVR's own dead-zone already produces — so no gating logic
+    # needed beyond this classification itself.
+    if netvol > 0:
+        return "Positive"
+    if netvol < 0:
+        return "Negative"
+    return "Neutral"
+
+def _net_volume_poll_loop(stop_evt):
+    """Always-on background thread, same shape as _drift_engine_loop/
+    _gex_engine_loop etc. — samples DRIFT_STATE's own live filtered net
+    volume every NET_VOLUME_POLL_SECS and republishes the directional read
+    (see _net_volume_classify) plus the raw value into NET_VOLUME_STATUS/
+    NET_VOLUME_VALUE. QQQ is left at None (renders as "n/a" / can't arm
+    under 'NV') outside its own 08:30-15:00 CT window; ETH always
+    updates."""
+    while not stop_evt.is_set():
+        with DRIFT_STATE["ETH"].lock:
+            eth_netvol = DRIFT_STATE["ETH"].net_vol_cum_f
+        eth_status = _net_volume_classify(eth_netvol)
+
+        qqq_status, qqq_netvol = None, None
+        if _net_volume_qqq_window_active():
+            with DRIFT_STATE["QQQ"].lock:
+                qqq_netvol = DRIFT_STATE["QQQ"].net_vol_cum_f
+            qqq_status = _net_volume_classify(qqq_netvol)
+
+        with NET_VOLUME_STATUS_LOCK:
+            NET_VOLUME_STATUS["ETH"] = eth_status
+            NET_VOLUME_STATUS["QQQ"] = qqq_status
+            NET_VOLUME_VALUE["ETH"] = eth_netvol
+            NET_VOLUME_VALUE["QQQ"] = qqq_netvol
+        stop_evt.wait(NET_VOLUME_POLL_SECS)
 
 
 def _drift_seed_state_from_samples(state, samples, is_crypto):
@@ -9335,7 +9452,7 @@ class AthenaInstrument:
             if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
                 return
             self.state = "ARMED"
-            trigger_desc = "BTD candle closes" if TRADING_MODE == "BTD" else "order flow"
+            trigger_desc = "BTD candle closes" if TRADING_MODE in ("BTD", "NV") else "order flow"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching {trigger_desc} ({regime})"
                         + (" [24H MODE]" if NO_SESSION else ""))
             # 2026-07-28 debugging aid, user-reported ("ETH entered a trade
@@ -9371,7 +9488,11 @@ class AthenaInstrument:
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
                                                      "athena_enabled": ATHENA_ENABLED[self.asset]})
                 return
-            if TRADING_MODE == "BTD":
+            if TRADING_MODE in ("BTD", "NV"):
+                # 2026-09-01: 'NV' shares this exact BTD candle-close
+                # confirmation path — the only thing 'NV' changes is where
+                # `regime` itself came from (see instrument_lights).
+                #
                 # 2026-08-27: ETH reads CH_STATE's own kline_p-fed candles
                 # instead of LIVE_TAPE's client-aggregated trade-print
                 # series — see ch_snapshot_1m's own docstring for why. QQQ
@@ -10067,7 +10188,13 @@ class AthenaInstrument:
 
         detail = {"regime": regime, "order_type": order_type, "pos_side": pos_side, "qty": qty_str,
                    "price": f"market (~{live_price})", "targets": targets_full, "sl_distance": R,
-                   "trigger": "BTD", "layer1_mult": layer1_mult, "drawdown_mult": dd_mult}
+                   # 2026-09-01: dynamic, not a hardcoded "BTD" — this
+                   # function is now shared by both BTD and NV modes (see
+                   # the confirmation-dispatch site's own comment); logging
+                   # the ACTUAL mode here keeps trade-log/backtest analysis
+                   # able to tell them apart later, same as the existing
+                   # "Order Flow" trigger already reads for that mode.
+                   "trigger": TRADING_MODE, "layer1_mult": layer1_mult, "drawdown_mult": dd_mult}
 
         result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, None, sequence_label)
         if not (isinstance(result, dict) and result.get("code") == 0):
@@ -10523,6 +10650,17 @@ class AthenaInstrument:
                 await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
             self._tp1_lock_done = True
 
+        # 2026-09-01 user request ("if Athena is in a position in NV mode
+        # and Net Volume shifts to the opposite side... the position
+        # should be closed immediately"): needed NO change here — `regime`
+        # is recomputed fresh every cycle by instrument_lights regardless
+        # of which trading mode is active, and under NV that's already
+        # Net-Volume-derived (Positive->long, Negative->short, anything
+        # else->None). A flip from Positive to Negative (or back) shows up
+        # here exactly like a PCVR flip always has; a mere move to Neutral
+        # does NOT trigger this (regime becomes None, matching neither
+        # arm below), same as PCVR's own dead-zone never force-closes an
+        # open position on its own.
         flipped = (pos_side == "Long" and regime == "short") or (pos_side == "Short" and regime == "long")
         if flipped:
             qty = abs(float(pos.get("size") or 0))
@@ -17097,8 +17235,19 @@ def draw_dashboard(db, snap, cols):
         ratchet_tag = f"   {DIM}trail: +(N-1)R lock{RST}" if PROFIT_RATCHET_ENABLED else ""
         db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}{ratchet_tag}")
         y += 1
+        # 2026-09-01 user request ("'PCVR' should become 'NV' and 'BTD'
+        # should stay, not change to 'NV'"): two INDEPENDENT relabels, not
+        # one shared TRADING_MODE substitution — the "Order Flow" light
+        # names the CONFIRMATION mechanism, identical for BTD and NV (NV
+        # shares BTD's exact candle-close trigger — see instrument_lights'
+        # own docstring), so it reads "BTD" for both; the "PCVR" light
+        # names the regime DATA SOURCE, which genuinely differs under NV
+        # (Net Volume, not PCVR), so only that one switches label.
         detail = "  " + "  ".join(
-            (GRN if lights.get(n) else RED) + ("BTD" if n == "Order Flow" and TRADING_MODE == "BTD" else n) + RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
+            (GRN if lights.get(n) else RED) +
+            ("BTD" if n == "Order Flow" and TRADING_MODE in ("BTD", "NV") else
+             "NV" if n == "PCVR" and TRADING_MODE == "NV" else n) +
+            RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
             for n in LIGHT_ORDER)
         db.puts_ansi(y, 0, detail)
         y += 1
@@ -20652,7 +20801,7 @@ TRADING_HELP_SECTIONS = [
         ("[2]",        "Toggle the profit ratchet  (trail an open stop to lock +(N-1)R at each +NR)"),
     ]),
     ("TRADING CONTROLS", [
-        ("[9]",        "Cycle trading mode  (Order Flow  <->  BTD candle-close)"),
+        ("[9]",        "Cycle trading mode  (Order Flow  ->  BTD candle-close  ->  NV candle-close)"),
         ("[A]",        "Pause/resume new entries for the focused asset"),
         ("[N]",        "Toggle 24H mode  (bypass the Session gate)"),
         ("[F]",        "Flatten — close any open position immediately"),
@@ -21184,6 +21333,11 @@ def curses_main(stdscr):
         # BackgroundTracker split.
         for _drift_asset in DRIFT_ASSETS:
             threading.Thread(target=_drift_engine_loop, args=(_drift_asset, _quit_evt), daemon=True).start()
+        # Net Volume (2026-09-01) — a lightweight sampler over the Net Drift
+        # engine started just above, not a fetch of its own; must start
+        # after it so DRIFT_STATE has something real to sample from the
+        # first tick. See _net_volume_poll_loop's own docstring.
+        threading.Thread(target=_net_volume_poll_loop, args=(_quit_evt,), daemon=True).start()
         # CVD — ported from cvd.py (2026-08-16). No dedicated feed thread of
         # its own: it's a passive second consumer of the ALREADY-always-on
         # footprint feed threads above (Phemex/Kraken/Coinbase/Alpaca, all

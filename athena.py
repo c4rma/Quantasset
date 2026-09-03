@@ -351,13 +351,28 @@ _funding_regime_date = [None]
 # AFTER a boosted trade always reverts to bare base risk, unconditionally.
 # A new boost only ever arms again from some LATER trade taken at base
 # risk that wins.
-SIZING_MODES = ("standard", "aggressive")
+#
+# AGGRESSIVE/1R+0.33W (2026-09-02 user request) — identical mechanic to
+# Aggressive above, except the one-shot boost only ever carries 33% of the
+# winning trade's own dollar PnL forward (conserving the other 67%),
+# instead of the full amount. Same one-shot/never-re-examined/reverts-to-
+# base rule otherwise. Internal key is "aggressive_033"; display name
+# ("Aggressive/1R+0.33W") lives in SIZING_MODE_LABELS below, not a
+# .capitalize() of the key, since that would read as "Aggressive_033".
+SIZING_MODES = ("standard", "aggressive", "aggressive_033")
+SIZING_MODE_LABELS = {"standard": "Standard", "aggressive": "Aggressive",
+                       "aggressive_033": "Aggressive/1R+0.33W"}
 
 def _default_sizing_state():
     # nv_auto_pending_boost_dollars (2026-09-02): NV-Auto's own "1R+0.33W"
     # boost slot — deliberately separate from pending_boost_dollars
     # (Aggressive's own), see _compute_trade_risk_dollars' own comment.
-    return {a: {"pending_boost_dollars": None, "nv_auto_pending_boost_dollars": None} for a in ASSETS}
+    # aggressive_033_pending_boost_dollars (2026-09-02): the [0]-selectable
+    # Aggressive/1R+0.33W mode's own boost slot — same isolation rationale,
+    # own key so switching SIZING_MODE via [0] can never cross-arm a boost
+    # a different mode actually produced.
+    return {a: {"pending_boost_dollars": None, "nv_auto_pending_boost_dollars": None,
+                "aggressive_033_pending_boost_dollars": None} for a in ASSETS}
 
 def _load_sizing_state():
     try:
@@ -2681,10 +2696,16 @@ def fetch_gex_snapshot(asset, is_crypto, mult):
     """Ported from gex.py's own fetch_snapshot — dispatches to whichever
     data source this asset actually uses. `asset` doubles as both the
     Deribit currency ("ETH") and the CBOE ticker ("QQQ") since Athena's
-    own ASSETS keys already match both conventions directly."""
+    own ASSETS keys already match both conventions directly. 2026-09-02
+    (TLT/NDX/VIX added to GEX mode): NDX/VIX are CBOE INDEX roots, which
+    need the same underscore-prefixed fetch symbol ("_NDX"/"_VIX") Net
+    Drift already established via DRIFT_CBOE_SYMBOL — reused here as the
+    single source of truth rather than a second, possibly-drifting copy
+    of the same mapping. TLT (a plain ETF ticker, like QQQ) needs no
+    override and falls through to using `asset` unchanged, same as QQQ."""
     if is_crypto:
         return fetch_gex_crypto(asset, mult)
-    return fetch_gex_equity(asset, mult)
+    return fetch_gex_equity(DRIFT_CBOE_SYMBOL.get(asset, asset), mult)
 
 # ── GEX persistence — logs/<Y>/<M>/<D>/gex_<ASSET>_<date>.jsonl ─────────────
 # SAME "logs/" folder gex.py itself writes to (GEX_LOG_DIR_BASE, defined
@@ -2783,16 +2804,26 @@ def gex_load_log(asset, date_str):
                 continue
     return cols
 
+# 2026-09-02 user request ("In GEX, include TLT, NDX, and VIX") — three
+# display/monitoring-only assets added to GEX mode, same non-tradeable
+# treatment Net Drift already gives them (never in ASSETS/chart_focus,
+# never reaching instrument_lights/any entry logic). Declared here as its
+# own tuple rather than reusing DRIFT_ASSETS directly — DRIFT_ASSETS isn't
+# defined until later in the file, and the two lists are conceptually
+# independent even though they happen to name the same three extras today.
+GEX_EXTRA_ASSETS = ("NDX", "TLT", "VIX")
+GEX_ASSETS = tuple(ASSETS) + GEX_EXTRA_ASSETS   # ("ETH", "QQQ", "NDX", "TLT", "VIX")
+
 # ── GEX in-process state (replaces the file round-trip a separate gex.py
 # process needed — read_gex_export now prefers this directly; see below) ──
-GEX_HISTORY = {a: deque(maxlen=GEX_HISTORY_MAXLEN) for a in ASSETS}
-GEX_GRID    = {a: set() for a in ASSETS}
-GEX_SCALE_MAX = {a: 0.0 for a in ASSETS}
-GEX_META    = {a: {} for a in ASSETS}
-GEX_EXPORT  = {a: None for a in ASSETS}   # export_status_snapshot's own payload shape, kept in memory
-GEX_STATUS  = {a: "connecting…" for a in ASSETS}   # same convention as LIVE_TAPE.status
-GEX_LOG_ROWS = {a: 0 for a in ASSETS}
-GEX_DIAG_COUNT = {a: 0 for a in ASSETS}
+GEX_HISTORY = {a: deque(maxlen=GEX_HISTORY_MAXLEN) for a in GEX_ASSETS}
+GEX_GRID    = {a: set() for a in GEX_ASSETS}
+GEX_SCALE_MAX = {a: 0.0 for a in GEX_ASSETS}
+GEX_META    = {a: {} for a in GEX_ASSETS}
+GEX_EXPORT  = {a: None for a in GEX_ASSETS}   # export_status_snapshot's own payload shape, kept in memory
+GEX_STATUS  = {a: "connecting…" for a in GEX_ASSETS}   # same convention as LIVE_TAPE.status
+GEX_LOG_ROWS = {a: 0 for a in GEX_ASSETS}
+GEX_DIAG_COUNT = {a: 0 for a in GEX_ASSETS}
 GEX_STATE_LOCK = threading.Lock()
 
 def _gex_snapshot_state(asset):
@@ -6657,6 +6688,13 @@ DRIFT_IS_CRYPTO = {"ETH": True, "QQQ": False, "NDX": False, "TLT": False, "VIX":
 # suffix offset, never by prefix), so nothing downstream of the fetch
 # needs to know this mapping exists.
 DRIFT_CBOE_SYMBOL = {"VIX": "_VIX", "NDX": "_NDX"}
+# 2026-09-02 user-reported ("Net Volume has stayed 0 all morning for TLT &
+# VIX... using the closest expiry instead of same-day, or raw?") — see
+# _drift_poll_once_cboe's own docstring for the full reasoning. These two
+# never have a same-day listed expiry (TLT's nearest is always >=1 day
+# out; VIX only expires weekly), so their own OTM filter uses the nearest
+# available expiry instead of requiring it be today specifically.
+DRIFT_FILTER_NEAREST_EXPIRY_ASSETS = ("TLT", "VIX")
 DRIFT_CRYPTO_CCY = {"ETH": "ETH"}          # Deribit/OKX/Bybit currency code per crypto asset
 
 DRIFT_DEFAULT_INTERVAL = 15         # [I] — how often each asset polls for new data
@@ -7147,16 +7185,26 @@ NET_VOLUME_EQUITY_WINDOW_ASSETS = ("QQQ", "NDX", "TLT", "VIX")   # every DRIFT_A
                                     # window (see _net_volume_equity_window_active); ETH
                                     # samples unconditionally (crypto, 24/7).
 
+# 2026-09-02 user-reported ("the Net Volume has stayed 0 all morning long
+# for TLT & VIX. Should I use the filtered version for these two assets, or
+# the non-filtered version?"): traced to _drift_poll_once_cboe's own
+# is_0dte gate on the OTM filter, which TLT/VIX's own real-world listing
+# calendar (never a same-day expiry) could never satisfy — fixed at the
+# SOURCE (see DRIFT_FILTER_NEAREST_EXPIRY_ASSETS/_drift_poll_once_cboe's
+# own docstring) rather than here: TLT/VIX's own net_vol_cum_f is now a
+# real, meaningful filtered figure (OTM of whatever expiry is actually
+# available), so this loop samples it uniformly for every asset, same as
+# ETH/QQQ/NDX — no more per-asset raw-vs-filtered special case needed.
+
 def _net_volume_poll_loop(stop_evt):
     """Always-on background thread, same shape as _drift_engine_loop/
     _gex_engine_loop etc. — samples DRIFT_STATE's own live filtered net
     volume every NET_VOLUME_POLL_SECS and republishes the directional read
     (see _net_volume_classify) plus the raw value into NET_VOLUME_STATUS/
-    NET_VOLUME_VALUE, for every asset DRIFT_STATE tracks. TLT/VIX
-    (2026-09-02) are display-only, same as QQQ's own gating but never
-    consulted for a trading decision — instrument_lights (the only reader
-    that turns a status into a regime) is never called with those asset
-    names."""
+    NET_VOLUME_VALUE, for every asset DRIFT_STATE tracks. QQQ/NDX/TLT/VIX
+    are all display-only, never consulted for a trading decision —
+    instrument_lights (the only reader that turns a status into a regime)
+    is never called with those asset names."""
     while not stop_evt.is_set():
         with DRIFT_STATE["ETH"].lock:
             eth_netvol = DRIFT_STATE["ETH"].net_vol_cum_f
@@ -7684,10 +7732,26 @@ def _drift_poll_once_cboe(asset, state, min_trade_usd, confidence_deadzone):
     mode here is BOTH real filters (unlike ETH, where 0DTE is a no-op):
     is_0dte gates the whole poll's filtered contribution to zero on days
     the chain fetch had to fall back off today's date; OTM is checked per
-    contract using this poll's one chain spot."""
+    contract using this poll's one chain spot.
+
+    2026-09-02 user-reported ("the Net Volume has stayed 0 all morning
+    long for TLT & VIX. Would it be better for TLT & VIX to still have a
+    filtered mode using the closest expiry instead of same-day, or to
+    continue using raw?"): TLT and VIX structurally never have a same-day
+    listed expiry (TLT's nearest is always at least a day out; VIX only
+    expires weekly, on Wednesdays) — is_0dte is permanently False for
+    both, so requiring it made their own OTM filter permanently zero too,
+    by construction, not from any actual lack of options flow. For assets
+    in DRIFT_FILTER_NEAREST_EXPIRY_ASSETS, the OTM filter uses whichever
+    expiry `_drift_fetch_cboe_chain` actually fetched (nearest available —
+    the SAME chain `net_vol_cum`/raw already reads), same as QQQ/NDX get
+    on every ordinary 0DTE day, instead of requiring it be today's own
+    date specifically. QQQ/NDX are unaffected — they keep the stricter
+    same-day-only definition (and, in practice, satisfy it most days
+    anyway)."""
     chain = _drift_fetch_cboe_chain(DRIFT_CBOE_SYMBOL.get(asset, asset))
     contracts = chain["contracts"]
-    is_0dte = chain["is_0dte"]
+    is_0dte = chain["is_0dte"] or asset in DRIFT_FILTER_NEAREST_EXPIRY_ASSETS
     spot = chain["spot"]
     live_quote = _drift_fetch_live_price(asset)
     if live_quote is not None and spot and abs(live_quote - spot) <= spot * DRIFT_LIVE_QUOTE_MAX_DEVIATION:
@@ -9836,6 +9900,13 @@ class AthenaInstrument:
                 _save_sizing_state()
                 return base + boost, f"Aggressive (W+${boost:,.2f})", True
             return base, "Aggressive", False
+        if SIZING_MODE == "aggressive_033":
+            boost = SIZING_STATE[self.asset].get("aggressive_033_pending_boost_dollars")
+            if boost:
+                SIZING_STATE[self.asset]["aggressive_033_pending_boost_dollars"] = None
+                _save_sizing_state()
+                return base + boost, f"Aggressive/1R+0.33W (+${boost:,.2f})", True
+            return base, "Aggressive/1R+0.33W", False
         return base, "Standard", False
 
     def _update_sizing_progression(self, pnl):
@@ -9862,6 +9933,18 @@ class AthenaInstrument:
                 console_log(f"{self.asset}: {YLW}1R+0.33W — next trade risks base + ${boost:,.2f} "
                             f"(33% of this trade's own ${pnl:,.2f} profit){RST}")
                 log_event(self.asset, "nv_auto_boost_armed", {"pnl": pnl, "boost": boost})
+            return
+        if SIZING_MODE == "aggressive_033":
+            was_boosted = bool(self.position and self.position.get("boosted"))
+            if was_boosted:
+                return
+            if pnl > 0:
+                boost = pnl * 0.33
+                SIZING_STATE[self.asset]["aggressive_033_pending_boost_dollars"] = boost
+                _save_sizing_state()
+                console_log(f"{self.asset}: {YLW}Aggressive/1R+0.33W — next trade risks base + ${boost:,.2f} "
+                            f"(33% of this trade's own ${pnl:,.2f} profit){RST}")
+                log_event(self.asset, "aggressive_033_boost_armed", {"pnl": pnl, "boost": boost})
             return
         if SIZING_MODE != "aggressive":
             return
@@ -13073,8 +13156,10 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
     # dollars), so this shows regardless of which source tab is active —
     # a plain fact check against what the table below might otherwise
     # imply.
-    mode_note = "flat risk, no progression" if SIZING_MODE == "standard" else "1R+W win-boost active"
-    db.puts_ansi(y, 0, f"  {DIM}Live sizing mode: {YLW}{SIZING_MODE.capitalize()}{RST}{DIM} ({mode_note}){RST}")
+    mode_note = ("flat risk, no progression" if SIZING_MODE == "standard"
+                 else "1R+0.33W win-boost active" if SIZING_MODE == "aggressive_033"
+                 else "1R+W win-boost active")
+    db.puts_ansi(y, 0, f"  {DIM}Live sizing mode: {YLW}{SIZING_MODE_LABELS[SIZING_MODE]}{RST}{DIM} ({mode_note}){RST}")
     y += 2
 
     db.puts_ansi(y, 0, f"{BLD}Trades{RST}    Total {stats['count']}   Wins {GRN}{stats['wins']}{RST}   "
@@ -13828,6 +13913,228 @@ def _ohlc_target_style(t_type):
         return P_MAGENTA, curses.A_BOLD
     return P_DIM, curses.A_NORMAL
 
+# 2026-09-02 user request ("In the QQQ OHLC chart, add NDX to the [Y]
+# function") — NDX's own small, standalone 1-minute OHLCV feed. Yahoo's
+# chart endpoint is the same one Markets' own _markets_fetch_yahoo already
+# polls (MARKETS_YAHOO_URL/_MARKETS_YAHOO_HEADERS, reused directly here —
+# one source of truth for the request shape rather than a second copy of
+# it), except that function only ever keeps the CLOSE price (a normalized-
+# %-overlay line has no use for open/high/low) — this keeps the full
+# OHLCV Yahoo already returns, needed for an actual candlestick chart.
+# Deliberately its own tiny poller rather than folding into the Markets
+# refresh loop: different data shape entirely (bars, not one shared %-
+# since-open series), and this needs to keep running regardless of
+# whether the Markets overview itself is even the active [Y] view.
+NDX_OHLC_SYMBOL = "^NDX"
+NDX_OHLC_POLL_SECS = 20
+NDX_OHLC_MAXLEN = 1440   # a full trading day of 1m bars, same horizon Yahoo's own "1d" range gives back
+NDX_OHLC_LOCK = threading.Lock()
+NDX_OHLC_BARS = deque(maxlen=NDX_OHLC_MAXLEN)   # oldest->newest, CLOSED bars only — {"ts","o","h","l","c","v"}
+NDX_OHLC_LIVE = [None]   # single still-forming bar, or None — same (bars, live) split ch_snapshot_1m/
+                          # LIVE_TAPE.snapshot_1m already use, so _draw_ohlc_chart_panel's own
+                          # all_candles = list(bars_1m) + ([live_1m] if live_1m else []) pattern works unchanged.
+NDX_OHLC_STATUS = "connecting…"
+
+def _fetch_ndx_ohlc_bars():
+    """One poll of Yahoo's own intraday chart endpoint for NDX_OHLC_SYMBOL,
+    today's session only (interval=1m, range=1d — same params
+    _markets_fetch_yahoo uses at its own finest resolution). Returns
+    oldest->newest {"ts","o","h","l","c","v"} dicts for every bar Yahoo
+    reports (a bar with any None OHLC field is dropped — a genuine gap in
+    Yahoo's own intraday feed, most often pre-market for an index with no
+    extended-hours trades of its own). Whole-list replace, not an
+    incremental append — Yahoo's own "1d" range already IS the whole
+    day's history every single poll, same trivial-refresh approach
+    _markets_fetch_yahoo itself relies on, so there's no baseline/cursor
+    state to track here at all."""
+    r = requests.get(MARKETS_YAHOO_URL.format(NDX_OHLC_SYMBOL), headers=_MARKETS_YAHOO_HEADERS,
+                      params={"interval": "1m", "range": "1d"}, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    result = data.get("chart", {}).get("result") or []
+    if not result:
+        raise RuntimeError("empty Yahoo chart response for NDX")
+    chart = result[0]
+    ts_raw = chart.get("timestamp") or []
+    quote = (chart.get("indicators", {}).get("quote") or [{}])[0]
+    opens, highs, lows, closes, vols = (quote.get(k) or [] for k in ("open", "high", "low", "close", "volume"))
+    bars = []
+    for i, ts in enumerate(ts_raw):
+        if i >= len(opens) or i >= len(highs) or i >= len(lows) or i >= len(closes):
+            break
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        if o is None or h is None or l is None or c is None:
+            continue
+        v = vols[i] if i < len(vols) and vols[i] is not None else 0.0
+        bars.append({"ts": int(ts), "o": float(o), "h": float(h), "l": float(l), "c": float(c), "v": float(v)})
+    if not bars:
+        raise RuntimeError("no usable NDX bars in Yahoo response")
+    return bars
+
+def _ndx_ohlc_poll_loop(stop_evt):
+    """Always-on background thread, same shape as _markets_refresh_loop —
+    polls _fetch_ndx_ohlc_bars every NDX_OHLC_POLL_SECS and republishes
+    into NDX_OHLC_BARS/NDX_OHLC_LIVE. The most recent bar is treated as
+    still-forming ("live") if its own minute bucket is the current
+    wall-clock minute, same rule ch_snapshot_1m/_vol_effort_records
+    already use — everything else is a genuinely closed bar."""
+    global NDX_OHLC_STATUS
+    while not stop_evt.is_set():
+        try:
+            bars = _fetch_ndx_ohlc_bars()
+            cur_minute = int(time.time()) // 60 * 60
+            live = bars[-1] if bars and bars[-1]["ts"] >= cur_minute else None
+            closed = bars[:-1] if live else bars
+            with NDX_OHLC_LOCK:
+                NDX_OHLC_BARS.clear()
+                NDX_OHLC_BARS.extend(closed)
+                NDX_OHLC_LIVE[0] = live
+            NDX_OHLC_STATUS = "live"
+        except Exception as e:
+            NDX_OHLC_STATUS = f"error: {e}"[:60]
+        stop_evt.wait(NDX_OHLC_POLL_SECS)
+
+def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, crosshair_bar_idx=None):
+    """NDX's own bare candlestick + volume chart — deliberately a much
+    smaller, standalone function rather than a heavily-conditional branch
+    of _draw_ohlc_chart_panel: NDX has no tick-level trade feed behind it
+    (only Yahoo's own aggregated 1m OHLCV bars), so none of VWAP/VP/
+    session overlays/BTD/position levels have real data to draw from
+    anyway. Scroll (hscroll_bars, "N bars back from the newest") and
+    crosshair (crosshair_bar_idx, same addressing) DO work, mirrored from
+    _draw_ohlc_chart_panel's own left_idx/right_idx window and its own
+    CROSSHAIR section — sourced from NDX's own scroll/crosshair state slot
+    in curses_main (see _effective_chart_asset), not QQQ's real one.
+    Candle body/wick and plain volume-histogram logic likewise mirrored
+    from that function's candle loop and its `else` branch of the VOLUME/
+    VOLEFFORT section — same visual language as ETH/QQQ's own candles,
+    just without anything layered on top."""
+    cols = x1 - x0
+    rows_avail = y1 - top
+    if rows_avail < 10 or cols < OHLC_PRICE_W + 4:
+        db.puts(top, x0, "too small", P_DIM)
+        return
+
+    all_candles = list(bars_1m)
+    if live_1m:
+        all_candles.append(live_1m)
+    n_all = len(all_candles)
+    if n_all == 0:
+        db.puts(top, x0, f"NDX — {NDX_OHLC_STATUS}", P_DIM)
+        return
+
+    HEADER_H, TIME_H, VOL_H = 1, 1, OHLC_VOL_H
+    chart_top = top + HEADER_H
+    chart_bot_excl = y1 - TIME_H - VOL_H - 1
+    chart_h = max(1, chart_bot_excl - chart_top)
+    chart_r = x0 + cols - OHLC_PRICE_W - 1
+    chart_w = max(1, chart_r - x0)
+    time_row = chart_bot_excl
+    vol_top = time_row + 1
+    vol_bot_excl = vol_top + VOL_H
+
+    hscroll_bars = max(0, min(hscroll_bars, max(0, n_all - 1)))
+    right_idx = n_all - hscroll_bars
+    left_idx = max(0, right_idx - chart_w)
+    visible = all_candles[left_idx:right_idx]
+    n_vis = len(visible)
+    if n_vis == 0:
+        return
+
+    last = all_candles[-1]
+    # No own [SCROLLED Nb back] tag here — the outer draw_footprint_panel
+    # title bar (row above this one) already shows it, sourced from the
+    # same hscroll_bars this function was called with; showing it twice
+    # would be redundant.
+    header = f"NDX   {fmt_price(last['c'])}   {datetime.fromtimestamp(last['ts']).strftime('%H:%M:%S')}"
+    db.puts(top, x0, header[:max(0, cols)], P_STATUS, curses.A_BOLD)
+
+    lo_p = min(b["l"] for b in visible)
+    hi_p = max(b["h"] for b in visible)
+    span = hi_p - lo_p
+    pad = max(span * 0.05, hi_p * 0.0005)
+    lo_p -= pad
+    hi_p += pad
+
+    def p2r(price):
+        if hi_p == lo_p:
+            return chart_h // 2
+        return int((1.0 - (price - lo_p) / (hi_p - lo_p)) * (chart_h - 1))
+
+    clamp = lambda v: max(chart_top, min(chart_bot_excl - 1, v))
+    start_col = chart_r - n_vis
+
+    # Crosshair column — same "N bars back from the newest" addressing
+    # hscroll_bars itself uses, resolved against the CURRENT scroll window
+    # exactly like _draw_ohlc_chart_panel's own crosshair_col computation.
+    crosshair_col = None
+    if crosshair_bar_idx is not None:
+        _ch_abs = n_all - 1 - crosshair_bar_idx
+        if left_idx <= _ch_abs < right_idx:
+            crosshair_col = start_col + (_ch_abs - left_idx)
+            _ch_bar = all_candles[_ch_abs]
+            _ch_tag = (f"   ✛ {datetime.fromtimestamp(_ch_bar['ts']).strftime('%H:%M:%S')} "
+                       f"O:{fmt_price(_ch_bar['o'])} H:{fmt_price(_ch_bar['h'])} "
+                       f"L:{fmt_price(_ch_bar['l'])} C:{fmt_price(_ch_bar['c'])}")
+            db.puts(top, x0 + len(header), _ch_tag[:max(0, cols - len(header))], P_CYAN, curses.A_BOLD)
+
+    label_step = max(1, chart_h // 8)
+    for r in range(chart_h):
+        if r % label_step == 0:
+            price_at_row = hi_p - (r / max(1, chart_h - 1)) * (hi_p - lo_p)
+            db.puts(chart_top + r, chart_r + 1, fmt_price(price_at_row).rjust(OHLC_PRICE_W), P_DIM)
+        db.put(chart_top + r, chart_r, "│", P_DIM)
+
+    for i, bar in enumerate(visible):
+        col = start_col + i
+        if col < x0 or col >= chart_r:
+            continue
+        bull = bar["c"] >= bar["o"]
+        body_pair = P_DEFAULT if bull else P_BLUE
+        r_hi = clamp(chart_top + p2r(bar["h"]))
+        r_top = clamp(chart_top + p2r(max(bar["o"], bar["c"])))
+        r_bot = clamp(chart_top + p2r(min(bar["o"], bar["c"])))
+        r_lo = clamp(chart_top + p2r(bar["l"]))
+        for r in range(r_hi, r_lo + 1):
+            db.put(r, col, "│", P_DIM)
+        if r_top == r_bot:
+            db.put(r_top, col, "─", body_pair, curses.A_BOLD)
+        else:
+            for r in range(r_top, r_bot + 1):
+                db.put(r, col, "█", body_pair)
+
+    db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
+    for r in range(vol_top, vol_bot_excl):
+        db.put(r, chart_r, "│", P_DIM)
+    max_vol = max((b["v"] for b in visible), default=1) or 1
+    for i, bar in enumerate(visible):
+        col = start_col + i
+        if col < x0 or col >= chart_r:
+            continue
+        bull = bar["c"] >= bar["o"]
+        vol_pair = P_DEFAULT if bull else P_BLUE
+        bar_h = max(1, int(bar["v"] / max_vol * VOL_H)) if bar["v"] > 0 else 0
+        for r in range(vol_bot_excl - bar_h, vol_bot_excl):
+            db.put(r, col, "#", vol_pair)
+
+    db.put(time_row, chart_r, "│", P_DIM)
+    time_step = max(6, n_vis // 8)
+    for i in range(0, n_vis, time_step):
+        bar = visible[i]
+        col = start_col + i
+        if col < x0 or col + 5 >= chart_r:
+            continue
+        db.puts(time_row, col, datetime.fromtimestamp(bar["ts"]).strftime("%H:%M"), P_DIM)
+
+    # ── CROSSHAIR ────────────────────────────────────────────────────────
+    # Drawn last, "blank cells only" (same convention _draw_ohlc_chart_
+    # panel's own crosshair line uses), spanning the full candle+volume
+    # height so it reaches through both bands.
+    if crosshair_col is not None and x0 <= crosshair_col < chart_r:
+        for _r in range(chart_top, vol_bot_excl):
+            if db.buf[_r][crosshair_col][0] == " ":
+                db.put(_r, crosshair_col, CROSSHAIR_LINE_CH, P_CYAN)
+
 def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_price, hscroll_bars,
                             position=None, pending=None, levels=None, targets=None, er=None,
                             vert_offset=0, ui=None, crosshair_bar_idx=None, trade_events=None):
@@ -13843,11 +14150,32 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
 
     if ui.get("show_markets"):
         # 2026-08-27 — [Y] on the QQQ pane: show the broader Markets
-        # overview instead of the candle chart (see ohlc_show_markets_qqq's
+        # overview instead of the candle chart (see ohlc_qqq_extra_view's
         # own comment in curses_main for why this lives on the QQQ pane
         # specifically). Branches away before any candle/VP/VWAP work
         # below even starts.
         _draw_markets_panel(db, top, y1, x0, x1)
+        return
+
+    if ui.get("show_ndx"):
+        # 2026-09-02 user request ("In the QQQ OHLC chart, add NDX to the
+        # [Y] function") — a genuine bare candlestick+volume chart from
+        # NDX's own small Yahoo-sourced 1m OHLCV feed (NDX_OHLC_BARS/
+        # _ndx_ohlc_poll_loop), deliberately NOT routed through this
+        # panel's own candle-drawing code below — none of VWAP/VP/session/
+        # BTD/position-levels have real tick-level data behind them for
+        # NDX the way they do for QQQ, so _draw_ndx_ohlc_panel is its own
+        # much smaller, dedicated function instead of a heavily-
+        # conditional fork of this one. Scroll (hscroll_bars) and
+        # crosshair (crosshair_bar_idx) DO carry over — same "N bars back
+        # from the newest" addressing every other OHLC view uses, sourced
+        # from NDX's own state slot (see _effective_chart_asset in
+        # curses_main), not QQQ's own.
+        with NDX_OHLC_LOCK:
+            _ndx_bars = list(NDX_OHLC_BARS)
+            _ndx_live = NDX_OHLC_LIVE[0]
+        _draw_ndx_ohlc_panel(db, _ndx_bars, _ndx_live, top, y1, x0, x1, hscroll_bars,
+                              crosshair_bar_idx=crosshair_bar_idx)
         return
 
     # Layout mirrors draw_chart's own row order top-to-bottom: price chart,
@@ -14918,7 +15246,17 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
         db.puts(y0, x0, f"{asset}: pane too small"[:max(0, cols)], P_DIM)
         return
 
-    vert_tag = f" v{ohlc_vert_offset:+d}" if (profile_mode == "ohlc" and ohlc_vert_offset) else ""
+    # 2026-09-02 user-reported ("the chart header should be 'NDX', not
+    # 'QQQ'"): this whole function is still called with asset="QQQ" when
+    # showing the NDX view (it's still fundamentally the QQQ pane — see
+    # _effective_chart_asset's own comment for why [W]/[T]/[E] stay on
+    # QQQ's real settings regardless) — the title line specifically needs
+    # its own override so it reads correctly. VP:Historical/VolEffort:On
+    # are QQQ's own OHLC-view settings and mean nothing for NDX's bare
+    # chart, so those are suppressed here too rather than shown misleadingly.
+    show_ndx = profile_mode == "ohlc" and (ohlc_ui or {}).get("show_ndx")
+    display_asset = "NDX" if show_ndx else asset
+    vert_tag = f" v{ohlc_vert_offset:+d}" if (profile_mode == "ohlc" and ohlc_vert_offset and not show_ndx) else ""
     scroll_tag = f"  [SCROLLED {hscroll_bars}b back{vert_tag}]" if (hscroll_bars or vert_tag) else ""
     # Persistent on-chart focus indicator — a footer hint alone was easy to
     # miss (and on a narrow terminal, easy to lose entirely to truncation,
@@ -14943,7 +15281,7 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # into the one string, never a separate overlay draw — see
     # closed_tag's own comment for why that matters).
     vp_mode_tag = ""
-    if profile_mode == "ohlc":
+    if profile_mode == "ohlc" and not show_ndx:
         vp_mode_tag = f"  VP:{'Historical' if (ohlc_ui or {}).get('vp_historical') else 'Normal'}"
         # 2026-08-29 — VolEffort ([6]) only shown when it's actually on,
         # unlike VP's own always-shown tag: VP always has SOME active
@@ -14963,7 +15301,11 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # since a split pane rarely has room for footprint.py's own
     # full-width status-bar readout.
     ch_header_bar = None
-    if crosshair_bar_idx is not None:
+    if crosshair_bar_idx is not None and not show_ndx:
+        # show_ndx's own crosshair readout is drawn by _draw_ndx_ohlc_panel
+        # itself, straight off NDX_OHLC_BARS (never off ohlc_1m_bars/
+        # ohlc_1m_live, which are QQQ's own real bars here) — skipped
+        # entirely on this outer header line to avoid showing it twice.
         if profile_mode == "ohlc":
             # 2026-08-26 fix (alongside the crosshair-line render fix
             # below): this used to always index into `bars` (footprint's
@@ -14993,7 +15335,7 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                   f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}")
     else:
         ch_tag = ""
-    header = f" {asset} FOOTPRINT — {profile_mode.upper()}{vp_mode_tag}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
+    header = f" {display_asset} FOOTPRINT — {profile_mode.upper()}{vp_mode_tag}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
 
@@ -17668,16 +18010,38 @@ def draw_dashboard(db, snap, cols):
             hh, mm = int(remaining // 3600), int((remaining % 3600) // 60)
             funding_txt = (f"   {DIM}funding {RST}{pnl_color(rate)}{rate * 100:+.4f}%{RST}"
                            f"{DIM} (next {hh}h{mm:02d}m){RST}")
-        sizing_txt = ""
+        # 2026-09-03 user-reported ("[0] is bound to two different
+        # functions - sizing mode & chart style. Chart style works but
+        # the sizing mode doesn't"): the [0] handler itself was already
+        # correct (context-dependent on profile_mode=="ohlc", same
+        # established "one key, two meanings" pattern [1]/[Y] use — see
+        # that handler's own comment) — what was actually missing is that
+        # Standard showed NOTHING here, unlike Aggressive/Aggressive-033,
+        # so cycling back to Standard (or starting there) looked
+        # indistinguishable from the key doing nothing at all. Every mode
+        # now shows something, so the dashboard itself confirms the
+        # toggle fired regardless of which mode it landed on.
         if SIZING_MODE == "aggressive":
             boost = SIZING_STATE[asset].get("pending_boost_dollars")
-            if boost:
-                sizing_txt = f"   {DIM}Sizing: Aggressive (next: base+${boost:,.2f}){RST}"
-            else:
-                sizing_txt = f"   {DIM}Sizing: Aggressive{RST}"
+            sizing_txt = (f"   {DIM}Sizing: Aggressive (next: base+${boost:,.2f}){RST}" if boost
+                          else f"   {DIM}Sizing: Aggressive{RST}")
+        elif SIZING_MODE == "aggressive_033":
+            boost = SIZING_STATE[asset].get("aggressive_033_pending_boost_dollars")
+            sizing_txt = (f"   {DIM}Sizing: Aggressive/1R+0.33W (next: base+${boost:,.2f}){RST}" if boost
+                          else f"   {DIM}Sizing: Aggressive/1R+0.33W{RST}")
+        else:
+            sizing_txt = f"   {DIM}Sizing: Standard{RST}"
         mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "Order Flow" else ""
+        # 2026-09-02 user request ("The risk structure should be shown in
+        # the main dashboard next to the mode (right now it doesn't show
+        # anything, only in the log)"): RISK_STRUCTURE only ever applies
+        # to ETH under NV/NV-Auto (see RISK_STRUCTURES/[8]) — shown right
+        # after mode_tag, same condition _check_fill/_manage_position etc.
+        # already gate the structure itself on.
+        risk_structure_tag = (f"   {DIM}risk: {RISK_STRUCTURE}{RST}"
+                               if asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto") else "")
         ratchet_tag = f"   {DIM}trail: +(N-1)R lock{RST}" if PROFIT_RATCHET_ENABLED else ""
-        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}{ratchet_tag}")
+        db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}{risk_structure_tag}{ratchet_tag}")
         y += 1
         # 2026-09-01 user request ("'PCVR' should become 'NV' and 'BTD'
         # should stay, not change to 'NV'"): two INDEPENDENT relabels, not
@@ -21241,14 +21605,14 @@ TRADING_HELP_SECTIONS = [
         ("[0]",        "Toggle candle vs. line chart style"),
         ("[4]",        "Toggle VAH/VAL/POC Historical Mode (developing trace) vs. Normal"),
         ("[6]",        "Toggle VolEffort — replaces the VOL histogram with a volume-effort z-score chart"),
-        ("[Y]",        "QQQ pane only — swap the candle chart for the Markets overview"),
+        ("[Y]",        "QQQ pane only — cycle candle chart -> Markets overview -> NDX chart -> back"),
     ]),
     ("RISK & SIZING", [
         ("[P]",        "Set risk per trade  (% of balance or a flat $ amount)"),
         ("[W]",        "Set the stop-loss distance in points for the focused asset"),
         ("[E]",        "Set the fee assumption used in PnL math"),
         ("[T]",        "Set the order-flow imbalance ratio threshold"),
-        ("[0]",        "Cycle sizing mode  (Standard  <->  Aggressive/1R+W)"),
+        ("[0]",        "Cycle sizing mode  (Standard -> Aggressive/1R+W -> Aggressive/1R+0.33W)"),
         ("[1]",        "Clear an active Drawdown Full Stop block (manual review)"),
         ("[2]",        "Toggle the profit ratchet  (trail an open stop to lock +(N-1)R at each +NR)"),
         ("[8]",        "Cycle risk structure  (Fixed <-> VE)  — ETH only, under NV/NV-Auto"),
@@ -21537,7 +21901,7 @@ def _startup_progress():
     # bust+wordmark combo again.
     steps = [("Trading engine", bool(APP_STATE.snapshot()["instruments"]))]
     steps.append(("Order-flow backfills", all(_backfill_ready[a].is_set() for a in ASSETS)))
-    steps.append(("GEX engines", all(GEX_STATUS.get(a) not in (None, "connecting…") for a in ASSETS)))
+    steps.append(("GEX engines", all(GEX_STATUS.get(a) not in (None, "connecting…") for a in GEX_ASSETS)))
     steps.append(("Status engine", STATUS_ENGINE_STATE[0] != "connecting…"))
     steps.append(("VWAP/VP engines", all(_ch_ready[a].is_set() for a in ASSETS)))
     steps.append(("Net Drift engines", all(DRIFT_READY[a].is_set() for a in DRIFT_ASSETS)))
@@ -21665,6 +22029,24 @@ def draw_loading_screen(db, rows, cols, steps, tick):
     hint = f" {done_n}/{total_n} ready — q=quit  any other key=skip "
     db.puts(rows - 1, 0, hint.ljust(cols)[:cols], P_STATUS)
 
+def _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view):
+    """Resolves the focused pane's asset for scroll/crosshair/vertical-pan
+    state lookups (chart_scroll/chart_crosshair_active/chart_crosshair_idx/
+    ohlc_vert_offset) — same as the plain `chart_focus if both_panes else
+    "ETH"` every OTHER per-asset key handler still uses ([W]/[T]/[E]'s own
+    trading-settings prompts, the footer hint), EXCEPT when the QQQ pane
+    is currently showing its own NDX candlestick view (2026-09-02 user
+    request — "add NDX to the [Y] function"), which needs entirely
+    separate scroll/crosshair state from QQQ's own real candle view
+    (different bar series/length — sharing QQQ's own slot would make the
+    two views fight over one scroll position). Deliberately NOT used for
+    [W]/[T]/[E] (SL distance/imbalance ratio/fee) — those stay QQQ's own
+    real trading settings regardless of which alternate view its pane
+    happens to be showing; NDX itself never trades and has none of its
+    own to edit."""
+    a = chart_focus if both_panes else "ETH"
+    return "NDX" if (a == "QQQ" and ohlc_qqq_extra_view == "ndx") else a
+
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
     global PCT, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE, RISK_STRUCTURE
@@ -21751,6 +22133,14 @@ def curses_main(stdscr):
             # no shared race to avoid the way footprint's late-trade guard
             # requires backfill-before-live-feed).
             threading.Thread(target=_gex_engine_loop, args=(asset, _quit_evt), daemon=True).start()
+        # 2026-09-02 user request ("In GEX, include TLT, NDX, and VIX") —
+        # same always-on per-asset thread as ETH/QQQ just above, just
+        # outside the tradeable-ASSETS loop (these three have no footprint/
+        # OHLC/trading machinery of their own to start alongside). See
+        # GEX_EXTRA_ASSETS's own comment and fetch_gex_snapshot's CBOE
+        # symbol-mapping note for how the CBOE fetch itself handles them.
+        for _gex_extra_asset in GEX_EXTRA_ASSETS:
+            threading.Thread(target=_gex_engine_loop, args=(_gex_extra_asset, _quit_evt), daemon=True).start()
         threading.Thread(target=_fast_publish_loop, args=(_quit_evt,), daemon=True).start()
         # Status engine (Phase 3 of the standalone-merge plan) — 3 threads,
         # same cadences/shape as status.py's own main()+live_price_loop+
@@ -21775,6 +22165,11 @@ def curses_main(stdscr):
         # from startup like every other always-on engine here, so the
         # data is already populated the first time a user toggles to it.
         threading.Thread(target=_markets_refresh_loop, args=(_quit_evt,), daemon=True).start()
+        # NDX OHLC feed (2026-09-02 user request, "add NDX to the [Y]
+        # function") — same always-on-from-startup treatment as Markets
+        # just above, so NDX_OHLC_BARS is already populated the first time
+        # [Y] is pressed a second time to reach it.
+        threading.Thread(target=_ndx_ohlc_poll_loop, args=(_quit_evt,), daemon=True).start()
         # Phemex bid/ask (2026-08-27 user request) — dashboard's own
         # real-time bid/ask/spread readout next to each asset's price.
         threading.Thread(target=_phemex_bid_ask_poller, args=(_quit_evt,), daemon=True).start()
@@ -21867,11 +22262,17 @@ def curses_main(stdscr):
     # each pane shows) — lives only on this thread, never touches AppState
     # or the trading engine. hscroll_bars follows footprint.py's own "N
     # bars back from the newest" convention; 0 is always the live tail.
-    chart_scroll = {"ETH": 0, "QQQ": 0}
+    # 2026-09-02: "NDX" added — the QQQ pane's own NDX candlestick view
+    # (see ohlc_qqq_extra_view) needs entirely separate scroll/crosshair/
+    # vert-pan state from QQQ's own real candle view (different bar
+    # series, different length — sharing chart_scroll["QQQ"] etc. would
+    # have the two views fight over the same scroll position). See
+    # _effective_chart_asset for how key handlers resolve to this key.
+    chart_scroll = {"ETH": 0, "QQQ": 0, "NDX": 0}
     # Vertical price-axis pan for the footprint dashboard's own OHLC view —
     # a shift-the-window-before-p2r offset, scoped per-asset like
     # chart_scroll itself.
-    ohlc_vert_offset = {"ETH": 0, "QQQ": 0}
+    ohlc_vert_offset = {"ETH": 0, "QQQ": 0, "NDX": 0}
     ohlc_show_sessions = True   # shared (not per-asset) view prefs, same as
     ohlc_line_mode = False       # profile_mode/chart_zoom already are
     ohlc_vp_historical = True    # [4] — VAH/VAL/POC "Historical Mode"
@@ -21887,16 +22288,26 @@ def curses_main(stdscr):
                                 # user request ("Athena should have VolEffort
                                 # toggled on by default") switched this to
                                 # on, same as [4]'s own default-on.
-    ohlc_show_markets_qqq = False   # [Y] — QQQ pane ONLY: swap the candle
-                                   # chart for the Markets overview (2026-08-27,
-                                   # folded in once the standalone Markets mode
-                                   # was removed). QQQ-only (not a per-asset
-                                   # {"ETH":.., "QQQ":..} dict like the state
-                                   # above) since Markets isn't QQQ data at all —
-                                   # it's a broader 8-asset macro overview, just
-                                   # surfaced here since the QQQ pane goes
-                                   # stale/less useful whenever QQQ's own market
-                                   # is closed.
+    ohlc_qqq_extra_view = None   # [Y] — QQQ pane ONLY: cycles the candle
+                                   # chart -> Markets overview -> NDX candlestick
+                                   # chart -> back (2026-08-27 Markets folded in
+                                   # once the standalone Markets mode was
+                                   # removed; NDX added 2026-09-02 user request
+                                   # — "In the QQQ OHLC chart, add NDX to the
+                                   # [Y] function", built as a genuine bare
+                                   # candlestick+volume chart, its own small
+                                   # Yahoo-sourced 1m OHLCV feed, see
+                                   # NDX_OHLC_BARS/_ndx_ohlc_poll_loop/
+                                   # _draw_ndx_ohlc_panel — no VWAP/VP/session/
+                                   # BTD overlays, since none of those concepts
+                                   # have real tick-level data behind them for
+                                   # NDX the way they do for QQQ). None="candle
+                                   # chart", "markets", "ndx". QQQ-only (not a
+                                   # per-asset {"ETH":.., "QQQ":..} dict like the
+                                   # state above) since neither alternate view is
+                                   # QQQ data at all — surfaced here since the
+                                   # QQQ pane goes stale/less useful whenever
+                                   # QQQ's own market is closed.
     # [H] full-key-menu overlay state for every mode — 2026-08-26 user
     # request: every mode's dense one-line footer was hard to read and
     # didn't fit on screen. See _draw_key_menu_overlay's own docstring for
@@ -21919,8 +22330,8 @@ def curses_main(stdscr):
     # via _footprint_crosshair_clamp exactly like footprint.py's own
     # auto-follow does. Esc/[Home] deactivate it, same as every other
     # panning key already resets to live.
-    chart_crosshair_active = {"ETH": False, "QQQ": False}
-    chart_crosshair_idx = {"ETH": 0, "QQQ": 0}      # "N bars back from newest"
+    chart_crosshair_active = {"ETH": False, "QQQ": False, "NDX": False}
+    chart_crosshair_idx = {"ETH": 0, "QQQ": 0, "NDX": 0}      # "N bars back from newest"
     gex_mode = False   # full-screen GEX mode (Phase 2 of the standalone-
                         # merge plan), replacing the dashboard+chart
                         # entirely while active, same as data_view. Phase 4:
@@ -21930,10 +22341,14 @@ def curses_main(stdscr):
     gex_by_strike = False   # [G] within gex_mode — dot-map (False) vs
                              # GEX-by-strike bar chart (True)
     gex_by_strike_net = False   # [N] within gex_mode's by-strike view
-    gex_live_follow = {"ETH": True, "QQQ": True}      # time-axis auto-follow (dot-map)
-    gex_view_end_idx = {"ETH": 0, "QQQ": 0}           # frozen time-axis index when panned
-    gex_vert_follow = {"ETH": True, "QQQ": True}      # strike-axis auto-center
-    gex_vert_center_idx = {"ETH": 0, "QQQ": 0}        # frozen strike-axis index when scrolled
+    # 2026-09-02: TLT/NDX/VIX entries added to every per-asset dict below
+    # (display/monitoring only — never in ASSETS/chart_focus, never reaches
+    # instrument_lights, so none of them can trade regardless). See
+    # gex_extra_focus below for how they're actually reached via [Tab].
+    gex_live_follow = {"ETH": True, "QQQ": True, "NDX": True, "TLT": True, "VIX": True}      # time-axis auto-follow (dot-map)
+    gex_view_end_idx = {"ETH": 0, "QQQ": 0, "NDX": 0, "TLT": 0, "VIX": 0}           # frozen time-axis index when panned
+    gex_vert_follow = {"ETH": True, "QQQ": True, "NDX": True, "TLT": True, "VIX": True}      # strike-axis auto-center
+    gex_vert_center_idx = {"ETH": 0, "QQQ": 0, "NDX": 0, "TLT": 0, "VIX": 0}        # frozen strike-axis index when scrolled
     # [X] within gex_mode's by-strike view (2026-08-28 user request, "Add
     # a crosshair to the Net GEX distribution in GEX") — same toggle-then-
     # arrow-keys convention every other chart's own [X] crosshair already
@@ -21942,8 +22357,17 @@ def curses_main(stdscr):
     # draw_gex_by_strike itself against whatever's actually visible that
     # render, so this stays valid across a resize/re-pan with no extra
     # bookkeeping here.
-    gex_by_strike_crosshair_active = {"ETH": False, "QQQ": False}
-    gex_by_strike_crosshair_idx = {"ETH": 0, "QQQ": 0}
+    gex_by_strike_crosshair_active = {"ETH": False, "QQQ": False, "NDX": False, "TLT": False, "VIX": False}
+    gex_by_strike_crosshair_idx = {"ETH": 0, "QQQ": 0, "NDX": 0, "TLT": 0, "VIX": 0}
+    gex_extra_focus = None   # [Tab] within GEX mode: None (-> chart_focus, ETH/QQQ)
+                              # / "NDX" / "TLT" / "VIX" — same pattern as Net Drift's
+                              # own drift_extra_focus, needed because chart_focus
+                              # only ever holds "ETH"/"QQQ" (the only two real
+                              # tradeable ASSETS) and must keep meaning that
+                              # everywhere else in the app; this overlay lets GEX
+                              # mode reach the three extra monitoring-only assets
+                              # without disturbing it. See gex_mode's own [Tab]
+                              # handler and the gex_asset resolution lines below.
     status_mode = False   # full-screen Status mode (Phase 3c) — the [M]
                             # cycle's next stop after GEX; see gex_mode above
     status_scroll = 0
@@ -22159,7 +22583,7 @@ def curses_main(stdscr):
             # the very last line, same as gex.py's own screen does, so
             # there's no separate Athena footer drawn underneath (see the
             # footer dispatch below).
-            gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            gex_asset = gex_extra_focus or (chart_focus if chart_focus in ASSETS else "ETH")
             gex_ui = {"live_follow": gex_live_follow[gex_asset], "view_end_idx": gex_view_end_idx[gex_asset],
                       "vert_follow": gex_vert_follow[gex_asset], "vert_center_idx": gex_vert_center_idx[gex_asset],
                       "by_strike_net": gex_by_strike_net,
@@ -22271,18 +22695,25 @@ def curses_main(stdscr):
                     z_1m = eth_1m if zoom_asset == "ETH" else qqq_1m
                     z_1m_live = eth_1m_live if zoom_asset == "ETH" else qqq_1m_live
                     z_levels = eth_levels if zoom_asset == "ETH" else qqq_levels
+                    # 2026-09-02: when the zoomed pane is QQQ showing its
+                    # own NDX candlestick view, scroll/crosshair/vert-pan
+                    # come from NDX's own state slot instead of QQQ's real
+                    # one — see _effective_chart_asset's own comment for why.
+                    _zoom_shows_ndx = (zoom_asset == "QQQ" and ohlc_qqq_extra_view == "ndx")
+                    _zoom_state_key = "NDX" if _zoom_shows_ndx else zoom_asset
                     draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
                                           profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
-                                          hscroll_bars=chart_scroll[zoom_asset], live_price=live, live_bar=live_bar,
+                                          hscroll_bars=chart_scroll[_zoom_state_key], live_price=live, live_bar=live_bar,
                                           focused=True,
                                           market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
-                                          crosshair_bar_idx=(chart_crosshair_idx[zoom_asset] if chart_crosshair_active[zoom_asset] else None),
+                                          crosshair_bar_idx=(chart_crosshair_idx[_zoom_state_key] if chart_crosshair_active[_zoom_state_key] else None),
                                           ohlc_1m_bars=z_1m, ohlc_1m_live=z_1m_live,
                                           ohlc_levels=z_levels, ohlc_targets=inst.get("targets") or [],
                                           ohlc_er=inst.get("er_bands"),
-                                          ohlc_vert_offset=ohlc_vert_offset[zoom_asset],
+                                          ohlc_vert_offset=ohlc_vert_offset[_zoom_state_key],
                                           ohlc_ui=dict(ohlc_ui_common,
-                                                        show_markets=(ohlc_show_markets_qqq if zoom_asset == "QQQ" else False)),
+                                                        show_markets=(ohlc_qqq_extra_view == "markets" if zoom_asset == "QQQ" else False),
+                                                        show_ndx=_zoom_shows_ndx),
                                           ohlc_trade_events=build_trade_markers(
                                               zoom_asset, z_1m + ([z_1m_live] if z_1m_live else []),
                                               inst, snap["trade_pairs"]))
@@ -22308,17 +22739,24 @@ def curses_main(stdscr):
                                           ohlc_trade_events=build_trade_markers(
                                               "ETH", eth_1m + ([eth_1m_live] if eth_1m_live else []),
                                               eth_inst, snap["trade_pairs"]))
+                    # 2026-09-02: see the zoomed-pane call site's own comment
+                    # just above for why this pulls from NDX's own scroll/
+                    # crosshair/vert-pan state slot instead of QQQ's real one
+                    # whenever this pane is currently showing NDX.
+                    _qqq_shows_ndx = (ohlc_qqq_extra_view == "ndx")
+                    _qqq_state_key = "NDX" if _qqq_shows_ndx else "QQQ"
                     draw_footprint_panel(db, "QQQ", qqq_bars, qqq_inst, chart_top, chart_bottom, qqq_x0, cols,
                                           profile_mode, build_trade_markers("QQQ", qqq_bars, qqq_inst, snap["trade_pairs"]),
-                                          hscroll_bars=chart_scroll["QQQ"], live_price=qqq_live, live_bar=qqq_live_bar,
+                                          hscroll_bars=chart_scroll[_qqq_state_key], live_price=qqq_live, live_bar=qqq_live_bar,
                                           focused=(chart_focus == "QQQ"),
                                           market_closed=snap["qqq_market_closed"],
-                                          crosshair_bar_idx=(chart_crosshair_idx["QQQ"] if chart_crosshair_active["QQQ"] else None),
+                                          crosshair_bar_idx=(chart_crosshair_idx[_qqq_state_key] if chart_crosshair_active[_qqq_state_key] else None),
                                           ohlc_1m_bars=qqq_1m, ohlc_1m_live=qqq_1m_live,
                                           ohlc_levels=qqq_levels, ohlc_targets=qqq_inst.get("targets") or [],
                                           ohlc_er=qqq_inst.get("er_bands"),
-                                          ohlc_vert_offset=ohlc_vert_offset["QQQ"],
-                                          ohlc_ui=dict(ohlc_ui_common, show_markets=ohlc_show_markets_qqq),
+                                          ohlc_vert_offset=ohlc_vert_offset[_qqq_state_key],
+                                          ohlc_ui=dict(ohlc_ui_common, show_markets=(ohlc_qqq_extra_view == "markets"),
+                                                        show_ndx=_qqq_shows_ndx),
                                           ohlc_trade_events=build_trade_markers(
                                               "QQQ", qqq_1m + ([qqq_1m_live] if qqq_1m_live else []),
                                               qqq_inst, snap["trade_pairs"]))
@@ -22506,7 +22944,7 @@ def curses_main(stdscr):
             # CVD -> Volatility Drift -> Chain -> Macro Options Flow ->
             # Status -> Trading cycle. Esc remains the fast "back to
             # Trading" escape hatch from any mode, unchanged.
-            gex_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            gex_asset = gex_extra_focus or (chart_focus if chart_focus in ASSETS else "ETH")
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
             elif key in (ord("h"), ord("H")):
@@ -22552,8 +22990,24 @@ def curses_main(stdscr):
                     gex_by_strike_crosshair_idx[gex_asset] = _gex_by_strike_spot_ch_idx(
                         gex_asset, gex_by_strike_net, gex_vert_follow[gex_asset],
                         gex_vert_center_idx[gex_asset], cols)
-            elif key == 9:   # Tab — switch asset, same convention as the footprint charts
-                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key == 9:   # Tab — cycle asset, ETH -> QQQ -> NDX -> TLT -> VIX -> ETH.
+                                # 2026-09-02 user request ("In GEX, include TLT, NDX, and
+                                # VIX"): the ETH<->QQQ leg still toggles chart_focus itself
+                                # (unchanged from before — same convention the footprint
+                                # charts use, and other modes read chart_focus while GEX
+                                # is active), the three extras live in gex_extra_focus
+                                # instead so they never disturb it.
+                if gex_extra_focus == "VIX":
+                    gex_extra_focus = None
+                    chart_focus = "ETH"
+                elif gex_extra_focus == "TLT":
+                    gex_extra_focus = "VIX"
+                elif gex_extra_focus == "NDX":
+                    gex_extra_focus = "TLT"
+                elif gex_extra_focus is None and chart_focus == "QQQ":
+                    gex_extra_focus = "NDX"
+                else:
+                    chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
             elif key in (ord("z"), ord("Z"), curses.KEY_END):
                 gex_live_follow[gex_asset] = True
                 gex_vert_follow[gex_asset] = True
@@ -23238,16 +23692,22 @@ def curses_main(stdscr):
             idx = SIZING_MODES.index(SIZING_MODE)
             SIZING_MODE = SIZING_MODES[(idx + 1) % len(SIZING_MODES)]
             _save_sizing_state()
-            console_log(f"{YLW}{BLD}Sizing mode: {SIZING_MODE.capitalize()}{RST} (via [0])")
+            console_log(f"{YLW}{BLD}Sizing mode: {SIZING_MODE_LABELS[SIZING_MODE]}{RST} (via [0])")
             log_event("SYSTEM", "sizing_mode_changed", {"mode": SIZING_MODE})
-        elif key == ord("2") and profile_mode != "ohlc":
+        elif key == ord("2"):
             # 2026-08-28: toggles the profit ratchet (see PROFIT_RATCHET_
             # ENABLED / _apply_profit_ratchet). Persisted as a reserved key
-            # in sizing_state.json, same as [0]/[9]. Guarded against
-            # profile_mode=="ohlc" for the same "same key, different meaning
-            # per view" reason [0] is (the OHLC panel owns the digit keys in
-            # that view). Only affects how an OPEN position's stop is
-            # trailed — never sizing, never entries.
+            # in sizing_state.json, same as [0]/[9]. Only affects how an
+            # OPEN position's stop is trailed — never sizing, never entries.
+            # 2026-09-02 bugfix, user-reported ("Pressing [2] does
+            # nothing"): this used to also carry `and profile_mode !=
+            # "ohlc"`, copied from [0]'s own guard — but unlike [0] (which
+            # genuinely means something else, candle/line style, inside the
+            # OHLC panel — see that key's own dispatch further below), [2]
+            # has no alternate OHLC-mode binding anywhere in this file, so
+            # the guard just silently ate every press while OHLC (the
+            # default-on profile view) was active, with nothing filling in
+            # for it.
             PROFIT_RATCHET_ENABLED = not PROFIT_RATCHET_ENABLED
             _save_profit_ratchet()
             console_log(f"{YLW}{BLD}Profit ratchet: {'ON' if PROFIT_RATCHET_ENABLED else 'OFF'}{RST} (via [2])")
@@ -23411,7 +23871,7 @@ def curses_main(stdscr):
             status_scroll = 0
             console_log(f"{YLW}Status mode — via [K]{RST}")
         elif key in (ord("x"), ord("X")):
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             chart_crosshair_active[asset] = not chart_crosshair_active[asset]
             if chart_crosshair_active[asset]:
                 # Activates at the current right edge of the view, same
@@ -23428,7 +23888,7 @@ def curses_main(stdscr):
             # never limited to a single column), so no change needed there
             # — only the step size fed into it.
             step = 50 if key in (curses.KEY_PPAGE, ord("{")) else (10 if key in (curses.KEY_SLEFT, ord("[")) else 1)
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             # OHLC view scrolls through LIVE_TAPE's own 1m bars, not
             # footprint.py's 90s ones — using the footprint count here
             # (as this used to, unconditionally) silently capped OHLC
@@ -23437,8 +23897,17 @@ def curses_main(stdscr):
             # actually seeded and available (2026-08-25 user-reported:
             # "QQQ only loads back to 15:58 CT" while sitting at
             # "[SCROLLED 20b back]" — the 1m array itself had 500 bars).
-            bar_count = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
-                         else len(snap["footprint_bars"].get(asset) or []))
+            # 2026-09-02: NDX isn't in snap["ohlc_1m_bars"] at all (it's
+            # not a real ASSET — see _effective_chart_asset) — its own
+            # bar count comes straight from NDX_OHLC_BARS/NDX_OHLC_LIVE
+            # instead, under the same lock _draw_ohlc_chart_panel's own
+            # show_ndx branch already uses.
+            if asset == "NDX":
+                with NDX_OHLC_LOCK:
+                    bar_count = len(NDX_OHLC_BARS) + (1 if NDX_OHLC_LIVE[0] else 0)
+            else:
+                bar_count = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
+                             else len(snap["footprint_bars"].get(asset) or []))
             if chart_crosshair_active[asset]:
                 total = bar_count
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
@@ -23466,10 +23935,14 @@ def curses_main(stdscr):
                 chart_scroll[asset] = min(max_back, chart_scroll[asset] + step)
         elif key in (curses.KEY_RIGHT, curses.KEY_SRIGHT, ord("]"), curses.KEY_NPAGE, ord("}")):
             step = 50 if key in (curses.KEY_NPAGE, ord("}")) else (10 if key in (curses.KEY_SRIGHT, ord("]")) else 1)
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             if chart_crosshair_active[asset]:
-                total = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
-                         else len(snap["footprint_bars"].get(asset) or []))
+                if asset == "NDX":
+                    with NDX_OHLC_LOCK:
+                        total = len(NDX_OHLC_BARS) + (1 if NDX_OHLC_LIVE[0] else 0)
+                else:
+                    total = (len(snap["ohlc_1m_bars"].get(asset) or []) if profile_mode == "ohlc"
+                             else len(snap["footprint_bars"].get(asset) or []))
                 pane_cols = cols if chart_zoom else (cols // 2 if both_panes else cols)
                 # See the matching KEY_LEFT handler's own comment just above
                 # for why OHLC mode needs its own n_est formula here.
@@ -23484,14 +23957,14 @@ def curses_main(stdscr):
             # convention, per-asset (ohlc_vert_offset). KEY_UP/KEY_DOWN are
             # otherwise unused in this dispatch (every other handler in
             # the file is gated inside a DIFFERENT mode's own block).
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             ohlc_vert_offset[asset] += 1
         elif key == curses.KEY_DOWN and profile_mode == "ohlc":
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             ohlc_vert_offset[asset] -= 1
         elif key in (ord("j"), ord("J")) and profile_mode == "ohlc":
             # Reset vertical pan only.
-            asset = chart_focus if both_panes else "ETH"
+            asset = _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view)
             ohlc_vert_offset[asset] = 0
         elif key in (ord("o"), ord("O")) and profile_mode == "ohlc":
             ohlc_show_sessions = not ohlc_show_sessions
@@ -23507,14 +23980,17 @@ def curses_main(stdscr):
             # z-score histogram of volume-per-range effort.
             ohlc_vol_effort = not ohlc_vol_effort
         elif key in (ord("y"), ord("Y")) and profile_mode == "ohlc":
-            # 2026-08-27 — QQQ pane ONLY: swap the candle chart for the
-            # Markets overview (folded in once the standalone Markets
-            # mode was removed — see ohlc_show_markets_qqq's own comment).
-            # No asset-focus gate needed beyond profile_mode=="ohlc" — the
-            # flag itself is QQQ-only regardless of which pane is
-            # currently focused/zoomed (see the ohlc_ui=dict(...,
-            # show_markets=...) construction at each call site).
-            ohlc_show_markets_qqq = not ohlc_show_markets_qqq
+            # 2026-08-27 — QQQ pane ONLY: cycle candle chart -> Markets
+            # overview -> back (folded in once the standalone Markets mode
+            # was removed). 2026-09-02 user request ("add NDX to the [Y]
+            # function") extends this to a 3-way cycle — see
+            # ohlc_qqq_extra_view's own comment. No asset-focus gate needed
+            # beyond profile_mode=="ohlc" — the flag itself is QQQ-only
+            # regardless of which pane is currently focused/zoomed (see the
+            # ohlc_ui=dict(..., show_markets=..., show_ndx=...) construction
+            # at each call site).
+            ohlc_qqq_extra_view = ({None: "markets", "markets": "ndx", "ndx": None}
+                                    [ohlc_qqq_extra_view])
         elif key == 27 and mode_help_open["trading"]:
             mode_help_open["trading"] = False
             mode_help_scroll["trading"] = 0
@@ -23526,6 +24002,14 @@ def curses_main(stdscr):
                 chart_scroll["ETH"] = 0
                 ohlc_vert_offset["ETH"] = 0
             chart_crosshair_active["ETH"] = chart_crosshair_active["QQQ"] = False
+            # 2026-09-02: NDX's own scroll/crosshair state (see
+            # _effective_chart_asset) snaps back to live too, same as
+            # every other pane's — it's simplest to always include it here
+            # rather than conditioning on whether the QQQ pane happens to
+            # be showing it at this exact moment.
+            chart_scroll["NDX"] = 0
+            ohlc_vert_offset["NDX"] = 0
+            chart_crosshair_active["NDX"] = False
 
 if __name__ == "__main__":
     curses.wrapper(curses_main)

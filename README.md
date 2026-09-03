@@ -130,7 +130,7 @@ python3 athena.py --dry-run --reset-sim --sim-balance 5000
 
 Athena has 8 full-screen modes, cycled with `[M]` (forward) and `[K]` (backward). Two additional overlays (`[D]` Data View, `[L]` Activity Log) are available from any mode. Every mode also has its own `[H]` full-key-reference overlay (scrollable, closes with `[H]`/`Esc`) listing everything that mode's own footer can't fit.
 
-**2026-08-27: Chart mode and the standalone Markets mode were both removed.** Chart mode's own free-symbol candlestick tool (VP, VWAP, BT/ST/GEX-Flip, Expected Range, Big Trade Detector, crosshair, historical trade markers) was fully ported into the Trading dashboard's own embedded OHLC panel (`[V]`-cycled) over the course of this project, at which point Chart mode's separate, independent WebSocket feeds became the sole remaining reason its own signals could ever disagree with the dashboard's — removing it removed that class of bug at the root. Markets (a 9-asset macro overview: BTC/ETH/XAUUSD/USDJPY/USOIL/SPX500/NAS100/DXY/TLT — TLT added 2026-09-01 user request, Yahoo-only since a bond ETF has no Phemex/Kraken crypto equivalent) is no longer its own mode either — it's a `[Y]` toggle on the QQQ pane specifically of the Trading dashboard's OHLC view, swapping the candle chart for the overview and back.
+**2026-08-27: Chart mode and the standalone Markets mode were both removed.** Chart mode's own free-symbol candlestick tool (VP, VWAP, BT/ST/GEX-Flip, Expected Range, Big Trade Detector, crosshair, historical trade markers) was fully ported into the Trading dashboard's own embedded OHLC panel (`[V]`-cycled) over the course of this project, at which point Chart mode's separate, independent WebSocket feeds became the sole remaining reason its own signals could ever disagree with the dashboard's — removing it removed that class of bug at the root. Markets (a 9-asset macro overview: BTC/ETH/XAUUSD/USDJPY/USOIL/SPX500/NAS100/DXY/TLT — TLT added 2026-09-01 user request, Yahoo-only since a bond ETF has no Phemex/Kraken crypto equivalent) is no longer its own mode either — it's part of a `[Y]` cycle on the QQQ pane specifically of the Trading dashboard's OHLC view (candle chart → Markets overview → NDX candlestick chart → back — NDX added 2026-09-02, see Trading mode's own note below).
 
 ### Trading (Default)
 
@@ -157,14 +157,19 @@ Two same-day follow-ups from a later user pass over the initial port: **(1)** "R
 **OHLC chart scale bug fixed (2026-09-01 user-reported, with a screenshot showing candles crushed into the bottom half of the pane — "should scale to the highest high and lowest low of all of the candles visible... the scaling is too small here"):** the 2026-08-27 fix that excludes an ER-type TP leg from extending the chart's own visible price range only ever listed `"ER 100%"`/`"ER 150%"` — it predates `ER 40%`/`ER 80%` joining the target list as their own TP types (added earlier the same day as this report). A TP leg landing on either of those two newer tiers was still blowing the visible range out exactly like ER 100%/150% used to, exactly as seen in the reported screenshot (TP2 at `ER 80%`, 46 points from price). All four ER tiers are excluded from the range-extension now — the chart scales to the candles' own high/low (plus Entry/SL/BT/ST/Cluster/GEX Flip/VWAP/POC/VAH/VAL, which stay close enough to price not to cost readability) exactly as originally intended. Verified with a synthetic render: a TP2 leg 46 points outside the candle range no longer pulls the top axis label anywhere near it.
 
 **VolEffort bias marker vs. BTD signal collision fixed (2026-09-01 user-reported, screenshot circling a bar where the marker had vanished — "the VolEffort marker is hidden underneath the BTD signal"):** VolEffort's own bias glyph (▲/▼/◆) was drawn immediately, one row above the bar's own high, during the candle-drawing loop — but the OHLC panel's BTD overlay draws its SELL marker at that exact same cell, unconditionally, much later in the render (after candles, sessions, and the live-price marker all finish), silently painting over any VolEffort glyph already sitting there whenever both fire on the same bar. Fixed by deferring VolEffort's own placement instead of drawing it inline: each candidate marker is collected during the candle loop, then actually placed *after* the BTD block runs — preferring the original one-row-above-the-high spot when it's still free, falling back to one row below the bar's own low (mirroring where BTD's own buy marker sits) when it isn't. Verified with a synthetic bar crafted to trigger both a "large" BTD sell signal and a VolEffort absorption reading simultaneously: the glyph now lands below the bar's low, where the old code would have silently dropped it under the BTD marker instead.
-- `[Y]` on the QQQ pane swaps to the Markets macro overview and back
+- `[Y]` on the QQQ pane cycles candle chart → Markets macro overview → NDX candlestick chart → back (NDX added 2026-09-02, see its own note below)
 - 6-light readiness meter per instrument
 - Position PnL, SL/TP levels, margin usage
-- Sizing mode status (Standard/Aggressive) and drawdown de-risking tracker
+- Sizing mode status (Standard/Aggressive/Aggressive-1R+0.33W) and drawdown de-risking tracker
+- Trading mode, risk structure (ETH, NV/NV-Auto only), and profit-ratchet status, shown inline next to each other on the readiness-row line (2026-09-02 user-reported — risk structure previously only ever appeared in the log, never on the dashboard itself; profit ratchet's own display line was already wired but the `[2]` key that activates it was silently broken while viewing the OHLC profile, so it never had anything to show)
 - Real-time bid/ask/spread next to each asset's price
 - DVOL layer indicator
 - Funding rate and next accrual countdown
 - Compact activity log
+
+**NDX candlestick chart added to `[Y]` (2026-09-02 user request — "In the QQQ OHLC chart, add NDX to the [Y] function"):** a genuine bare candlestick + volume chart, not a repeat of the Markets overview's own normalized-%-since-open line (which already carries NDX's own data under the label "NAS100", but as a single overlay line, not real OHLC). Sourced from its own small always-on poller (`_ndx_ohlc_poll_loop`, `NDX_OHLC_POLL_SECS=20`) hitting Yahoo's intraday chart endpoint directly for `^NDX` — the same endpoint Markets itself already uses, just keeping the full `open`/`high`/`low`/`close`/`volume` Yahoo returns instead of only `close`. Deliberately minimal: no VWAP/VP/session overlays, BTD signals, or position levels — none of those have real tick-level trade data behind them for NDX the way they do for ETH/QQQ, so `_draw_ndx_ohlc_panel` is its own small, dedicated function rather than a heavily-conditional fork of the full OHLC panel. One known, structural limitation: Yahoo reports `0` volume for `^NDX` itself (an index has no traded volume of its own, unlike a stock or ETF) — the volume band renders but stays empty; this is a real gap in the data source, not a bug.
+
+**Scroll, crosshair, and the chart title fixed (2026-09-02 user-reported, screenshot showing "QQQ FOOTPRINT" as the title and an embedded "NDX ..." sub-line):** the first version was scroll/crosshair-less and always showed the tail — both now work exactly like every other OHLC view, sourced from NDX's own dedicated scroll/crosshair state (`_effective_chart_asset`, a new "NDX" entry alongside ETH/QQQ in `chart_scroll`/`chart_crosshair_active`/`chart_crosshair_idx`/`ohlc_vert_offset` — kept separate from QQQ's own real candle view's state so the two can't fight over one scroll position). The outer title bar is still drawn by `draw_footprint_panel` itself, which always receives `asset="QQQ"` (it's still fundamentally the QQQ pane) — it now overrides the DISPLAYED name to "NDX" and suppresses QQQ's own VP:Historical/VolEffort tags (meaningless for NDX's bare view) whenever `ohlc_ui["show_ndx"]` is set, rather than showing "QQQ" unconditionally.
 
 ### GEX
 
@@ -173,6 +178,8 @@ Gamma Exposure visualization with two sub-modes:
 - **By Strike** — Bar chart of net gamma per strike
 
 Toggle between views with `[G]`, net/gross with `[N]`.
+
+**TLT, NDX and VIX added (2026-09-02 user request):** `[Tab]` now cycles `ETH → QQQ → NDX → TLT → VIX → ETH` — the ETH↔QQQ leg still toggles `chart_focus` itself (unchanged, same convention the footprint charts use elsewhere), the three extras live in their own `gex_extra_focus` overlay instead so they never disturb it (same pattern Net Drift's own `drift_extra_focus` already established). All three are monitoring-only, same as everywhere else in the app. NDX/VIX (CBOE index roots) reuse Net Drift's own `DRIFT_CBOE_SYMBOL` underscore-prefix mapping for the fetch — one source of truth, not a second copy of it.
 
 ### Net Drift
 
@@ -209,7 +216,7 @@ Options chain viewer pulling from Deribit (ETH) and CBOE (QQQ).
 
 ### Macro Options Flow
 
-Large-block institutional options flow. Always-on refresh loop with alert muting via `[U]`. (The Markets macro overview that used to be its own mode after this one is now a `[Y]` toggle on the Trading dashboard's own QQQ pane instead — see Trading, above.)
+Large-block institutional options flow. Always-on refresh loop with alert muting via `[U]`. (The Markets macro overview that used to be its own mode after this one is now part of the `[Y]` cycle on the Trading dashboard's own QQQ pane instead, alongside an NDX candlestick chart — see Trading, above.)
 
 ### Status
 
@@ -298,6 +305,8 @@ The compact per-instrument readiness row on the Trading dashboard relabels two o
 
 **Net Volume** (2026-09-01 user request) is a lightweight directional-bias readout, sampled every 15s (`NET_VOLUME_POLL_SECS`) off Net Drift (Premium)'s own already-live engine — specifically its **filtered** (OTM-only) cumulative net volume (`net_vol_cum_f`, the same field `[F]` toggles into view in Net Drift mode), not the standard one. Reads as **Positive** (`net_vol_cum_f > 0`), **Negative** (`< 0`), or **Neutral** (exactly `0` — added same-day follow-up, "if Net Volume is 0, its status should be 'Neutral'. When Neutral, no trades are to be taken"; a bare `> 0`/`<= 0` split had silently folded an exact-zero reading into Negative). Neutral (like the `None`/not-yet-available state) maps to `regime = None` under NV/NV-Auto, the same "can't arm" value PCVR's own 0.98–1.02 dead-zone already produces — no separate gating needed. ETH samples continuously; QQQ/NDX/TLT/VIX only within their own 08:30–15:00 CT window (a dedicated window, not a reuse of the 08:45–15:00 CT gate used elsewhere). Displayed in the Data view's own Status screen, section **3. Options** (renamed from "PCVR" the same request), each status followed by the raw value it was classified from (e.g. `Positive (+142.30)`) sourced from the exact same 15s snapshot, never a second, possibly-inconsistent read — and consumed directly by NV/NV-Auto's own regime derivation, so the display and the trading decision never disagree mid-tick. **Only ETH is ever traded from this data** (2026-09-02) — QQQ/NDX/TLT/VIX are tracked for monitoring/comparison only ("I still want & need that data in order to compare with the others"), per the QQQ trading-removal decision below; the "each asset traded independently" framing from when this was first built (ETH from ETH's own Net Volume, QQQ from QQQ's own) no longer applies now that QQQ can't trade at all — its Net Volume is display data only now, same as NDX/TLT/VIX.
 
+**TLT and VIX's own filtered figure now uses the nearest available expiry, not raw (2026-09-02 user-reported — "the Net Volume has stayed 0 all morning long for TLT & VIX. Should I use the filtered version for these two assets, or the non-filtered version?"):** confirmed live against CBOE's own chain data — the filtered metric's OTM classification was gated behind same-day (`is_0dte`) availability (see `_drift_poll_once_cboe`: `otm = is_0dte and _drift_is_otm(...)`), which QQQ/NDX both have every trading day, but TLT and VIX structurally never do — TLT's nearest listed expiry was a full day out, VIX's a full week out (VIX only ever expires weekly, on Wednesdays) at the moment this was checked. That permanently zeroed the filtered figure for these two by construction, regardless of how much real options flow was happening. Fixed at the source rather than falling back to raw: `DRIFT_FILTER_NEAREST_EXPIRY_ASSETS = (TLT, VIX)` relaxes the `is_0dte` requirement for just these two, so their own OTM filter now applies to whichever expiry `_drift_fetch_cboe_chain` actually fetched (nearest available — the SAME chain the raw figure already reads), restoring a genuine "speculative OTM positioning" signal instead of raw's own ITM-diluted one — closer in kind to what ETH/QQQ/NDX's own filtered figure already means, better for the stated cross-asset comparison goal. QQQ/NDX keep the stricter same-day-only rule unchanged (and satisfy it most days anyway).
+
 ### Entry Blackout
 
 No new entries are placed between 19:00–19:30 CT (the daily session boundary).
@@ -306,12 +315,13 @@ No new entries are placed between 19:00–19:30 CT (the daily session boundary).
 
 ## Sizing Modes
 
-**2026-08-27: replaces the old Blackjack loss-progression ladder entirely.** Two user-selectable sizing modes, cycled with `[0]`, both built on the same base risk-per-trade amount (`[P]`, see Risk Sizing below):
+**2026-08-27: replaces the old Blackjack loss-progression ladder entirely.** Three user-selectable sizing modes, cycled with `[0]`, all built on the same base risk-per-trade amount (`[P]`, see Risk Sizing below):
 
 - **Standard** — every trade risks exactly the base amount. No progression.
 - **Aggressive ("1R+W")** — a trade taken at base risk that nets a profit arms a **one-shot boost** for the very next trade: that next trade risks base + the previous winner's own dollar PnL. The boosted trade's own result — win or lose — is never itself examined for a further boost; the trade after a boosted trade always reverts to bare base risk, unconditionally. A new boost only ever arms again from some later trade taken at base risk that wins.
+- **Aggressive/1R+0.33W** (2026-09-02 user request) — identical mechanic to Aggressive, except the one-shot boost only ever carries **33%** of the winning trade's own dollar PnL forward (conserving the other 67%), not the full amount. Same one-shot/never-re-examined/reverts-to-base rule otherwise.
 
-A third progression, **"1R+0.33W"**, exists but isn't one of these two `[0]`-selectable modes — it's inherent to **NV-Auto** trading mode specifically (see Trading Engine's own NV-Auto Confirmation section), applies regardless of which Sizing Mode is active, and conserves 66% of a win's profit instead of rolling all of it forward.
+A fourth, separate "1R+0.33W" progression exists but is **not** one of these three `[0]`-selectable modes — it's inherent to **NV-Auto** trading mode specifically (see Trading Engine's own NV-Auto Confirmation section), applies regardless of which Sizing Mode is active, and uses its own isolated boost slot so switching between NV-Auto and Aggressive/1R+0.33W elsewhere can never cross-arm a boost the other one actually produced.
 
 **Safety Limits** (independent of sizing mode):
 - **Daily Loss Limit** — 5 consecutive losses blocks the asset until the next 19:30 CT rollover or a PCVR regime switch.
@@ -526,11 +536,12 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `E` | Set fee per unit |
 | `T` | Set imbalance ratio |
 | `N` | Toggle 24H/session mode |
-| `0` | Cycle sizing mode (Standard ↔ Aggressive) — candle/line style toggle instead, while viewing the OHLC profile |
+| `0` | Cycle sizing mode (Standard → Aggressive → Aggressive/1R+0.33W) — candle/line style toggle instead, while viewing the OHLC profile. Aggressive/1R+0.33W added 2026-09-02, see Sizing Modes |
 | `1` | Clear an active Drawdown Full Stop block (manual review) |
+| `2` | Toggle the profit ratchet (trail an open stop to lock +(N-1)R at each +NR) — 2026-09-02 bugfix: used to silently do nothing while viewing the OHLC profile (a stray copy-paste of `0`'s own guard, with no actual OHLC-mode meaning of its own to justify it); now works in every view |
 | `8` | Cycle risk structure (Fixed ↔ VE) — ETH only, under NV/NV-Auto (2026-09-02, see Risk Structures) |
 | `9` | Cycle trading mode (Order Flow → BTD → NV → NV-Auto → Order Flow) — renamed 2026-08-27, was "CCCCWIDE"; NV added 2026-09-01, NV-Auto added 2026-09-02 (see Trading Engine's own NV/NV-Auto Confirmation sections) |
-| `Y` | OHLC profile, QQQ pane only — toggle the Markets macro overview |
+| `Y` | OHLC profile, QQQ pane only — cycle candle chart → Markets macro overview → NDX candlestick chart → back (NDX added 2026-09-02) |
 | `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27). Current state (`VP:Normal`/`VP:Historical`) shows right in the pane's own header (2026-08-28) |
 | `6` | OHLC profile — toggle **VolEffort** (2026-08-29), ported from `vol-effort.py`. Replaces the bottom VOL histogram with a z-score histogram of volume-per-range "effort" — off by default. Header shows `VolEffort:On` when active |
 | `F` | Flatten position |
@@ -545,7 +556,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `G` | Toggle dot-map / by-strike |
 | `N` | Toggle net/gross |
 | `X` | Toggle crosshair (by-strike view only, 2026-08-28) — `←`/`→` move it while on, otherwise they pan the strike window as usual. Readout shows the selected strike's own Net GEX (or Call/Put, in non-net mode) in the info line. Confined to strikes that actually have a nonzero value in either direction (2026-08-29 fix) — the visible pan window routinely extends into deep-OTM strikes with $0 gamma either side, and activating/moving into that dead space put the crosshair nowhere near an actual bar. Activates at the strike nearest the live spot price, not the rightmost strike in view (2026-08-30 user-reported — "still starts at the farthest end of the graph. Have it begin where the current price is."): `crosshair_idx` is stored as "N candidates back from the rightmost nonzero strike," and activation used to always set it to 0 — with `vert_follow` on, spot sits near the MIDDLE of the visible window, not its right edge, so that landed the crosshair far from price. `[X]` now resolves the candidate nearest spot (`_gex_by_strike_spot_ch_idx`, replicating the render's own visible-window math) and stores ITS position in that same convention instead — `←`/`→` still walk away from/back toward the edge exactly as before, just starting from price instead of the edge |
-| `Tab` | Switch asset |
+| `Tab` | Switch asset — cycles `ETH → QQQ → NDX → TLT → VIX → ETH` (2026-09-02; NDX/TLT/VIX are monitoring-only) |
 | `Arrows` | Pan |
 | `[` / `]` | Zoom |
 | `H` | Full key-reference overlay for this mode |

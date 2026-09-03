@@ -354,7 +354,10 @@ _funding_regime_date = [None]
 SIZING_MODES = ("standard", "aggressive")
 
 def _default_sizing_state():
-    return {a: {"pending_boost_dollars": None} for a in ASSETS}
+    # nv_auto_pending_boost_dollars (2026-09-02): NV-Auto's own "1R+0.33W"
+    # boost slot — deliberately separate from pending_boost_dollars
+    # (Aggressive's own), see _compute_trade_risk_dollars' own comment.
+    return {a: {"pending_boost_dollars": None, "nv_auto_pending_boost_dollars": None} for a in ASSETS}
 
 def _load_sizing_state():
     try:
@@ -1011,8 +1014,63 @@ def _save_trading_mode():
     except Exception:
         pass
 
-TRADING_MODES = ("Order Flow", "BTD", "NV")
+TRADING_MODES = ("Order Flow", "BTD", "NV", "NV-Auto")
 TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
+
+# 2026-09-02 user request ("Create 2 risk management structures for 'NV'
+# and 'NV - Auto': 'Fixed' and 'VE'... For now, these will only apply to
+# ETH - QQQ will not be traded for now"): a THIRD, independent selector
+# alongside SIZING_MODE/TRADING_MODE — [8] cycles it, persisted the exact
+# same way (a reserved top-level key in sizing_state.json). Only consulted
+# when self.asset=="ETH" and TRADING_MODE in ("NV","NV-Auto") — every
+# other mode/asset combination is completely untouched by this and keeps
+# using the standard reconstruct_targets-driven target system (see
+# _check_fill's own branch). Not a toggleable "off" state: whenever ETH
+# trades under NV/NV-Auto it always uses whichever of these two is
+# currently selected — there's no third "use the normal targets" option
+# for those two modes, per the user's own framing of these as the risk
+# management for NV/NV-Auto.
+RISK_STRUCTURES = ("Fixed", "VE")
+# 'Fixed' structure's own dollar offsets from fill price (2026-09-02
+# explicit user spec: "TP1 to $20 away from entry, TP2 will be set $30
+# away from entry, SL begins static at $10" — SL reuses ETH's own already-
+# configured ASSETS["ETH"]["sl"], which already is $10, so no separate
+# constant needed for it).
+NV_FIXED_TP1_DISTANCE = 20.0
+NV_FIXED_TP2_DISTANCE = 30.0
+# 'VE' structure's own absorption-signal partial-close count (explicit
+# user spec: "1/3 of the position will be closed each time... meaning
+# after 3 signals the position should be completely closed out") and the
+# price-move threshold (in R) that triggers its own breakeven move
+# ("once price has traveled 2R into profit").
+NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE = 3
+NV_VE_BREAKEVEN_R_MULTIPLE = 2.0
+
+def _load_risk_structure():
+    try:
+        with open(SIZING_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        structure = data.get("_risk_structure")
+        if structure in RISK_STRUCTURES:
+            return structure
+    except Exception:
+        pass
+    return "Fixed"
+
+def _save_risk_structure():
+    try:
+        try:
+            with open(SIZING_STATE_PATH, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            payload = {}
+        payload["_risk_structure"] = RISK_STRUCTURE
+        with open(SIZING_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+RISK_STRUCTURE = _load_risk_structure()   # [8] in curses_main toggles + persists it
 BTD_ENTRY_LOOKBACK = 10
 # 2026-08-31 user-reported ("Reduce QQQ's BTD sensitivity to 2.5 from 3.0.
 # There are too few signals and they often miss the big moves."): per-asset
@@ -1418,7 +1476,15 @@ def instrument_lights(snapshot, asset):
     # mode-agnostic. The `lights["PCVR"]` KEY stays the same either way —
     # only the Status screen's own section title was asked to change, not
     # this internal light name used throughout the rest of the gate.
-    if TRADING_MODE == "NV":
+    # 2026-09-02 bugfix, user-reported ("'NV - Auto' is using 'Order Flow'
+    # for trade entries instead of 'BTD'"): this branch originally checked
+    # TRADING_MODE == "NV" only — NV-Auto silently fell through to the
+    # PCVR `else` below instead, meaning NV-Auto's regime (and therefore
+    # every entry it took) was actually PCVR-derived, not Net-Volume-
+    # derived at all, defeating the entire point of the mode. NV-Auto
+    # shares NV's exact regime derivation; nothing else about it changes
+    # here (see the ARMED-state dispatch for what actually differs).
+    if TRADING_MODE in ("NV", "NV-Auto"):
         with NET_VOLUME_STATUS_LOCK:
             nv_status = NET_VOLUME_STATUS.get(asset)
         regime = "long" if nv_status == "Positive" else "short" if nv_status == "Negative" else None
@@ -4657,12 +4723,16 @@ def _status_build_render_lines(display_data):
     # Net Volume (2026-09-01 user request) — sampled off Net Drift
     # (Premium)'s own FILTERED (OTM-only) cumulative net volume, not the
     # standard one — see _net_volume_poll_loop's own header comment.
-    # Positioned above the PCVR value itself, per that request.
+    # Positioned above the PCVR value itself, per that request. TLT/VIX
+    # added 2026-09-02 ("also track TLT... I want to see how the flow
+    # affects ETH/QQQ", then "Also track VIX") — display only, same as the
+    # Net Drift engine itself: never consulted for a trading decision.
+    # Looping DRIFT_ASSETS directly (rather than naming each one here)
+    # means a future addition only needs that one tuple updated.
     with NET_VOLUME_STATUS_LOCK:
-        _nv_eth, _nv_qqq = NET_VOLUME_STATUS.get("ETH"), NET_VOLUME_STATUS.get("QQQ")
-        _nv_eth_val, _nv_qqq_val = NET_VOLUME_VALUE.get("ETH"), NET_VOLUME_VALUE.get("QQQ")
-    for _nv_label, _nv_status, _nv_val in (("Net Volume - ETH", _nv_eth, _nv_eth_val),
-                                             ("Net Volume - QQQ", _nv_qqq, _nv_qqq_val)):
+        _nv_rows = [(f"Net Volume - {_a}", NET_VOLUME_STATUS.get(_a), NET_VOLUME_VALUE.get(_a))
+                    for _a in DRIFT_ASSETS]
+    for _nv_label, _nv_status, _nv_val in _nv_rows:
         # 2026-09-01 follow-up: the raw value next to each status, straight
         # from the same 15s snapshot the status itself was classified from
         # (NET_VOLUME_VALUE — see _net_volume_poll_loop) — never re-derived
@@ -6554,8 +6624,39 @@ DRIFT_CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json
 DRIFT_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 _DRIFT_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-DRIFT_ASSETS = ("ETH", "QQQ")             # Athena's own fixed pair — drift.py's own BG_SYMBOLS
-DRIFT_IS_CRYPTO = {"ETH": True, "QQQ": False}
+DRIFT_ASSETS = ("ETH", "QQQ", "NDX", "TLT", "VIX")   # drift.py's own BG_SYMBOLS pair started as
+                                            # ("ETH", "QQQ"); TLT and VIX joined 2026-09-02
+                                            # ("track TLT at the same time as ETH & QQQ... No
+                                            # trading decisions are to be made from TLT yet",
+                                            # then "Also track VIX"), then QQQ itself was swapped
+                                            # for NDX the same day ("please include the swap of
+                                            # NDX for QQQ... NDX & VIX/VXN will be for my own
+                                            # monitoring, no trades will be taken with Athena for
+                                            # NDX") once QQQ stopped trading entirely (see the
+                                            # WATCHING-gate's own "if self.asset == 'QQQ': return"
+                                            # for that) — then, same day, "I changed my mind - keep
+                                            # tracking QQQ in everything like you were before. I
+                                            # still want & need that data in order to compare with
+                                            # the others" put QQQ back ALONGSIDE NDX (not instead of
+                                            # it) — QQQ's own TRADING stays permanently disabled
+                                            # (that instruction was never retracted), only its Net
+                                            # Drift/Net Volume/Options DATA tracking came back.
+                                            # Every one of these except ETH is display/monitoring
+                                            # only, never passed to instrument_lights/
+                                            # reconstruct_targets/any entry logic, which only ever
+                                            # runs for "ETH" now.
+DRIFT_IS_CRYPTO = {"ETH": True, "QQQ": False, "NDX": False, "TLT": False, "VIX": False}
+# CBOE lists index option roots under an underscore-prefixed symbol
+# ("_VIX"/"_NDX", both confirmed live) distinct from the plain equity/ETF
+# ticker ("TLT") _drift_fetch_cboe_chain otherwise passes straight
+# through — VIX and NDX are Athena's own INDEX-rooted Net Drift assets, so
+# this override maps each internal asset name to its actual CBOE fetch
+# symbol; every other asset is absent here and falls through to using its
+# own name unchanged. The option contract NAMES CBOE returns still read
+# "VIX.../NDX..." either way (_drift_fetch_cboe_chain parses them by fixed
+# suffix offset, never by prefix), so nothing downstream of the fetch
+# needs to know this mapping exists.
+DRIFT_CBOE_SYMBOL = {"VIX": "_VIX", "NDX": "_NDX"}
 DRIFT_CRYPTO_CCY = {"ETH": "ETH"}          # Deribit/OKX/Bybit currency code per crypto asset
 
 DRIFT_DEFAULT_INTERVAL = 15         # [I] — how often each asset polls for new data
@@ -6993,25 +7094,32 @@ DRIFT_NEXT_POLL_TS = {asset: time.time() for asset in DRIFT_ASSETS}          # f
 # snapshot, not two independent reads that could disagree mid-tick.
 NET_VOLUME_POLL_SECS = 15
 NET_VOLUME_STATUS_LOCK = threading.Lock()
-NET_VOLUME_STATUS = {"ETH": None, "QQQ": None}   # "Positive" / "Negative" / "Neutral" / None (not yet available)
+# TLT added 2026-09-02 ("track TLT at the same time as ETH & QQQ... No
+# trading decisions are to be made from TLT yet") — display/monitoring
+# only: instrument_lights (the only reader that turns a status into a real
+# regime/trade) is never called with asset="TLT", so this entry can never
+# influence an entry no matter what it reads.
+NET_VOLUME_STATUS = {"ETH": None, "QQQ": None, "NDX": None, "TLT": None, "VIX": None}   # "Positive" / "Negative" / "Neutral" / None (not yet available)
 # 2026-09-01 follow-up: the raw net_vol_cum_f each status above was derived
 # from, sampled at the exact same instant — kept alongside the status so
 # the Status screen can show both ("Positive (+142.30)") without a second,
 # possibly-inconsistent read of DRIFT_STATE.
-NET_VOLUME_VALUE = {"ETH": None, "QQQ": None}
-# QQQ-only eligibility window, explicit user spec (2026-09-01): 08:30-15:00
+NET_VOLUME_VALUE = {"ETH": None, "QQQ": None, "NDX": None, "TLT": None, "VIX": None}
+# QQQ/TLT eligibility window, explicit user spec (2026-09-01 for QQQ,
+# 2026-09-02 "Like QQQ, TLT should be tracked 08:30-15:00 CT"): 08:30-15:00
 # CT — deliberately its OWN window, not a reuse of STATUS_QQQ_OPEN_CT_MIN
 # (08:45) elsewhere in this file; the two happen to nearly coincide, but
 # outside 08:45-15:00 QQQ is already market_closed-gated everywhere that
 # matters, so the extra 15 minutes here is harmless. ETH has no such
-# window — crypto trades continuously.
-NET_VOLUME_QQQ_OPEN_CT_MIN = 8 * 60 + 30
-NET_VOLUME_QQQ_CLOSE_CT_MIN = 15 * 60
+# window — crypto trades continuously. Named "equity" now, not "qqq" —
+# TLT uses this exact same window, not a QQQ-specific one.
+NET_VOLUME_EQUITY_OPEN_CT_MIN = 8 * 60 + 30
+NET_VOLUME_EQUITY_CLOSE_CT_MIN = 15 * 60
 
-def _net_volume_qqq_window_active():
+def _net_volume_equity_window_active():
     n = _status_now_ct()
     minutes = n.hour * 60 + n.minute
-    return n.weekday() < 5 and NET_VOLUME_QQQ_OPEN_CT_MIN <= minutes < NET_VOLUME_QQQ_CLOSE_CT_MIN
+    return n.weekday() < 5 and NET_VOLUME_EQUITY_OPEN_CT_MIN <= minutes < NET_VOLUME_EQUITY_CLOSE_CT_MIN
 
 def _net_volume_classify(netvol):
     # 2026-09-01 follow-up ("If Net Volume is 0, its status should be
@@ -7030,30 +7138,44 @@ def _net_volume_classify(netvol):
         return "Negative"
     return "Neutral"
 
+NET_VOLUME_EQUITY_WINDOW_ASSETS = ("QQQ", "NDX", "TLT", "VIX")   # every DRIFT_ASSETS entry
+                                    # except ETH (QQQ briefly swapped for NDX 2026-09-02, then
+                                    # restored alongside it the same day — "keep tracking QQQ
+                                    # in everything like you were before... I still want &
+                                    # need that data in order to compare with the others") —
+                                    # all four only sample within their own 08:30-15:00 CT
+                                    # window (see _net_volume_equity_window_active); ETH
+                                    # samples unconditionally (crypto, 24/7).
+
 def _net_volume_poll_loop(stop_evt):
     """Always-on background thread, same shape as _drift_engine_loop/
     _gex_engine_loop etc. — samples DRIFT_STATE's own live filtered net
     volume every NET_VOLUME_POLL_SECS and republishes the directional read
     (see _net_volume_classify) plus the raw value into NET_VOLUME_STATUS/
-    NET_VOLUME_VALUE. QQQ is left at None (renders as "n/a" / can't arm
-    under 'NV') outside its own 08:30-15:00 CT window; ETH always
-    updates."""
+    NET_VOLUME_VALUE, for every asset DRIFT_STATE tracks. TLT/VIX
+    (2026-09-02) are display-only, same as QQQ's own gating but never
+    consulted for a trading decision — instrument_lights (the only reader
+    that turns a status into a regime) is never called with those asset
+    names."""
     while not stop_evt.is_set():
         with DRIFT_STATE["ETH"].lock:
             eth_netvol = DRIFT_STATE["ETH"].net_vol_cum_f
-        eth_status = _net_volume_classify(eth_netvol)
+        new_status = {"ETH": _net_volume_classify(eth_netvol)}
+        new_value = {"ETH": eth_netvol}
 
-        qqq_status, qqq_netvol = None, None
-        if _net_volume_qqq_window_active():
-            with DRIFT_STATE["QQQ"].lock:
-                qqq_netvol = DRIFT_STATE["QQQ"].net_vol_cum_f
-            qqq_status = _net_volume_classify(qqq_netvol)
+        equity_window_open = _net_volume_equity_window_active()
+        for _asset in NET_VOLUME_EQUITY_WINDOW_ASSETS:
+            status, netvol = None, None
+            if equity_window_open:
+                with DRIFT_STATE[_asset].lock:
+                    netvol = DRIFT_STATE[_asset].net_vol_cum_f
+                status = _net_volume_classify(netvol)
+            new_status[_asset] = status
+            new_value[_asset] = netvol
 
         with NET_VOLUME_STATUS_LOCK:
-            NET_VOLUME_STATUS["ETH"] = eth_status
-            NET_VOLUME_STATUS["QQQ"] = qqq_status
-            NET_VOLUME_VALUE["ETH"] = eth_netvol
-            NET_VOLUME_VALUE["QQQ"] = qqq_netvol
+            NET_VOLUME_STATUS.update(new_status)
+            NET_VOLUME_VALUE.update(new_value)
         stop_evt.wait(NET_VOLUME_POLL_SECS)
 
 
@@ -7563,7 +7685,7 @@ def _drift_poll_once_cboe(asset, state, min_trade_usd, confidence_deadzone):
     is_0dte gates the whole poll's filtered contribution to zero on days
     the chain fetch had to fall back off today's date; OTM is checked per
     contract using this poll's one chain spot."""
-    chain = _drift_fetch_cboe_chain(asset)
+    chain = _drift_fetch_cboe_chain(DRIFT_CBOE_SYMBOL.get(asset, asset))
     contracts = chain["contracts"]
     is_0dte = chain["is_0dte"]
     spot = chain["spot"]
@@ -9051,6 +9173,13 @@ class AthenaInstrument:
                                      # cancel-by-ID instead of cancel_all, added
                                      # 2026-08-11 alongside the same fix in
                                      # _sync_moving_tps (see that docstring for why).
+        self._nv_auto_last_midnight_flatten_day = None   # 2026-09-02 — CT calendar-day
+                                     # key of the last NV-Auto midnight flatten, so the
+                                     # "flatten any open ETH position at 00:00 CT" check
+                                     # (process_cycle) fires exactly once per day rather
+                                     # than re-flattening every cycle for the entire hour-0
+                                     # window (which would also nuke a brand-new position
+                                     # NV-Auto opens later that same hour).
 
     async def _place_sl_with_retry(self, symbol, pos_side, sl_price, price_decimals, retries=3):
         """A resting stop-loss is the single most important order this app
@@ -9433,6 +9562,27 @@ class AthenaInstrument:
             await self._flatten_now("eod")
             return
 
+        # 2026-09-02 user request (NV-Auto spec — "Any open ETH positions
+        # should be flattened at 00:00 CT since the Net Volume resets to
+        # 0. After 00:00, the new day begins and new positions may be
+        # opened as soon as Net Volume goes either Negative or Positive"):
+        # a clock-time trigger, not a status-derived one (unlike QQQ's own
+        # EOD flatten above) — Net Volume's own cumulative counter resets
+        # server-side at CT midnight regardless of what status this cycle
+        # happens to read. Guarded by day_key so this fires exactly ONCE
+        # per calendar day (hour==0 alone would otherwise match every
+        # cycle for the whole hour, including flattening a brand new
+        # position NV-Auto opens later that same hour once Net Volume
+        # goes Positive/Negative again).
+        if (self.asset == "ETH" and TRADING_MODE == "NV-Auto"
+                and self.state in ("PENDING_FILL", "IN_POSITION") and TZ_CT):
+            now_ct = _status_now_ct()
+            day_key = _ct_calendar_day_key(now_ct)
+            if now_ct.hour == 0 and self._nv_auto_last_midnight_flatten_day != day_key:
+                self._nv_auto_last_midnight_flatten_day = day_key
+                await self._flatten_now("nv_auto_midnight")
+                return
+
         required = required_status_lights()
         gate_ok = all(lights5[n] for n in required)
         # Daily Loss Limit (2026-07-25) / Max Win Limit (2026-08-21) / the
@@ -9449,10 +9599,31 @@ class AthenaInstrument:
 
         if self.state == "WATCHING":
             self.lights["Order Flow"] = False
+            # 2026-09-02 user request — first scoped to "these [Fixed/VE]
+            # will only apply to ETH - QQQ will not be traded for now",
+            # then widened the same day: "You can remove QQQUSDT entirely
+            # from trading - I will not be trading that instrument
+            # anymore. The only trading functionality going forward is
+            # solely for ETH." QQQ now never arms under ANY trading mode,
+            # not just NV/NV-Auto — a permanent, code-level block, not the
+            # softer/reversible [A] per-asset pause (ATHENA_ENABLED),
+            # which stays available for ETH unaffected. Deliberately only
+            # here, at the WATCHING gate: every other QQQ subsystem (its
+            # own footprint/OHLC/GEX/CVD feeds and displays, and — briefly
+            # dropped for NDX the same day, then explicitly restored
+            # alongside it a moment later, "keep tracking QQQ in
+            # everything like you were before... need that data... to
+            # compare with the others" — Net Drift's own options-flow
+            # tracking) is untouched; the user asked to stop TRADING it,
+            # never to stop tracking/showing it. Only blocks NEW entries;
+            # an already-open QQQ position from before this change is
+            # still fully managed below regardless.
+            if self.asset == "QQQ":
+                return
             if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
                 return
             self.state = "ARMED"
-            trigger_desc = "BTD candle closes" if TRADING_MODE in ("BTD", "NV") else "order flow"
+            trigger_desc = "BTD candle closes" if TRADING_MODE in ("BTD", "NV") else "immediate on regime flip" if TRADING_MODE == "NV-Auto" else "order flow"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching {trigger_desc} ({regime})"
                         + (" [24H MODE]" if NO_SESSION else ""))
             # 2026-07-28 debugging aid, user-reported ("ETH entered a trade
@@ -9488,7 +9659,25 @@ class AthenaInstrument:
                 log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
                                                      "athena_enabled": ATHENA_ENABLED[self.asset]})
                 return
-            if TRADING_MODE in ("BTD", "NV"):
+            if TRADING_MODE == "NV-Auto":
+                # 2026-09-02 user request ("As soon as the Net Volume goes
+                # either 'Negative' or 'Positive', enter a trade in the
+                # corresponding direction"): no bar-confirmation wait at
+                # all, and deliberately NO "only once per new bar" dedup
+                # either — instrument_lights' own NV branch already can't
+                # produce `regime in ("long","short")` (the only thing that
+                # gets this instrument ARMED at all under NV/NV-Auto in the
+                # first place) unless Net Volume is ALREADY decisively
+                # Positive/Negative, so "just became ARMED" already IS the
+                # flip signal. The moment _check_btd_confirmation places an
+                # order it moves self.state to PENDING_FILL, which takes
+                # this whole ARMED branch out of the loop on its own — no
+                # extra guard needed against firing twice for one flip.
+                bars_1m, _ = (ch_snapshot_1m(self.asset) if self.asset == "ETH"
+                              else LIVE_TAPE.snapshot_1m(self.asset))
+                if bars_1m and regime in ("long", "short"):
+                    await self._check_btd_confirmation(bars_1m, regime, price, targets_full, auto_entry=True)
+            elif TRADING_MODE in ("BTD", "NV"):
                 # 2026-09-01: 'NV' shares this exact BTD candle-close
                 # confirmation path — the only thing 'NV' changes is where
                 # `regime` itself came from (see instrument_lights).
@@ -9622,6 +9811,24 @@ class AthenaInstrument:
         right after this returns (see current_drawdown_mult)."""
         base = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) else balance * (PCT / 100.0)
         base *= layer1_mult
+        # 2026-09-02 user request ("Win progression is now '1R+0.33W'...
+        # instead of rolling over all of the profit from a winning trade
+        # into the next one, I'd like to conserve 66% of the profits"):
+        # an NV-Auto-INHERENT sizing behavior, not a 3rd SIZING_MODE the
+        # user selects via [0] — checked first, ahead of Standard/
+        # Aggressive, so it always applies under NV-Auto regardless of
+        # whatever SIZING_MODE happens to be set to. Own boost slot
+        # (SIZING_STATE[asset]["nv_auto_pending_boost_dollars"]) — never
+        # shares Aggressive's own "pending_boost_dollars" key, so toggling
+        # between NV-Auto and Aggressive elsewhere can't cross-arm a boost
+        # neither mode actually produced.
+        if TRADING_MODE == "NV-Auto":
+            boost = SIZING_STATE[self.asset].get("nv_auto_pending_boost_dollars")
+            if boost:
+                SIZING_STATE[self.asset]["nv_auto_pending_boost_dollars"] = None
+                _save_sizing_state()
+                return base + boost, f"1R+0.33W (+${boost:,.2f})", True
+            return base, "1R+0.33W", False
         if SIZING_MODE == "aggressive":
             boost = SIZING_STATE[self.asset].get("pending_boost_dollars")
             if boost:
@@ -9636,8 +9843,27 @@ class AthenaInstrument:
         realized net pnl — see SIZING_MODES' own module-level comment for
         the full spec. No-op entirely in Standard mode or when pnl is
         unknown. Called from every close site, replacing the old
-        _check_5r_home_run + _update_blackjack pair."""
-        if SIZING_MODE != "aggressive" or pnl is None:
+        _check_5r_home_run + _update_blackjack pair.
+
+        2026-09-02: NV-Auto's own "1R+0.33W" progression is handled first,
+        as its own branch — see _compute_trade_risk_dollars' own comment
+        for why this checks TRADING_MODE directly rather than going
+        through SIZING_MODE at all."""
+        if pnl is None:
+            return
+        if TRADING_MODE == "NV-Auto":
+            was_boosted = bool(self.position and self.position.get("boosted"))
+            if was_boosted:
+                return
+            if pnl > 0:
+                boost = pnl * 0.33
+                SIZING_STATE[self.asset]["nv_auto_pending_boost_dollars"] = boost
+                _save_sizing_state()
+                console_log(f"{self.asset}: {YLW}1R+0.33W — next trade risks base + ${boost:,.2f} "
+                            f"(33% of this trade's own ${pnl:,.2f} profit){RST}")
+                log_event(self.asset, "nv_auto_boost_armed", {"pnl": pnl, "boost": boost})
+            return
+        if SIZING_MODE != "aggressive":
             return
         was_boosted = bool(self.position and self.position.get("boosted"))
         if was_boosted:
@@ -10100,8 +10326,18 @@ class AthenaInstrument:
                     f"{price_str or 'market'}")
         log_event(self.asset, "entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
 
-    async def _check_btd_confirmation(self, bars_1m, regime, live_price_fallback, targets_full):
-        confirmed, entry_price = btd_confirmation(bars_1m, regime, sigma=BTD_ENTRY_SIGMA[self.asset])
+    async def _check_btd_confirmation(self, bars_1m, regime, live_price_fallback, targets_full, auto_entry=False):
+        # 2026-09-02: auto_entry (NV-Auto only) skips the candle-based
+        # volume-imbalance check entirely — the regime flip itself IS the
+        # signal (see the confirmation-dispatch site's own comment). Falls
+        # back to bars_1m's own last close as the reference "entry_price"
+        # (only ever used below as a live_price fallback if the reference-
+        # price fetch fails) since there's no confirming candle to read
+        # one off.
+        if auto_entry:
+            confirmed, entry_price = True, bars_1m[-1]["c"]
+        else:
+            confirmed, entry_price = btd_confirmation(bars_1m, regime, sigma=BTD_ENTRY_SIGMA[self.asset])
         if not confirmed:
             return
         if entry_price is None:
@@ -10112,43 +10348,53 @@ class AthenaInstrument:
         if live_price is None:
             live_price = entry_price
 
-        def _is_top_tier(t):
-            # 2026-08-27, explicit user request: VWAP/POC/VAH/VAL (session
-            # Volume Profile levels) join BT/ST/Large-cluster as top-tier
-            # — see reconstruct_targets' own docstring for where these
-            # come from and VAH/VAL's own regime-direction restriction.
-            #
-            # 2026-08-31, explicit user request ("Add ER 40/80% levels as
-            # top-tier targets. Cluster (Medium) is the only target that is
-            # not a top-tier target" + "ER 100/150% levels should also be
-            # considered top-tier targets"): every target type is now
-            # top-tier EXCEPT a Medium cluster — ER 40/80/100/150% and GEX
-            # Flip (previously fallback-only alongside Medium clusters)
-            # are promoted too, since the user's own wording names Medium
-            # clusters as the ONLY exception. Written as an exclusion
-            # rather than an inclusion list so any future new target type
-            # defaults to top-tier without needing to be added here.
-            return not (t["type"] == "Cluster" and t.get("tier") == "Medium")
+        # 2026-09-02 user request ("Create 2 risk management structures
+        # for 'NV' and 'NV-Auto'... For now, these will only apply to
+        # ETH"): Fixed/VE compute their own SL/TP directly from fill price
+        # (see _check_fill) — there is no "does a qualifying target exist"
+        # question to ask for them at all, so the whole target-viability
+        # gate below is skipped entirely rather than asking it of a target
+        # list these structures never consult.
+        risk_structure_active = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto"))
 
-        top_tier_present = any(_is_top_tier(t) for t in targets_full)
-        usable_target = None
-        for t in targets_full:
-            if abs(t["level"] - live_price) < R:
-                continue
-            if top_tier_present and not _is_top_tier(t):
-                continue
-            usable_target = t["level"]
-            break
+        if not risk_structure_active:
+            def _is_top_tier(t):
+                # 2026-08-27, explicit user request: VWAP/POC/VAH/VAL (session
+                # Volume Profile levels) join BT/ST/Large-cluster as top-tier
+                # — see reconstruct_targets' own docstring for where these
+                # come from and VAH/VAL's own regime-direction restriction.
+                #
+                # 2026-08-31, explicit user request ("Add ER 40/80% levels as
+                # top-tier targets. Cluster (Medium) is the only target that is
+                # not a top-tier target" + "ER 100/150% levels should also be
+                # considered top-tier targets"): every target type is now
+                # top-tier EXCEPT a Medium cluster — ER 40/80/100/150% and GEX
+                # Flip (previously fallback-only alongside Medium clusters)
+                # are promoted too, since the user's own wording names Medium
+                # clusters as the ONLY exception. Written as an exclusion
+                # rather than an inclusion list so any future new target type
+                # defaults to top-tier without needing to be added here.
+                return not (t["type"] == "Cluster" and t.get("tier") == "Medium")
 
-        if usable_target is None:
-            nearest_dist = min((abs(t["level"] - live_price) for t in targets_full), default=None)
-            dist_txt = "n/a" if nearest_dist is None else f"{nearest_dist:.2f}"
-            reason = ("a top-tier target exists but none clear it"
-                      if top_tier_present else f"no target >= {R}R away")
-            console_log(f"{self.asset}: BTD confirmed {regime.upper()} but rejected — {reason} (nearest {dist_txt})")
-            log_event(self.asset, "btd_rejected_viability", {"regime": regime, "targets": targets_full,
-                                                               "nearest_distance": nearest_dist, "R": R})
-            return
+            top_tier_present = any(_is_top_tier(t) for t in targets_full)
+            usable_target = None
+            for t in targets_full:
+                if abs(t["level"] - live_price) < R:
+                    continue
+                if top_tier_present and not _is_top_tier(t):
+                    continue
+                usable_target = t["level"]
+                break
+
+            if usable_target is None:
+                nearest_dist = min((abs(t["level"] - live_price) for t in targets_full), default=None)
+                dist_txt = "n/a" if nearest_dist is None else f"{nearest_dist:.2f}"
+                reason = ("a top-tier target exists but none clear it"
+                          if top_tier_present else f"no target >= {R}R away")
+                console_log(f"{self.asset}: BTD confirmed {regime.upper()} but rejected — {reason} (nearest {dist_txt})")
+                log_event(self.asset, "btd_rejected_viability", {"regime": regime, "targets": targets_full,
+                                                                   "nearest_distance": nearest_dist, "R": R})
+                return
 
         order_type = "market"
 
@@ -10267,66 +10513,101 @@ class AthenaInstrument:
         symbol = self.cfg["phemex_symbol"]
         await self._place_sl_with_retry(symbol, p["pos_side"], sl_price, p["price_decimals"])
 
-        targets = list(p["targets"])
         qd = p["qty_decimals"]
         step = 10 ** (-qd) if qd else 1.0
         total_steps = round(qty / step)
 
-        def _tp_level(target):
-            if target["type"] == "GEX Flip":
-                return target["level"] - GEX_FLIP_TP_BUFFER if p["pos_side"] == "Long" else target["level"] + GEX_FLIP_TP_BUFFER
-            return target["level"]
-
-        def _valid_tp(level):
-            return level >= fill_price + R if p["pos_side"] == "Long" else level <= fill_price - R
-
-        candidates = [(_tp_level(t), t) for t in targets]
-        valid = [(lvl, t) for lvl, t in candidates if _valid_tp(lvl)]
-        valid.sort(key=lambda lt: abs(lt[0] - fill_price))
-        dropped = [t for lvl, t in candidates if not _valid_tp(lvl)]
-
-        if dropped:
-            console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
-            log_event(self.asset, "tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
-
-        if len(valid) >= 2 and total_steps >= 2:
-            tp1_steps = total_steps // 2
-            tp2_steps = total_steps - tp1_steps
-            tp1_qty = tp1_steps * step
-            tp2_qty = tp2_steps * step
-            (tp1_level, tp1_t), (tp2_level, tp2_t) = valid[0], valid[1]
-            tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
-            tp2_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
-            tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid},
-                       {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": tp2_t["type"] == "GEX Flip", "type": tp2_t["type"], "order_id": tp2_oid}]
-        elif valid:
-            tp1_level, tp1_t = valid[0]
-            tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
-            tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid}]
-        elif candidates:
-            # 2026-08-12 user-reported (a real ETH long: BT $1900.00 and
-            # Cluster $1900.00 both missed the $1900.24 full-R cutoff by
-            # just $0.24, GEX Flip missed by $5.89 — every candidate got
-            # dropped, leaving the position with NO TP at all, SL only).
-            # Explicit user choice over leaving it naked: fall back to
-            # whichever dropped candidate came CLOSEST to clearing the R
-            # filter (max distance from fill_price among the dropped set
-            # — the "least invalid" one, i.e. giving up the least reward)
-            # and use it as a single TP leg, full qty — same shape as the
-            # `elif valid:` branch above, just sourced from `candidates`
-            # instead of `valid`. Tagged "tp_fallback_used" in the log so
-            # it's distinguishable from a normal in-bounds placement.
-            fallback_level, fallback_t = max(candidates, key=lambda lt: abs(lt[0] - fill_price))
-            fallback_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", fallback_level,
-                                                              p["price_decimals"], "1", fallback_t["type"])
-            tp_legs = [{"level": fallback_level, "qty": qty, "tracks_gex_flip": fallback_t["type"] == "GEX Flip",
-                        "type": fallback_t["type"], "order_id": fallback_oid}]
-            console_log(f"{self.asset}: {YLW}no target cleared the full-R filter — using nearest anyway "
-                        f"({fallback_t['type']} {fmt_num(fallback_level)}){RST}")
-            log_event(self.asset, "tp_fallback_used", {"fill_price": fill_price, "R": R,
-                                                         "level": fallback_level, "type": fallback_t["type"]})
+        # 2026-09-02 user request ("Create 2 risk management structures
+        # for 'NV' and 'NV-Auto': 'Fixed' and 'VE'... For now, these will
+        # only apply to ETH"): completely bypasses the standard
+        # reconstruct_targets-driven target selection below — Fixed's own
+        # TP1/TP2 are fixed dollar offsets from fill price, VE has no
+        # preset TP at all (see _manage_position's own VE-specific
+        # absorption-signal/2R-breakeven logic instead). Both converge
+        # back into the exact same shared tail below (tp_desc onward) as
+        # the standard path — position bookkeeping, logging, and the
+        # PENDING_FILL->IN_POSITION transition are all identical either
+        # way, only how tp_legs itself gets built differs.
+        if self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto"):
+            sign = 1 if p["pos_side"] == "Long" else -1
+            if RISK_STRUCTURE == "Fixed":
+                tp1_level = fill_price + sign * NV_FIXED_TP1_DISTANCE
+                tp2_level = fill_price + sign * NV_FIXED_TP2_DISTANCE
+                if total_steps >= 2:
+                    tp1_steps = total_steps // 2
+                    tp2_steps = total_steps - tp1_steps
+                    tp1_qty, tp2_qty = tp1_steps * step, tp2_steps * step
+                    tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", "Fixed TP1")
+                    tp2_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", "Fixed TP2")
+                    tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": False, "type": "Fixed TP1", "order_id": tp1_oid},
+                               {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": False, "type": "Fixed TP2", "order_id": tp2_oid}]
+                else:
+                    # Too small a qty to split into two legs — same
+                    # fallback shape the standard system's own `elif
+                    # valid:` branch uses: one leg, full qty, nearer level.
+                    tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", "Fixed TP1")
+                    tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": False, "type": "Fixed TP1", "order_id": tp1_oid}]
+            else:   # "VE" — no preset TP leg(s) at all; qty stays fully open,
+                     # managed entirely by _manage_position's own VE section.
+                tp_legs = []
         else:
-            tp_legs = []
+            targets = list(p["targets"])
+
+            def _tp_level(target):
+                if target["type"] == "GEX Flip":
+                    return target["level"] - GEX_FLIP_TP_BUFFER if p["pos_side"] == "Long" else target["level"] + GEX_FLIP_TP_BUFFER
+                return target["level"]
+
+            def _valid_tp(level):
+                return level >= fill_price + R if p["pos_side"] == "Long" else level <= fill_price - R
+
+            candidates = [(_tp_level(t), t) for t in targets]
+            valid = [(lvl, t) for lvl, t in candidates if _valid_tp(lvl)]
+            valid.sort(key=lambda lt: abs(lt[0] - fill_price))
+            dropped = [t for lvl, t in candidates if not _valid_tp(lvl)]
+
+            if dropped:
+                console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
+                log_event(self.asset, "tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
+
+            if len(valid) >= 2 and total_steps >= 2:
+                tp1_steps = total_steps // 2
+                tp2_steps = total_steps - tp1_steps
+                tp1_qty = tp1_steps * step
+                tp2_qty = tp2_steps * step
+                (tp1_level, tp1_t), (tp2_level, tp2_t) = valid[0], valid[1]
+                tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp1_qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+                tp2_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{tp2_qty:.{qd}f}", tp2_level, p["price_decimals"], "2", tp2_t["type"])
+                tp_legs = [{"level": tp1_level, "qty": tp1_qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid},
+                           {"level": tp2_level, "qty": tp2_qty, "tracks_gex_flip": tp2_t["type"] == "GEX Flip", "type": tp2_t["type"], "order_id": tp2_oid}]
+            elif valid:
+                tp1_level, tp1_t = valid[0]
+                tp1_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", tp1_level, p["price_decimals"], "1", tp1_t["type"])
+                tp_legs = [{"level": tp1_level, "qty": qty, "tracks_gex_flip": tp1_t["type"] == "GEX Flip", "type": tp1_t["type"], "order_id": tp1_oid}]
+            elif candidates:
+                # 2026-08-12 user-reported (a real ETH long: BT $1900.00 and
+                # Cluster $1900.00 both missed the $1900.24 full-R cutoff by
+                # just $0.24, GEX Flip missed by $5.89 — every candidate got
+                # dropped, leaving the position with NO TP at all, SL only).
+                # Explicit user choice over leaving it naked: fall back to
+                # whichever dropped candidate came CLOSEST to clearing the R
+                # filter (max distance from fill_price among the dropped set
+                # — the "least invalid" one, i.e. giving up the least reward)
+                # and use it as a single TP leg, full qty — same shape as the
+                # `elif valid:` branch above, just sourced from `candidates`
+                # instead of `valid`. Tagged "tp_fallback_used" in the log so
+                # it's distinguishable from a normal in-bounds placement.
+                fallback_level, fallback_t = max(candidates, key=lambda lt: abs(lt[0] - fill_price))
+                fallback_oid = await self._place_tp_leg_checked(symbol, p["pos_side"], f"{qty:.{qd}f}", fallback_level,
+                                                                  p["price_decimals"], "1", fallback_t["type"])
+                tp_legs = [{"level": fallback_level, "qty": qty, "tracks_gex_flip": fallback_t["type"] == "GEX Flip",
+                            "type": fallback_t["type"], "order_id": fallback_oid}]
+                console_log(f"{self.asset}: {YLW}no target cleared the full-R filter — using nearest anyway "
+                            f"({fallback_t['type']} {fmt_num(fallback_level)}){RST}")
+                log_event(self.asset, "tp_fallback_used", {"fill_price": fill_price, "R": R,
+                                                             "level": fallback_level, "type": fallback_t["type"]})
+            else:
+                tp_legs = []
         tp_desc = [leg["level"] for leg in tp_legs]
 
         # 2026-07-28 user request: the trades table's TP1/TP1 TYPE/TP2/TP2
@@ -10377,8 +10658,24 @@ class AthenaInstrument:
                           # — read fresh every render by the dashboard, no
                           # caching, same "always tracks the real state"
                           # approach as everything else on this line.
-                          "fill_time": time.time()}
-        self._tp1_lock_done = False
+                          "fill_time": time.time(),
+                          # VE-structure-only bookkeeping (2026-09-02) —
+                          # harmless/unused whenever RISK_STRUCTURE isn't
+                          # "VE" or TRADING_MODE isn't NV/NV-Auto; see
+                          # _manage_position's own VE section for what
+                          # reads/updates these.
+                          "ve_absorption_count": 0, "ve_last_absorption_bar_ts": None,
+                          "ve_breakeven_done": False}
+        # 2026-09-02: VE structure has no TP1 leg to ever fill (tp_legs is
+        # empty by design — see the branch above), and its own breakeven
+        # trigger is entirely different (a 2R price move, not "TP1
+        # filled") — pre-marking this True keeps the generic TP1-partial-
+        # fill-detection block below permanently out of the way for VE
+        # trades, so it never tries (and fails, tp1_price staying None
+        # with no tp_legs to fall back on) to treat a VE-driven partial
+        # close as a TP1 fill. _manage_position's own VE section handles
+        # ALL of VE's pnl-booking/breakeven/absorption-counting instead.
+        self._tp1_lock_done = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto") and RISK_STRUCTURE == "VE")
         self._ratchet_milestone = 0   # fresh trade — see _apply_profit_ratchet
         self.pending = None
         self.state = "IN_POSITION"
@@ -10398,6 +10695,10 @@ class AthenaInstrument:
                                           "sequence_label": p.get("sequence_label"),
                                           "tp_legs": [{"level": leg["level"], "qty": leg["qty"], "type": leg["type"]}
                                                       for leg in tp_legs],
+                                          # risk_structure (2026-09-02): only meaningful for an
+                                          # ETH NV/NV-Auto trade — None otherwise, so a backtest
+                                          # can filter to exactly the trades Fixed/VE governed.
+                                          "risk_structure": (RISK_STRUCTURE if (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")) else None),
                                           "sim": DRY_RUN})
 
     def _infer_close_reason(self, pos_side, exit_price):
@@ -10647,8 +10948,131 @@ class AthenaInstrument:
                                                           "pnl": leg_gross,
                                                           "type": old_tp_legs[0].get("type") if old_tp_legs else None,
                                                           "price_exact": True})
-                await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty)
+                # 2026-09-02 user request (ETH 'Fixed' risk structure
+                # under NV/NV-Auto — "Once TP1 is hit, SL should be moved
+                # to breakeven (level where the open position's entry &
+                # exit trading costs are recovered)"): TRUE breakeven
+                # (net_per_unit=0.0), not the usual $1.00/unit cushion
+                # every other mode gets here.
+                _nv_fixed_active = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")
+                                     and RISK_STRUCTURE == "Fixed")
+                await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty,
+                                                      net_per_unit=(0.0 if _nv_fixed_active else 1.00))
             self._tp1_lock_done = True
+
+        # 2026-09-02 user request ("'VE' will not have a preset TP1/TP2...
+        # 1/3 of the position will be closed each time there is a VolEffort
+        # signal showing absorption in the opposing direction of the
+        # trade... SL begins at $10 initially, but should be adjusted to
+        # breakeven... once price has traveled 2R into profit"): VE has no
+        # TP legs at all (see _check_fill) so there's nothing for the
+        # generic TP1-fill block above to ever detect — _tp1_lock_done was
+        # already pre-set True for VE trades at fill time specifically so
+        # it never tries. Everything about managing a VE trade lives here
+        # instead, checked every IN_POSITION cycle.
+        if (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")
+                and RISK_STRUCTURE == "VE" and self.position):
+            entry = self.position["fill_price"]
+            R = self.cfg["sl"]
+
+            # -- 2R-move breakeven (once) --------------------------------
+            if not self.position.get("ve_breakeven_done"):
+                live_price = await reference_price(self.asset, symbol)
+                if live_price is not None:
+                    favorable = (live_price - entry) if pos_side == "Long" else (entry - live_price)
+                    if favorable >= NV_VE_BREAKEVEN_R_MULTIPLE * R:
+                        # tp1_price/tp1_qty are purely cosmetic in the log
+                        # line when tp1_qty is falsy — see that method's
+                        # own trigger_label/tp1_clause handling. entry/0
+                        # here just means "no TP1 leg to reference".
+                        await self._apply_tp1_breakeven_lock(symbol, pos_side, entry, 0, net_per_unit=0.0,
+                                                              trigger_label=f"VE {NV_VE_BREAKEVEN_R_MULTIPLE:g}R move")
+                        self.position["ve_breakeven_done"] = True
+
+            # -- VolEffort absorption-signal partial closes --------------
+            if self.position.get("ve_absorption_count", 0) < NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE:
+                bars_1m, live_1m = ch_snapshot_1m(self.asset)
+                all_bars = list(bars_1m)
+                if live_1m:
+                    all_bars.append(live_1m)
+                closed_records = [r for r in _vol_effort_records(all_bars, self.asset) if not r["live"]]
+                last_rec = closed_records[-1] if closed_records else None
+                if (last_rec is not None and last_rec["klass"] == VOL_EFFORT_ABSORPTION
+                        and last_rec["ts"] != self.position.get("ve_last_absorption_bar_ts")):
+                    # Opposing direction: bearish (bias<0) absorption
+                    # against a Long, bullish (bias>0) against a Short —
+                    # same bias sign convention _vol_effort_classify
+                    # already establishes elsewhere in this file.
+                    opposing = (last_rec["bias"] < 0) if pos_side == "Long" else (last_rec["bias"] > 0)
+                    self.position["ve_last_absorption_bar_ts"] = last_rec["ts"]   # mark seen either way —
+                                                                                    # a same-direction absorption
+                                                                                    # bar is a non-event, not a
+                                                                                    # signal to re-check later.
+                    if opposing:
+                        orig_qty = self.position.get("orig_qty", self.position["qty"])
+                        qd = self.position.get("qty_decimals", 2)
+                        step = 10 ** (-qd) if qd else 1.0
+                        signal_num = self.position["ve_absorption_count"] + 1
+                        # Exactly 1/3 of the ORIGINAL qty on signals 1-2;
+                        # the 3rd takes WHATEVER remains, so rounding drift
+                        # from the /3 split can never leave a dust
+                        # remainder open past "3 signals = fully closed".
+                        close_qty = (self.position["qty"] if signal_num >= NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE
+                                     else floor_to_step(orig_qty / NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE, step))
+                        close_qty = max(0.0, min(close_qty, self.position["qty"]))
+                        if close_qty > 0:
+                            try:
+                                close_result = await market_close(symbol, pos_side, close_qty, reason="ve_absorption")
+                            except Exception as e:
+                                close_result = {"code": -1, "msg": str(e)}
+                            if _order_ok(close_result):
+                                self.position["ve_absorption_count"] = signal_num
+                                # Must shrink OUR OWN copy of qty right now, not
+                                # wait for next cycle's exchange resync (line
+                                # ~10800 above) — this function returns before
+                                # that resync happens again, so the "position
+                                # flat" branch at the top of the NEXT cycle
+                                # would otherwise still see this leg's qty as
+                                # un-closed and double-book its PnL via
+                                # _finalize_and_book_pnl. Clamped to exactly 0
+                                # on the final leg so that branch's own
+                                # `exit_qty` truthiness guard skips cleanly
+                                # (float subtraction could otherwise leave
+                                # sub-epsilon dust instead of a clean zero).
+                                self.position["qty"] = (0.0 if signal_num >= NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE
+                                                         else max(0.0, self.position["qty"] - close_qty))
+                                exit_price = await live_price_for_symbol(symbol)
+                                leg_gross = leg_fee = None
+                                if exit_price is not None:
+                                    leg_gross = (exit_price - entry) * close_qty if pos_side == "Long" else (entry - exit_price) * close_qty
+                                    leg_fee = fee_for_leg(self.asset, close_qty, exit_price)
+                                    # Same incremental-total pattern the TP1-fill
+                                    # block above uses — adds only THIS leg's own
+                                    # net on top of whatever's already here. The
+                                    # qty-zeroing just above is what keeps the
+                                    # eventual "position flat" branch's own
+                                    # _finalize_and_book_pnl call from re-adding
+                                    # this same final leg a second time (its
+                                    # exit_qty will read 0 there).
+                                    self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
+                                    self._book_closed_pnl_delta()
+                                bias_desc = "bearish" if pos_side == "Long" else "bullish"
+                                console_log(f"{self.asset}: {YLW}VE absorption signal {signal_num}/{NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE} "
+                                            f"({bias_desc} absorption, opposing {pos_side}) — closed {close_qty:.{qd}f} @ ~{exit_price}{RST}")
+                                log_event(self.asset, "ve_absorption_partial_close",
+                                          {"signal_num": signal_num, "qty": close_qty, "price": exit_price,
+                                           "bar_ts": last_rec["ts"], "bias": last_rec["bias"],
+                                           "gross": leg_gross, "sim": DRY_RUN})
+                                if not DRY_RUN and exit_price is not None:
+                                    # Real-mode detailed-trade-table parity with
+                                    # every other partial-close leg this file
+                                    # logs — see the TP1 "leg_closed" event just
+                                    # above for the same shape/reasoning.
+                                    log_event(self.asset, "leg_closed", {"pos_side": pos_side, "qty": close_qty,
+                                                                          "price": exit_price, "pnl": leg_gross,
+                                                                          "type": "VE absorption", "price_exact": False})
+                            else:
+                                console_log(f"{self.asset}: {RED}VE absorption partial close FAILED ({close_result}){RST}")
 
         # 2026-09-01 user request ("if Athena is in a position in NV mode
         # and Net Volume shifts to the opposite side... the position
@@ -10997,7 +11421,7 @@ class AthenaInstrument:
         console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
         log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
 
-    async def _apply_tp1_breakeven_lock(self, symbol, pos_side, tp1_price, tp1_qty):
+    async def _apply_tp1_breakeven_lock(self, symbol, pos_side, tp1_price, tp1_qty, net_per_unit=1.00, trigger_label="TP1 hit"):
         """2026-07-28 user request: "once TP1 is achieved, adjust the SL to
         what would equate to 1 point of net profit... this protects the
         account from unnecessary drawdown and guarantees a 1 point net
@@ -11066,7 +11490,13 @@ class AthenaInstrument:
         rem_qty = self.position["qty"]
         if rem_qty <= 0:
             return
-        target_remaining_net = rem_qty * 1.00
+        # net_per_unit (2026-09-02): 1.00 everywhere except ETH's own
+        # 'Fixed' risk structure under NV/NV-Auto, which wants TRUE
+        # breakeven — "level where the open position's entry & exit
+        # trading costs are recovered" — i.e. exactly $0.00 of net profit
+        # beyond the fees, not the usual $1.00/unit cushion. See this
+        # method's own call site for where that 0.0 gets passed in.
+        target_remaining_net = rem_qty * net_per_unit
         entry_fee_share = fee_for_leg(self.asset, rem_qty, entry)
         needed_remaining_net = target_remaining_net + entry_fee_share
         new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
@@ -11128,12 +11558,20 @@ class AthenaInstrument:
             self.position["sl_order_id"] = self._sl_order_id
 
         self.position["sl_price"] = new_sl
-        console_log(f"{self.asset}: {GRN}{BLD}TP1 hit — remaining {fmt_num(rem_qty, 2)} locked to "
-                    f"guarantee {fmt_money(target_remaining_net)} net profit ON ITS OWN, "
-                    f"independent of TP1's own {fmt_money((tp1_price - entry) * tp1_qty if pos_side == 'Long' else (entry - tp1_price) * tp1_qty)} "
-                    f"gross gain (SL -> {fmt_num(new_sl)}){RST}")
+        # trigger_label (2026-09-02): VE structure's own 2R-move breakeven
+        # call has no TP1 leg to reference at all (tp1_qty=0) — the
+        # original "independent of TP1's own $X gross gain" clause would
+        # be actively wrong there (there IS no TP1), so it's only included
+        # when this really was triggered by a TP1 fill.
+        tp1_clause = (f", independent of TP1's own "
+                      f"{fmt_money((tp1_price - entry) * tp1_qty if pos_side == 'Long' else (entry - tp1_price) * tp1_qty)} "
+                      f"gross gain" if tp1_qty else "")
+        console_log(f"{self.asset}: {GRN}{BLD}{trigger_label} — remaining {fmt_num(rem_qty, 2)} locked to "
+                    f"guarantee {fmt_money(target_remaining_net)} net profit ON ITS OWN{tp1_clause} "
+                    f"(SL -> {fmt_num(new_sl)}){RST}")
         log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price, "tp1_qty": tp1_qty,
-                                                        "rem_qty": rem_qty, "target_remaining_net": target_remaining_net})
+                                                        "rem_qty": rem_qty, "target_remaining_net": target_remaining_net,
+                                                        "trigger": trigger_label})
 
     async def _apply_profit_ratchet(self, symbol, pos_side):
         """Profit ratchet (2026-08-28) — opt-in extension of the TP1
@@ -11290,11 +11728,16 @@ class AthenaInstrument:
         blackout/staleness, never the current regime; _manage_position's
         own "flipped" emergency-close only covers an ALREADY-FILLED
         IN_POSITION trade, never a still-pending one — see process_cycle's
-        own PENDING_FILL branch for the new check). Mirrors the PCVR-flip-close branch of
+        own PENDING_FILL branch for the new check), and `reason=
+        "nv_auto_midnight"` (2026-09-02, ETH/NV-Auto only — "Any open ETH
+        positions should be flattened at 00:00 CT since the Net Volume
+        resets to 0", see process_cycle's own dedicated clock-time check).
+        Mirrors the PCVR-flip-close branch of
         _manage_position above (same approximate-exit/PnL caveat for real
         trades — see that method's own comment). Event names stay distinct
         per reason ("eod_flatten"/"manual_flatten"/"entry_blackout_flatten"/
-        "stale_entry_flatten"/"regime_flip_flatten") — same one-event-name-per-cause convention
+        "stale_entry_flatten"/"regime_flip_flatten"/"nv_auto_midnight_flatten") —
+        same one-event-name-per-cause convention
         "pcvr_flip_close" already established, so the trades table/
         blotter/chart markers can tell them apart."""
         symbol = self.cfg["phemex_symbol"]
@@ -11302,6 +11745,7 @@ class AthenaInstrument:
                  else "19:00-19:30 CT entry blackout — cancelling pending order" if reason == "entry_blackout"
                  else "entry order stale — cancelling unfilled pending order" if reason == "stale_entry"
                  else "regime flipped — cancelling stale-direction pending order" if reason == "regime_flip"
+                 else "00:00 CT — flattening for NV-Auto day rollover" if reason == "nv_auto_midnight"
                  else "manual Flatten All")
         console_log(f"{self.asset}: {YLW}{label}{RST}")
         event_name = f"{reason}_flatten"
@@ -17238,15 +17682,23 @@ def draw_dashboard(db, snap, cols):
         # 2026-09-01 user request ("'PCVR' should become 'NV' and 'BTD'
         # should stay, not change to 'NV'"): two INDEPENDENT relabels, not
         # one shared TRADING_MODE substitution — the "Order Flow" light
-        # names the CONFIRMATION mechanism, identical for BTD and NV (NV
-        # shares BTD's exact candle-close trigger — see instrument_lights'
-        # own docstring), so it reads "BTD" for both; the "PCVR" light
-        # names the regime DATA SOURCE, which genuinely differs under NV
-        # (Net Volume, not PCVR), so only that one switches label.
+        # names the CONFIRMATION mechanism, identical for BTD/NV/NV-Auto
+        # (NV shares BTD's exact candle-close trigger, NV-Auto shares the
+        # same underlying _check_btd_confirmation call just without
+        # waiting for the candle close — see instrument_lights' own
+        # docstring and the ARMED-state dispatch), so it reads "BTD" for
+        # all three; the "PCVR" light names the regime DATA SOURCE, which
+        # genuinely differs under NV/NV-Auto (Net Volume, not PCVR), so
+        # only those two switch label. 2026-09-02 bugfix, user-reported
+        # ("'NV - Auto' is using 'Order Flow' for trade entries instead of
+        # 'BTD'"): both checks originally omitted "NV-Auto" entirely, so
+        # an NV-Auto row showed the literal light names instead of either
+        # relabel — fixed alongside the matching instrument_lights bug
+        # (NV-Auto's regime was ALSO silently falling back to PCVR).
         detail = "  " + "  ".join(
             (GRN if lights.get(n) else RED) +
-            ("BTD" if n == "Order Flow" and TRADING_MODE in ("BTD", "NV") else
-             "NV" if n == "PCVR" and TRADING_MODE == "NV" else n) +
+            ("BTD" if n == "Order Flow" and TRADING_MODE in ("BTD", "NV", "NV-Auto") else
+             "NV" if n == "PCVR" and TRADING_MODE in ("NV", "NV-Auto") else n) +
             RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
             for n in LIGHT_ORDER)
         db.puts_ansi(y, 0, detail)
@@ -20799,9 +21251,10 @@ TRADING_HELP_SECTIONS = [
         ("[0]",        "Cycle sizing mode  (Standard  <->  Aggressive/1R+W)"),
         ("[1]",        "Clear an active Drawdown Full Stop block (manual review)"),
         ("[2]",        "Toggle the profit ratchet  (trail an open stop to lock +(N-1)R at each +NR)"),
+        ("[8]",        "Cycle risk structure  (Fixed <-> VE)  — ETH only, under NV/NV-Auto"),
     ]),
     ("TRADING CONTROLS", [
-        ("[9]",        "Cycle trading mode  (Order Flow  ->  BTD candle-close  ->  NV candle-close)"),
+        ("[9]",        "Cycle trading mode  (Order Flow -> BTD candle-close -> NV candle-close -> NV-Auto immediate-entry)"),
         ("[A]",        "Pause/resume new entries for the focused asset"),
         ("[N]",        "Toggle 24H mode  (bypass the Session gate)"),
         ("[F]",        "Flatten — close any open position immediately"),
@@ -21214,7 +21667,7 @@ def draw_loading_screen(db, rows, cols, steps, tick):
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global PCT, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE
+    global PCT, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE, RISK_STRUCTURE
     global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE, PROFIT_RATCHET_ENABLED
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -21502,9 +21955,12 @@ def curses_main(stdscr):
                           # own cycle stop); see voldrift_mode below and
                           # each mode's own [M] key-dispatch branch for
                           # where the cycle actually advances).
-    drift_live = {"ETH": True, "QQQ": True}         # [H] per-asset live/historical
-    drift_view_date = {"ETH": None, "QQQ": None}     # per-asset — which date [H] is browsing
-    drift_view_offset = {"ETH": 0, "QQQ": 0}         # per-asset pan/scroll — deliberately
+    # 2026-09-02: TLT entries added to every per-asset dict below (display/
+    # monitoring only, per that request — TLT is never in ASSETS/chart_focus
+    # and never reaches instrument_lights, so it can't trade regardless).
+    drift_live = {"ETH": True, "QQQ": True, "NDX": True, "TLT": True, "VIX": True}         # [H] per-asset live/historical
+    drift_view_date = {"ETH": None, "QQQ": None, "NDX": None, "TLT": None, "VIX": None}     # per-asset — which date [H] is browsing
+    drift_view_offset = {"ETH": 0, "QQQ": 0, "NDX": 0, "TLT": 0, "VIX": 0}         # per-asset pan/scroll — deliberately
                           # per-asset (unlike drift.py's own single ctrl.view_offset, which
                           # resets on [S]-switch) so Tab-switching ETH<->QQQ preserves each
                           # asset's own scroll position, matching the SAME per-asset state
@@ -21518,12 +21974,23 @@ def curses_main(stdscr):
                                       # (2026-08-12: the old [V] venue-breakdown toggle was
                                       # removed entirely per user request — the breakdown is
                                       # now always shown wherever it applies, see draw_drift)
-    drift_crosshair_active = {"ETH": False, "QQQ": False}   # [X] — 2026-08-15 user request:
+    drift_crosshair_active = {"ETH": False, "QQQ": False, "NDX": False, "TLT": False, "VIX": False}   # [X] — 2026-08-15 user request:
                                       # OHLC + Net Volume/Volume readout for the selected column,
                                       # same convention as the footprint charts' own [X] crosshair.
-    drift_crosshair_idx = {"ETH": 0, "QQQ": 0}   # columns back from the right edge of the
+    drift_crosshair_idx = {"ETH": 0, "QQQ": 0, "NDX": 0, "TLT": 0, "VIX": 0}   # columns back from the right edge of the
                                       # CURRENT view (0 = rightmost) — see draw_drift/
                                       # _drift_crosshair_clamp for how panning at the edges works.
+    drift_extra_focus = None   # [Tab] within Net Drift mode: None (-> "ETH") / "QQQ" / "NDX" /
+                          # "TLT" / "VIX" — 2026-09-02, QQQ was briefly dropped entirely (NDX took
+                          # its place) then restored the SAME day alongside NDX ("keep tracking
+                          # QQQ in everything like you were before... need that data... to
+                          # compare with the others" — see DRIFT_ASSETS's own comment). Net
+                          # Drift's own Tab-cycle still doesn't touch chart_focus at all — this is
+                          # purely a display-focus stop WITHIN Net Drift mode, separate from
+                          # chart_focus's own ETH/QQQ meaning used everywhere else in the app
+                          # (NDX/TLT/VIX are never tradeable at all; QQQ can be tracked here
+                          # without affecting its own separately-disabled trading status).
+                          # See drift_mode's own [Tab] handler.
     cvd_mode = False   # full-screen CVD mode, ported from cvd.py (2026-08-16) — sits
                         # between Net Drift and Volatility Drift in the [M] cycle:
                         # Trading -> GEX -> Net Drift -> CVD -> Volatility
@@ -21717,7 +22184,7 @@ def curses_main(stdscr):
             # draw_drift draws its own hint row at the very last line, so no
             # separate Athena footer is drawn underneath (see the footer
             # dispatch below).
-            drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            drift_asset = drift_extra_focus or "ETH"
             drift_ui = {"live": drift_live[drift_asset], "view_date": drift_view_date[drift_asset],
                         "view_offset": drift_view_offset[drift_asset], "bar_interval": drift_bar_interval,
                         "filtered_mode": drift_filtered_mode, "net_volume_mode": drift_net_volume_mode,
@@ -22157,7 +22624,7 @@ def curses_main(stdscr):
             # matching gex_mode's own convention; drift.py's Esc (snap to
             # live) moves to [L], freeing Esc for the same cross-mode "back
             # to Trading" convention every other full-screen mode uses.
-            drift_asset = chart_focus if chart_focus in ASSETS else "ETH"
+            drift_asset = drift_extra_focus or "ETH"
             if key in (ord("q"), ord("Q")):
                 _quit_evt.set()
             elif key in (ord("h"), ord("H")):
@@ -22179,8 +22646,22 @@ def curses_main(stdscr):
             elif key in (ord("k"), ord("K")):   # [K] — cycle backward (2026-08-17 user request)
                 drift_mode = False
                 gex_mode = True
-            elif key == 9:   # Tab — switch asset focus, same convention as gex_mode
-                chart_focus = "QQQ" if chart_focus == "ETH" else "ETH"
+            elif key == 9:   # Tab — cycle asset focus, ETH -> QQQ -> NDX -> TLT -> VIX -> ETH.
+                                # 2026-09-02: QQQ was briefly dropped entirely (NDX took its
+                                # place) then restored the SAME day alongside NDX ("keep
+                                # tracking QQQ in everything like you were before... need that
+                                # data... to compare with the others"); this cycle still never
+                                # touches chart_focus at all — purely drift_extra_focus.
+                if drift_extra_focus == "VIX":
+                    drift_extra_focus = None
+                elif drift_extra_focus == "TLT":
+                    drift_extra_focus = "VIX"
+                elif drift_extra_focus == "NDX":
+                    drift_extra_focus = "TLT"
+                elif drift_extra_focus == "QQQ":
+                    drift_extra_focus = "NDX"
+                else:
+                    drift_extra_focus = "QQQ"
             elif key in (ord("l"), ord("L")):   # snap back to the live edge
                 drift_live[drift_asset] = True
                 drift_view_date[drift_asset] = None
@@ -22789,6 +23270,17 @@ def curses_main(stdscr):
             _save_trading_mode()
             console_log(f"{YLW}{BLD}Trading mode: {TRADING_MODE}{RST} (via [9])")
             log_event("SYSTEM", "trading_mode_changed", {"mode": TRADING_MODE})
+        elif key == ord("8"):
+            # 2026-09-02: cycles RISK_STRUCTURE (Fixed/VE) — only meaningful
+            # while ETH is trading under NV/NV-Auto (see that global's own
+            # module-level comment), but freely togglable any time so it's
+            # already set correctly before the user switches TRADING_MODE
+            # into NV/NV-Auto via [9].
+            idx = RISK_STRUCTURES.index(RISK_STRUCTURE)
+            RISK_STRUCTURE = RISK_STRUCTURES[(idx + 1) % len(RISK_STRUCTURES)]
+            _save_risk_structure()
+            console_log(f"{YLW}{BLD}Risk structure: {RISK_STRUCTURE}{RST} (via [8]) — ETH only, under NV/NV-Auto")
+            log_event("SYSTEM", "risk_structure_changed", {"structure": RISK_STRUCTURE})
         elif key in (ord("w"), ord("W")):
             # 2026-07-28 user request: "Allow the user to set the default SL
             # amount in points for ETH and QQQ" — acts on whichever pane is

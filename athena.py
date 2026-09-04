@@ -364,14 +364,11 @@ SIZING_MODE_LABELS = {"standard": "Standard", "aggressive": "Aggressive",
                        "aggressive_033": "Aggressive/1R+0.33W"}
 
 def _default_sizing_state():
-    # nv_auto_pending_boost_dollars (2026-09-02): NV-Auto's own "1R+0.33W"
-    # boost slot — deliberately separate from pending_boost_dollars
-    # (Aggressive's own), see _compute_trade_risk_dollars' own comment.
     # aggressive_033_pending_boost_dollars (2026-09-02): the [0]-selectable
-    # Aggressive/1R+0.33W mode's own boost slot — same isolation rationale,
-    # own key so switching SIZING_MODE via [0] can never cross-arm a boost
-    # a different mode actually produced.
-    return {a: {"pending_boost_dollars": None, "nv_auto_pending_boost_dollars": None,
+    # Aggressive/1R+0.33W mode's own boost slot — separate from
+    # pending_boost_dollars (Aggressive's own) so switching SIZING_MODE via
+    # [0] can never cross-arm a boost a different mode actually produced.
+    return {a: {"pending_boost_dollars": None,
                 "aggressive_033_pending_boost_dollars": None} for a in ASSETS}
 
 def _load_sizing_state():
@@ -3466,16 +3463,70 @@ def compute_bt_st(strikes, is_crypto, spot, ratio):
         candidates.append((dist, s, near_idx))
     candidates.sort(key=lambda c: c[0])
 
+    def dominant(idx):
+        # +1 call-dominant, -1 put-dominant, 0 neutral/no data — used below
+        # to walk a qualifying window out to its full contiguous extent
+        # and to tell a genuine flip apart from just running out of chain
+        # data at the edge of the fetched strike range.
+        cv, pv = vols(sorted_strikes[idx])
+        return 1 if cv > pv else -1 if pv > cv else 0
+
+    want_side = -1 if want_put else 1
+
     for _dist, s, near_idx in candidates:
         if run_ok(s):
-            anchor = sorted_strikes[near_idx]
+            # 2026-09-03 CRITICAL fix, user-reported ("BT/ST keep moving
+            # up strikes... notice how far price has moved to the upside
+            # - BT is over $100 below the current price" — expected
+            # BT=$2420/ST=$2400, Athena showed BT=$2520): `near_idx` above
+            # only ever finds the edge of the MINIMAL run_len-sized
+            # window nearest ATM — once price sits well INSIDE an already
+            # long-established dominant zone (here, ETH calls dominated
+            # every strike from $2420 clear through $3000, a 15-strike
+            # block, while spot climbed from ~2420 to ~2515), that near
+            # edge trivially collapses to wherever ATM currently is,
+            # sliding BT up right along with every price tick instead of
+            # staying pinned to the zone's own real boundary. Fixed:
+            # extend the found window out to its FULL contiguous
+            # same-dominance block first, then anchor at whichever edge
+            # of that block borders a GENUINE flip to the opposite side
+            # (not merely the end of the fetched chain, and not a blank/
+            # neutral strike) — that boundary is the actual "wall," and
+            # it only moves when the options market's own positioning
+            # actually flips, not whenever price drifts through territory
+            # that was already uniformly one-sided. Verified live against
+            # this exact report: with ETH's call-dominant run spanning
+            # $2420-$3000 and spot at $2515.67 sitting inside it, the low
+            # edge ($2420) borders $2400 (genuinely put-dominant — a real
+            # flip) while the high edge ($3000) borders nothing (top of
+            # the fetched chain) — now correctly anchors at $2420/$2400
+            # instead of the $2520/$2540 nearest-to-spot pair it used to.
+            lo_edge, hi_edge = s, s + run_len - 1
+            while lo_edge - 1 >= 0 and dominant(lo_edge - 1) == want_side:
+                lo_edge -= 1
+            while hi_edge + 1 < n and dominant(hi_edge + 1) == want_side:
+                hi_edge += 1
+            lo_is_flip = lo_edge - 1 >= 0 and dominant(lo_edge - 1) == -want_side
+            hi_is_flip = hi_edge + 1 < n and dominant(hi_edge + 1) == -want_side
+            if lo_is_flip and not hi_is_flip:
+                anchor_idx = lo_edge
+            elif hi_is_flip and not lo_is_flip:
+                anchor_idx = hi_edge
+            else:
+                # Neither edge borders a real flip (the whole band is one
+                # uniform block) or both do (a short dominant pocket
+                # sandwiched between opposite territory on either side) —
+                # either way, fall back to the original nearest-to-ATM
+                # tie-break, unchanged from before this fix.
+                anchor_idx = near_idx
+            anchor = sorted_strikes[anchor_idx]
             if want_put:
                 st = anchor
-                bt = sorted_strikes[near_idx + 1] if near_idx + 1 < n else None
+                bt = sorted_strikes[anchor_idx + 1] if anchor_idx + 1 < n else None
                 return bt, st
             else:
                 bt = anchor
-                st = sorted_strikes[near_idx - 1] if near_idx - 1 >= 0 else None
+                st = sorted_strikes[anchor_idx - 1] if anchor_idx - 1 >= 0 else None
                 return bt, st
 
     return None, None
@@ -9726,21 +9777,38 @@ class AthenaInstrument:
             if TRADING_MODE == "NV-Auto":
                 # 2026-09-02 user request ("As soon as the Net Volume goes
                 # either 'Negative' or 'Positive', enter a trade in the
-                # corresponding direction"): no bar-confirmation wait at
-                # all, and deliberately NO "only once per new bar" dedup
-                # either — instrument_lights' own NV branch already can't
-                # produce `regime in ("long","short")` (the only thing that
-                # gets this instrument ARMED at all under NV/NV-Auto in the
-                # first place) unless Net Volume is ALREADY decisively
-                # Positive/Negative, so "just became ARMED" already IS the
-                # flip signal. The moment _check_btd_confirmation places an
-                # order it moves self.state to PENDING_FILL, which takes
-                # this whole ARMED branch out of the loop on its own — no
-                # extra guard needed against firing twice for one flip.
+                # corresponding direction"): no bar-confirmation WAIT at
+                # all — enters the instant regime is decisive, rather than
+                # waiting for a candle to close first the way BTD/NV do.
+                #
+                # 2026-09-04 CRITICAL fix, user-reported (screenshot: eight
+                # ETH entries inside the same two 1-minute bars, most
+                # stopped out in 1-38 seconds before immediately
+                # re-entering — "Athena entered several trades back-to-
+                # back all in the same candle. This should not happen.
+                # Only 1 trade may be opened per candle."): the original
+                # reasoning above ("becoming ARMED already IS the flip
+                # signal, so no dedup needed") only holds for the FIRST
+                # entry after a genuine flip — it does NOT hold once that
+                # first entry gets stopped out fast: _manage_position's SL
+                # branch sets self.state back to WATCHING immediately,
+                # process_cycle re-arms on literally the next cycle since
+                # gate_ok/regime are unchanged (Net Volume hasn't actually
+                # flipped), and this branch fired again with nothing to
+                # stop it — repeatedly, all within the same still-forming
+                # bar, exactly matching the reported whipsaw. Now uses the
+                # SAME one-attempt-per-bar dedup BTD/NV already rely on
+                # (_last_checked_bar_ts) — a second flip within the same
+                # minute simply waits for the next bar to roll over
+                # (≤60s), which is the deliberate trade-off for "only 1
+                # trade may be opened per candle."
                 bars_1m, _ = (ch_snapshot_1m(self.asset) if self.asset == "ETH"
                               else LIVE_TAPE.snapshot_1m(self.asset))
                 if bars_1m and regime in ("long", "short"):
-                    await self._check_btd_confirmation(bars_1m, regime, price, targets_full, auto_entry=True)
+                    last_ts = bars_1m[-1]["ts"]
+                    if last_ts != self._last_checked_bar_ts:
+                        self._last_checked_bar_ts = last_ts
+                        await self._check_btd_confirmation(bars_1m, regime, price, targets_full, auto_entry=True)
             elif TRADING_MODE in ("BTD", "NV"):
                 # 2026-09-01: 'NV' shares this exact BTD candle-close
                 # confirmation path — the only thing 'NV' changes is where
@@ -9875,24 +9943,20 @@ class AthenaInstrument:
         right after this returns (see current_drawdown_mult)."""
         base = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) else balance * (PCT / 100.0)
         base *= layer1_mult
-        # 2026-09-02 user request ("Win progression is now '1R+0.33W'...
-        # instead of rolling over all of the profit from a winning trade
-        # into the next one, I'd like to conserve 66% of the profits"):
-        # an NV-Auto-INHERENT sizing behavior, not a 3rd SIZING_MODE the
-        # user selects via [0] — checked first, ahead of Standard/
-        # Aggressive, so it always applies under NV-Auto regardless of
-        # whatever SIZING_MODE happens to be set to. Own boost slot
-        # (SIZING_STATE[asset]["nv_auto_pending_boost_dollars"]) — never
-        # shares Aggressive's own "pending_boost_dollars" key, so toggling
-        # between NV-Auto and Aggressive elsewhere can't cross-arm a boost
-        # neither mode actually produced.
-        if TRADING_MODE == "NV-Auto":
-            boost = SIZING_STATE[self.asset].get("nv_auto_pending_boost_dollars")
-            if boost:
-                SIZING_STATE[self.asset]["nv_auto_pending_boost_dollars"] = None
-                _save_sizing_state()
-                return base + boost, f"1R+0.33W (+${boost:,.2f})", True
-            return base, "1R+0.33W", False
+        # 2026-09-04 user-reported ("The 'Aggressive' sizing mode has been
+        # active all this time, but for some reason Athena has been using
+        # 'Aggressive/1R+0.33W' instead... Whichever sizing mode the user
+        # has set in the main dashboard should be the same one used"):
+        # NV-Auto used to have its own hardcoded "1R+0.33W" progression
+        # here, checked BEFORE SIZING_MODE and completely overriding it
+        # regardless of what [0] was set to (2026-09-02 spec: "an
+        # NV-Auto-INHERENT sizing behavior, not a SIZING_MODE toggle") —
+        # removed per explicit follow-up request the same day: [0]'s own
+        # SIZING_MODE now governs sizing under NV-Auto exactly like it
+        # does under every other trading mode. See SIZING_STATE's own
+        # now-unused "nv_auto_pending_boost_dollars" key (left in place in
+        # already-persisted sizing_state.json files, just never read or
+        # written anymore) if you're wondering where that went.
         if SIZING_MODE == "aggressive":
             boost = SIZING_STATE[self.asset].get("pending_boost_dollars")
             if boost:
@@ -9914,25 +9978,11 @@ class AthenaInstrument:
         realized net pnl — see SIZING_MODES' own module-level comment for
         the full spec. No-op entirely in Standard mode or when pnl is
         unknown. Called from every close site, replacing the old
-        _check_5r_home_run + _update_blackjack pair.
-
-        2026-09-02: NV-Auto's own "1R+0.33W" progression is handled first,
-        as its own branch — see _compute_trade_risk_dollars' own comment
-        for why this checks TRADING_MODE directly rather than going
-        through SIZING_MODE at all."""
+        _check_5r_home_run + _update_blackjack pair. Applies uniformly
+        regardless of TRADING_MODE — see _compute_trade_risk_dollars' own
+        comment for the now-removed NV-Auto-specific override this used
+        to have."""
         if pnl is None:
-            return
-        if TRADING_MODE == "NV-Auto":
-            was_boosted = bool(self.position and self.position.get("boosted"))
-            if was_boosted:
-                return
-            if pnl > 0:
-                boost = pnl * 0.33
-                SIZING_STATE[self.asset]["nv_auto_pending_boost_dollars"] = boost
-                _save_sizing_state()
-                console_log(f"{self.asset}: {YLW}1R+0.33W — next trade risks base + ${boost:,.2f} "
-                            f"(33% of this trade's own ${pnl:,.2f} profit){RST}")
-                log_event(self.asset, "nv_auto_boost_armed", {"pnl": pnl, "boost": boost})
             return
         if SIZING_MODE == "aggressive_033":
             was_boosted = bool(self.position and self.position.get("boosted"))
@@ -12420,6 +12470,39 @@ def _apply_1r_plus_w_recompute(rows, starting_balance):
     balance = starting_balance
     pending_boost = None
     for row in rows:
+        # 2026-09-04 user-reported ("The balance shown in Data and the one
+        # shown in the main dashboard are not the same") — traced to this
+        # hypothetical unconditionally overwriting EVERY sim trade with an
+        # "as if Aggressive/1R+W had been active" replay, even trades that
+        # actually ran under NV-Auto's own real "1R+0.33W" progression
+        # (TRADING_MODE=="NV-Auto" overrides SIZING_MODE entirely in
+        # _compute_trade_risk_dollars — SIZING_MODE=="aggressive" has been
+        # completely dormant this whole time whenever NV-Auto is active).
+        # Hypothesizing a DIFFERENT boost formula (100%, not 33%) on top of
+        # an ALREADY-real compounding history serves none of the original
+        # "what would Standard have missed" comparison purpose this
+        # feature was built for — it just diverges from the real ledger
+        # for no informative reason. Any row whose own REAL sequence_label
+        # (captured before this function ever runs, see _build_trade_rows)
+        # starts with "1R+0.33W" was genuinely placed under NV-Auto's own
+        # progression — passed through completely untouched, walking
+        # `balance` forward by its own REAL net_pnl instead of a
+        # hypothetical one, so the running total in this table never
+        # drifts from the real one for these trades. Trades genuinely
+        # placed under Order Flow/BTD/NV with Standard or plain Aggressive
+        # sizing still get the ORIGINAL hypothetical treatment unchanged.
+        if str(row.get("sequence") or "").startswith("1R+0.33W"):
+            balance += row["net_pnl"]
+            new_row = dict(row)
+            new_row["balance"] = balance
+            new_row["dd_pct"] = (row["dd"] / (balance - row["net_pnl"]) * 100.0) \
+                if (row.get("dd") is not None and (balance - row["net_pnl"])) else None
+            out.append(new_row)
+            pending_boost = None   # A real historical NV-Auto "1R+0.33W" trade's own
+                                     # win/loss must not arm or consume a HYPOTHETICAL
+                                     # Aggressive boost either way.
+            continue
+
         asset = row.get("asset")
         sl_distance = ASSETS.get(asset, {}).get("sl", 10.0)
         original_qty = row.get("qty") or 0.0
@@ -13155,11 +13238,16 @@ def draw_data_view(db, rows, cols, source, events, stats, trades, table_scroll, 
     # DRY_RUN and real trades go through the same _compute_trade_risk_
     # dollars), so this shows regardless of which source tab is active —
     # a plain fact check against what the table below might otherwise
-    # imply.
+    # imply. 2026-09-04: TRADING_MODE used to override SIZING_MODE under
+    # NV-Auto (its own inherent "1R+0.33W" progression) — removed per
+    # explicit user request ("Whichever sizing mode the user has set in
+    # the main dashboard should be the same one used in Data"), so this
+    # readout is uniform across every trading mode again.
+    live_label = SIZING_MODE_LABELS[SIZING_MODE]
     mode_note = ("flat risk, no progression" if SIZING_MODE == "standard"
                  else "1R+0.33W win-boost active" if SIZING_MODE == "aggressive_033"
                  else "1R+W win-boost active")
-    db.puts_ansi(y, 0, f"  {DIM}Live sizing mode: {YLW}{SIZING_MODE_LABELS[SIZING_MODE]}{RST}{DIM} ({mode_note}){RST}")
+    db.puts_ansi(y, 0, f"  {DIM}Live sizing mode: {YLW}{live_label}{RST}{DIM} ({mode_note}){RST}")
     y += 2
 
     db.puts_ansi(y, 0, f"{BLD}Trades{RST}    Total {stats['count']}   Wins {GRN}{stats['wins']}{RST}   "
@@ -13994,21 +14082,26 @@ def _ndx_ohlc_poll_loop(stop_evt):
             NDX_OHLC_STATUS = f"error: {e}"[:60]
         stop_evt.wait(NDX_OHLC_POLL_SECS)
 
-def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, crosshair_bar_idx=None):
+def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, crosshair_bar_idx=None,
+                          vert_offset=0, show_sessions=True):
     """NDX's own bare candlestick + volume chart — deliberately a much
     smaller, standalone function rather than a heavily-conditional branch
     of _draw_ohlc_chart_panel: NDX has no tick-level trade feed behind it
-    (only Yahoo's own aggregated 1m OHLCV bars), so none of VWAP/VP/
-    session overlays/BTD/position levels have real data to draw from
-    anyway. Scroll (hscroll_bars, "N bars back from the newest") and
-    crosshair (crosshair_bar_idx, same addressing) DO work, mirrored from
-    _draw_ohlc_chart_panel's own left_idx/right_idx window and its own
-    CROSSHAIR section — sourced from NDX's own scroll/crosshair state slot
-    in curses_main (see _effective_chart_asset), not QQQ's real one.
-    Candle body/wick and plain volume-histogram logic likewise mirrored
-    from that function's candle loop and its `else` branch of the VOLUME/
-    VOLEFFORT section — same visual language as ETH/QQQ's own candles,
-    just without anything layered on top."""
+    (only Yahoo's own aggregated 1m OHLCV bars), so VWAP/VP/BTD/position
+    levels have no real data to draw from anyway. Scroll (hscroll_bars,
+    "N bars back from the newest"), vertical pan (vert_offset, "N clicks
+    of price-axis shift"), crosshair (crosshair_bar_idx, same addressing
+    as hscroll_bars), and the session-boundary overlay (2026-09-03 user
+    request, "Include sessions in the NDX OHLC chart" + "give it vertical
+    & horizontal scrolling, the same as is in QQQ and ETH") all work,
+    mirrored from _draw_ohlc_chart_panel's own left_idx/right_idx window,
+    its own vertical-pan shift, its own CROSSHAIR section, and its own
+    SESSIONS OVERLAY section — sourced from NDX's own scroll/crosshair/
+    vert-pan state slot in curses_main (see _effective_chart_asset), not
+    QQQ's real one. Candle body/wick and plain volume-histogram logic
+    likewise mirrored from that function's candle loop and its `else`
+    branch of the VOLUME/VOLEFFORT section — same visual language as
+    ETH/QQQ's own candles, just without anything layered on top."""
     cols = x1 - x0
     rows_avail = y1 - top
     if rows_avail < 10 or cols < OHLC_PRICE_W + 4:
@@ -14055,6 +14148,12 @@ def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, 
     pad = max(span * 0.05, hi_p * 0.0005)
     lo_p -= pad
     hi_p += pad
+    # Vertical price-axis pan — same shift-the-window-before-p2r approach
+    # _draw_ohlc_chart_panel's own ohlc_vert_offset uses.
+    if vert_offset:
+        _vshift = vert_offset * (hi_p - lo_p) * 0.15
+        lo_p += _vshift
+        hi_p += _vshift
 
     def p2r(price):
         if hi_p == lo_p:
@@ -14102,6 +14201,75 @@ def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, 
         else:
             for r in range(r_top, r_bot + 1):
                 db.put(r, col, "█", body_pair)
+
+    # ── SESSIONS OVERLAY ─────────────────────────────────────────────────
+    # 2026-09-03 user request ("Include sessions in the NDX OHLC chart") —
+    # ported verbatim from _draw_ohlc_chart_panel's own SESSIONS OVERLAY
+    # (same OHLC_SESSIONS table, same per-day grouping/border/label/time-
+    # axis-strip logic) — drawn AFTER candles for the same reason that
+    # function's own copy is (a border sitting at a candle's own high/low
+    # row would otherwise get silently painted over). No PERIOD SEPARATOR
+    # here (that one marks ETH's own 19:00 CT crypto trading-day
+    # rollover — not a meaningful boundary for an equity index).
+    if show_sessions and visible and chart_h > 0:
+        OHLC_SESSIONS = [
+            ("NDO",   (0,  0), (3, 30), P_BLUE,   None),
+            ("Morn",  (8, 30), (10,30), P_CYAN,  None),
+            ("Excl",  (9,  0), (10, 0), P_RED,   [2, 3]),
+            ("Lunch", (11,30), (13,30), P_YELLOW,  None),
+            ("PWR",   (14, 0), (15, 0), P_MAGENTA,   None),
+            ("EOD",   (16, 0), (18, 0), P_GREEN, None),
+            ("EEOD",  (19,30), (23,59), P_RED,   None),
+        ]
+        from itertools import groupby as _groupby
+        def _sess_date_key(_pair):
+            _i, _c = _pair
+            return datetime.fromtimestamp(_c["ts"]).date()
+
+        _indexed = [(i, c) for i, c in enumerate(visible)]
+        for _sname, _sstart, _send, _scol, _sdays in OHLC_SESSIONS:
+            _sh, _sm = _sstart; _eh, _em = _send
+            _s_mins = _sh * 60 + _sm; _e_mins = _eh * 60 + _em
+            for _day, _day_group in _groupby(_indexed, _sess_date_key):
+                _day_candles = list(_day_group)
+                _sess_cols, _sess_hi, _sess_lo = [], None, None
+                for _i, _candle in _day_candles:
+                    _col = start_col + _i
+                    if not (x0 <= _col < chart_r):
+                        continue
+                    _dt = datetime.fromtimestamp(_candle["ts"])
+                    if _sdays and _dt.weekday() not in _sdays:
+                        continue
+                    _mins = _dt.hour * 60 + _dt.minute
+                    if _s_mins <= _mins < _e_mins:
+                        _sess_cols.append(_col)
+                        if _sess_hi is None or _candle["h"] > _sess_hi:
+                            _sess_hi = _candle["h"]
+                        if _sess_lo is None or _candle["l"] < _sess_lo:
+                            _sess_lo = _candle["l"]
+                if not _sess_cols or _sess_hi is None:
+                    continue
+                _c0, _c1 = _sess_cols[0], _sess_cols[-1]
+                _r_top = clamp(chart_top + p2r(_sess_hi))
+                _r_bot = clamp(chart_top + p2r(_sess_lo))
+                for _bc in range(_c0, _c1 + 1):
+                    if x0 <= _bc < chart_r:
+                        db.put(_r_top, _bc, "-", _scol, curses.A_BOLD)
+                if _r_bot != _r_top:
+                    for _bc in range(_c0, _c1 + 1):
+                        if x0 <= _bc < chart_r:
+                            db.put(_r_bot, _bc, "-", _scol, curses.A_BOLD)
+                for _r in range(_r_top, _r_bot + 1):
+                    db.put(_r, _c0, "|", _scol, curses.A_BOLD)
+                    db.put(_r, _c1, "|", _scol, curses.A_BOLD)
+                if _c0 + 1 < chart_r:
+                    db.puts(_r_top, _c0 + 1, _sname, _scol, curses.A_BOLD)
+                # Reverse-video strip on the time-axis row, same as the
+                # main panel — the plain "HH:MM" labels drawn further
+                # below punch through wherever an actual tick lands.
+                for _bc in range(_c0, _c1 + 1):
+                    if x0 <= _bc < chart_r:
+                        db.put(time_row, _bc, "=", _scol, curses.A_BOLD | curses.A_REVERSE)
 
     db.puts(vol_top, x0, "VOL", P_DIM, curses.A_DIM)
     for r in range(vol_top, vol_bot_excl):
@@ -14162,20 +14330,22 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
         # [Y] function") — a genuine bare candlestick+volume chart from
         # NDX's own small Yahoo-sourced 1m OHLCV feed (NDX_OHLC_BARS/
         # _ndx_ohlc_poll_loop), deliberately NOT routed through this
-        # panel's own candle-drawing code below — none of VWAP/VP/session/
-        # BTD/position-levels have real tick-level data behind them for
-        # NDX the way they do for QQQ, so _draw_ndx_ohlc_panel is its own
-        # much smaller, dedicated function instead of a heavily-
-        # conditional fork of this one. Scroll (hscroll_bars) and
-        # crosshair (crosshair_bar_idx) DO carry over — same "N bars back
-        # from the newest" addressing every other OHLC view uses, sourced
+        # panel's own candle-drawing code below — VWAP/VP/BTD/position-
+        # levels have no real tick-level data behind them for NDX the way
+        # they do for QQQ, so _draw_ndx_ohlc_panel is its own much
+        # smaller, dedicated function instead of a heavily-conditional
+        # fork of this one. Scroll (hscroll_bars), vertical pan
+        # (vert_offset), crosshair (crosshair_bar_idx), and the session
+        # overlay DO carry over — same "N bars back from the newest"/"N
+        # clicks of shift" addressing every other OHLC view uses, sourced
         # from NDX's own state slot (see _effective_chart_asset in
         # curses_main), not QQQ's own.
         with NDX_OHLC_LOCK:
             _ndx_bars = list(NDX_OHLC_BARS)
             _ndx_live = NDX_OHLC_LIVE[0]
         _draw_ndx_ohlc_panel(db, _ndx_bars, _ndx_live, top, y1, x0, x1, hscroll_bars,
-                              crosshair_bar_idx=crosshair_bar_idx)
+                              crosshair_bar_idx=crosshair_bar_idx, vert_offset=vert_offset,
+                              show_sessions=show_sessions)
         return
 
     # Layout mirrors draw_chart's own row order top-to-bottom: price chart,
@@ -14263,15 +14433,35 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # earlier turn), so a TP leg landing on either of those two newer
     # tiers was still blowing the range out exactly like ER 100%/150%
     # used to. All four ER tiers are excluded now.
+    #
+    # 2026-09-04 user-reported ("There was a very large bearish candle...
+    # Now when I scroll back past that, the scaling does not re-adjust and
+    # instead stays flattened"): this extension used to apply
+    # UNCONDITIONALLY on every render, regardless of hscroll_bars — so an
+    # open position's entry/SL/TP legs kept pinning lo_p/hi_p to their own
+    # (often far-away) prices even once scrolled back to a time window
+    # that ends BEFORE the position was ever opened, crushing that older,
+    # perfectly normal-range candle history into a sliver. Now only
+    # applied when the visible window's own newest bar is at/after the
+    # position's fill_time — i.e. the position could plausibly still be
+    # open somewhere within this window — so scrolling entirely into the
+    # pre-entry past lets the scale track just the visible candles again,
+    # the same way it already does with no position open at all. Pending
+    # (not-yet-filled) orders have no fill_time to check against and are
+    # inherently a "right now" concept, so they're only included on the
+    # live tail (hscroll_bars == 0).
     _pos_prices = []
-    if position:
+    _vis_end_ts = visible[-1]["ts"] if visible else None
+    _pos_fill_ts = position.get("fill_time") if position else None
+    _pos_in_window = bool(position) and (_pos_fill_ts is None or _vis_end_ts is None or _pos_fill_ts <= _vis_end_ts)
+    if _pos_in_window:
         for _k in ("fill_price", "sl_price"):
             if position.get(_k) is not None:
                 _pos_prices.append(position[_k])
         for _leg in (position.get("tp_legs") or []):
             if _leg.get("level") is not None and _leg.get("type") not in ("ER 40%", "ER 80%", "ER 100%", "ER 150%"):
                 _pos_prices.append(_leg["level"])
-    elif pending and pending.get("entry_price") is not None:
+    elif pending and hscroll_bars == 0 and pending.get("entry_price") is not None:
         _pos_prices.append(pending["entry_price"])
     if _pos_prices:
         lo_p = min(lo_p, min(_pos_prices) - pad)
@@ -14818,19 +15008,37 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             # own _flag_box, was removed the same day per explicit user
             # request: "remove the bar outlines but leave the markers").
             # Only the directional bias glyph remains — the tool's own
-            # READ on the bar (▲ green bullish lean / ▼ red bearish lean /
-            # ◆ dim no lean), NOT the candle's own up/down — placed one
-            # row above the bar's own high, no outline/recoloring of the
-            # bar itself.
+            # READ on the bar (▲ bullish lean / ▼ bearish lean / ◆ no
+            # lean), NOT the candle's own up/down — placed one row above
+            # the bar's own high, no outline/recoloring of the bar itself.
+            #
+            # 2026-09-04 user-reported ("VE mode is activated, but there
+            # were no profits taken when there was bearish absorption" —
+            # circling ▼ markers on the chart): the glyph's own COLOR used
+            # to encode bias direction ONLY (green/red/dim) — completely
+            # identical whether the bar was actually classified Absorption
+            # or Clean, the two concepts this exact glyph is drawn for
+            # (see the `klass in (...)` check just below). A red ▼ could
+            # mean either "heavy volume, no result" (Absorption — the ONLY
+            # class VE's own partial-close logic reacts to) or "ordinary
+            # volume, unresisted move" (Clean — VE correctly ignores it) —
+            # completely indistinguishable at a glance, which is exactly
+            # what made a genuinely-correct "no partial close fired" look
+            # like a bug. Color now matches the bottom VolEffort histogram's
+            # own already-established class convention (magenta=Absorption,
+            # cyan=Clean) instead of bias — shape (▲/▼/◆) still carries
+            # the bias direction, so both dimensions are now visible from
+            # one glyph instead of only one of them.
             if ui.get("vol_effort"):
                 _ve_rec = _ve_by_ts.get(bar["ts"])
                 if _ve_rec and _ve_rec["klass"] in (VOL_EFFORT_ABSORPTION, VOL_EFFORT_CLEAN):
+                    _ve_gpair = P_MAGENTA if _ve_rec["klass"] == VOL_EFFORT_ABSORPTION else P_CYAN
                     if _ve_rec["bias"] > 0:
-                        _ve_glyph, _ve_gpair = "▲", P_GREEN
+                        _ve_glyph = "▲"
                     elif _ve_rec["bias"] < 0:
-                        _ve_glyph, _ve_gpair = "▼", P_RED
+                        _ve_glyph = "▼"
                     else:
-                        _ve_glyph, _ve_gpair = "◆", P_DIM
+                        _ve_glyph = "◆"
                     # Placement deferred — see _ve_markers' own comment
                     # above for why (the BTD overlay, drawn later, can
                     # otherwise silently paint over this exact cell).
@@ -15256,7 +15464,12 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
     # chart, so those are suppressed here too rather than shown misleadingly.
     show_ndx = profile_mode == "ohlc" and (ohlc_ui or {}).get("show_ndx")
     display_asset = "NDX" if show_ndx else asset
-    vert_tag = f" v{ohlc_vert_offset:+d}" if (profile_mode == "ohlc" and ohlc_vert_offset and not show_ndx) else ""
+    # 2026-09-03 user request ("give it vertical & horizontal scrolling,
+    # the same as is in QQQ and ETH") — vert_tag is no longer suppressed
+    # for show_ndx now that _draw_ndx_ohlc_panel actually applies
+    # ohlc_vert_offset (it used to always read 0 effect, so showing it
+    # here would have been misleading).
+    vert_tag = f" v{ohlc_vert_offset:+d}" if (profile_mode == "ohlc" and ohlc_vert_offset) else ""
     scroll_tag = f"  [SCROLLED {hscroll_bars}b back{vert_tag}]" if (hscroll_bars or vert_tag) else ""
     # Persistent on-chart focus indicator — a footer hint alone was easy to
     # miss (and on a narrow terminal, easy to lose entirely to truncation,

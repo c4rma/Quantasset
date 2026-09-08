@@ -84,7 +84,7 @@ import asyncio
 import threading
 import socket
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -363,13 +363,15 @@ SIZING_MODES = ("standard", "aggressive", "aggressive_033")
 SIZING_MODE_LABELS = {"standard": "Standard", "aggressive": "Aggressive",
                        "aggressive_033": "Aggressive/1R+0.33W"}
 
+def _default_sizing_state_row():
+    return {"pending_boost_dollars": None, "aggressive_033_pending_boost_dollars": None}
+
 def _default_sizing_state():
     # aggressive_033_pending_boost_dollars (2026-09-02): the [0]-selectable
     # Aggressive/1R+0.33W mode's own boost slot — separate from
     # pending_boost_dollars (Aggressive's own) so switching SIZING_MODE via
     # [0] can never cross-arm a boost a different mode actually produced.
-    return {a: {"pending_boost_dollars": None,
-                "aggressive_033_pending_boost_dollars": None} for a in ASSETS}
+    return {a: _default_sizing_state_row() for a in ASSETS}
 
 def _load_sizing_state():
     try:
@@ -432,9 +434,12 @@ def _reset_sizing_state():
 DAILY_LOSS_STATE_PATH = os.path.join(SCRIPT_DIR, "daily_loss_state.json")
 DAILY_LOSS_LIMIT = 5
 
+def _default_daily_loss_state_row():
+    return {"consecutive_losses": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
+            "loss_streak_day": None}
+
 def _default_daily_loss_state():
-    return {a: {"consecutive_losses": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
-                "loss_streak_day": None} for a in ASSETS}
+    return {a: _default_daily_loss_state_row() for a in ASSETS}
 
 def _load_daily_loss_state():
     try:
@@ -483,9 +488,12 @@ def _reset_daily_loss_state():
 MAX_WIN_STATE_PATH = os.path.join(SCRIPT_DIR, "max_win_state.json")
 MAX_WIN_LIMIT = 5
 
+def _default_max_win_state_row():
+    return {"consecutive_wins": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
+            "win_streak_day": None}
+
 def _default_max_win_state():
-    return {a: {"consecutive_wins": 0, "blocked": False, "blocked_regime": None, "blocked_at": None,
-                "win_streak_day": None} for a in ASSETS}
+    return {a: _default_max_win_state_row() for a in ASSETS}
 
 def _load_max_win_state():
     try:
@@ -539,11 +547,24 @@ def _reset_max_win_state():
 # warrants a human looking at it before resuming. Manually cleared via
 # [1] (freed up once Blackjack's own per-asset ladder-reset key went
 # away with it).
+def _default_equity_peak_state_row():
+    return {"peak": None, "blocked": False, "blocked_at": None,
+            "tier": 0, "pending_tier": None, "pending_since_day": None}
+
 def _default_equity_peak_state():
-    return {"sim": {"peak": None, "blocked": False, "blocked_at": None,
-                     "tier": 0, "pending_tier": None, "pending_since_day": None},
-            "real": {"peak": None, "blocked": False, "blocked_at": None,
-                      "tier": 0, "pending_tier": None, "pending_since_day": None}}
+    return {"sim": _default_equity_peak_state_row(), "real": _default_equity_peak_state_row()}
+
+def _account_state_key(engine_id=None):
+    """The bucket key for EQUITY_PEAK_STATE/CLOSED_PNL_STATE — 'sim'/'real'
+    for every existing single-engine call (engine_id=None), unchanged.
+    2026-09-07 'Dual' mode: engine_id=1/2 gets its OWN bucket ('sim#1'/
+    'sim#2') so Engine 1 losing money can never trip a shared Full-Stop
+    that wrongly blocks Engine 2's entries too, and the two engines'
+    realized PnL/drawdown never merge into one number. Dual is DRY_RUN-
+    only, so there's no 'real#N' — only 'sim#N'."""
+    if engine_id:
+        return f"sim#{engine_id}"
+    return "sim" if DRY_RUN else "real"
 
 def _load_equity_peak_state():
     try:
@@ -618,22 +639,29 @@ def _drawdown_tier_for_pct(dd_pct):
             return i
     return len(DRAWDOWN_TIERS) - 1   # unreachable (last tier's upper is inf) — defensive only
 
-def _update_equity_peak(equity):
+def _update_equity_peak(equity, engine_id=None):
     """Called once per AppState.publish() cycle with the CURRENT sim-or-
-    real equity (balance + open PnL) — advances that account's own
-    all-time peak if a new high was just reached, then advances the
-    de-risk ladder's own persisted tier: DOWN immediately on a worse
-    dd_pct (same unconditional trip the 20%+ Full Stop block always had),
-    UP only one tier at a time, only once dd_pct has held below that
-    tier's own specific recovery threshold across a full CT calendar-day
-    boundary — see DRAWDOWN_TIERS' own comment for the exact table.
-    Popping back above the recovery threshold at any point before the
-    day rolls over cancels the pending upgrade; it has to re-qualify
-    fresh from there, not resume a partially-elapsed wait."""
+    real REALIZED balance (2026-09-07: no longer balance + open PnL — see
+    that call site's own comment; the param is still named `equity` since
+    that's the general "account value" concept this tracks, just no
+    longer including any currently-open position's own unrealized swing)
+    — advances that account's own all-time peak if a new high was just
+    reached, then advances the de-risk ladder's own persisted tier: DOWN
+    immediately on a worse dd_pct (same unconditional trip the 20%+ Full
+    Stop block always had), UP only one tier at a time, only once dd_pct
+    has held below that tier's own specific recovery threshold across a
+    full CT calendar-day boundary — see DRAWDOWN_TIERS' own comment for
+    the exact table. Popping back above the recovery threshold at any
+    point before the day rolls over cancels the pending upgrade; it has
+    to re-qualify fresh from there, not resume a partially-elapsed wait.
+
+    engine_id=None (every existing call) uses the 'sim'/'real' bucket,
+    unchanged. A 'Dual' mode engine passes its own engine_id so its own
+    peak/tier tracks independently — see _account_state_key."""
     if equity is None:
         return
-    key = "sim" if DRY_RUN else "real"
-    st = EQUITY_PEAK_STATE[key]
+    key = _account_state_key(engine_id)
+    st = EQUITY_PEAK_STATE.setdefault(key, _default_equity_peak_state_row())
     changed = False
     if st["peak"] is None or equity > st["peak"]:
         st["peak"] = equity
@@ -661,9 +689,10 @@ def _update_equity_peak(equity):
         if tier == last_tier_idx and not st["blocked"]:
             st["blocked"] = True
             st["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
+            _scope_desc = f"Engine {engine_id}" if engine_id else "either asset"
             console_log(f"{RED}{BLD}Drawdown Full Stop — {dd_pct:.1f}% from peak (${st['peak']:,.2f}). "
-                        f"No new entries on either asset until manually cleared ([1]).{RST}")
-            log_event("ACCOUNT", "drawdown_full_stop", {"dd_pct": dd_pct, "peak": st["peak"], "equity": equity})
+                        f"No new entries on {_scope_desc} until manually cleared ([1]).{RST}")
+            log_event("ACCOUNT", "drawdown_full_stop", {"dd_pct": dd_pct, "peak": st["peak"], "equity": equity, "engine": engine_id})
     elif not st["blocked"] and tier > 0:
         # Possible recovery — only when NOT sitting in the manual-clear-
         # only Full Stop tier (that one never auto-advances, dd_pct
@@ -704,28 +733,30 @@ def _update_equity_peak(equity):
     if changed:
         _save_equity_peak_state()
 
-def _equity_drawdown_pct(equity):
-    """Current %-from-peak for the active (sim/real) account — 0.0 if no
-    peak has been recorded yet (e.g. right at startup, before the first
-    publish() cycle)."""
+def _equity_drawdown_pct(equity, engine_id=None):
+    """Current %-from-peak for the active (sim/real, or a Dual engine's own
+    'sim#N') account — 0.0 if no peak has been recorded yet (e.g. right at
+    startup, before the first publish() cycle)."""
     if equity is None:
         return 0.0
-    key = "sim" if DRY_RUN else "real"
-    peak = EQUITY_PEAK_STATE[key]["peak"]
+    key = _account_state_key(engine_id)
+    peak = EQUITY_PEAK_STATE.setdefault(key, _default_equity_peak_state_row())["peak"]
     if not peak or peak <= 0:
         return 0.0
     return max(0.0, (peak - equity) / peak * 100.0)
 
-def drawdown_gate_active():
-    """True if the ACTIVE account (sim or real, whichever DRY_RUN
-    currently selects) is in the 20%+ Full Stop tier — blocks new
-    entries account-wide (both ETH and QQQ) until manually cleared."""
-    key = "sim" if DRY_RUN else "real"
-    return EQUITY_PEAK_STATE[key]["blocked"]
+def drawdown_gate_active(engine_id=None):
+    """True if the account (sim/real, or a Dual engine's own 'sim#N') is
+    in the 20%+ Full Stop tier — blocks new entries for that account until
+    manually cleared. engine_id=None blocks account-wide (both ETH and
+    QQQ), since neither has ever had its own engine_id; a Dual engine's
+    own Full Stop only ever blocks THAT engine (see _account_state_key)."""
+    key = _account_state_key(engine_id)
+    return EQUITY_PEAK_STATE.setdefault(key, _default_equity_peak_state_row())["blocked"]
 
-def _clear_drawdown_block():
-    key = "sim" if DRY_RUN else "real"
-    st = EQUITY_PEAK_STATE[key]
+def _clear_drawdown_block(engine_id=None):
+    key = _account_state_key(engine_id)
+    st = EQUITY_PEAK_STATE.setdefault(key, _default_equity_peak_state_row())
     st["blocked"] = False
     st["blocked_at"] = None
     # 2026-08-27: re-derive the tier fresh off CURRENT dd_pct (the down-
@@ -735,8 +766,17 @@ def _clear_drawdown_block():
     # stands right now; any FURTHER improvement from there still has to
     # earn its way up through the normal hysteresis + 1-day wait, same as
     # always. No pending recovery survives a manual clear either.
-    equity = APP_STATE.equity
-    dd_pct = _equity_drawdown_pct(equity) if equity is not None else 0.0
+    # 2026-09-07: realized_balance (frozen while a position is open), not
+    # live balance/equity — see AppState.realized_balance's own comment
+    # and publish()'s call site for why (neither open PnL nor an entry
+    # fee taken mid-trade counts as drawdown; only a fully closed trade's
+    # net result does). A Dual engine has no AppState.realized_balance of
+    # its own (that field is the single-engine ETH+QQQ combined account)
+    # — its own SimAccount's .balance IS its realized balance by
+    # definition (only fill/close events ever touch it), so that's used
+    # directly instead.
+    realized_bal = get_sim_account(engine_id).balance if engine_id else APP_STATE.realized_balance
+    dd_pct = _equity_drawdown_pct(realized_bal, engine_id) if realized_bal is not None else 0.0
     # Clamped one short of Full Stop (never back to 0% sizing) — a manual
     # clear is a decision to RESUME trading; still being >20% down at the
     # moment of clearing gets the worst genuinely-tradeable tier
@@ -750,14 +790,20 @@ def _clear_drawdown_block():
     _mult, _label = _drawdown_tier_info(st["tier"])
     console_log(f"{GRN}Drawdown Full Stop cleared (manual review) — new entries allowed again, "
                 f"resuming at {_label} ({dd_pct:.1f}% from peak){RST}")
-    log_event("ACCOUNT", "drawdown_block_cleared", {"resumed_tier": st["tier"], "dd_pct": dd_pct})
+    log_event("ACCOUNT", "drawdown_block_cleared", {"resumed_tier": st["tier"], "dd_pct": dd_pct, "engine": engine_id})
 
-def current_drawdown_mult():
+def current_drawdown_mult(engine_id=None):
     """(risk_multiplier, dd_pct, tier_label) for the CURRENT sim/real
-    account — uses APP_STATE.equity, refreshed every publish() cycle,
-    same once-per-cycle staleness every other risk gate here (Daily Loss
-    Limit, Max Win Limit) already tolerates. Falls back to (1.0, 0.0,
-    "Normal") before the first publish() cycle has ever run.
+    account, or a Dual engine's own 'sim#N' one — uses APP_STATE.
+    realized_balance for the single-engine case (2026-09-07: was
+    APP_STATE.equity — see that field's own comment; frozen while a
+    position is open, so neither its floating PnL swing nor its own
+    entry fee affects the displayed dd_pct until it actually closes), or
+    that Dual engine's own SimAccount.balance (its realized balance by
+    definition) when engine_id is given. Refreshed every publish()/
+    process_cycle, same once-per-cycle staleness every other risk gate
+    here (Daily Loss Limit, Max Win Limit) already tolerates. Falls back
+    to (1.0, 0.0, "Normal") before the first publish() cycle has ever run.
 
     Reads the PERSISTED tier (EQUITY_PEAK_STATE[key]["tier"]), not a
     fresh dd_pct->tier lookup — 2026-08-27, hysteresis + the 1-day
@@ -767,10 +813,10 @@ def current_drawdown_mult():
     better tier, but the 1-day hold hasn't elapsed yet) — see
     _update_equity_peak, the only thing allowed to actually ADVANCE this
     tier."""
-    equity = APP_STATE.equity
-    dd_pct = _equity_drawdown_pct(equity)
-    key = "sim" if DRY_RUN else "real"
-    mult, label = _drawdown_tier_info(EQUITY_PEAK_STATE[key].get("tier", 0))
+    realized_bal = get_sim_account(engine_id).balance if engine_id else APP_STATE.realized_balance
+    dd_pct = _equity_drawdown_pct(realized_bal, engine_id)
+    key = _account_state_key(engine_id)
+    mult, label = _drawdown_tier_info(EQUITY_PEAK_STATE.setdefault(key, _default_equity_peak_state_row()).get("tier", 0))
     return mult, dd_pct, label
 
 # ── "Closed PnL Today" dashboard stat (explicit user request, 2026-07-30) ────
@@ -827,6 +873,27 @@ def _reset_closed_pnl_state_sim():
     CLOSED_PNL_STATE["sim"] = {}
     _save_closed_pnl_state()
 
+def _reset_dual_engine_accounts():
+    """2026-09-07 user-decided ('[R] resets each engine to its own
+    configured starting balance, not one shared prompted value') — the
+    Dual-mode counterpart to the default-account [R] reset above. Resets
+    each engine's own SimAccount to ITS OWN configured starting_balance
+    (not whatever new_balance the plain [R] prompt collected — that value
+    is meaningless once there's no longer one shared account), plus that
+    engine's own 'sim#N' drawdown-peak/closed-PnL buckets. NOT YET WIRED
+    into the [R] key handler — that needs the instruments list to
+    actually contain live Dual-engine AthenaInstrument objects first (see
+    the guided-setup/instruments-rebuild phase); calling this before then
+    would reset accounts nothing is currently trading through."""
+    for engine_id in (1, 2):
+        cfg = DUAL_ENGINES[engine_id]
+        get_sim_account(engine_id).reset(cfg["starting_balance"])
+        key = f"sim#{engine_id}"
+        EQUITY_PEAK_STATE[key] = _default_equity_peak_state_row()
+        CLOSED_PNL_STATE[key] = {}
+    _save_equity_peak_state()
+    _save_closed_pnl_state()
+
 def _ct_calendar_day_key(dt_ct):
     """Plain midnight-to-midnight CT calendar day, as a date string —
     the boundary "Closed PnL Today" explicitly resets at, per the user's
@@ -837,16 +904,22 @@ def _ct_calendar_day_key(dt_ct):
     whatever boundary its own feature was explicitly specified with."""
     return str(dt_ct.date())
 
-def closed_pnl_today(sim):
+def closed_pnl_today(sim, engine_id=None):
     """The account-wide (both ETH+QQQ combined) realized pnl for trades
     ENTERED during today's CT calendar day, for the sim or real bucket as
     requested. Returns 0.0 (not None) if TZ_CT failed to load — same
     fail-safe-empty convention every other CT-boundary feature in this
     file already uses rather than guessing at a boundary with no
-    timezone."""
+    timezone.
+
+    engine_id=None (every existing call) is unchanged. 2026-09-07 'Dual'
+    mode: a Dual engine (sim=True, engine_id=1/2) gets its OWN 'sim#N'
+    bucket, so the two engines' realized PnL never merge into one number
+    — see _account_state_key's own comment."""
     if not TZ_CT:
         return 0.0
-    bucket = CLOSED_PNL_STATE["sim" if sim else "real"]
+    bucket_key = f"sim#{engine_id}" if (sim and engine_id) else ("sim" if sim else "real")
+    bucket = CLOSED_PNL_STATE.setdefault(bucket_key, {})
     return bucket.get(_ct_calendar_day_key(datetime.now(TZ_CT)), 0.0)
 
 def _trading_day_key(dt_ct):
@@ -958,7 +1031,14 @@ if "--backfill-budget-secs" in args:
 CVD_BACKFILL_BUDGET_SECS = 180
 
 DRY_RUN = "--dry-run" in args
-NO_SESSION = "--no-session" in args
+# 2026-09-06 user request ([N] now cycles 3 modes instead of toggling one
+# bool): "Standard Sessions" (adheres to Sessions & Exclusion rules) ->
+# "Sunday On" (same rules, but Sunday is no longer excluded) -> "24H"
+# (disregards all Sessions & Exclusion rules — the old NO_SESSION=True
+# behavior). --no-session still starts Athena straight into "24h", same
+# external meaning the flag always had.
+SESSION_MODE_LABELS = {"standard": "Standard Sessions", "sunday_on": "Sunday On", "24h": "24H"}
+SESSION_MODE = "24h" if ("--no-session" in args) else "standard"
 # [A] per-asset on/off toggle (acts on whichever pane is currently [Tab]-
 # focused — explicit user request 2026-07-24 to control ETH/QQQ
 # independently rather than one shared switch) — see process_cycle's own
@@ -1037,12 +1117,18 @@ TRADING_MODE = _load_trading_mode()   # [9] in curses_main toggles + persists it
 # when self.asset=="ETH" and TRADING_MODE in ("NV","NV-Auto") — every
 # other mode/asset combination is completely untouched by this and keeps
 # using the standard reconstruct_targets-driven target system (see
-# _check_fill's own branch). Not a toggleable "off" state: whenever ETH
-# trades under NV/NV-Auto it always uses whichever of these two is
-# currently selected — there's no third "use the normal targets" option
-# for those two modes, per the user's own framing of these as the risk
-# management for NV/NV-Auto.
-RISK_STRUCTURES = ("Fixed", "VE")
+# _check_fill's own branch).
+# 2026-09-08 user request ("Add 'Standard' to the Risk Structures — it
+# will use Athena's original TP1/TP2 set to the 2 nearest targets from
+# the target list, automatically adjusting like it normally does"): a
+# third option, restoring exactly that "use the normal targets" path
+# for ETH under NV/NV-Auto too — self._eff("risk_structure") == "Standard"
+# is treated the same as "not Fixed and not VE" everywhere Fixed/VE
+# compute their own SL/TP directly from fill price (_check_fill,
+# _check_btd_confirmation's target-viability gate), so a Standard-
+# structure NV/NV-Auto trade falls straight into the same
+# reconstruct_targets-driven branch every non-NV mode already uses.
+RISK_STRUCTURES = ("Standard", "Fixed", "VE")
 # 'Fixed' structure's own dollar offsets from fill price (2026-09-02
 # explicit user spec: "TP1 to $20 away from entry, TP2 will be set $30
 # away from entry, SL begins static at $10" — SL reuses ETH's own already-
@@ -1057,6 +1143,12 @@ NV_FIXED_TP2_DISTANCE = 30.0
 # ("once price has traveled 2R into profit").
 NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE = 3
 NV_VE_BREAKEVEN_R_MULTIPLE = 2.0
+# 2026-09-06 user request ("VE mode should not begin taking profits until
+# price has moved at least +1R in profit"): the FIRST absorption-triggered
+# partial close of a trade is gated behind this (see _manage_position's own
+# VE block) — once profit-taking has actually begun (ve_absorption_count
+# >= 1), later signals are no longer re-gated by this.
+NV_VE_MIN_PROFIT_R_TO_CLOSE = 1.0
 
 def _load_risk_structure():
     try:
@@ -1083,6 +1175,80 @@ def _save_risk_structure():
         pass
 
 RISK_STRUCTURE = _load_risk_structure()   # [8] in curses_main toggles + persists it
+
+# ── 'Dual' mode (2026-09-07 user request) ───────────────────────────────────
+# Two independently-configured paper-trading engines run CONCURRENTLY on the
+# same real ETH market data — each with its own trading mode, sizing mode,
+# risk %, risk structure, fee %, session-restriction mode, and starting
+# balance. DUAL_MODE_ACTIVE is a SEPARATE, orthogonal global from
+# TRADING_MODE — NOT a 5th TRADING_MODES entry — because entering Dual is a
+# TOPOLOGY change (it restructures the live `instruments` list from
+# [ETH, QQQ] to [ETH#1, ETH#2, QQQ]) and blocks on a guided multi-field setup
+# flow, neither of which fits `[9]`'s instant single-keystroke cycle the way
+# every other TRADING_MODE value does. Dual mode is DRY_RUN-only — a real
+# Phemex account has exactly one real balance, so "each engine's own
+# starting balance" only has coherent meaning in the simulated ledger.
+# Persisted to its own dedicated file (not sizing_state.json — that file is
+# already a crowded dumping-ground of unrelated reserved keys, and this
+# feature's per-engine config has enough fields to deserve a clean file).
+DUAL_ENGINE_STATE_PATH = os.path.join(SCRIPT_DIR, "dual_engine_state.json")
+DUAL_ENGINE_FIELDS = ("trading_mode", "sizing_mode", "starting_balance", "pct",
+                      "risk_structure", "fee_pct", "session_mode")
+
+def _default_dual_engine_config():
+    return {"trading_mode": "Order Flow", "sizing_mode": "standard", "starting_balance": 500.0,
+            "pct": 1.0, "risk_structure": "Fixed", "fee_pct": 0.06, "session_mode": "standard"}
+
+def _default_dual_engines():
+    return {1: _default_dual_engine_config(), 2: _default_dual_engine_config()}
+
+def _validate_dual_engine_config(cfg):
+    """Field-by-field validation against each field's own known-valid set —
+    same "fall back to a safe default on anything corrupt/unrecognized"
+    discipline _load_trading_mode/_load_risk_structure already use, applied
+    per-field so one bad field doesn't discard the other 6."""
+    d = _default_dual_engine_config()
+    if not isinstance(cfg, dict):
+        return d
+    if cfg.get("trading_mode") in TRADING_MODES:
+        d["trading_mode"] = cfg["trading_mode"]
+    if cfg.get("sizing_mode") in SIZING_MODES:
+        d["sizing_mode"] = cfg["sizing_mode"]
+    if cfg.get("risk_structure") in RISK_STRUCTURES:
+        d["risk_structure"] = cfg["risk_structure"]
+    if cfg.get("session_mode") in SESSION_MODE_LABELS:
+        d["session_mode"] = cfg["session_mode"]
+    for numeric_field, min_val in (("starting_balance", 1.0), ("pct", 0.0), ("fee_pct", 0.0)):
+        try:
+            val = float(cfg.get(numeric_field))
+            if val >= min_val:
+                d[numeric_field] = val
+        except (TypeError, ValueError):
+            pass
+    return d
+
+def _load_dual_engine_state():
+    try:
+        with open(DUAL_ENGINE_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        engines_raw = data.get("engines") or {}
+        engines = {1: _validate_dual_engine_config(engines_raw.get("1")),
+                   2: _validate_dual_engine_config(engines_raw.get("2"))}
+        active = bool(data.get("active", False)) and DRY_RUN   # never resume Dual mode live
+        return engines, active
+    except Exception:
+        return _default_dual_engines(), False
+
+def _save_dual_engine_state():
+    try:
+        with open(DUAL_ENGINE_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"engines": {str(k): v for k, v in DUAL_ENGINES.items()},
+                       "active": DUAL_MODE_ACTIVE}, f)
+    except Exception:
+        pass
+
+DUAL_ENGINES, DUAL_MODE_ACTIVE = _load_dual_engine_state()
+
 BTD_ENTRY_LOOKBACK = 10
 # 2026-08-31 user-reported ("Reduce QQQ's BTD sensitivity to 2.5 from 3.0.
 # There are too few signals and they often miss the big moves."): per-asset
@@ -1152,12 +1318,19 @@ PROFIT_RATCHET_ENABLED = _load_profit_ratchet()   # [2] in curses_main toggles +
 
 STATUS_LIGHT_NAMES = ["Session", "Volatility", "PCVR", "HPLs", "Targets"]
 
-def required_status_lights():
+def required_status_lights(session_mode=None):
     """The subset of the 5 status.py-derived lights that must actually be
-    active to arm — all 5 normally, or all but Session in --no-session
-    (24-hour) mode. Session is still computed/displayed either way, just
-    not required."""
-    return [n for n in STATUS_LIGHT_NAMES if not (NO_SESSION and n == "Session")]
+    active to arm — all 5 in Standard Sessions/Sunday On, or all but
+    Session in 24H mode. Session is still computed/displayed either way,
+    just not required in 24H.
+
+    session_mode=None (every existing call site) reads the bare global
+    SESSION_MODE, unchanged. A 'Dual' mode engine passes its OWN
+    self._eff("session_mode") instead, since its session restriction can
+    differ from the other engine's / the single-engine global's."""
+    if session_mode is None:
+        session_mode = SESSION_MODE
+    return [n for n in STATUS_LIGHT_NAMES if not (session_mode == "24h" and n == "Session")]
 
 # ── Athena's own event log — athena_logs/YYYY/MM/DD/athena_MM_DD_YYYY.jsonl ──
 def athena_log_path(dt=None):
@@ -1166,10 +1339,17 @@ def athena_log_path(dt=None):
     os.makedirs(day_dir, exist_ok=True)
     return os.path.join(day_dir, f"athena_{dt.strftime('%m_%d_%Y')}.jsonl")
 
-def log_event(asset, event, detail=None):
+def log_event(asset, event, detail=None, engine=None):
+    """engine=None (every existing call) is unchanged — omitted from the
+    row entirely, so legacy readers/older log lines are indistinguishable
+    from each other, exactly as before. 2026-09-07 'Dual' mode: a Dual
+    engine's own AthenaInstrument calls this via self._log_event, which
+    fills engine in automatically from self.engine_id (1 or 2)."""
     row = {"ts": datetime.now().isoformat(), "asset": asset, "event": event}
     if detail is not None:
         row["detail"] = detail
+    if engine is not None:
+        row["engine"] = engine
     try:
         with open(athena_log_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
@@ -1438,7 +1618,7 @@ def reconstruct_targets(log_targets, gex_export, price, regime, er_targets=None,
         full.append({"type": "GEX Flip", "level": float(gex_flip)})
     return full
 
-def instrument_lights(snapshot, asset):
+def instrument_lights(snapshot, asset, trading_mode=None, session_mode=None):
     """(lights_dict, regime, price, targets_full, market_closed, er_bands)
     for one instrument, from the latest status.py snapshot + this cycle's
     gex export. regime is 'long' (PCVR<=0.98), 'short' (PCVR>=1.02), or
@@ -1456,7 +1636,13 @@ def instrument_lights(snapshot, asset):
     false and regime None rather than showing whatever partial/stale state
     (Session/Volatility/PCVR are computed independently of market hours and
     can easily still read green) would otherwise light up and look like
-    real progress toward a trade that can't actually happen."""
+    real progress toward a trade that can't actually happen.
+
+    trading_mode/session_mode=None (every existing call site) read the bare
+    globals TRADING_MODE/SESSION_MODE, unchanged. A 'Dual' mode engine
+    passes its OWN self._eff(...) values instead, since its regime source
+    and Session-light computation can differ from the global / the other
+    engine's."""
     cfg = ASSETS[asset]
     lights = {"Session": False, "Volatility": False, "PCVR": False, "HPLs": False, "Targets": False}
     if snapshot is None:
@@ -1468,7 +1654,15 @@ def instrument_lights(snapshot, asset):
     if market_closed:
         return lights, None, price, [], True, None
 
-    lights["Session"] = bool((snapshot.get("session") or {}).get("in_session"))
+    if session_mode is not None:
+        # 2026-09-07 'Dual' mode: recompute fresh (cheap — pure date-math,
+        # no I/O) instead of trusting the shared snapshot's own value,
+        # which was derived from the GLOBAL SESSION_MODE by the status-
+        # polling engine, not this specific engine's own configured mode.
+        _sess_name, _sess_excl = status_get_session_status(session_mode)
+        lights["Session"] = _sess_name is not None and _sess_excl is None
+    else:
+        lights["Session"] = bool((snapshot.get("session") or {}).get("in_session"))
 
     if asset == "ETH":
         lights["Volatility"] = snapshot.get("dvol") is not None
@@ -1496,7 +1690,8 @@ def instrument_lights(snapshot, asset):
     # derived at all, defeating the entire point of the mode. NV-Auto
     # shares NV's exact regime derivation; nothing else about it changes
     # here (see the ARMED-state dispatch for what actually differs).
-    if TRADING_MODE in ("NV", "NV-Auto"):
+    effective_trading_mode = trading_mode if trading_mode is not None else TRADING_MODE
+    if effective_trading_mode in ("NV", "NV-Auto"):
         with NET_VOLUME_STATUS_LOCK:
             nv_status = NET_VOLUME_STATUS.get(asset)
         regime = "long" if nv_status == "Positive" else "short" if nv_status == "Negative" else None
@@ -3059,25 +3254,65 @@ STATUS_EXCL_DAYS_09    = {2, 3}
 STATUS_EXCL_START      = 540
 STATUS_EXCL_END        = 600
 STATUS_EXCL_SUN        = 6
-STATUS_EXCL_EEOD_START = 1170   # 2026-08-30 user-reported ("EEOD should begin
-                                  # at 19:30 CT, not 18:30 CT"): was 1110
-                                  # (18:30 CT) — moved to 1170 (19:30 CT).
 STATUS_TLT_WINDOW_START = 8 * 60 + 45
 STATUS_TLT_WINDOW_END   = 15 * 60
 STATUS_QQQ_OPEN_CT_MIN  = 8 * 60 + 45
 STATUS_QQQ_CLOSE_CT_MIN = 15 * 60
 
-def status_get_session_status():
+# 2026-09-07 user-reported ("The market is currently closed today since
+# it's Labor Day, but Athena is using TLT's PCVR for 08:30-15:00 like it
+# normally does"): status_in_tlt_window()/status_qqq_market_closed() only
+# ever checked weekday + time-of-day — neither had any notion of a market
+# holiday or an early-close day, so a fully-closed NYSE session (no real
+# TLT/QQQ options volume at all) still got treated as a normal open
+# trading day all the way through. NYSE_HOLIDAYS/NYSE_EARLY_CLOSES cover
+# the current + next year (source: NYSE Group's own published 2025-2027
+# holiday/early-closing calendar, verified 2026-09-07) — add the
+# following year's dates here annually; a year with no entries here isn't
+# treated as "no holidays" silently, it just falls back to the pre-fix
+# weekday-only behavior for that year specifically.
+NYSE_HOLIDAYS = {
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
+    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
+    date(2027, 11, 25), date(2027, 12, 24),
+}
+NYSE_EARLY_CLOSES = {
+    date(2026, 11, 27), date(2026, 12, 24),
+    date(2027, 11, 26),
+}
+NYSE_EARLY_CLOSE_CT_MIN = 12 * 60   # 1:00 PM ET / 1:15 PM options = 12:00 PM CT
+
+def status_get_session_status(session_mode=None):
+    """session_mode=None (every existing call site) reads the bare global
+    SESSION_MODE, unchanged. 2026-09-07 'Dual' mode: each engine can
+    configure its OWN session-restriction mode, but the Session light
+    itself is normally computed ONCE per status-poll cycle (off the
+    global) and shared via the snapshot to every instrument — passing an
+    explicit session_mode here lets a Dual engine's own instrument_lights
+    call recompute this cheaply/fresh (no I/O, pure date-math) instead of
+    trusting the shared snapshot's own global-derived value, so its
+    Sunday-exclusion rule genuinely reflects that engine's own setting."""
     n = _status_now_ct()
     t_mins = n.hour * 60 + n.minute
     dow = n.weekday()
     excl_reason = None
-    if dow == STATUS_EXCL_SUN:
+    effective_session_mode = session_mode if session_mode is not None else SESSION_MODE
+    # 2026-09-06 user request ("The EEOD session should be tradable and no
+    # longer restricted"): EEOD (19:30 CT - midnight) stays a named kill
+    # zone below for labeling/breakdowns, it just no longer forces
+    # excl_reason — same as every other kill zone, it's tradable whenever
+    # the Session light would otherwise be green for it.
+    if dow == STATUS_EXCL_SUN and effective_session_mode == "standard":
+        # 2026-09-06 user request ([N] now also has a "Sunday On" mode):
+        # Sunday is excluded only in "standard" mode — "sunday_on" and
+        # "24h" both allow it (24h bypasses the Session light requirement
+        # entirely regardless of what this function returns).
         excl_reason = 'Sunday — no trading'
     elif dow in STATUS_EXCL_DAYS_09 and STATUS_EXCL_START <= t_mins < STATUS_EXCL_END:
         excl_reason = 'Excluded (09:00-10:00)'
-    elif t_mins >= STATUS_EXCL_EEOD_START:
-        excl_reason = 'EEOD — no trading'
     for name, start, end, _col in STATUS_KILL_ZONES:
         if start <= t_mins < end:
             return name, excl_reason
@@ -3087,7 +3322,13 @@ def status_in_tlt_window():
     n = _status_now_ct()
     t_mins = n.hour * 60 + n.minute
     is_weekday = n.weekday() < 5
-    return is_weekday and STATUS_TLT_WINDOW_START <= t_mins < STATUS_TLT_WINDOW_END
+    if not is_weekday:
+        return False
+    today = n.date()
+    if today in NYSE_HOLIDAYS:
+        return False
+    window_end = NYSE_EARLY_CLOSE_CT_MIN if today in NYSE_EARLY_CLOSES else STATUS_TLT_WINDOW_END
+    return STATUS_TLT_WINDOW_START <= t_mins < window_end
 
 def status_session_open_ts():
     n = datetime.now()
@@ -3103,8 +3344,16 @@ def status_qqq_market_closed():
     n = _status_now_ct()
     if n.weekday() >= 5:
         return True
+    # 2026-09-07: same holiday/early-close blind spot fixed in
+    # status_in_tlt_window() just above — QQQ's own options/shares don't
+    # trade on an NYSE holiday either, and an early-close day ends at
+    # NYSE_EARLY_CLOSE_CT_MIN, not the regular close.
+    today = n.date()
+    if today in NYSE_HOLIDAYS:
+        return True
     minutes = n.hour * 60 + n.minute
-    return not (STATUS_QQQ_OPEN_CT_MIN <= minutes < STATUS_QQQ_CLOSE_CT_MIN)
+    close_min = NYSE_EARLY_CLOSE_CT_MIN if today in NYSE_EARLY_CLOSES else STATUS_QQQ_CLOSE_CT_MIN
+    return not (STATUS_QQQ_OPEN_CT_MIN <= minutes < close_min)
 
 STATUS_DVOL_URL = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
 
@@ -3347,7 +3596,16 @@ def fetch_status_pcvr():
     branch only, per the user's own follow-up clarification ("this should
     only change for when BTC is the primary asset - all of TLT's
     rules/processes still apply, unchanged") — the TLT/CBOE branch below
-    is untouched."""
+    is untouched.
+
+    2026-09-07 user-reported (Labor Day — "Athena is using TLT's PCVR for
+    08:30-15:00 like it normally does" on a day the NYSE never opened):
+    status_in_tlt_window() is now holiday/early-close aware (see
+    NYSE_HOLIDAYS/NYSE_EARLY_CLOSES), so it returns False all day on a
+    full-closure holiday and narrows its own window on an early-close
+    day — this function needs no changes of its own, it just inherits
+    the fix by falling through to the ETH/Deribit branch below on those
+    days, exactly like it already does every evening/weekend."""
     if status_in_tlt_window():
         underlying = "TLT"
         put_vol, call_vol = fetch_status_cboe_pcvr("TLT")
@@ -5708,9 +5966,17 @@ def sim_log_path(dt=None):
     os.makedirs(day_dir, exist_ok=True)
     return os.path.join(day_dir, f"sim_{dt.strftime('%m_%d_%Y')}.jsonl")
 
-def sim_log_event(event, detail):
+def sim_log_event(event, detail, engine=None):
+    """engine=None (every existing call) is unchanged — omitted from the
+    row entirely. 2026-09-07 'Dual' mode: a per-engine SimAccount's own
+    self._sim_log(...) wrapper fills this in automatically from its own
+    self.engine_id, and AthenaInstrument's self._sim_log_event(...)
+    wrapper does the same for the one call site that logs directly
+    (_sync_moving_tps's 'tp_targets_set') rather than through SimAccount."""
     row = {"ts": datetime.now().isoformat(), "event": event}
     row.update(detail)
+    if engine is not None:
+        row["engine"] = engine
     try:
         with open(sim_log_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
@@ -5789,7 +6055,7 @@ class SimAccount:
     (fetch_last_price) so a paper trade fills at the same price a real one
     would have, even though no real order is ever sent."""
 
-    def __init__(self, default_balance=SIM_DEFAULT_BALANCE):
+    def __init__(self, default_balance=SIM_DEFAULT_BALANCE, state_path=None, fee_pct_override=None, engine_id=None):
         self.balance = default_balance
         self.positions = {}   # symbol -> {"pos_side","qty","avg_entry"}
         self.orders = {}      # clOrdID -> order dict
@@ -5799,12 +6065,28 @@ class SimAccount:
                                      # Persisted so a restart mid-window doesn't
                                      # re-charge (or, worse, silently skip) funding
                                      # that already happened.
+        # 2026-09-07 'Dual' mode: state_path (own save file), fee_pct_
+        # override (own fee %, consulted instead of the bare FEE_ETH_PCT
+        # global in _apply_fill/_close), and engine_id (tags every
+        # sim_log_event row this account writes via self._sim_log, so
+        # scan_all_trades_detailed can tell the two engines' fills apart)
+        # let two independent SimAccount instances coexist with their own
+        # balance/positions/fee rate/trade history — every existing
+        # single-engine call (all three params left at their defaults) is
+        # byte-identical to before (the module default SIM_STATE_PATH,
+        # FEE_ETH_PCT, no engine tag on logged rows).
+        self.state_path = state_path or SIM_STATE_PATH
+        self.fee_pct_override = fee_pct_override
+        self.engine_id = engine_id
         self._seq = 0
         self._load()
 
+    def _sim_log(self, event, detail):
+        sim_log_event(event, detail, engine=self.engine_id)
+
     def _load(self):
         try:
-            with open(SIM_STATE_PATH, encoding="utf-8") as f:
+            with open(self.state_path, encoding="utf-8") as f:
                 data = json.load(f)
             self.balance = data.get("balance", self.balance)
             self.positions = data.get("positions", {})
@@ -5815,11 +6097,23 @@ class SimAccount:
 
     def _save(self):
         try:
-            with open(SIM_STATE_PATH, "w", encoding="utf-8") as f:
+            with open(self.state_path, "w", encoding="utf-8") as f:
                 json.dump({"balance": self.balance, "positions": self.positions,
                            "orders": self.orders, "last_funding_ts": self.last_funding_ts}, f, indent=2)
         except Exception:
             pass
+
+    def _fee(self, symbol, qty, price):
+        """Same shape as the module-level fee_for_leg(asset, qty, price),
+        except it consults self.fee_pct_override first (2026-09-07 'Dual'
+        mode — each engine's own configured fee %) — only meaningful for
+        ETH's %-of-notional model, since Dual is ETH-only; QQQ's flat-
+        per-unit fee has no override and always uses fee_for_leg's own
+        FEE_QQQ_PER_UNIT global."""
+        asset = PHEMEX_SYMBOL_TO_ASSET.get(symbol)
+        if self.fee_pct_override is not None and asset == "ETH":
+            return qty * price * (self.fee_pct_override / 100.0)
+        return fee_for_leg(asset, qty, price)
 
     def reset(self, balance):
         self.balance = balance
@@ -5828,7 +6122,7 @@ class SimAccount:
         self.last_funding_ts = {}
         self._save()
         _archive_sim_logs()
-        sim_log_event("reset", {"balance": balance})
+        self._sim_log("reset", {"balance": balance})
 
     def _next_id(self, prefix):
         self._seq += 1
@@ -5859,7 +6153,7 @@ class SimAccount:
         # scan_all_trades_detailed's own existing fee formula, so the
         # real balance and the trade log's own NET PNL walk forward
         # identically from now on.
-        self.balance -= fee_for_leg(PHEMEX_SYMBOL_TO_ASSET.get(symbol), qty, price)
+        self.balance -= self._fee(symbol, qty, price)
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty,
                   "price": price, "order_type": order_type}
         if sequence_label is not None:
@@ -5873,7 +6167,7 @@ class SimAccount:
             # event scan_all_trades_detailed already reconstructs trades
             # from.
             detail["sequence_label"] = sequence_label
-        sim_log_event("filled", detail)
+        self._sim_log("filled", detail)
 
     def _close(self, symbol, pos_side, qty, price, reason, target_type=None):
         pos = self.positions.get(symbol)
@@ -5891,13 +6185,13 @@ class SimAccount:
         # (unchanged) — it still feeds the trade log's own GROSS column
         # and sim_logs' own historical "pnl" field; the fee is a
         # separate balance effect, same as a real exchange.
-        self.balance -= fee_for_leg(PHEMEX_SYMBOL_TO_ASSET.get(symbol), qty, price)
+        self.balance -= self._fee(symbol, qty, price)
         pos["qty"] -= qty
         detail = {"symbol": symbol, "pos_side": pos_side, "qty": qty, "price": price,
                   "entry": entry, "pnl": pnl, "reason": reason, "balance": self.balance}
         if target_type is not None:
             detail["type"] = target_type
-        sim_log_event("closed", detail)
+        self._sim_log("closed", detail)
         if pos["qty"] <= 1e-9:
             del self.positions[symbol]
             for oid in [k for k, o in self.orders.items() if o["symbol"] == symbol]:
@@ -5914,7 +6208,7 @@ class SimAccount:
             oid = self._next_id("entry")
             self.orders[oid] = {"symbol": symbol, "kind": "entry", "posSide": pos_side,
                                  "qty": qty, "price": float(price_str), "sequence_label": sequence_label}
-            sim_log_event("order_placed", {"symbol": symbol, "kind": "entry", "pos_side": pos_side,
+            self._sim_log("order_placed", {"symbol": symbol, "kind": "entry", "pos_side": pos_side,
                                             "qty": qty, "price": float(price_str)})
         self._save()
         return {"code": 0}
@@ -6066,7 +6360,7 @@ class SimAccount:
             payment = -side_sign * notional * rate
             self.balance += payment
             self.last_funding_ts[symbol] = boundary
-            sim_log_event("funding", {"symbol": symbol, "pos_side": pos["pos_side"], "qty": pos["qty"],
+            self._sim_log("funding", {"symbol": symbol, "pos_side": pos["pos_side"], "qty": pos["qty"],
                                        "mark_price": mark_price, "rate": rate, "payment": payment,
                                        "balance": self.balance})
             console_log(f"{pnl_color(payment)}Funding: {asset or symbol} {pos['pos_side']} "
@@ -6098,9 +6392,26 @@ class SimAccount:
                           "positions": positions}}
 
 _sim_account = None
+_sim_accounts_by_engine = {}   # engine_id (1 or 2) -> its own SimAccount
 
-def get_sim_account():
+def get_sim_account(engine_id=None):
+    """engine_id=None (every existing single-engine call) returns the
+    SAME process-wide singleton this always has, unchanged. 2026-09-07
+    'Dual' mode: engine_id=1/2 returns/creates a SEPARATE SimAccount
+    instance for that engine — its own starting balance (from
+    DUAL_ENGINES), its own save file (sim_account_engine{N}.json, never
+    sim_account.json), and its own fee_pct_override — so the two engines'
+    balances/positions/orders can never collide or merge (see SimAccount's
+    own positions dict, keyed only by symbol — two engines both trading
+    "ETHUSDT" through the SAME account instance would blend their fills)."""
     global _sim_account
+    if engine_id:
+        if engine_id not in _sim_accounts_by_engine:
+            cfg = DUAL_ENGINES[engine_id]
+            path = os.path.join(SCRIPT_DIR, f"sim_account_engine{engine_id}.json")
+            _sim_accounts_by_engine[engine_id] = SimAccount(
+                cfg["starting_balance"], state_path=path, fee_pct_override=cfg["fee_pct"], engine_id=engine_id)
+        return _sim_accounts_by_engine[engine_id]
     if _sim_account is None:
         _sim_account = SimAccount(SIM_BALANCE_ARG)
     return _sim_account
@@ -6139,9 +6450,9 @@ async def phemex_request(method, path, params=None, body=None):
             raise ValueError(f"Unsupported HTTP method: {method}")
         return r.json()
 
-async def fetch_account():
+async def fetch_account(engine_id=None):
     if DRY_RUN:
-        sim = get_sim_account()
+        sim = get_sim_account(engine_id)
         await sim.tick_matching()
         return await sim.to_account_snapshot()
     return await phemex_request('GET', '/g-accounts/accountPositions', params={'currency': 'USDT'})
@@ -6226,9 +6537,9 @@ def floor_to_step(value, step):
     steps = math.floor(value / step + 1e-9)
     return steps * step
 
-async def place_entry(symbol, pos_side, order_type, qty_str, price_str=None, sequence_label=None):
+async def place_entry(symbol, pos_side, order_type, qty_str, price_str=None, sequence_label=None, engine_id=None):
     if DRY_RUN:
-        return await get_sim_account().place_entry(symbol, pos_side, order_type, qty_str, price_str, sequence_label)
+        return await get_sim_account(engine_id).place_entry(symbol, pos_side, order_type, qty_str, price_str, sequence_label)
     side = 'Buy' if pos_side == 'Long' else 'Sell'
     params = {
         'symbol': symbol, 'clOrdID': f'athena_{int(time.time() * 1000)}',
@@ -6240,9 +6551,9 @@ async def place_entry(symbol, pos_side, order_type, qty_str, price_str=None, seq
         params['priceRp'] = price_str
     return await phemex_request('PUT', '/g-orders/create', params=params)
 
-async def place_sl(symbol, pos_side, sl_price, price_decimals):
+async def place_sl(symbol, pos_side, sl_price, price_decimals, engine_id=None):
     if DRY_RUN:
-        return await get_sim_account().place_sl(symbol, pos_side, sl_price)
+        return await get_sim_account(engine_id).place_sl(symbol, pos_side, sl_price)
     close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     params = {
         'symbol': symbol, 'clOrdID': f'athena_sl_{int(time.time() * 1000)}',
@@ -6280,9 +6591,9 @@ _TP_TYPE_DISPLAY = {"BT": "BT/ST", "ST": "BT/ST", "GEX Flip": "GEXFLIP", "Cluste
 def _tp_type_display(target_type):
     return _TP_TYPE_DISPLAY.get(target_type, "—")
 
-async def place_tp_leg(symbol, pos_side, qty_str, price, price_decimals, suffix, target_type="?"):
+async def place_tp_leg(symbol, pos_side, qty_str, price, price_decimals, suffix, target_type="?", engine_id=None):
     if DRY_RUN:
-        return await get_sim_account().place_tp_leg(symbol, pos_side, qty_str, price, suffix, target_type)
+        return await get_sim_account(engine_id).place_tp_leg(symbol, pos_side, qty_str, price, suffix, target_type)
     close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     params = {
         'symbol': symbol,
@@ -6427,7 +6738,7 @@ def _parse_resting_orders(rows, pos_side):
         del leg["_suffix"]
     return sl_price, sl_order_id, tp_legs
 
-async def cancel_all(symbol):
+async def cancel_all(symbol, engine_id=None):
     """Real mode: Phemex's DELETE /g-orders/all needs to be called TWICE
     with different `untriggered` values to actually clear everything —
     confirmed against Phemex's own docs: untriggered='false' cancels
@@ -6449,20 +6760,20 @@ async def cancel_all(symbol):
     referencing a position that no longer exists. Returns ok only if
     BOTH calls succeeded."""
     if DRY_RUN:
-        return await get_sim_account().cancel_all(symbol)
+        return await get_sim_account(engine_id).cancel_all(symbol)
     active_result = await phemex_request('DELETE', '/g-orders/all', params={'symbol': symbol, 'untriggered': 'false'})
     cond_result = await phemex_request('DELETE', '/g-orders/all', params={'symbol': symbol, 'untriggered': 'true'})
     if _order_ok(active_result) and _order_ok(cond_result):
         return {"code": 0}
     return active_result if not _order_ok(active_result) else cond_result
 
-async def market_close(symbol, pos_side, qty, reason="flip"):
+async def market_close(symbol, pos_side, qty, reason="flip", engine_id=None):
     # `reason` only matters for --dry-run's own sim_logs "closed" reason tag
     # (real mode's athena_logs event NAME already distinguishes pcvr_flip_close
     # vs. eod_flatten at the call site — see AthenaInstrument._manage_position/
     # _flatten_eod) — a real Phemex market-close order carries no such field.
     if DRY_RUN:
-        return await get_sim_account().market_close(symbol, pos_side, qty, reason)
+        return await get_sim_account(engine_id).market_close(symbol, pos_side, qty, reason)
     close_side = 'Sell' if pos_side == 'Long' else 'Buy'
     params = {
         'symbol': symbol, 'clOrdID': f'athena_close_{int(time.time() * 1000)}',
@@ -9244,9 +9555,24 @@ def _voldrift_load_historical(asset, date_str):
 
 # ── Per-instrument state machine ──────────────────────────────────────────────
 class AthenaInstrument:
-    def __init__(self, asset):
+    def __init__(self, asset, engine_id=None):
         self.asset = asset
         self.cfg = ASSETS[asset]
+        # 2026-09-07 'Dual' mode — two independently-configured engines can
+        # both run on the SAME real asset (ETH); self.asset/self.cfg stay
+        # the literal underlying (both engines trade real ETH market data/
+        # targets, sharing the same sl distance/phemex_symbol/tick), but
+        # every currently ASSET-KEYED bucket of per-INSTRUMENT state
+        # (ATHENA_ENABLED, DAILY_LOSS_STATE, MAX_WIN_STATE, SIZING_STATE,
+        # AppState.publish's inst_snap dict) needs a key that can tell two
+        # same-asset instruments apart. self.engine_id is None for every
+        # existing single-engine ETH/QQQ instrument (unchanged behavior);
+        # self.instance_key collapses to the bare asset string in that
+        # case too, so every dict lookup keyed by it is byte-identical to
+        # before Dual mode existed. Only when engine_id is 1 or 2 does it
+        # diverge, to "ETH#1"/"ETH#2".
+        self.engine_id = engine_id
+        self.instance_key = f"{asset}#{engine_id}" if engine_id else asset
         self.state = "WATCHING"
         self.lights = {"Session": False, "Volatility": False, "PCVR": False, "HPLs": False, "Targets": False, "Order Flow": False}
         self.regime = None
@@ -9296,6 +9622,56 @@ class AthenaInstrument:
                                      # window (which would also nuke a brand-new position
                                      # NV-Auto opens later that same hour).
 
+    def _eff(self, field):
+        """Effective value of a trading-config field for THIS instrument —
+        its own Dual-mode engine config (DUAL_ENGINES[self.engine_id]) when
+        self.engine_id is set, else the existing bare module global. Every
+        single-engine ETH/QQQ instrument (engine_id=None, the only kind that
+        existed before Dual mode) reads EXACTLY the same global it always
+        has — this helper changes nothing for them. Centralizing the lookup
+        here is what lets _compute_trade_risk_dollars/process_cycle/
+        _check_fill/_manage_position support two independently-configured
+        engines with no risk of one silently reading the other's config, or
+        a Dual engine falling back to the single-engine global by accident.
+        Dual engines always risk a % of their own balance (no dollar-risk
+        mode) and are ETH-only, so "risk_mode"/"risk_dollars" have no
+        per-engine entry — callers that need them should check
+        self.engine_id directly rather than routing through here."""
+        if self.engine_id:
+            return DUAL_ENGINES[self.engine_id][field]
+        return {"trading_mode": TRADING_MODE, "sizing_mode": SIZING_MODE,
+                "risk_structure": RISK_STRUCTURE, "session_mode": SESSION_MODE,
+                "pct": PCT, "fee_pct": FEE_ETH_PCT * 100.0}[field]
+
+    def _fee_for_leg(self, qty, price):
+        """This instrument's own effective fee — routes through _eff so a
+        Dual engine's configured fee % is the ONE source of truth consulted
+        both here (the instrument's own realized_pnl/gating bookkeeping)
+        and by the SimAccount it trades through (which carries the same
+        fee_pct as its own override at construction — see get_sim_account),
+        so the two can never silently drift apart. Single-engine ETH/QQQ
+        instruments (engine_id=None) get byte-identical behavior to the
+        bare module-level fee_for_leg(self.asset, qty, price) call this
+        replaces, since _eff falls back to FEE_ETH_PCT for them and QQQ
+        never has an engine_id (Dual is ETH-only)."""
+        if self.asset == "QQQ":
+            return qty * FEE_QQQ_PER_UNIT
+        return qty * price * (self._eff("fee_pct") / 100.0)
+
+    def _log_event(self, event, detail=None):
+        """Wraps the module-level log_event, auto-injecting self.engine_id
+        so every athena_logs row this instrument writes carries the same
+        Dual-mode engine tag its sim_logs rows do (see SimAccount._sim_log).
+        engine_id=None (every single-engine ETH/QQQ instrument) produces a
+        row byte-identical to calling log_event directly."""
+        log_event(self.asset, event, detail, engine=self.engine_id)
+
+    def _sim_log_event(self, event, detail):
+        """Counterpart to SimAccount._sim_log for the one call site that
+        logs to sim_logs directly from AthenaInstrument rather than
+        through a SimAccount method (_sync_moving_tps's 'tp_targets_set')."""
+        sim_log_event(event, detail, engine=self.engine_id)
+
     async def _place_sl_with_retry(self, symbol, pos_side, sl_price, price_decimals, retries=3):
         """A resting stop-loss is the single most important order this app
         ever places for a real position — losing it silently is the worst
@@ -9313,7 +9689,7 @@ class AthenaInstrument:
             if attempt > 0:
                 await asyncio.sleep(1.0)
             try:
-                last_result = await place_sl(symbol, pos_side, sl_price, price_decimals)
+                last_result = await place_sl(symbol, pos_side, sl_price, price_decimals, engine_id=self.engine_id)
             except Exception as e:
                 last_result = {"code": -1, "msg": str(e)}
             if _order_ok(last_result):
@@ -9324,7 +9700,7 @@ class AthenaInstrument:
                 return True
         console_log(f"{self.asset}: {RED}{BLD}CRITICAL — stop-loss placement FAILED after {retries} attempts "
                     f"({last_result}) — position has NO resting stop-loss right now{RST}")
-        log_event(self.asset, "sl_placement_failed", {"sl_price": sl_price, "result": last_result, "sim": DRY_RUN})
+        self._log_event("sl_placement_failed", {"sl_price": sl_price, "result": last_result, "sim": DRY_RUN})
         self._sl_missing = True
         return False
 
@@ -9344,13 +9720,13 @@ class AthenaInstrument:
         no existing caller used the old boolean return value, so this is
         a safe widening, not a breaking change."""
         try:
-            result = await place_tp_leg(symbol, pos_side, qty_str, level, price_decimals, suffix, target_type)
+            result = await place_tp_leg(symbol, pos_side, qty_str, level, price_decimals, suffix, target_type, engine_id=self.engine_id)
         except Exception as e:
             result = {"code": -1, "msg": str(e)}
         if not _order_ok(result):
             console_log(f"{self.asset}: {RED}TP{suffix} ({target_type}) placement FAILED @ {fmt_num(level)} "
                         f"({result}) — that leg is NOT resting{RST}")
-            log_event(self.asset, "tp_placement_failed",
+            self._log_event("tp_placement_failed",
                        {"suffix": suffix, "level": level, "type": target_type, "result": result, "sim": DRY_RUN})
             return None
         return (result.get("data") or {}).get("orderID")
@@ -9509,7 +9885,7 @@ class AthenaInstrument:
             pass
 
         try:
-            acc = await fetch_account()
+            acc = await fetch_account(self.engine_id)
         except Exception as e:
             console_log(f"{self.asset}: startup reconciliation failed ({e}) — assuming flat")
             return
@@ -9613,7 +9989,7 @@ class AthenaInstrument:
             # exact scenario. Real mode has no history to recover at all
             # (same documented no-fill-history-API gap as elsewhere) —
             # stays at just the negative entry fee.
-            realized_pnl = -fee_for_leg(self.asset, size, fill_price)
+            realized_pnl = -self._fee_for_leg(size, fill_price)
             if DRY_RUN:
                 realized_pnl += already_realized
 
@@ -9622,6 +9998,18 @@ class AthenaInstrument:
                               "entry_day_ct": _ct_calendar_day_key(datetime.now(TZ_CT)) if TZ_CT else None,
                               "price_decimals": pd, "qty_decimals": qd,
                               "realized_pnl": realized_pnl,
+                              # VE-structure-only bookkeeping (2026-09-08 fix)
+                              # — a position reconciled here on restart used
+                              # to omit these three keys entirely (only the
+                              # fresh-fill site above set them), so
+                              # _manage_position's VE section would
+                              # KeyError on "ve_absorption_count" the first
+                              # time an opposing absorption signal fired on
+                              # a resumed VE trade. Same defaults the fresh-
+                              # fill site uses — harmless/unused whenever
+                              # risk_structure isn't "VE".
+                              "ve_absorption_count": 0, "ve_last_absorption_bar_ts": None,
+                              "ve_breakeven_done": False,
                               # fill_time (2026-08-27 user-reported: "Duration
                               # resets to 00:00 each time Athena is
                               # relaunched... should be set from the
@@ -9646,12 +10034,25 @@ class AthenaInstrument:
                 sl_note = f" {DIM}(no resting SL found — will retry placing one){RST}" if self._sl_missing \
                           else f" {DIM}(SL/TP reconciled from Phemex's own resting orders){RST}"
             console_log(f"{self.asset}: found existing {pos_side} position ({size}) on restart — resuming IN_POSITION{sl_note}")
-            log_event(self.asset, "reconciled_existing_position", {"pos_side": pos_side, "qty": size,
+            self._log_event("reconciled_existing_position", {"pos_side": pos_side, "qty": size,
                                                                      "fill_price": fill_price, "sl_price": sl_price,
                                                                      "tp_legs": tp_legs, "sl_missing": self._sl_missing})
 
     async def process_cycle(self, snapshot):
-        lights5, regime, price, targets_full, market_closed, er_bands = instrument_lights(snapshot, self.asset)
+        # 2026-09-07 'Dual' mode: computed once per cycle and used
+        # throughout below instead of reading the bare TRADING_MODE/
+        # SESSION_MODE globals directly. Only actually threaded into
+        # instrument_lights as an override for a genuine Dual engine
+        # (engine_id set) — every single-engine ETH/QQQ instrument keeps
+        # passing None/None so instrument_lights takes the EXACT same
+        # code path it always has (trusting the shared snapshot's own
+        # Session-light value), not just an equivalent recomputation.
+        trading_mode = self._eff("trading_mode")
+        session_mode = self._eff("session_mode")
+        lights5, regime, price, targets_full, market_closed, er_bands = instrument_lights(
+            snapshot, self.asset,
+            trading_mode=(trading_mode if self.engine_id else None),
+            session_mode=(session_mode if self.engine_id else None))
         self.lights.update(lights5)
         self.regime = regime
         self.price = price
@@ -9689,7 +10090,7 @@ class AthenaInstrument:
         # cycle for the whole hour, including flattening a brand new
         # position NV-Auto opens later that same hour once Net Volume
         # goes Positive/Negative again).
-        if (self.asset == "ETH" and TRADING_MODE == "NV-Auto"
+        if (self.asset == "ETH" and trading_mode == "NV-Auto"
                 and self.state in ("PENDING_FILL", "IN_POSITION") and TZ_CT):
             now_ct = _status_now_ct()
             day_key = _ct_calendar_day_key(now_ct)
@@ -9698,7 +10099,7 @@ class AthenaInstrument:
                 await self._flatten_now("nv_auto_midnight")
                 return
 
-        required = required_status_lights()
+        required = required_status_lights(session_mode)
         gate_ok = all(lights5[n] for n in required)
         # Daily Loss Limit (2026-07-25) / Max Win Limit (2026-08-21) / the
         # Drawdown de-risking ladder's own 20%+ Full Stop tier (2026-08-27,
@@ -9710,7 +10111,7 @@ class AthenaInstrument:
         # own docstrings) and reused in both branches below.
         daily_loss_blocked = self._daily_loss_limit_active(regime)
         max_win_blocked = self._max_win_limit_active()
-        drawdown_blocked = drawdown_gate_active()
+        drawdown_blocked = drawdown_gate_active(self.engine_id)
 
         if self.state == "WATCHING":
             self.lights["Order Flow"] = False
@@ -9735,12 +10136,12 @@ class AthenaInstrument:
             # still fully managed below regardless.
             if self.asset == "QQQ":
                 return
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
+            if not gate_ok or not ATHENA_ENABLED.setdefault(self.instance_key, DRY_RUN) or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
                 return
             self.state = "ARMED"
-            trigger_desc = "BTD candle closes" if TRADING_MODE in ("BTD", "NV") else "immediate on regime flip" if TRADING_MODE == "NV-Auto" else "order flow"
+            trigger_desc = "BTD candle closes" if trading_mode in ("BTD", "NV") else "immediate on regime flip" if trading_mode == "NV-Auto" else "order flow"
             console_log(f"{self.asset}: all required conditions active — ARMED, watching {trigger_desc} ({regime})"
-                        + (" [24H MODE]" if NO_SESSION else ""))
+                        + (" [24H MODE]" if session_mode == "24h" else ""))
             # 2026-07-28 debugging aid, user-reported ("ETH entered a trade
             # while only ST was active, which should NOT validate an entry
             # since BT/ST are targets only") — hpl_any_active() DOES already
@@ -9754,7 +10155,7 @@ class AthenaInstrument:
             # can be diagnosed conclusively instead of re-guessing.
             active_hpls = sorted(label for label, v in ((snapshot.get(self.cfg["snap_key"]) or {}).get("hpl") or {}).items()
                                   if v.get("status") == "active")
-            log_event(self.asset, "armed", {"regime": regime, "no_session": NO_SESSION, "active_hpls": active_hpls})
+            self._log_event("armed", {"regime": regime, "session_mode": session_mode, "active_hpls": active_hpls})
             # Fall through into the ARMED check below in this same cycle —
             # otherwise a bar that already closed (confirming or not) right
             # as/just before arming would get silently treated as the
@@ -9762,19 +10163,19 @@ class AthenaInstrument:
             # against its predecessor (see read_last_two_footprint_bars).
 
         if self.state == "ARMED":
-            if not gate_ok or not ATHENA_ENABLED[self.asset] or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
+            if not gate_ok or not ATHENA_ENABLED.setdefault(self.instance_key, DRY_RUN) or _in_entry_blackout() or daily_loss_blocked or max_win_blocked or drawdown_blocked:
                 self.state = "WATCHING"
                 self.lights["Order Flow"] = False
                 reason = ("19:00-19:30 CT entry blackout" if _in_entry_blackout()
                           else "Daily Loss Limit active" if daily_loss_blocked
                           else "Max Win Limit active" if max_win_blocked
                           else "Drawdown Full Stop active" if drawdown_blocked
-                          else f"{self.asset} paused ([A])" if not ATHENA_ENABLED[self.asset] else "a required condition dropped")
+                          else f"{self.asset} paused ([A])" if not ATHENA_ENABLED.setdefault(self.instance_key, DRY_RUN) else "a required condition dropped")
                 console_log(f"{self.asset}: {reason} — back to WATCHING")
-                log_event(self.asset, "disarmed", {"lights": lights5, "no_session": NO_SESSION,
-                                                     "athena_enabled": ATHENA_ENABLED[self.asset]})
+                self._log_event("disarmed", {"lights": lights5, "session_mode": session_mode,
+                                                     "athena_enabled": ATHENA_ENABLED.setdefault(self.instance_key, DRY_RUN)})
                 return
-            if TRADING_MODE == "NV-Auto":
+            if trading_mode == "NV-Auto":
                 # 2026-09-02 user request ("As soon as the Net Volume goes
                 # either 'Negative' or 'Positive', enter a trade in the
                 # corresponding direction"): no bar-confirmation WAIT at
@@ -9809,7 +10210,7 @@ class AthenaInstrument:
                     if last_ts != self._last_checked_bar_ts:
                         self._last_checked_bar_ts = last_ts
                         await self._check_btd_confirmation(bars_1m, regime, price, targets_full, auto_entry=True)
-            elif TRADING_MODE in ("BTD", "NV"):
+            elif trading_mode in ("BTD", "NV"):
                 # 2026-09-01: 'NV' shares this exact BTD candle-close
                 # confirmation path — the only thing 'NV' changes is where
                 # `regime` itself came from (see instrument_lights).
@@ -9941,8 +10342,16 @@ class AthenaInstrument:
         Does NOT apply the drawdown de-risking multiplier — that's a
         separate, mode-independent third layer applied by the caller
         right after this returns (see current_drawdown_mult)."""
-        base = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) else balance * (PCT / 100.0)
+        # 2026-09-07 'Dual' mode: a Dual engine always risks a % of its own
+        # balance (no dollar-risk mode — see DUAL_ENGINE_FIELDS) so it skips
+        # straight to the pct branch using its OWN configured pct, never
+        # the single-engine RISK_MODE/RISK_DOLLARS/PCT globals.
+        if self.engine_id:
+            base = balance * (self._eff("pct") / 100.0)
+        else:
+            base = RISK_DOLLARS if (RISK_MODE == "dollars" and RISK_DOLLARS is not None) else balance * (PCT / 100.0)
         base *= layer1_mult
+        sizing_mode = self._eff("sizing_mode")
         # 2026-09-04 user-reported ("The 'Aggressive' sizing mode has been
         # active all this time, but for some reason Athena has been using
         # 'Aggressive/1R+0.33W' instead... Whichever sizing mode the user
@@ -9957,17 +10366,17 @@ class AthenaInstrument:
         # now-unused "nv_auto_pending_boost_dollars" key (left in place in
         # already-persisted sizing_state.json files, just never read or
         # written anymore) if you're wondering where that went.
-        if SIZING_MODE == "aggressive":
-            boost = SIZING_STATE[self.asset].get("pending_boost_dollars")
+        if sizing_mode == "aggressive":
+            boost = SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row()).get("pending_boost_dollars")
             if boost:
-                SIZING_STATE[self.asset]["pending_boost_dollars"] = None
+                SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row())["pending_boost_dollars"] = None
                 _save_sizing_state()
                 return base + boost, f"Aggressive (W+${boost:,.2f})", True
             return base, "Aggressive", False
-        if SIZING_MODE == "aggressive_033":
-            boost = SIZING_STATE[self.asset].get("aggressive_033_pending_boost_dollars")
+        if sizing_mode == "aggressive_033":
+            boost = SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row()).get("aggressive_033_pending_boost_dollars")
             if boost:
-                SIZING_STATE[self.asset]["aggressive_033_pending_boost_dollars"] = None
+                SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row())["aggressive_033_pending_boost_dollars"] = None
                 _save_sizing_state()
                 return base + boost, f"Aggressive/1R+0.33W (+${boost:,.2f})", True
             return base, "Aggressive/1R+0.33W", False
@@ -9984,19 +10393,20 @@ class AthenaInstrument:
         to have."""
         if pnl is None:
             return
-        if SIZING_MODE == "aggressive_033":
+        sizing_mode = self._eff("sizing_mode")
+        if sizing_mode == "aggressive_033":
             was_boosted = bool(self.position and self.position.get("boosted"))
             if was_boosted:
                 return
             if pnl > 0:
                 boost = pnl * 0.33
-                SIZING_STATE[self.asset]["aggressive_033_pending_boost_dollars"] = boost
+                SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row())["aggressive_033_pending_boost_dollars"] = boost
                 _save_sizing_state()
                 console_log(f"{self.asset}: {YLW}Aggressive/1R+0.33W — next trade risks base + ${boost:,.2f} "
                             f"(33% of this trade's own ${pnl:,.2f} profit){RST}")
-                log_event(self.asset, "aggressive_033_boost_armed", {"pnl": pnl, "boost": boost})
+                self._log_event("aggressive_033_boost_armed", {"pnl": pnl, "boost": boost})
             return
-        if SIZING_MODE != "aggressive":
+        if sizing_mode != "aggressive":
             return
         was_boosted = bool(self.position and self.position.get("boosted"))
         if was_boosted:
@@ -10006,11 +10416,11 @@ class AthenaInstrument:
             # won or lost.
             return
         if pnl > 0:
-            SIZING_STATE[self.asset]["pending_boost_dollars"] = pnl
+            SIZING_STATE.setdefault(self.instance_key, _default_sizing_state_row())["pending_boost_dollars"] = pnl
             _save_sizing_state()
             console_log(f"{self.asset}: {YLW}Aggressive — next trade risks base + ${pnl:,.2f} "
                         f"(this trade's own profit){RST}")
-            log_event(self.asset, "aggressive_boost_armed", {"pnl": pnl})
+            self._log_event("aggressive_boost_armed", {"pnl": pnl})
 
     def _update_daily_loss_limit(self, pnl):
         """Daily Loss Limit tracking (explicit user request, 2026-07-25) —
@@ -10027,7 +10437,7 @@ class AthenaInstrument:
         if starting fresh, before counting this one."""
         if pnl is None:
             return
-        dl = DAILY_LOSS_STATE[self.asset]
+        dl = DAILY_LOSS_STATE.setdefault(self.instance_key, _default_daily_loss_state_row())
         if pnl > 0:
             dl["consecutive_losses"] = 0
             dl["loss_streak_day"] = None
@@ -10045,7 +10455,7 @@ class AthenaInstrument:
                 dl["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
                 console_log(f"{self.asset}: {RED}{BLD}Daily Loss Limit hit — {DAILY_LOSS_LIMIT} consecutive losses. "
                             f"No new entries until PCVR switches or 19:30 CT.{RST}")
-                log_event(self.asset, "daily_loss_limit_hit", {"blocked_regime": dl["blocked_regime"]})
+                self._log_event("daily_loss_limit_hit", {"blocked_regime": dl["blocked_regime"]})
         _save_daily_loss_state()
 
     def _update_closed_pnl_today(self, net_amount):
@@ -10082,7 +10492,8 @@ class AthenaInstrument:
         entry_day_ct = (self.position or {}).get("entry_day_ct")
         if entry_day_ct is None:
             return
-        bucket = CLOSED_PNL_STATE["sim" if DRY_RUN else "real"]
+        bucket_key = f"sim#{self.engine_id}" if self.engine_id else ("sim" if DRY_RUN else "real")
+        bucket = CLOSED_PNL_STATE.setdefault(bucket_key, {})
         bucket[entry_day_ct] = bucket.get(entry_day_ct, 0.0) + net_amount
         _save_closed_pnl_state()
 
@@ -10134,19 +10545,19 @@ class AthenaInstrument:
         entry = self.position.get("fill_price")
         if entry is not None and exit_price is not None and exit_qty:
             leg_gross = (exit_price - entry) * exit_qty if pos_side == "Long" else (entry - exit_price) * exit_qty
-            leg_fee = fee_for_leg(self.asset, exit_qty, exit_price)
+            leg_fee = self._fee_for_leg(exit_qty, exit_price)
             self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
         self._book_closed_pnl_delta()
         return self.position.get("realized_pnl")
 
     def _clear_daily_loss_block(self, reason):
-        dl = DAILY_LOSS_STATE[self.asset]
+        dl = DAILY_LOSS_STATE.setdefault(self.instance_key, _default_daily_loss_state_row())
         dl["blocked"] = False
         dl["blocked_regime"] = None
         dl["blocked_at"] = None
         _save_daily_loss_state()
         console_log(f"{self.asset}: {GRN}Daily Loss Limit cleared ({reason}) — new entries allowed again{RST}")
-        log_event(self.asset, "daily_loss_limit_cleared", {"reason": reason})
+        self._log_event("daily_loss_limit_cleared", {"reason": reason})
 
     def _daily_loss_limit_active(self, regime):
         """True if this asset is currently blocked from NEW entries by the
@@ -10154,7 +10565,7 @@ class AthenaInstrument:
         clears the block as a side effect) — called every cycle from
         process_cycle's own gate, so there's no separate polling loop
         needed for the "PCVR switches or 19:30 CT" conditions."""
-        dl = DAILY_LOSS_STATE[self.asset]
+        dl = DAILY_LOSS_STATE.setdefault(self.instance_key, _default_daily_loss_state_row())
         if not dl["blocked"]:
             return False
         # Unblock condition 1: PCVR's regime switched away from whatever
@@ -10193,7 +10604,7 @@ class AthenaInstrument:
         one."""
         if pnl is None:
             return
-        mw = MAX_WIN_STATE[self.asset]
+        mw = MAX_WIN_STATE.setdefault(self.instance_key, _default_max_win_state_row())
         if pnl <= 0:
             mw["consecutive_wins"] = 0
             mw["win_streak_day"] = None
@@ -10211,17 +10622,17 @@ class AthenaInstrument:
                 mw["blocked_at"] = datetime.now(TZ_CT).isoformat() if TZ_CT else datetime.now().isoformat()
                 console_log(f"{self.asset}: {RED}{BLD}Max Win Limit hit — {MAX_WIN_LIMIT} consecutive wins. "
                             f"No new entries until 19:30 CT.{RST}")
-                log_event(self.asset, "max_win_limit_hit", {"blocked_regime": mw["blocked_regime"]})
+                self._log_event("max_win_limit_hit", {"blocked_regime": mw["blocked_regime"]})
         _save_max_win_state()
 
     def _clear_max_win_block(self, reason):
-        mw = MAX_WIN_STATE[self.asset]
+        mw = MAX_WIN_STATE.setdefault(self.instance_key, _default_max_win_state_row())
         mw["blocked"] = False
         mw["blocked_regime"] = None
         mw["blocked_at"] = None
         _save_max_win_state()
         console_log(f"{self.asset}: {GRN}Max Win Limit cleared ({reason}) — new entries allowed again{RST}")
-        log_event(self.asset, "max_win_limit_cleared", {"reason": reason})
+        self._log_event("max_win_limit_cleared", {"reason": reason})
 
     def _max_win_limit_active(self):
         """True if this asset is currently blocked from NEW entries by the
@@ -10235,7 +10646,7 @@ class AthenaInstrument:
         regardless of regime. blocked_regime is still recorded (parity
         with DAILY_LOSS_STATE's shape, useful for diagnostics) but is
         never read here."""
-        mw = MAX_WIN_STATE[self.asset]
+        mw = MAX_WIN_STATE.setdefault(self.instance_key, _default_max_win_state_row())
         if not mw["blocked"]:
             return False
         if TZ_CT and mw["blocked_at"]:
@@ -10257,7 +10668,7 @@ class AthenaInstrument:
 
         entry_price = vah if regime == "long" else val
         if entry_price is None:
-            log_event(self.asset, "confirmation_no_entry_price", {"regime": regime})
+            self._log_event("confirmation_no_entry_price", {"regime": regime})
             return
 
         R = self.cfg["sl"]
@@ -10331,7 +10742,7 @@ class AthenaInstrument:
                       if top_tier_present else f"no target >= {R}R away")
             console_log(f"{self.asset}: order flow confirmed {regime.upper()} but rejected — "
                         f"{reason} (nearest {dist_txt})")
-            log_event(self.asset, "confirmation_rejected_viability", {"regime": regime, "targets": targets_full,
+            self._log_event("confirmation_rejected_viability", {"regime": regime, "targets": targets_full,
                                                                         "nearest_distance": nearest_dist, "R": R,
                                                                         "top_tier_present": top_tier_present})
             return
@@ -10340,11 +10751,11 @@ class AthenaInstrument:
                                    (regime == "short" and live_price >= entry_price)) else "limit"
 
         try:
-            acc = await fetch_account()
+            acc = await fetch_account(self.engine_id)
             balance = account_available_balance(acc)
         except Exception as e:
             console_log(f"{self.asset}: balance fetch failed ({e}) — skipping entry")
-            log_event(self.asset, "entry_skipped_balance_error", {"error": str(e)})
+            self._log_event("entry_skipped_balance_error", {"error": str(e)})
             return
 
         qty_step, price_step = await fetch_contract_spec(self.cfg["phemex_symbol"])
@@ -10389,7 +10800,7 @@ class AthenaInstrument:
         # module-level comment for the full table; the 20%+ Full Stop
         # tier never reaches here at all (blocked earlier, in
         # process_cycle's own gate, alongside Daily/Max Win Limit).
-        dd_mult, dd_pct, dd_label = current_drawdown_mult()
+        dd_mult, dd_pct, dd_label = current_drawdown_mult(self.engine_id)
         if dd_mult < 1.0:
             trade_risk_dollars *= dd_mult
             console_log(f"{self.asset}: {YLW}Drawdown de-risk — sizing at {dd_mult*100:.0f}% "
@@ -10397,8 +10808,9 @@ class AthenaInstrument:
         raw_qty = trade_risk_dollars / R
         qty = floor_to_step(raw_qty, qty_step)
         if qty <= 0:
-            console_log(f"{self.asset}: sized qty is 0 (balance ${balance:.2f}, pct {PCT}%) — skipping entry")
-            log_event(self.asset, "entry_skipped_zero_size", {"balance": balance, "pct": PCT})
+            _eff_pct = self._eff("pct") if self.engine_id else PCT
+            console_log(f"{self.asset}: sized qty is 0 (balance ${balance:.2f}, pct {_eff_pct}%) — skipping entry")
+            self._log_event("entry_skipped_zero_size", {"balance": balance, "pct": _eff_pct})
             return
 
         qty_decimals = _decimals_for_step(qty_step)
@@ -10416,10 +10828,10 @@ class AthenaInstrument:
         # machine (PENDING_FILL -> IN_POSITION -> closed, SL/TP, PCVR-flip
         # close) runs identically either way, against a paper ledger instead
         # of real money.
-        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, price_str, sequence_label)
+        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, price_str, sequence_label, engine_id=self.engine_id)
         if not (isinstance(result, dict) and result.get("code") == 0):
             console_log(f"{self.asset}: entry order FAILED — {result}")
-            log_event(self.asset, "entry_order_failed", {"result": result, **detail})
+            self._log_event("entry_order_failed", {"result": result, **detail})
             return
 
         self.pending = {"pos_side": pos_side, "qty": qty, "qty_decimals": qty_decimals,
@@ -10457,7 +10869,7 @@ class AthenaInstrument:
         tag = " (sim)" if DRY_RUN else ""
         console_log(f"{self.asset}: entry order placed{tag} — {pos_side} {order_type} {qty_str} @ "
                     f"{price_str or 'market'}")
-        log_event(self.asset, "entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
+        self._log_event("entry_order_placed", {"result": result, "sim": DRY_RUN, **detail})
 
     async def _check_btd_confirmation(self, bars_1m, regime, live_price_fallback, targets_full, auto_entry=False):
         # 2026-09-02: auto_entry (NV-Auto only) skips the candle-based
@@ -10487,8 +10899,11 @@ class AthenaInstrument:
         # (see _check_fill) — there is no "does a qualifying target exist"
         # question to ask for them at all, so the whole target-viability
         # gate below is skipped entirely rather than asking it of a target
-        # list these structures never consult.
-        risk_structure_active = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto"))
+        # list these structures never consult. 2026-09-08: 'Standard' DOES
+        # consult the target list (same as every non-NV mode), so it's
+        # deliberately excluded here — the gate below still applies to it.
+        risk_structure_active = (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto")
+                                  and self._eff("risk_structure") in ("Fixed", "VE"))
 
         if not risk_structure_active:
             def _is_top_tier(t):
@@ -10525,14 +10940,14 @@ class AthenaInstrument:
                 reason = ("a top-tier target exists but none clear it"
                           if top_tier_present else f"no target >= {R}R away")
                 console_log(f"{self.asset}: BTD confirmed {regime.upper()} but rejected — {reason} (nearest {dist_txt})")
-                log_event(self.asset, "btd_rejected_viability", {"regime": regime, "targets": targets_full,
+                self._log_event("btd_rejected_viability", {"regime": regime, "targets": targets_full,
                                                                    "nearest_distance": nearest_dist, "R": R})
                 return
 
         order_type = "market"
 
         try:
-            acc = await fetch_account()
+            acc = await fetch_account(self.engine_id)
             balance = account_available_balance(acc)
         except Exception as e:
             console_log(f"{self.asset}: balance fetch failed ({e}) — skipping BTD entry")
@@ -10550,7 +10965,7 @@ class AthenaInstrument:
             layer1_mult = 1.0
 
         trade_risk_dollars, sequence_label, boosted = self._compute_trade_risk_dollars(balance, layer1_mult)
-        dd_mult, dd_pct, dd_label = current_drawdown_mult()
+        dd_mult, dd_pct, dd_label = current_drawdown_mult(self.engine_id)
         if dd_mult < 1.0:
             trade_risk_dollars *= dd_mult
             console_log(f"{self.asset}: {YLW}Drawdown de-risk — sizing at {dd_mult*100:.0f}% "
@@ -10573,12 +10988,12 @@ class AthenaInstrument:
                    # the ACTUAL mode here keeps trade-log/backtest analysis
                    # able to tell them apart later, same as the existing
                    # "Order Flow" trigger already reads for that mode.
-                   "trigger": TRADING_MODE, "layer1_mult": layer1_mult, "drawdown_mult": dd_mult}
+                   "trigger": self._eff("trading_mode"), "layer1_mult": layer1_mult, "drawdown_mult": dd_mult}
 
-        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, None, sequence_label)
+        result = await place_entry(self.cfg["phemex_symbol"], pos_side, order_type, qty_str, None, sequence_label, engine_id=self.engine_id)
         if not (isinstance(result, dict) and result.get("code") == 0):
             console_log(f"{self.asset}: BTD entry order FAILED — {result}")
-            log_event(self.asset, "btd_entry_failed", {"result": result, **detail})
+            self._log_event("btd_entry_failed", {"result": result, **detail})
             return
 
         self.pending = {"pos_side": pos_side, "qty": qty, "qty_decimals": qty_decimals,
@@ -10592,7 +11007,7 @@ class AthenaInstrument:
         self.lights["Order Flow"] = True
         tag = " (sim)" if DRY_RUN else ""
         console_log(f"{self.asset}: BTD entry placed{tag} — {pos_side} market {qty_str} @ ~{live_price}")
-        log_event(self.asset, "btd_entry_placed", {"result": result, "sim": DRY_RUN, **detail})
+        self._log_event("btd_entry_placed", {"result": result, "sim": DRY_RUN, **detail})
 
     def _entry_order_stale(self):
         """True once ENTRY_ORDER_EXPIRY_BARS new footprint bars have closed
@@ -10620,7 +11035,7 @@ class AthenaInstrument:
     async def _check_fill(self):
         p = self.pending
         try:
-            acc = await fetch_account()
+            acc = await fetch_account(self.engine_id)
         except Exception as e:
             console_log(f"{self.asset}: fill check failed ({e})")
             return
@@ -10661,9 +11076,15 @@ class AthenaInstrument:
         # the standard path — position bookkeeping, logging, and the
         # PENDING_FILL->IN_POSITION transition are all identical either
         # way, only how tp_legs itself gets built differs.
-        if self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto"):
+        # 2026-09-08 user request: 'Standard' risk structure deliberately
+        # excluded from this branch — it falls straight into the `else`
+        # below, the exact same reconstruct_targets-driven TP1/TP2
+        # selection (2 nearest qualifying targets) every non-NV mode
+        # already uses, "automatically adjusting like it normally does."
+        if (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto")
+                and self._eff("risk_structure") in ("Fixed", "VE")):
             sign = 1 if p["pos_side"] == "Long" else -1
-            if RISK_STRUCTURE == "Fixed":
+            if self._eff("risk_structure") == "Fixed":
                 tp1_level = fill_price + sign * NV_FIXED_TP1_DISTANCE
                 tp2_level = fill_price + sign * NV_FIXED_TP2_DISTANCE
                 if total_steps >= 2:
@@ -10684,6 +11105,9 @@ class AthenaInstrument:
                      # managed entirely by _manage_position's own VE section.
                 tp_legs = []
         else:
+            # 2026-09-08: also the path a 'Standard'-risk-structure ETH
+            # NV/NV-Auto trade takes — same 2-nearest-qualifying-targets
+            # selection as every other trading mode gets here.
             targets = list(p["targets"])
 
             def _tp_level(target):
@@ -10701,7 +11125,7 @@ class AthenaInstrument:
 
             if dropped:
                 console_log(f"{self.asset}: {YLW}{len(dropped)} target(s) within ${R} of fill ${fill_price:.2f} — dropped from TP{RST}")
-                log_event(self.asset, "tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
+                self._log_event("tp_target_dropped_too_close", {"fill_price": fill_price, "R": R, "dropped": dropped})
 
             if len(valid) >= 2 and total_steps >= 2:
                 tp1_steps = total_steps // 2
@@ -10737,7 +11161,7 @@ class AthenaInstrument:
                             "type": fallback_t["type"], "order_id": fallback_oid}]
                 console_log(f"{self.asset}: {YLW}no target cleared the full-R filter — using nearest anyway "
                             f"({fallback_t['type']} {fmt_num(fallback_level)}){RST}")
-                log_event(self.asset, "tp_fallback_used", {"fill_price": fill_price, "R": R,
+                self._log_event("tp_fallback_used", {"fill_price": fill_price, "R": R,
                                                              "level": fallback_level, "type": fallback_t["type"]})
             else:
                 tp_legs = []
@@ -10757,7 +11181,7 @@ class AthenaInstrument:
         # are already known at this exact point for real trades too (see
         # that log_event's own comment).
         if DRY_RUN and tp_legs:
-            sim_log_event("tp_targets_set", {"symbol": symbol, "pos_side": p["pos_side"],
+            self._sim_log_event("tp_targets_set", {"symbol": symbol, "pos_side": p["pos_side"],
                                               "tp_legs": [{"level": leg["level"], "type": leg["type"]} for leg in tp_legs]})
 
         self.position = {"pos_side": p["pos_side"], "qty": qty, "orig_qty": qty, "fill_price": fill_price,
@@ -10777,7 +11201,7 @@ class AthenaInstrument:
                           # by each TP leg's own net contribution as legs
                           # actually close — see _manage_position's partial-
                           # fill block below.
-                          "realized_pnl": -fee_for_leg(self.asset, qty, fill_price),
+                          "realized_pnl": -self._fee_for_leg(qty, fill_price),
                           # sequence_label/trade_risk_dollars/boosted
                           # (2026-08-22, boosted added 2026-08-27): threaded
                           # from self.pending the same way entry_day_ct etc.
@@ -10808,7 +11232,7 @@ class AthenaInstrument:
         # with no tp_legs to fall back on) to treat a VE-driven partial
         # close as a TP1 fill. _manage_position's own VE section handles
         # ALL of VE's pnl-booking/breakeven/absorption-counting instead.
-        self._tp1_lock_done = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto") and RISK_STRUCTURE == "VE")
+        self._tp1_lock_done = (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto") and self._eff("risk_structure") == "VE")
         self._ratchet_milestone = 0   # fresh trade — see _apply_profit_ratchet
         self.pending = None
         self.state = "IN_POSITION"
@@ -10823,7 +11247,7 @@ class AthenaInstrument:
         # Phemex call needed. tp_legs carries only level/qty/type (not the
         # order_id) — the SAME planned-target shape DRY_RUN's separate
         # tp_targets_set event uses, so _tp_slot works unchanged for both.
-        log_event(self.asset, "filled", {"symbol": symbol, "fill_price": fill_price, "qty": qty, "sl": sl_price, "tp": tp_desc,
+        self._log_event("filled", {"symbol": symbol, "fill_price": fill_price, "qty": qty, "sl": sl_price, "tp": tp_desc,
                                           "pos_side": p["pos_side"], "order_type": p.get("order_type"),
                                           "sequence_label": p.get("sequence_label"),
                                           "tp_legs": [{"level": leg["level"], "qty": leg["qty"], "type": leg["type"]}
@@ -10831,7 +11255,7 @@ class AthenaInstrument:
                                           # risk_structure (2026-09-02): only meaningful for an
                                           # ETH NV/NV-Auto trade — None otherwise, so a backtest
                                           # can filter to exactly the trades Fixed/VE governed.
-                                          "risk_structure": (RISK_STRUCTURE if (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")) else None),
+                                          "risk_structure": (self._eff("risk_structure") if (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto")) else None),
                                           "sim": DRY_RUN})
 
     def _infer_close_reason(self, pos_side, exit_price):
@@ -10880,7 +11304,7 @@ class AthenaInstrument:
         symbol = self.cfg["phemex_symbol"]
         pos_side = self.position["pos_side"]
         try:
-            acc = await fetch_account()
+            acc = await fetch_account(self.engine_id)
         except Exception as e:
             console_log(f"{self.asset}: position check failed ({e})")
             return
@@ -10888,7 +11312,7 @@ class AthenaInstrument:
         if not pos:
             console_log(f"{self.asset}: position flat — cleaning up resting orders")
             try:
-                await cancel_all(symbol)
+                await cancel_all(symbol, engine_id=self.engine_id)
             except Exception:
                 pass
             # Athena doesn't query the exchange's own fill/close records, so
@@ -10930,7 +11354,7 @@ class AthenaInstrument:
             # cleared a few lines below. price_exact is always False here —
             # this is the one leg whose price is a live-price-at-detection
             # approximation, same documented gap as `reason` itself.
-            log_event(self.asset, "position_closed", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
+            self._log_event("position_closed", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "reason": reason,
                                                         "type": (self.position["tp_legs"][0]["type"]
@@ -11054,7 +11478,7 @@ class AthenaInstrument:
                 # block's own docstring below) — independent of whether
                 # the breakeven-lock itself ends up actually moving the SL.
                 entry = self.position["fill_price"]
-                leg_fee = fee_for_leg(self.asset, tp1_qty, tp1_price)
+                leg_fee = self._fee_for_leg(tp1_qty, tp1_price)
                 leg_gross = (tp1_price - entry) * tp1_qty if pos_side == "Long" else (entry - tp1_price) * tp1_qty
                 self.position["realized_pnl"] = self.position.get("realized_pnl", 0.0) + leg_gross - leg_fee
                 # Book THIS leg's own realized net into today's Closed PnL
@@ -11077,7 +11501,7 @@ class AthenaInstrument:
                     # (never worse than) its own resting price, so this is
                     # the real fill price for all practical purposes, same
                     # confidence DRY_RUN's own exact sim_logs price has.
-                    log_event(self.asset, "leg_closed", {"pos_side": pos_side, "qty": tp1_qty, "price": tp1_price,
+                    self._log_event("leg_closed", {"pos_side": pos_side, "qty": tp1_qty, "price": tp1_price,
                                                           "pnl": leg_gross,
                                                           "type": old_tp_legs[0].get("type") if old_tp_legs else None,
                                                           "price_exact": True})
@@ -11087,8 +11511,8 @@ class AthenaInstrument:
                 # exit trading costs are recovered)"): TRUE breakeven
                 # (net_per_unit=0.0), not the usual $1.00/unit cushion
                 # every other mode gets here.
-                _nv_fixed_active = (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")
-                                     and RISK_STRUCTURE == "Fixed")
+                _nv_fixed_active = (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto")
+                                     and self._eff("risk_structure") == "Fixed")
                 await self._apply_tp1_breakeven_lock(symbol, pos_side, tp1_price, tp1_qty,
                                                       net_per_unit=(0.0 if _nv_fixed_active else 1.00))
             self._tp1_lock_done = True
@@ -11103,8 +11527,8 @@ class AthenaInstrument:
         # already pre-set True for VE trades at fill time specifically so
         # it never tries. Everything about managing a VE trade lives here
         # instead, checked every IN_POSITION cycle.
-        if (self.asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto")
-                and RISK_STRUCTURE == "VE" and self.position):
+        if (self.asset == "ETH" and self._eff("trading_mode") in ("NV", "NV-Auto")
+                and self._eff("risk_structure") == "VE" and self.position):
             entry = self.position["fill_price"]
             R = self.cfg["sl"]
 
@@ -11141,11 +11565,30 @@ class AthenaInstrument:
                                                                                     # a same-direction absorption
                                                                                     # bar is a non-event, not a
                                                                                     # signal to re-check later.
+                    # 2026-09-06 user request ("VE mode should not begin
+                    # taking profits until price has moved at least +1R in
+                    # profit"): only gates the FIRST partial close — once
+                    # profit-taking has actually begun (ve_absorption_count
+                    # >= 1), later signals fire on the opposing-absorption
+                    # read alone, same as before. An opposing signal that
+                    # arrives before +1R is a non-event here too (already
+                    # marked seen above), not a deferred one — it doesn't
+                    # wait around to fire once +1R is later reached.
+                    if opposing and self.position.get("ve_absorption_count", 0) == 0:
+                        live_price = await reference_price(self.asset, symbol)
+                        favorable = ((live_price - entry) if pos_side == "Long" else (entry - live_price)) \
+                                    if live_price is not None else None
+                        opposing = favorable is not None and favorable >= NV_VE_MIN_PROFIT_R_TO_CLOSE * R
                     if opposing:
                         orig_qty = self.position.get("orig_qty", self.position["qty"])
                         qd = self.position.get("qty_decimals", 2)
                         step = 10 ** (-qd) if qd else 1.0
-                        signal_num = self.position["ve_absorption_count"] + 1
+                        # .get(...) here too (2026-09-08 fix), belt-and-
+                        # suspenders alongside the restart-reconciliation
+                        # fix above — every other read of this key in this
+                        # block already guards with .get, this was the one
+                        # raw subscript that could still KeyError.
+                        signal_num = self.position.get("ve_absorption_count", 0) + 1
                         # Exactly 1/3 of the ORIGINAL qty on signals 1-2;
                         # the 3rd takes WHATEVER remains, so rounding drift
                         # from the /3 split can never leave a dust
@@ -11155,7 +11598,7 @@ class AthenaInstrument:
                         close_qty = max(0.0, min(close_qty, self.position["qty"]))
                         if close_qty > 0:
                             try:
-                                close_result = await market_close(symbol, pos_side, close_qty, reason="ve_absorption")
+                                close_result = await market_close(symbol, pos_side, close_qty, reason="ve_absorption", engine_id=self.engine_id)
                             except Exception as e:
                                 close_result = {"code": -1, "msg": str(e)}
                             if _order_ok(close_result):
@@ -11178,7 +11621,7 @@ class AthenaInstrument:
                                 leg_gross = leg_fee = None
                                 if exit_price is not None:
                                     leg_gross = (exit_price - entry) * close_qty if pos_side == "Long" else (entry - exit_price) * close_qty
-                                    leg_fee = fee_for_leg(self.asset, close_qty, exit_price)
+                                    leg_fee = self._fee_for_leg(close_qty, exit_price)
                                     # Same incremental-total pattern the TP1-fill
                                     # block above uses — adds only THIS leg's own
                                     # net on top of whatever's already here. The
@@ -11192,7 +11635,7 @@ class AthenaInstrument:
                                 bias_desc = "bearish" if pos_side == "Long" else "bullish"
                                 console_log(f"{self.asset}: {YLW}VE absorption signal {signal_num}/{NV_VE_ABSORPTION_SIGNALS_TO_FULL_CLOSE} "
                                             f"({bias_desc} absorption, opposing {pos_side}) — closed {close_qty:.{qd}f} @ ~{exit_price}{RST}")
-                                log_event(self.asset, "ve_absorption_partial_close",
+                                self._log_event("ve_absorption_partial_close",
                                           {"signal_num": signal_num, "qty": close_qty, "price": exit_price,
                                            "bar_ts": last_rec["ts"], "bias": last_rec["bias"],
                                            "gross": leg_gross, "sim": DRY_RUN})
@@ -11201,7 +11644,7 @@ class AthenaInstrument:
                                     # every other partial-close leg this file
                                     # logs — see the TP1 "leg_closed" event just
                                     # above for the same shape/reasoning.
-                                    log_event(self.asset, "leg_closed", {"pos_side": pos_side, "qty": close_qty,
+                                    self._log_event("leg_closed", {"pos_side": pos_side, "qty": close_qty,
                                                                           "price": exit_price, "pnl": leg_gross,
                                                                           "type": "VE absorption", "price_exact": False})
                             else:
@@ -11224,14 +11667,14 @@ class AthenaInstrument:
             entry = self.position.get("fill_price")
             console_log(f"{self.asset}: {RED}PCVR flipped against open {pos_side} position — emergency close{RST}")
             try:
-                await cancel_all(symbol)
+                await cancel_all(symbol, engine_id=self.engine_id)
             except Exception:
                 pass
             try:
-                close_result = await market_close(symbol, pos_side, qty, reason="flip")
+                close_result = await market_close(symbol, pos_side, qty, reason="flip", engine_id=self.engine_id)
             except Exception as e:
                 console_log(f"{self.asset}: emergency close FAILED — {e}")
-                log_event(self.asset, "pcvr_flip_close_failed", {"error": str(e)})
+                self._log_event("pcvr_flip_close_failed", {"error": str(e)})
                 return
             if not _order_ok(close_result):
                 # Hardening fix, 2026-07-25: Phemex responding 200 OK with an
@@ -11247,7 +11690,7 @@ class AthenaInstrument:
                 # close, instead of Athena silently believing it's flat.
                 console_log(f"{self.asset}: {RED}{BLD}CRITICAL — emergency close FAILED ({close_result}) — "
                             f"position is STILL OPEN, will retry next cycle{RST}")
-                log_event(self.asset, "pcvr_flip_close_failed", {"result": close_result})
+                self._log_event("pcvr_flip_close_failed", {"result": close_result})
                 return
             exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
@@ -11259,7 +11702,7 @@ class AthenaInstrument:
             # to close this, not a bracket order), type is always None (a
             # flip is never a TP hit), price_exact is always False (same
             # live-price-at-detection approximation as every forced close).
-            log_event(self.asset, "pcvr_flip_close", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
+            self._log_event("pcvr_flip_close", {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                         "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                         "reason": "FLIP", "type": None, "price_exact": False,
                                                         "sim": DRY_RUN})
@@ -11507,13 +11950,13 @@ class AthenaInstrument:
             # Unchanged from before — see this function's own docstring for
             # why DRY_RUN keeps the simpler full-bracket-refresh behavior.
             try:
-                cancel_result = await cancel_all(symbol)
+                cancel_result = await cancel_all(symbol, engine_id=self.engine_id)
             except Exception as e:
                 console_log(f"{self.asset}: TP refresh — cancel failed ({e})")
                 return
             if not _order_ok(cancel_result):
                 console_log(f"{self.asset}: {RED}TP refresh — cancel failed ({cancel_result}), aborting this cycle's refresh{RST}")
-                log_event(self.asset, "tp_refresh_cancel_failed", {"result": cancel_result})
+                self._log_event("tp_refresh_cancel_failed", {"result": cancel_result})
                 return
             sl_price = self.position.get("sl_price")
             if sl_price is not None:
@@ -11552,7 +11995,7 @@ class AthenaInstrument:
             leg.pop("_changed", None)
         self.position["tp_legs"] = new_legs
         console_log(f"{self.asset}: {YLW}TP target(s) refreshed — {[fmt_num(l['level']) for l in new_legs]}{RST}")
-        log_event(self.asset, "tp_targets_adjusted", {"legs": new_legs})
+        self._log_event("tp_targets_adjusted", {"legs": new_legs})
 
     async def _apply_tp1_breakeven_lock(self, symbol, pos_side, tp1_price, tp1_qty, net_per_unit=1.00, trigger_label="TP1 hit"):
         """2026-07-28 user request: "once TP1 is achieved, adjust the SL to
@@ -11630,9 +12073,10 @@ class AthenaInstrument:
         # beyond the fees, not the usual $1.00/unit cushion. See this
         # method's own call site for where that 0.0 gets passed in.
         target_remaining_net = rem_qty * net_per_unit
-        entry_fee_share = fee_for_leg(self.asset, rem_qty, entry)
+        entry_fee_share = self._fee_for_leg(rem_qty, entry)
         needed_remaining_net = target_remaining_net + entry_fee_share
-        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
+        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net,
+                                             fee_pct=(self._eff("fee_pct") / 100.0 if self.engine_id else None))
 
         # Round in whichever direction can only ever HELP the guarantee, not
         # undershoot it — plain string-format rounding (round-half-to-even)
@@ -11662,13 +12106,13 @@ class AthenaInstrument:
         if DRY_RUN:
             # Unchanged from before — see this function's own docstring.
             try:
-                cancel_result = await cancel_all(symbol)
+                cancel_result = await cancel_all(symbol, engine_id=self.engine_id)
             except Exception as e:
                 console_log(f"{self.asset}: TP1 breakeven-lock — cancel failed ({e})")
                 return
             if not _order_ok(cancel_result):
                 console_log(f"{self.asset}: {RED}TP1 breakeven-lock — cancel failed ({cancel_result}), aborting{RST}")
-                log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
+                self._log_event("tp1_lock_cancel_failed", {"result": cancel_result})
                 return
             await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
             for i, leg in enumerate(tp_legs, start=1):
@@ -11685,7 +12129,7 @@ class AthenaInstrument:
                     cancel_result = {"code": -1, "msg": str(e)}
                 if not _order_ok(cancel_result):
                     console_log(f"{self.asset}: {RED}TP1 breakeven-lock — SL cancel failed ({cancel_result}), aborting{RST}")
-                    log_event(self.asset, "tp1_lock_cancel_failed", {"result": cancel_result})
+                    self._log_event("tp1_lock_cancel_failed", {"result": cancel_result})
                     return
             await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
             self.position["sl_order_id"] = self._sl_order_id
@@ -11702,7 +12146,7 @@ class AthenaInstrument:
         console_log(f"{self.asset}: {GRN}{BLD}{trigger_label} — remaining {fmt_num(rem_qty, 2)} locked to "
                     f"guarantee {fmt_money(target_remaining_net)} net profit ON ITS OWN{tp1_clause} "
                     f"(SL -> {fmt_num(new_sl)}){RST}")
-        log_event(self.asset, "tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price, "tp1_qty": tp1_qty,
+        self._log_event("tp1_breakeven_lock", {"new_sl": new_sl, "tp1_price": tp1_price, "tp1_qty": tp1_qty,
                                                         "rem_qty": rem_qty, "target_remaining_net": target_remaining_net,
                                                         "trigger": trigger_label})
 
@@ -11770,9 +12214,10 @@ class AthenaInstrument:
 
         lock_r = milestone - 1
         target_remaining_net = rem_qty * lock_r * R
-        entry_fee_share = fee_for_leg(self.asset, rem_qty, entry)
+        entry_fee_share = self._fee_for_leg(rem_qty, entry)
         needed_remaining_net = target_remaining_net + entry_fee_share
-        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net)
+        new_sl_raw = _new_sl_for_target_net(self.asset, pos_side, entry, rem_qty, needed_remaining_net,
+                                             fee_pct=(self._eff("fee_pct") / 100.0 if self.engine_id else None))
 
         pd = self.position.get("price_decimals", 2)
         qd = self.position.get("qty_decimals", 2)
@@ -11809,13 +12254,13 @@ class AthenaInstrument:
 
         if DRY_RUN:
             try:
-                cancel_result = await cancel_all(symbol)
+                cancel_result = await cancel_all(symbol, engine_id=self.engine_id)
             except Exception as e:
                 console_log(f"{self.asset}: {label} — cancel failed ({e})")
                 return
             if not _order_ok(cancel_result):
                 console_log(f"{self.asset}: {RED}{label} — cancel failed ({cancel_result}), aborting{RST}")
-                log_event(self.asset, "profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
+                self._log_event("profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
                 return
             await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
             for i, leg in enumerate(tp_legs, start=1):
@@ -11829,7 +12274,7 @@ class AthenaInstrument:
                     cancel_result = {"code": -1, "msg": str(e)}
                 if not _order_ok(cancel_result):
                     console_log(f"{self.asset}: {RED}{label} — SL cancel failed ({cancel_result}), aborting{RST}")
-                    log_event(self.asset, "profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
+                    self._log_event("profit_ratchet_cancel_failed", {"result": cancel_result, "milestone": milestone})
                     return
             await self._place_sl_with_retry(symbol, pos_side, new_sl, pd)
             self.position["sl_order_id"] = self._sl_order_id
@@ -11839,7 +12284,7 @@ class AthenaInstrument:
         console_log(f"{self.asset}: {GRN}{BLD}+{milestone}R open — stop ratcheted to lock "
                     f"{fmt_money(target_remaining_net)} net (+{lock_r}R) on the open "
                     f"{fmt_num(rem_qty, 2)} (SL -> {fmt_num(new_sl)}){RST}")
-        log_event(self.asset, "profit_ratchet", {"milestone": milestone, "lock_r": lock_r,
+        self._log_event("profit_ratchet", {"milestone": milestone, "lock_r": lock_r,
                                                   "new_sl": new_sl, "old_sl": cur_sl, "rem_qty": rem_qty,
                                                   "target_remaining_net": target_remaining_net, "live": live})
 
@@ -11883,7 +12328,7 @@ class AthenaInstrument:
         console_log(f"{self.asset}: {YLW}{label}{RST}")
         event_name = f"{reason}_flatten"
         try:
-            await cancel_all(symbol)
+            await cancel_all(symbol, engine_id=self.engine_id)
         except Exception:
             pass
 
@@ -11892,7 +12337,7 @@ class AthenaInstrument:
             qty = self.position.get("qty")
             entry = self.position.get("fill_price")
             try:
-                acc = await fetch_account()
+                acc = await fetch_account(self.engine_id)
                 pos = account_position(acc, symbol, pos_side)
                 if pos:
                     qty = abs(float(pos.get("size") or 0))
@@ -11900,10 +12345,10 @@ class AthenaInstrument:
                 pass
             if qty:
                 try:
-                    close_result = await market_close(symbol, pos_side, qty, reason=reason)
+                    close_result = await market_close(symbol, pos_side, qty, reason=reason, engine_id=self.engine_id)
                 except Exception as e:
                     console_log(f"{self.asset}: {label} close FAILED — {e}")
-                    log_event(self.asset, f"{event_name}_failed", {"error": str(e)})
+                    self._log_event(f"{event_name}_failed", {"error": str(e)})
                     return
                 if not _order_ok(close_result):
                     # Same hardening fix as the PCVR-flip-close path — a 200
@@ -11914,7 +12359,7 @@ class AthenaInstrument:
                     # (cancel_all already ran above) and nothing watching it.
                     console_log(f"{self.asset}: {RED}{BLD}CRITICAL — {label} close FAILED ({close_result}) — "
                                 f"position is STILL OPEN{RST}")
-                    log_event(self.asset, f"{event_name}_failed", {"result": close_result})
+                    self._log_event(f"{event_name}_failed", {"result": close_result})
                     return
             exit_price = await live_price_for_symbol(symbol)   # approximate, same caveat as position_closed
             pnl_approx = None
@@ -11928,7 +12373,7 @@ class AthenaInstrument:
             # bracket order, so nothing needs inferring. type is always
             # None (never a TP hit); price_exact is always False (same
             # live-price-at-detection approximation as every forced close).
-            log_event(self.asset, event_name, {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
+            self._log_event(event_name, {"symbol": symbol, "pos_side": pos_side, "qty": qty, "entry": entry,
                                                 "exit_approx": exit_price, "pnl_approx": pnl_approx,
                                                 "reason": reason.upper(), "type": None, "price_exact": False,
                                                 "sim": DRY_RUN})
@@ -11952,7 +12397,7 @@ class AthenaInstrument:
             self._update_daily_loss_limit(net_pnl)
             self._update_max_win_limit(net_pnl)
         else:
-            log_event(self.asset, event_name, {"note": "cancelled pending/resting order, no open position"})
+            self._log_event(event_name, {"note": "cancelled pending/resting order, no open position"})
 
         self.pending = None
         self.position = None
@@ -12177,7 +12622,7 @@ def fee_for_leg(asset, qty, price):
         return qty * FEE_QQQ_PER_UNIT
     return qty * price * FEE_ETH_PCT
 
-def _new_sl_for_target_net(asset, pos_side, entry, rem_qty, needed_remaining_net):
+def _new_sl_for_target_net(asset, pos_side, entry, rem_qty, needed_remaining_net, fee_pct=None):
     """Solves for the SL price that gives EXACTLY `needed_remaining_net`
     combined net profit on the remaining leg once it eventually closes at
     that price — used by `_apply_tp1_breakeven_lock`. The algebra depends
@@ -12197,13 +12642,21 @@ def _new_sl_for_target_net(asset, pos_side, entry, rem_qty, needed_remaining_net
         net = rem_qty*(new_sl - entry) - rem_qty*FEE_QQQ_PER_UNIT      [Long]
         -> new_sl = entry + net/rem_qty + FEE_QQQ_PER_UNIT
 
-    Both mirror for Short (sign-flipped around entry)."""
+    Both mirror for Short (sign-flipped around entry).
+
+    fee_pct=None (every existing call site) uses the bare FEE_ETH_PCT
+    global, unchanged. A 'Dual' mode ETH engine passes its OWN configured
+    fee_pct/100.0 instead, so this SL-solving algebra uses the SAME fee
+    rate that engine's own ledger actually charges — otherwise a Dual
+    engine with a non-default fee % would get a breakeven-lock/profit-
+    ratchet SL solved against the WRONG fee assumption."""
     if asset == "QQQ":
         offset = needed_remaining_net / rem_qty + FEE_QQQ_PER_UNIT
         return entry + offset if pos_side == "Long" else entry - offset
+    eth_fee_pct = fee_pct if fee_pct is not None else FEE_ETH_PCT
     if pos_side == "Long":
-        return (entry + needed_remaining_net / rem_qty) / (1 - FEE_ETH_PCT)
-    return (entry - needed_remaining_net / rem_qty) / (1 + FEE_ETH_PCT)
+        return (entry + needed_remaining_net / rem_qty) / (1 - eth_fee_pct)
+    return (entry - needed_remaining_net / rem_qty) / (1 + eth_fee_pct)
 
 PHEMEX_SYMBOL_TO_ASSET = {cfg["phemex_symbol"]: a for a, cfg in ASSETS.items()}
 
@@ -12330,7 +12783,20 @@ def _tp_slot(planned_tp_legs, tp_exits, idx):
         return {"price": leg.get("level"), "type": leg.get("type"), "hit": False}
     return None
 
-def _build_trade_rows(closed_trades, running_balance):
+def _fee_for_leg_display(asset, qty, price, engine_id=None):
+    """Same shape as fee_for_leg, except a Dual-mode engine's OWN
+    configured fee % is consulted instead of the bare FEE_ETH_PCT global
+    (2026-09-07) — this is a display-time RECOMPUTATION from current
+    config, not a value stored at log-write time (same pre-existing quirk
+    fee_for_leg's own callers in _build_trade_rows always had: editing
+    [E]'s fee % retroactively changes every historical row's displayed
+    fee too). engine_id=None (every legacy/single-engine row) is
+    byte-identical to calling fee_for_leg directly."""
+    if engine_id and asset == "ETH":
+        return qty * price * (DUAL_ENGINES[engine_id]["fee_pct"] / 100.0)
+    return fee_for_leg(asset, qty, price)
+
+def _build_trade_rows(closed_trades, running_balance, engine_id=None):
     """Shared per-trade aggregation — factored out 2026-08-11 (real-mode
     detailed trade table) from what used to be scan_all_trades_detailed's
     own inline loop. Both scan_all_trades_detailed (sim) and
@@ -12346,6 +12812,12 @@ def _build_trade_rows(closed_trades, running_balance):
     most-recent "reset" event, or SIM_DEFAULT_BALANCE) — pass None for real
     mode, which has no equivalent "reset" starting-balance concept; every
     row's own `balance`/`dd_pct` come back None then (renders as "—").
+
+    `engine_id` (2026-09-07 'Dual' mode, one call per engine — see
+    scan_all_trades_detailed's own per-engine grouping): tags every
+    output row with "engine" and uses that engine's own configured fee %
+    (_fee_for_leg_display) instead of the single-engine FEE_ETH_PCT
+    global. None for every legacy/single-engine call — unchanged.
 
     REASON gets " (approx)" appended whenever ANY exit in the trade was
     marked `price_exact: False` — real mode's one genuinely-approximated
@@ -12363,11 +12835,11 @@ def _build_trade_rows(closed_trades, running_balance):
         # ETH, flat $/unit for QQQ) is asset-specific, unlike the old flat
         # PHEMEX_FEE_RATE this replaced.
         asset = PHEMEX_SYMBOL_TO_ASSET.get(t["symbol"])
-        entry_fee = fee_for_leg(asset, entry_qty, entry_price)
+        entry_fee = _fee_for_leg_display(asset, entry_qty, entry_price, engine_id)
         exit_qty_total = sum(x["qty"] for x in exits)
         exit_price_avg = sum(x["price"] * x["qty"] for x in exits) / exit_qty_total if exit_qty_total else None
         gross_pnl = sum(x["pnl"] for x in exits)
-        exit_fees = sum(fee_for_leg(asset, x["qty"], x["price"]) for x in exits)
+        exit_fees = sum(_fee_for_leg_display(asset, x["qty"], x["price"], engine_id) for x in exits)
         total_fees = entry_fee + exit_fees
         net_pnl = gross_pnl - total_fees
         # trade_risk = qty * sl_distance (THIS asset's own fixed SL
@@ -12425,6 +12897,10 @@ def _build_trade_rows(closed_trades, running_balance):
             # per-trade record) always land here, so the table can show
             # "n/a" rather than a misleading "$0.00 charged".
             "funding": t.get("funding_total"),
+            # 2026-09-07 'Dual' mode: None for every legacy/single-engine
+            # trade (unchanged); 1 or 2 for a trade taken by that Dual
+            # engine — see the Data view's own ENGINE column.
+            "engine": engine_id,
         })
     return out
 
@@ -12627,22 +13103,36 @@ def scan_all_trades_detailed():
     # self-healing regardless of what any individual historical log entry
     # happens to say, and immediately correct the moment this function is
     # called, no separate backfill step needed ever again.
-    reset_balance = SIM_DEFAULT_BALANCE
+    # 2026-09-07 'Dual' mode: reset balances are now tracked PER ENGINE
+    # (reset_balances[None] for the single-engine account, [1]/[2] for
+    # each Dual engine's own — each engine's own SimAccount.reset() logs
+    # its own "reset" event tagged with its own engine via _sim_log, so
+    # this naturally partitions with zero change to how "reset" events
+    # are written).
+    reset_balances = {None: SIM_DEFAULT_BALANCE}
     for d in rows:
         if d.get("event") == "reset" and d.get("balance") is not None:
-            reset_balance = d["balance"]
-    running_balance = reset_balance
+            reset_balances[d.get("engine")] = d["balance"]
 
+    # 2026-09-07 'Dual' mode: the correlation key gains `engine` as its
+    # FIRST component — `d.get("engine")` is None for every legacy row
+    # (no engine field ever written before Dual mode existed) and 1/2 for
+    # a Dual engine's own rows, so this is fully backward compatible: old
+    # data pairs by (None, symbol, pos_side) exactly as it always has,
+    # and two engines that happen to both be Long ETH at once can never
+    # have their fills merged into one trade the way a bare (symbol,
+    # pos_side) key would.
     open_trades = {}
     closed_trades = []
     for d in rows:
         ev = d.get("event")
-        key = (d.get("symbol"), d.get("pos_side"))
+        engine = d.get("engine")
+        key = (engine, d.get("symbol"), d.get("pos_side"))
         if ev == "filled":
             if key in open_trades:
                 closed_trades.append(open_trades.pop(key))   # defensive — see docstring
             open_trades[key] = {
-                "symbol": d.get("symbol"), "pos_side": d.get("pos_side"),
+                "engine": engine, "symbol": d.get("symbol"), "pos_side": d.get("pos_side"),
                 "entry_ts": d.get("ts"), "entry_price": d.get("price"),
                 "qty": d.get("qty"), "entry_order_type": d.get("order_type"),
                 "sequence_label": d.get("sequence_label"),
@@ -12674,15 +13164,38 @@ def scan_all_trades_detailed():
             if sum(x["qty"] for x in t["exits"]) >= t["qty"] - 1e-9:
                 closed_trades.append(open_trades.pop(key))
 
-    out = _build_trade_rows(closed_trades, running_balance)
+    # 2026-09-07 'Dual' mode: TWO INDEPENDENT running-balance walks (one
+    # per engine group), not one shared walk — each engine has its own
+    # balance, so a merged chronological walk would nonsensically blend
+    # them. Built separately, tagged, then merged by exit_ts for display
+    # — this is also exactly what makes the Data page's "combined" trade
+    # log/PnL chart work with no separate merging logic of its own (see
+    # draw_data_view/the equity curve, which just consume this list).
+    by_engine = {}
+    for t in closed_trades:
+        by_engine.setdefault(t.get("engine"), []).append(t)
+
+    out = []
+    for engine_key, group in by_engine.items():
+        start_balance = reset_balances.get(
+            engine_key, DUAL_ENGINES[engine_key]["starting_balance"] if engine_key else SIM_DEFAULT_BALANCE)
+        group_rows = _build_trade_rows(group, start_balance, engine_id=engine_key)
+        if engine_key is None:
+            # 2026-08-27 explicit user request: the sim trading log (this
+            # table AND the PnL chart/stats header, which both derive
+            # their own data from this exact return value — see
+            # draw_data_view's caller) shows the retroactive "1R+W had
+            # been active the whole time" hypothetical instead of what
+            # was actually executed — see _apply_1r_plus_w_recompute's
+            # own docstring for the full rationale. 2026-09-07: this is a
+            # SINGLE-shared-global concept (a fixed SIZING_MODE/PCT
+            # applied retroactively) with no meaning for a Dual engine's
+            # own independently-configured sizing, so it's only ever
+            # applied to the single-engine (engine=None) group.
+            group_rows = _apply_1r_plus_w_recompute(group_rows, start_balance)
+        out.extend(group_rows)
+
     out.sort(key=lambda t: t["exit_ts"] or "")
-    # 2026-08-27 explicit user request: the sim trading log (this table
-    # AND the PnL chart/stats header, which both derive their own data
-    # from this exact return value — see draw_data_view's caller) shows
-    # the retroactive "1R+W had been active the whole time" hypothetical
-    # instead of what was actually executed — see
-    # _apply_1r_plus_w_recompute's own docstring for the full rationale.
-    out = _apply_1r_plus_w_recompute(out, reset_balance)
     return out
 
 def scan_real_trades_detailed(current_balance=None):
@@ -13100,8 +13613,14 @@ def _fee_drag_pct(trades):
 # narrower terminals now rely on [←]/[→] horizontal scroll (see
 # _draw_trades_table's own hscroll param) rather than truncation alone to
 # reach the columns this pushed further right.
+# ENGINE (2026-09-07, new) sits right after SYM — 'Dual' mode's two
+# concurrent engines both trade ETH, so SYM alone can no longer say which
+# one took a given trade; "Engine 1"/"Engine 2" here does. Blank for
+# every trade taken outside Dual mode (engine=None — see _build_trade_
+# rows/scan_all_trades_detailed), so this column reads as empty noise on
+# a normal single-engine trade history.
 TRADES_TABLE_COLS = [
-    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 20),
+    ("ENTRY", 12), ("EXIT", 12), ("SYM", 4), ("ENGINE", 8), ("DIR", 5), ("QTY", 6), ("SEQUENCE", 20),
     ("GROSS", 10), ("R:R", 6), ("ENTRY$", 9), ("EXIT$", 9),
     ("REASON", 10), ("FEES", 7), ("FUNDING", 9), ("NET PNL", 10), ("BALANCE", 11), ("DD", 10),
     ("R$", 7), ("TP1", 9), ("TP1 TYPE", 9), ("TP2", 9), ("TP2 TYPE", 9), ("DUR", 7),
@@ -13191,6 +13710,7 @@ def _draw_trades_table(db, y0, y1, cols, source, trades, scroll, hscroll=0):
             (_fmt_ts_short(t["entry_ts"]), P_DEFAULT),
             (_fmt_ts_short(t["exit_ts"]), P_DEFAULT),
             (t["asset"], P_DEFAULT),
+            (f"Engine {t['engine']}" if t.get("engine") else "—", P_CYAN if t.get("engine") else P_DIM),
             (t["pos_side"] or "—", P_GREEN if t["pos_side"] == "Long" else P_RED),
             (fmt_num(t["qty"], 2), P_DEFAULT),
             (t.get("sequence", "—"), P_YELLOW if "Win" in (t.get("sequence") or "") else P_DIM),
@@ -13616,7 +14136,7 @@ def _nearest_bar_ts(bars, epoch_ts):
             break
     return nearest
 
-def build_trade_markers(asset, bars, inst_snap, trade_pairs):
+def build_trade_markers(asset, bars, inst_snap, trade_pairs, engine=None):
     """Text-label markers (per explicit user request — labels, not arrows)
     for HISTORICAL trades only, both --dry-run and real: "ENTRY" at the
     fill, and the actual close reason ("TP"/"SL"/"FLIP"/"EOD") at the exit
@@ -13627,12 +14147,22 @@ def build_trade_markers(asset, bars, inst_snap, trade_pairs):
     the Recent Closed Trades blotter. The CURRENT live/pending position's
     Entry/SL/TP are drawn separately as full-width reference lines (see
     draw_footprint_panel's own position-levels pass) — a single point
-    marker doesn't fit "show me where TP1/TP2 actually are right now"."""
+    marker doesn't fit "show me where TP1/TP2 actually are right now".
+
+    engine=None (every existing call) shows every trade for this asset/
+    symbol, regardless of any Dual-mode tag — unchanged. 2026-09-07 'Dual'
+    mode: the OHLC chart's own Engine 1/Engine 2 switch passes its
+    selected engine here so only THAT engine's own historical trades draw
+    on the chart, not the other engine's (both trade the same real ETH,
+    so `symbol`/`asset` alone can no longer tell them apart — see
+    scan_all_trades_detailed's own engine-aware pairing key)."""
     events = []
     if not bars:
         return events
     symbol = ASSETS[asset]["phemex_symbol"]
     for t in trade_pairs:
+        if engine is not None and t.get("engine") != engine:
+            continue
         if DRY_RUN:
             if t.get("symbol") != symbol:
                 continue
@@ -14219,7 +14749,13 @@ def _draw_ndx_ohlc_panel(db, bars_1m, live_1m, top, y1, x0, x1, hscroll_bars=0, 
             ("Lunch", (11,30), (13,30), P_YELLOW,  None),
             ("PWR",   (14, 0), (15, 0), P_MAGENTA,   None),
             ("EOD",   (16, 0), (18, 0), P_GREEN, None),
-            ("EEOD",  (19,30), (23,59), P_RED,   None),
+            # 2026-09-06 user request ("The EEOD session should be tradable
+            # and no longer restricted"): was P_RED, the SAME color "Excl"
+            # (the genuine Tue/Wed 09:00-10:00 exclusion) uses — now that
+            # EEOD is a normal tradable session again, keeping it red would
+            # visually mislabel it as excluded right next to a row that
+            # actually is.
+            ("EEOD",  (19,30), (23,59), P_DIM,   None),
         ]
         from itertools import groupby as _groupby
         def _sess_date_key(_pair):
@@ -15073,7 +15609,11 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
             ("EOD",   (16, 0), (18, 0), P_GREEN, None),
             # 2026-08-30 user-reported ("EEOD should begin at 19:30 CT, not
             # 18:30 CT"): was (18,30) — moved to (19,30).
-            ("EEOD",  (19,30), (23,59), P_RED,   None),
+            # 2026-09-06 user request ("The EEOD session should be tradable
+            # and no longer restricted"): color was P_RED, matching "Excl"
+            # (the genuine Tue/Wed 09:00-10:00 exclusion) — now that EEOD
+            # is a normal tradable session, red would visually mislabel it.
+            ("EEOD",  (19,30), (23,59), P_DIM,   None),
         ]
         from itertools import groupby as _groupby
         def _sess_date_key(_pair):
@@ -15300,7 +15840,37 @@ def _draw_ohlc_chart_panel(db, asset, bars_1m, live_1m, top, y1, x0, x1, live_pr
     # the plain per-bar volume bars, same vol_top..vol_bot_excl footprint,
     # nothing else in the panel changes.
     if ui.get("vol_effort"):
-        db.puts(vol_top, x0, "VolEffort", P_DIM, curses.A_DIM)
+        _ve_label = "VolEffort"
+        db.puts(vol_top, x0, _ve_label, P_DIM, curses.A_DIM)
+        # Marker legend (2026-09-04 user request, following the same-day
+        # Absorption/Clean glyph-color fix above): the ▲/▼/◆ bias glyph
+        # drawn over each candle only ever appears in these two colors
+        # (see that glyph's own comment — the `klass in (...)` check right
+        # above skips drawing it at all for an ordinary, no-signal bar),
+        # so spelling both out here is a complete key, not a partial one.
+        # Drawn into the same blank-space-only real estate the ±hi_z/lo_z
+        # guide lines below already respect (they only ever write into a
+        # still-blank cell), so this legend safely wins any overlap with
+        # those rather than being silently overwritten by them. Skipped
+        # entirely on a pane too narrow to fit it without wrapping or
+        # colliding with the price-axis gutter — same "nothing to say
+        # rather than a garbled fit" precedent as this panel's other
+        # optional header tags (see closed_tag's own comment).
+        _ve_legend = [
+            ("   ", P_DIM, curses.A_DIM),
+            ("▲/▼/◆", P_DEFAULT, curses.A_BOLD),
+            ("=", P_DIM, curses.A_DIM),
+            ("Absorption", P_MAGENTA, curses.A_BOLD),
+            ("   ", P_DIM, curses.A_DIM),
+            ("▲/▼/◆", P_DEFAULT, curses.A_BOLD),
+            ("=", P_DIM, curses.A_DIM),
+            ("Clean", P_CYAN, curses.A_BOLD),
+        ]
+        _ve_lx = x0 + len(_ve_label)
+        if chart_r - _ve_lx >= sum(len(t) for t, _, _ in _ve_legend):
+            for _txt, _pair, _attrs in _ve_legend:
+                db.puts(vol_top, _ve_lx, _txt, _pair, _attrs)
+                _ve_lx += len(_txt)
         for r in range(vol_top, vol_bot_excl):
             db.put(r, chart_r, "│", P_DIM)
         # _ve_by_ts already computed once, up in the candle-drawing block
@@ -15548,7 +16118,26 @@ def draw_footprint_panel(db, asset, bars, inst_snap, y0, y1, x0, x1, profile_mod
                   f"C:{fmt_price(ch_header_bar['c'])} Δ:{fmt_delta(ch_header_bar.get('delta', 0.0))}")
     else:
         ch_tag = ""
-    header = f" {display_asset} FOOTPRINT — {profile_mode.upper()}{vp_mode_tag}{scroll_tag}{focus_tag}{closed_tag}{ch_tag} "
+    # 2026-09-07 user-reported (screenshot showing the crosshair OHLCV
+    # readout cut off mid-value, "09:33:00 O:2,472.73 H" with nothing
+    # after it): this used to be one unconditionally-concatenated string,
+    # hard-truncated to `cols` via `[:cols]` — `.center()` only PADS a
+    # string shorter than `cols`, it does nothing to shrink one that's
+    # already longer, so a crowded header (VP mode + VolEffort:On +
+    # SCROLLED + FOCUSED + the crosshair tag, all at once) just got
+    # chopped off wherever `cols` happened to land, mid-tag/mid-number.
+    # Now built incrementally in priority order — closed/scroll/crosshair
+    # first (state you could otherwise misread), then the more cosmetic
+    # VP-mode and focus tags — each optional tag added only if the WHOLE
+    # thing still fits; one that doesn't fit is dropped entirely, never
+    # sliced. focus_tag is deliberately last: focus is already visible via
+    # this header's own color (P_YELLOW vs P_CYAN, right below), so it's
+    # the least costly one to lose first under real space pressure.
+    header = f" {display_asset} FOOTPRINT — {profile_mode.upper()}"
+    for _tag in (closed_tag, scroll_tag, ch_tag, vp_mode_tag, focus_tag):
+        if _tag and len(header) + len(_tag) + 1 <= cols:
+            header += _tag
+    header += " "
     header_pair = P_YELLOW if focused else P_CYAN
     db.puts(y0, x0, header.center(cols, "─")[:cols], header_pair, curses.A_BOLD)
 
@@ -15977,9 +16566,22 @@ class AppState:
         self.closed_pnl = None
         self.equity = None   # balance + open_pnl (always a plain float once
                                # known, unlike open_pnl which is None while
-                               # flat for display purposes) — feeds the
-                               # drawdown de-risking ladder's own peak
-                               # tracking, see _update_equity_peak.
+                               # flat for display purposes) — DISPLAY only
+                               # (the "Equity" dashboard line); see
+                               # realized_balance below for what actually
+                               # feeds the drawdown tracker.
+        self.realized_balance = None   # 2026-09-07 user request ("DD should
+                               # only calculate DD AFTER a trade is closed,
+                               # net of fees") — `balance` as of the last
+                               # moment the account was fully FLAT; frozen
+                               # (unchanged) for the entire duration any
+                               # position is open, including the instant the
+                               # entry fee gets deducted from live `balance`.
+                               # Only ever reassigned in publish() while
+                               # `not has_open`. This, not live `balance` or
+                               # `equity`, is what _update_equity_peak/
+                               # _equity_drawdown_pct/current_drawdown_mult/
+                               # _clear_drawdown_block all read.
         self.event_log = []
         self.closed_trades = []
         self.trade_pairs = []
@@ -16055,18 +16657,41 @@ class AppState:
         has_open = any(i.position for i in instruments)
         closed_pnl = closed_pnl_today(DRY_RUN)
         equity = (balance + open_pnl_total) if balance is not None else None
-        _update_equity_peak(equity)
+        # 2026-09-07 user-reported ("the account is always in drawdown
+        # since it takes the deduction of fees as a dip from the equity
+        # high... should only calculate DD AFTER a trade is closed, net
+        # of fees"): the drawdown peak/tier tracker used to advance off
+        # live `equity` every cycle — bare `balance` alone isn't enough
+        # either, since the ENTRY fee is deducted from it the instant a
+        # trade fills, before price has moved at all. `realized_balance`
+        # (see AppState's own field comment) is only ever reassigned here
+        # while fully FLAT — a position being open, at any depth of open
+        # profit/loss/fee-drag, leaves it exactly where it was after the
+        # LAST close. _update_equity_peak (and every other drawdown
+        # reader — the dashboard, current_drawdown_mult,
+        # _clear_drawdown_block) reads this, never live balance/equity.
+        if not has_open:
+            _update_equity_peak(balance)
         inst_snap = {}
         for i in instruments:
-            inst_snap[i.asset] = {
+            # 2026-09-07 'Dual' mode: keyed by instance_key (== i.asset for
+            # every existing single-engine instrument, so this dict is
+            # unchanged for ETH/QQQ) so two same-asset engines each get
+            # their own dashboard/chart snapshot entry instead of
+            # silently overwriting each other's. live_price stays keyed
+            # by the REAL asset — shared market data, identical for both
+            # engines trading the same underlying.
+            dl_state = DAILY_LOSS_STATE.setdefault(i.instance_key, _default_daily_loss_state_row())
+            mw_state = MAX_WIN_STATE.setdefault(i.instance_key, _default_max_win_state_row())
+            inst_snap[i.instance_key] = {
                 "lights": dict(i.lights), "regime": i.regime, "price": i.price, "state": i.state,
                 "pending": dict(i.pending) if i.pending else None,
                 "position": dict(i.position) if i.position else None,
                 "live_price": live_prices.get(i.asset),
                 "market_closed": i.market_closed,
                 "sl_missing": i._sl_missing,
-                "daily_loss_blocked": DAILY_LOSS_STATE[i.asset]["blocked"],
-                "max_win_blocked": MAX_WIN_STATE[i.asset]["blocked"],
+                "daily_loss_blocked": dl_state["blocked"],
+                "max_win_blocked": mw_state["blocked"],
                 "targets": list(i.last_targets) if i.last_targets else [],
                 "er_bands": dict(i.last_er_bands) if i.last_er_bands else None,
             }
@@ -16092,6 +16717,8 @@ class AppState:
             self.margin_used = margin_used
             self.open_pnl = open_pnl_total if has_open else None
             self.equity = equity
+            if not has_open:
+                self.realized_balance = balance
             self.closed_pnl = closed_pnl
             self.event_log = list(_event_log)
             self.closed_trades = recent_closed_trades(6)
@@ -16117,6 +16744,7 @@ class AppState:
                 "instruments": self.instruments, "snapshot_age": self.snapshot_age,
                 "balance": self.balance, "available": self.available, "margin_used": self.margin_used,
                 "open_pnl": self.open_pnl, "closed_pnl": self.closed_pnl,
+                "realized_balance": self.realized_balance,
                 "event_log": self.event_log, "closed_trades": self.closed_trades,
                 "trade_pairs": self.trade_pairs,
                 "footprint_bars": self.footprint_bars, "live_bars": self.live_bars,
@@ -16150,6 +16778,7 @@ class AppState:
             self.available = data.get("available")
             self.margin_used = data.get("margin_used")
             self.open_pnl = data.get("open_pnl")
+            self.realized_balance = data.get("realized_balance")
             self.closed_pnl = data.get("closed_pnl")
             self.event_log = data.get("event_log", [])
             self.closed_trades = data.get("closed_trades", [])
@@ -16183,7 +16812,7 @@ class AppState:
 APP_STATE = AppState()
 
 def _apply_wire_control_flags(data):
-    """Client side — DRY_RUN/NO_SESSION/ATHENA_ENABLED/SIZING_MODE/
+    """Client side — DRY_RUN/SESSION_MODE/ATHENA_ENABLED/SIZING_MODE/
     SIZING_STATE are plain module globals, NOT part of AppState, but
     draw_dashboard's own shared render code (the SAME function Server and
     Client both call — see curses_main) reads them directly as globals —
@@ -16197,12 +16826,12 @@ def _apply_wire_control_flags(data):
     shared for anyone to see." Called only by _sync_client_connect_loop,
     once per received app_state message (every message carries a
     "control" section — see _sync_broadcast_app_state)."""
-    global DRY_RUN, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, SIZING_STATE, PROFIT_RATCHET_ENABLED
+    global DRY_RUN, SESSION_MODE, ATHENA_ENABLED, SIZING_MODE, SIZING_STATE, PROFIT_RATCHET_ENABLED
     control = data.get("control")
     if not control:
         return
     DRY_RUN = control.get("dry_run", DRY_RUN)
-    NO_SESSION = control.get("no_session", NO_SESSION)
+    SESSION_MODE = control.get("session_mode", SESSION_MODE)
     if "athena_enabled" in control:
         ATHENA_ENABLED = control["athena_enabled"]
     SIZING_MODE = control.get("sizing_mode", SIZING_MODE)
@@ -16416,6 +17045,14 @@ _flatten_scope = ["ALL"]   # 2026-07-28 — curses thread writes "ETH"/"QQQ"/"AL
                             # _flatten_all_evt, same single-item cross-thread box
                             # _reset_sim_balance already established for [R].
 _profile_mode_idx = [0]   # mutable single-item box so the curses thread's [V] key can cycle it in place
+_dual_mode_toggle_evt = threading.Event()   # 2026-09-07 'Dual' mode — [B] (successfully
+                                              # enabled/disabled/DUAL_MODE_ACTIVE flipped)
+                                              # sets this; engine_loop is the only thing
+                                              # that owns/iterates `instruments`, so the
+                                              # actual list rebuild (single ETH/QQQ <->
+                                              # ETH#1/ETH#2/QQQ) happens there, not on the
+                                              # curses thread — same cross-thread signal
+                                              # convention as _reset_sim_evt/_flatten_all_evt.
 
 # ── Server Mode / Client Mode — networking ──────────────────────────────────
 # Server side: accept loop + per-client handshake thread + a broadcast
@@ -16645,7 +17282,7 @@ def _sync_broadcast_app_state(include_footprint=True):
         if not include_footprint:
             data = dict(data)
             data.pop("footprint_bars", None)
-        # "control" — DRY_RUN/NO_SESSION/ATHENA_ENABLED/SIZING_MODE/
+        # "control" — DRY_RUN/SESSION_MODE/ATHENA_ENABLED/SIZING_MODE/
         # SIZING_STATE are plain module globals, NOT part of AppState,
         # but draw_dashboard's own shared render code (identical on Server
         # and Client) reads them directly as globals — see
@@ -16657,7 +17294,7 @@ def _sync_broadcast_app_state(include_footprint=True):
                             # a fresh copy in the include_footprint=False
                             # branch above; avoid a redundant second copy
         data["control"] = {
-            "dry_run": DRY_RUN, "no_session": NO_SESSION,
+            "dry_run": DRY_RUN, "session_mode": SESSION_MODE,
             "athena_enabled": dict(ATHENA_ENABLED),
             "sizing_mode": SIZING_MODE,
             "profit_ratchet": PROFIT_RATCHET_ENABLED,
@@ -17832,7 +18469,7 @@ async def engine_loop():
         return
 
     console_log(f"{BLD}Athena starting{RST} — interval={INTERVAL}s pct={PCT}% dry_run={DRY_RUN}")
-    log_event("SYSTEM", "startup", {"interval": INTERVAL, "pct": PCT, "dry_run": DRY_RUN, "no_session": NO_SESSION})
+    log_event("SYSTEM", "startup", {"interval": INTERVAL, "pct": PCT, "dry_run": DRY_RUN, "session_mode": SESSION_MODE})
     if not DRY_RUN:
         # Safety requirement (explicit user request 2026-07-25) — ATHENA_ENABLED
         # was already initialized to False for every asset at module load
@@ -17899,24 +18536,59 @@ async def engine_loop():
         if _reset_sim_evt.is_set():
             _reset_sim_evt.clear()
             if DRY_RUN:
-                new_balance = _reset_sim_balance[0]
-                get_sim_account().reset(new_balance)
-                _reset_sizing_state()
-                _reset_daily_loss_state()
-                _reset_max_win_state()
-                _reset_equity_peak_state()
-                _reset_closed_pnl_state_sim()
+                # 2026-09-07 user-decided ("[R] resets each engine to its
+                # own configured starting balance, not one shared prompted
+                # value"): while Dual mode is active, `instruments` holds
+                # ETH#1/ETH#2/QQQ, not the plain single ETH — resetting
+                # ONLY the default (unused-while-Dual) account would leave
+                # the two engines that are actually trading completely
+                # untouched. _reset_sim_balance[0] (the [R] prompt's typed
+                # amount) is simply ignored in this branch — it has no
+                # single meaning once there are two independently
+                # configured balances.
+                if DUAL_MODE_ACTIVE:
+                    _reset_dual_engine_accounts()
+                    console_log(f"{YLW}Dual engines reset — Engine 1 to ${DUAL_ENGINES[1]['starting_balance']:,.2f}, "
+                                f"Engine 2 to ${DUAL_ENGINES[2]['starting_balance']:,.2f}{RST} (via [R])")
+                    log_event("SYSTEM", "dual_engines_reset_inapp", {"engines": DUAL_ENGINES})
+                else:
+                    new_balance = _reset_sim_balance[0]
+                    get_sim_account().reset(new_balance)
+                    _reset_sizing_state()
+                    _reset_daily_loss_state()
+                    _reset_max_win_state()
+                    _reset_equity_peak_state()
+                    _reset_closed_pnl_state_sim()
+                    console_log(f"{YLW}Paper account reset to ${new_balance:,.2f}{RST} (via [R])")
+                    log_event("SYSTEM", "reset_sim_inapp", {"balance": new_balance})
                 # A wiped sim ledger has no positions/orders left for these
                 # to match against — force them back to WATCHING too, or
                 # _check_fill/_manage_position would just poll forever
-                # against a fill/position that no longer exists.
+                # against a fill/position that no longer exists. Applies
+                # regardless of which branch above ran.
                 for inst in instruments:
                     inst.pending = None
                     inst.position = None
                     inst.state = "WATCHING"
                     inst.lights["Order Flow"] = False
-                console_log(f"{YLW}Paper account reset to ${new_balance:,.2f}{RST} (via [R])")
-                log_event("SYSTEM", "reset_sim_inapp", {"balance": new_balance})
+
+        if _dual_mode_toggle_evt.is_set():
+            _dual_mode_toggle_evt.clear()
+            # 2026-09-07 'Dual' mode — the ONLY place `instruments` (owned
+            # entirely by this loop/thread) gets rebuilt: [ETH, QQQ] <->
+            # [ETH#1, ETH#2, QQQ]. The [B] key handler already refused
+            # this toggle if any instrument had an open position/pending
+            # order, so there's nothing in-flight to lose here — a fresh
+            # AthenaInstrument starts clean (WATCHING, no position), which
+            # is correct since nothing was open when this fired.
+            if DUAL_MODE_ACTIVE:
+                instruments = [AthenaInstrument("ETH", engine_id=1), AthenaInstrument("ETH", engine_id=2),
+                               AthenaInstrument("QQQ")]
+                console_log(f"{GRN}{BLD}Dual mode engine topology active — Engine 1 & Engine 2 both trading ETH{RST}")
+            else:
+                instruments = [AthenaInstrument(a) for a in ASSETS]
+                console_log(f"{YLW}Dual mode topology cleared — back to single-engine ETH/QQQ{RST}")
+            log_event("SYSTEM", "dual_mode_topology_changed", {"dual_mode_active": DUAL_MODE_ACTIVE})
 
         if _flatten_all_evt.is_set():
             _flatten_all_evt.clear()
@@ -18079,7 +18751,9 @@ def draw_dashboard(db, snap, cols):
     # Per-asset PAUSED state now shown on each instrument's own title line
     # below (not here) — a single shared tag stopped making sense once [A]
     # could pause ETH and QQQ independently.
-    mode_tag = ('  [DRY RUN]' if DRY_RUN else '') + ('  [24H MODE]' if NO_SESSION else '')
+    mode_tag = (('  [DRY RUN]' if DRY_RUN else '')
+                + ('  [24H MODE]' if SESSION_MODE == "24h" else
+                   '  [SUN ON]' if SESSION_MODE == "sunday_on" else ''))
     now_et = datetime.now(TZ_ET).strftime("%I:%M:%S %p ET") if TZ_ET else "ET n/a"
     now_ct = datetime.now(TZ_CT).strftime("%I:%M:%S %p CT") if TZ_CT else "CT n/a"
     db.puts_ansi(y, 0, f"{BLD}{CYN}ATHENA{RST}{DIM} — {now_et} | {now_ct} | interval {INTERVAL}s | "
@@ -18121,7 +18795,19 @@ def draw_dashboard(db, snap, cols):
     _dd_peak = _dd_st["peak"]
     dd_txt = ""
     if _dd_peak:
-        _dd_pct = _equity_drawdown_pct(equity)
+        # 2026-09-07 user-reported ("the account is always in drawdown
+        # since it takes the deduction of fees as a dip from the equity
+        # high... should only calculate DD AFTER a trade is closed, net
+        # of fees"): this used to read live `equity` (balance + open
+        # PnL) — the entry fee alone dips that below the peak the instant
+        # ANY trade opens, before price even moves, so the account read
+        # as "in drawdown" almost continuously. Drawdown now reads
+        # `snap["realized_balance"]` — frozen at its last value for the
+        # entire time any position is open (see AppState.realized_
+        # balance's own comment, and publish()'s call site) — so it only
+        # moves once a trade actually closes and its full net result
+        # (fees included) lands in it.
+        _dd_pct = _equity_drawdown_pct(snap["realized_balance"])
         # 2026-08-27: label reflects the PERSISTED (hysteresis-aware)
         # tier actually being applied to sizing, not a fresh dd_pct
         # lookup — see current_drawdown_mult's own docstring for why
@@ -18154,35 +18840,62 @@ def draw_dashboard(db, snap, cols):
     db.puts_ansi(y, 0, f"{DIM}Margin Used{RST}   {fmt_money(margin_used) if margin_used is not None else 'n/a'}{DIM}{pct_tag}{RST}")
     y += 2   # blank row separates ACCOUNT from the first instrument block
 
-    for asset in ASSETS:
-        inst = snap["instruments"].get(asset) or {}
+    # 2026-09-07 'Dual' mode: three instrument rows (Engine 1 / Engine 2 /
+    # QQQ) instead of the normal two (ETH / QQQ) — QQQ's own row is kept
+    # as-is (monitoring only; it can never actually trade), not replaced.
+    # `instance_key` is what every per-INSTRUMENT lookup below uses
+    # (snap["instruments"], ATHENA_ENABLED, SIZING_STATE — all keyed by
+    # instance_key since Phase 1/2, "ETH#1"/"ETH#2" for a Dual engine,
+    # else identical to `asset`); `asset` itself stays the REAL underlying
+    # for every lookup into genuinely shared market data (PHEMEX_BID_ASK,
+    # FUNDING_RATE) that's identical for both engines regardless.
+    _dashboard_rows = ([("ETH#1", "ETH", " (Engine 1)"), ("ETH#2", "ETH", " (Engine 2)"), ("QQQ", "QQQ", "")]
+                        if DUAL_MODE_ACTIVE else [(a, a, "") for a in ASSETS])
+    for instance_key, asset, engine_label in _dashboard_rows:
+        inst = snap["instruments"].get(instance_key) or {}
         lights = inst.get("lights", {})
         names = gated_light_names()
         segs = "".join((GRN if lights.get(n) else RED) + "█" + RST for n in names)
         count = sum(1 for n in names if lights.get(n))
-        paused_tag = " [PAUSED]" if not ATHENA_ENABLED[asset] else ""
+        paused_tag = " [PAUSED]" if not ATHENA_ENABLED.get(instance_key, DRY_RUN) else ""
         loss_limit_tag = " [LOSS LIMIT]" if inst.get("daily_loss_blocked") else ""
         win_limit_tag = " [WIN LIMIT]" if inst.get("max_win_blocked") else ""
-        title = f"── {asset}{paused_tag}{loss_limit_tag}{win_limit_tag} "
+        title = f"── {asset}{engine_label}{paused_tag}{loss_limit_tag}{win_limit_tag} "
         db.puts(y, 0, (title + "─" * max(2, min(cols, BOX_W) - len(title)))[:cols], P_DIM)
         if paused_tag:
             # Overlay just the tag in red/bold — the dash-fill above is
             # already drawn plain-DIM the full width, so this only needs
             # to color the few characters the tag itself occupies.
-            tag_x = len(f"── {asset}")
+            # 2026-09-07: engine_label folded into this offset too (empty
+            # string outside Dual mode, so unchanged there) — otherwise
+            # the overlay would land on top of " (Engine N)" instead of
+            # the actual paused_tag text.
+            tag_x = len(f"── {asset}{engine_label}")
             db.puts(y, tag_x, paused_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         if loss_limit_tag:
             # Same overlay technique, positioned after paused_tag (both
             # can show at once — paused and loss-limited are independent).
-            tag_x = len(f"── {asset}{paused_tag}")
+            tag_x = len(f"── {asset}{engine_label}{paused_tag}")
             db.puts(y, tag_x, loss_limit_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         if win_limit_tag:
             # Same overlay technique again, positioned after loss_limit_tag
             # (paused, loss-limited, and win-limited are all independent —
             # any combination can show at once).
-            tag_x = len(f"── {asset}{paused_tag}{loss_limit_tag}")
+            tag_x = len(f"── {asset}{engine_label}{paused_tag}{loss_limit_tag}")
             db.puts(y, tag_x, win_limit_tag[:max(0, cols - tag_x)], P_RED, curses.A_BOLD)
         y += 1
+        # 2026-09-07 'Dual' mode: this row's OWN effective trading mode/
+        # sizing mode/risk structure/session mode — a Dual engine's own
+        # DUAL_ENGINES config, not the single-engine global — so Engine
+        # 1/Engine 2 can show genuinely different settings on the
+        # dashboard instead of both echoing whatever [9]/[0]/[8]/[N] last
+        # set (which is exactly the ambiguity those keys becoming no-ops
+        # in Dual mode is meant to avoid).
+        _row_engine_id = {"ETH#1": 1, "ETH#2": 2}.get(instance_key)
+        eff_trading_mode = DUAL_ENGINES[_row_engine_id]["trading_mode"] if _row_engine_id else TRADING_MODE
+        eff_sizing_mode = DUAL_ENGINES[_row_engine_id]["sizing_mode"] if _row_engine_id else SIZING_MODE
+        eff_risk_structure = DUAL_ENGINES[_row_engine_id]["risk_structure"] if _row_engine_id else RISK_STRUCTURE
+        eff_session_mode = DUAL_ENGINES[_row_engine_id]["session_mode"] if _row_engine_id else SESSION_MODE
         if inst.get("market_closed"):
             regime_txt, state_txt = "n/a", "CLOSED"
         else:
@@ -18234,25 +18947,25 @@ def draw_dashboard(db, snap, cols):
         # indistinguishable from the key doing nothing at all. Every mode
         # now shows something, so the dashboard itself confirms the
         # toggle fired regardless of which mode it landed on.
-        if SIZING_MODE == "aggressive":
-            boost = SIZING_STATE[asset].get("pending_boost_dollars")
+        if eff_sizing_mode == "aggressive":
+            boost = SIZING_STATE.get(instance_key, {}).get("pending_boost_dollars")
             sizing_txt = (f"   {DIM}Sizing: Aggressive (next: base+${boost:,.2f}){RST}" if boost
                           else f"   {DIM}Sizing: Aggressive{RST}")
-        elif SIZING_MODE == "aggressive_033":
-            boost = SIZING_STATE[asset].get("aggressive_033_pending_boost_dollars")
+        elif eff_sizing_mode == "aggressive_033":
+            boost = SIZING_STATE.get(instance_key, {}).get("aggressive_033_pending_boost_dollars")
             sizing_txt = (f"   {DIM}Sizing: Aggressive/1R+0.33W (next: base+${boost:,.2f}){RST}" if boost
                           else f"   {DIM}Sizing: Aggressive/1R+0.33W{RST}")
         else:
             sizing_txt = f"   {DIM}Sizing: Standard{RST}"
-        mode_tag = f"   {DIM}mode: {TRADING_MODE}{RST}" if TRADING_MODE != "Order Flow" else ""
+        mode_tag = f"   {DIM}mode: {eff_trading_mode}{RST}" if eff_trading_mode != "Order Flow" else ""
         # 2026-09-02 user request ("The risk structure should be shown in
         # the main dashboard next to the mode (right now it doesn't show
         # anything, only in the log)"): RISK_STRUCTURE only ever applies
         # to ETH under NV/NV-Auto (see RISK_STRUCTURES/[8]) — shown right
         # after mode_tag, same condition _check_fill/_manage_position etc.
         # already gate the structure itself on.
-        risk_structure_tag = (f"   {DIM}risk: {RISK_STRUCTURE}{RST}"
-                               if asset == "ETH" and TRADING_MODE in ("NV", "NV-Auto") else "")
+        risk_structure_tag = (f"   {DIM}risk: {eff_risk_structure}{RST}"
+                               if asset == "ETH" and eff_trading_mode in ("NV", "NV-Auto") else "")
         ratchet_tag = f"   {DIM}trail: +(N-1)R lock{RST}" if PROFIT_RATCHET_ENABLED else ""
         db.puts_ansi(y, 0, f"  [{segs}] {count}/{len(names)}   regime: {regime_txt}   state: {state_txt}{price_txt}{bidask_txt}{funding_txt}{sizing_txt}{mode_tag}{risk_structure_tag}{ratchet_tag}")
         y += 1
@@ -18274,9 +18987,9 @@ def draw_dashboard(db, snap, cols):
         # (NV-Auto's regime was ALSO silently falling back to PCVR).
         detail = "  " + "  ".join(
             (GRN if lights.get(n) else RED) +
-            ("BTD" if n == "Order Flow" and TRADING_MODE in ("BTD", "NV", "NV-Auto") else
-             "NV" if n == "PCVR" and TRADING_MODE in ("NV", "NV-Auto") else n) +
-            RST + (f"{DIM}(bypassed){RST}" if n == "Session" and NO_SESSION else "")
+            ("BTD" if n == "Order Flow" and eff_trading_mode in ("BTD", "NV", "NV-Auto") else
+             "NV" if n == "PCVR" and eff_trading_mode in ("NV", "NV-Auto") else n) +
+            RST + (f"{DIM}(bypassed){RST}" if n == "Session" and eff_session_mode == "24h" else "")
             for n in LIGHT_ORDER)
         db.puts_ansi(y, 0, detail)
         y += 1
@@ -19061,6 +19774,194 @@ def _prompt_flatten_scope(stdscr):
     finally:
         stdscr.nodelay(True)
     return result
+
+def _prompt_choice(stdscr, title, options, current=None):
+    """2026-09-07 'Dual' mode — generic single-keypress choice picker,
+    the same bordered-box pattern _prompt_flatten_scope already
+    established, generalized to any list of (key_char, label, value)
+    options rather than one hardcoded ETH/QQQ/ALL set. Unlike
+    _prompt_flatten_scope (where any non-matching key CANCELS the whole
+    flatten action), an unrecognized key here just keeps waiting — this
+    is one field in a multi-step setup wizard, not a one-shot destructive
+    action, so a stray keypress shouldn't blow away the rest of the flow.
+    Esc explicitly keeps `current` (the field's own existing value)
+    unchanged, letting a setup/edit flow be re-run without being forced
+    to re-pick every single field."""
+    rows, cols = stdscr.getmaxyx()
+    opts_line = "  ".join(f"[{k}] {label}" for k, label, _v in options) + "   [Esc] keep current"
+    box_lines = ["", title, "", opts_line, ""]
+    box_w = min(cols - 4, max(60, max(len(l) for l in box_lines) + 4))
+    box_h = len(box_lines) + 2
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+
+    result = current
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    try:
+        attrs = curses.color_pair(P_CYAN) | curses.A_BOLD
+        # 2026-09-08 fix ("dialog boxes stacking on top of each other"):
+        # _run_dual_engine_setup chains many _prompt_choice calls back to
+        # back, each with its own title/option text — box_w varies per
+        # call (sized to fit that call's own content) while box_h is
+        # always the same fixed 7 rows. A narrower box drawn after a
+        # wider one only overwrites its own (smaller) footprint, leaving
+        # the wider box's outer border/text fragments still on screen
+        # right beside the new box. Blank out the full row range at the
+        # WIDEST this box could ever be (cols - 4, same ceiling box_w
+        # itself is capped to) before drawing, so any previous box —
+        # narrower or wider — is always fully covered first.
+        max_w = max(0, cols - 4)
+        mx0 = max(0, (cols - max_w) // 2)
+        blank = " " * max(0, min(max_w, cols - mx0 - 1))
+        for r in range(box_h):
+            try:
+                stdscr.addstr(y0 + r, mx0, blank)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+            for i, line in enumerate(box_lines):
+                stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+            stdscr.addstr(y0 + 1 + len(box_lines), x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        while True:
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch == "\x1b":
+                break
+            if not isinstance(ch, str):
+                continue
+            match = next((value for k, _label, value in options if ch.lower() == k.lower()), None)
+            if match is not None:
+                result = match
+                break
+    finally:
+        stdscr.nodelay(True)
+    return result
+
+def _prompt_number_boxed(stdscr, title, default=None):
+    """Boxed numeric-input variant of _prompt_number, used only by
+    _run_dual_engine_setup (2026-09-08 user-reported — "the prompts jump
+    from being in dialog boxes to being prompts at the bottom of the
+    terminal... every prompt for [B] should be in a dialog box"): the
+    wizard's three numeric fields (starting balance, risk %, fee %) used
+    to fall through to the plain footer-row _prompt_number, breaking the
+    consistent bordered-box look every _prompt_choice field around them
+    already has. Same get_wch()-loop typed-buffer handling as
+    _prompt_number, drawn inside a _prompt_choice-style box instead.
+    Returns the entered float, or `default` if left blank/Esc'd."""
+    rows, cols = stdscr.getmaxyx()
+    default_disp = f"{default:,.2f}" if default is not None else "0.00"
+    # Sized off a worst-case sample line, not the live typed buffer, so
+    # the box itself never resizes mid-keystroke — only its content text
+    # is redrawn each time.
+    sample = f"$ 000000.00   (current {default_disp})   [Enter] confirm   [Esc] keep current"
+    box_w = min(cols - 4, max(60, max(len(l) for l in ("", title, "", sample, "")) + 4))
+    box_h = 7
+    x0 = max(0, (cols - box_w) // 2)
+    y0 = max(0, (rows - box_h) // 2)
+
+    buf = ""
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    try:
+        attrs = curses.color_pair(P_CYAN) | curses.A_BOLD
+        while True:
+            content = f"$ {buf}   (current {default_disp})   [Enter] confirm   [Esc] keep current"
+            box_lines = ["", title, "", content, ""]
+            # Clear the full max-width footprint first (same fix as
+            # _prompt_choice — guards against a differently-sized box
+            # chained immediately before/after this one in the wizard,
+            # and against this field's OWN content growing/shrinking a
+            # character at a time as the user types).
+            max_w = max(0, cols - 4)
+            mx0 = max(0, (cols - max_w) // 2)
+            blank = " " * max(0, min(max_w, cols - mx0 - 1))
+            for r in range(box_h):
+                try:
+                    stdscr.addstr(y0 + r, mx0, blank)
+                except curses.error:
+                    pass
+            try:
+                stdscr.addstr(y0, x0, ("┌" + "─" * (box_w - 2) + "┐")[:box_w], attrs)
+                for i, line in enumerate(box_lines):
+                    stdscr.addstr(y0 + 1 + i, x0, ("│" + line.center(box_w - 2)[:box_w - 2] + "│"), attrs)
+                stdscr.addstr(y0 + 1 + len(box_lines), x0, ("└" + "─" * (box_w - 2) + "┘")[:box_w], attrs)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except Exception:
+                continue
+            if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                break
+            if ch == "\x1b":
+                buf = ""
+                break
+            if ch in ("\x08", "\x7f") or ch == curses.KEY_BACKSPACE:
+                buf = buf[:-1]
+            elif isinstance(ch, str) and (ch.isdigit() or ch == "."):
+                buf += ch
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+    if not buf:
+        return default
+    try:
+        return max(0.0, float(buf))
+    except ValueError:
+        return default
+
+def _run_dual_engine_setup(stdscr, current_engines):
+    """2026-09-07 'Dual' mode guided setup — 7 fields x 2 engines, chained
+    single-field prompts (each following _prompt_choice's/
+    _prompt_number_boxed's own proven get_wch()-loop shape — 2026-09-08:
+    numeric fields moved from the plain footer-row _prompt_number to
+    _prompt_number_boxed so every field in the wizard shares the same
+    bordered-box look), reusing `current_engines` as each field's own
+    default so re-running this to EDIT an already-configured Dual mode
+    doesn't force re-entering every value. Returns a fresh {1: {...},
+    2: {...}} config dict — never None; Esc on any single field just
+    keeps that field's own current value, there's no "cancel the whole
+    wizard" concept (matches _prompt_choice/_prompt_number_boxed's own
+    per-field Esc-keeps-current behavior)."""
+    new_engines = {}
+    for engine_id in (1, 2):
+        cur = current_engines[engine_id]
+        cfg = {}
+        cfg["trading_mode"] = _prompt_choice(
+            stdscr, f"Engine {engine_id} — trading mode",
+            [("o", "Order Flow", "Order Flow"), ("b", "BTD candle-close", "BTD"),
+             ("n", "NV candle-close", "NV"), ("a", "NV-Auto immediate-entry", "NV-Auto")],
+            current=cur["trading_mode"])
+        cfg["sizing_mode"] = _prompt_choice(
+            stdscr, f"Engine {engine_id} — sizing mode",
+            [("s", "Standard", "standard"), ("a", "Aggressive (1R+W)", "aggressive"),
+             ("t", "Aggressive/1R+0.33W", "aggressive_033")],
+            current=cur["sizing_mode"])
+        cfg["starting_balance"] = _prompt_number_boxed(
+            stdscr, f"Engine {engine_id} — starting balance ($)", default=cur["starting_balance"])
+        cfg["pct"] = _prompt_number_boxed(
+            stdscr, f"Engine {engine_id} — risk per trade (% of balance)", default=cur["pct"])
+        cfg["risk_structure"] = _prompt_choice(
+            stdscr, f"Engine {engine_id} — risk structure",
+            [("s", "Standard", "Standard"), ("f", "Fixed", "Fixed"), ("v", "VE", "VE")],
+            current=cur["risk_structure"])
+        cfg["fee_pct"] = _prompt_number_boxed(
+            stdscr, f"Engine {engine_id} — fee (% of position value)", default=cur["fee_pct"])
+        cfg["session_mode"] = _prompt_choice(
+            stdscr, f"Engine {engine_id} — session restrictions ([N] equivalent)",
+            [("s", "Standard Sessions", "standard"), ("u", "Sunday On", "sunday_on"),
+             ("h", "24H", "24h")],
+            current=cur["session_mode"])
+        new_engines[engine_id] = cfg
+    return new_engines
 
 def _go_live(stdscr):
     """[G] — switch from --dry-run paper trading to the REAL Phemex
@@ -20625,21 +21526,21 @@ OPTFLOW_EXCL_DAYS_09    = {2, 3}
 OPTFLOW_EXCL_START      = 540
 OPTFLOW_EXCL_END        = 600
 OPTFLOW_EXCL_SUN        = 6
-OPTFLOW_EXCL_EEOD_START = 1170   # 2026-08-30 user-reported ("EEOD should
-                                   # begin at 19:30 CT, not 18:30 CT"): was
-                                   # 1110 (18:30 CT) — moved to 1170 (19:30 CT).
 
 def _optflow_session_status():
+    # 2026-09-06 user request ("The EEOD session should be tradable and no
+    # longer restricted") + [N]'s new "Sunday On" mode — mirrors the exact
+    # same two changes made to status_get_session_status (this is a
+    # display-only duplicate of that function for the Options Flow panel;
+    # kept in sync so the two never show conflicting session info).
     now_ct = datetime.now(timezone.utc) + OPTFLOW_CT_OFFSET
     t_mins = now_ct.hour * 60 + now_ct.minute
     dow = now_ct.weekday()
     excl_reason = None
-    if dow == OPTFLOW_EXCL_SUN:
+    if dow == OPTFLOW_EXCL_SUN and SESSION_MODE == "standard":
         excl_reason = 'Sunday — no trading'
     elif dow in OPTFLOW_EXCL_DAYS_09 and OPTFLOW_EXCL_START <= t_mins < OPTFLOW_EXCL_END:
         excl_reason = 'Excluded (09:00–10:00)'
-    elif t_mins >= OPTFLOW_EXCL_EEOD_START:
-        excl_reason = 'EEOD — no trading'
     for name, start, end, col in OPTFLOW_KILL_ZONES:
         if start <= t_mins < end:
             return name, col, excl_reason
@@ -21819,6 +22720,7 @@ TRADING_HELP_SECTIONS = [
         ("[4]",        "Toggle VAH/VAL/POC Historical Mode (developing trace) vs. Normal"),
         ("[6]",        "Toggle VolEffort — replaces the VOL histogram with a volume-effort z-score chart"),
         ("[Y]",        "QQQ pane only — cycle candle chart -> Markets overview -> NDX chart -> back"),
+        ("[U]",        "Dual mode only — switch the ETH pane between Engine 1's and Engine 2's own position/trades"),
     ]),
     ("RISK & SIZING", [
         ("[P]",        "Set risk per trade  (% of balance or a flat $ amount)"),
@@ -21828,15 +22730,16 @@ TRADING_HELP_SECTIONS = [
         ("[0]",        "Cycle sizing mode  (Standard -> Aggressive/1R+W -> Aggressive/1R+0.33W)"),
         ("[1]",        "Clear an active Drawdown Full Stop block (manual review)"),
         ("[2]",        "Toggle the profit ratchet  (trail an open stop to lock +(N-1)R at each +NR)"),
-        ("[8]",        "Cycle risk structure  (Fixed <-> VE)  — ETH only, under NV/NV-Auto"),
+        ("[8]",        "Cycle risk structure  (Standard -> Fixed -> VE)  — ETH only, under NV/NV-Auto"),
     ]),
     ("TRADING CONTROLS", [
-        ("[9]",        "Cycle trading mode  (Order Flow -> BTD candle-close -> NV candle-close -> NV-Auto immediate-entry)"),
+        ("[9]",        "Cycle trading mode  (Order Flow -> BTD candle-close -> NV candle-close -> NV-Auto immediate-entry)  — no-op in Dual mode"),
         ("[A]",        "Pause/resume new entries for the focused asset"),
-        ("[N]",        "Toggle 24H mode  (bypass the Session gate)"),
+        ("[N]",        "Cycle session restriction mode  (Standard -> Sunday On -> 24H)"),
         ("[F]",        "Flatten — close any open position immediately"),
         ("[G]",        "Go live / go sim  (toggle real trading vs. paper/DRY_RUN)"),
-        ("[R]",        "Reset the paper account balance  (DRY_RUN only)"),
+        ("[R]",        "Reset the paper account balance  (DRY_RUN only — resets both engines' own balances in Dual mode)"),
+        ("[B]",        "Enable/reconfigure/disable Dual mode — run two independently-configured paper engines on ETH concurrently (DRY_RUN only)"),
     ]),
     ("DATA & LOGS", [
         ("[D]",        "Open the raw data table view"),
@@ -22262,7 +23165,8 @@ def _effective_chart_asset(chart_focus, both_panes, ohlc_qqq_extra_view):
 
 # ── Main curses loop ───────────────────────────────────────────────────────────
 def curses_main(stdscr):
-    global PCT, NO_SESSION, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE, RISK_STRUCTURE
+    global PCT, SESSION_MODE, ATHENA_ENABLED, SIZING_MODE, RISK_MODE, RISK_DOLLARS, TRADING_MODE, RISK_STRUCTURE
+    global DUAL_MODE_ACTIVE, DUAL_ENGINES
     global FEE_ETH_PCT, FEE_QQQ_PER_UNIT, CLIENT_MODE, SERVER_MODE, PROFIT_RATCHET_ENABLED
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -22530,6 +23434,18 @@ def curses_main(stdscr):
                        "macro_options": False, "status": False}
     mode_help_scroll = {k: 0 for k in mode_help_open}
     chart_focus = "ETH"
+    # 2026-09-07 'Dual' mode: which of the two concurrent ETH engines the
+    # ETH OHLC/footprint pane currently shows — None (not yet switched;
+    # behaves the same as before Dual mode existed) / 1 / 2. Deliberately
+    # the SAME kind of plain, non-global, non-persisted local variable as
+    # gex_extra_focus/drift_extra_focus below (a chart-DISPLAY choice, not
+    # a trading-config change) — never touches chart_focus itself, which
+    # keeps meaning "ETH pane vs QQQ pane" for every other per-asset key
+    # ([W]/[T]/[E]/[A] etc.). Only meaningful (and only shown/toggleable)
+    # while DUAL_MODE_ACTIVE; resolves which of inst_snap["ETH#1"]/
+    # ["ETH#2"] feeds the ETH pane's position/pending/targets, and which
+    # engine's own trades build_trade_markers draws.
+    ohlc_engine_focus = None
     chart_zoom = False   # [Z] — fullscreen whichever pane is [Tab]-focused
                           # instead of the normal ETH/QQQ side-by-side split
     # [X] crosshair — re-created 2026-07-25 per explicit user request
@@ -22870,7 +23786,17 @@ def curses_main(stdscr):
 
             both_panes = chart_bottom - chart_top > 10
             if both_panes:
-                eth_inst = snap["instruments"].get("ETH") or {}
+                # 2026-09-07 'Dual' mode: the ETH pane shows Engine 1's or
+                # Engine 2's own snapshot (position/pending/targets/state)
+                # instead of the plain "ETH" one, once [U] has picked one
+                # — falls back to plain "ETH" if that engine's own
+                # instrument hasn't published a snapshot yet (e.g. Dual
+                # mode was just enabled this exact cycle). market
+                # data (eth_bars/eth_1m/CH_STATE levels, right below)
+                # stays keyed by the real "ETH" regardless — both engines
+                # trade the same real market.
+                _eth_inst_key = f"ETH#{ohlc_engine_focus}" if (DUAL_MODE_ACTIVE and ohlc_engine_focus) else "ETH"
+                eth_inst = snap["instruments"].get(_eth_inst_key) or snap["instruments"].get("ETH") or {}
                 qqq_inst = snap["instruments"].get("QQQ") or {}
                 eth_bars = snap["footprint_bars"].get("ETH") or []
                 qqq_bars = snap["footprint_bars"].get("QQQ") or []
@@ -22914,8 +23840,11 @@ def curses_main(stdscr):
                     # one — see _effective_chart_asset's own comment for why.
                     _zoom_shows_ndx = (zoom_asset == "QQQ" and ohlc_qqq_extra_view == "ndx")
                     _zoom_state_key = "NDX" if _zoom_shows_ndx else zoom_asset
+                    # 2026-09-07 'Dual' mode: only meaningful when the
+                    # zoomed pane IS the ETH one — QQQ never has engines.
+                    _zoom_engine = ohlc_engine_focus if (DUAL_MODE_ACTIVE and zoom_asset == "ETH") else None
                     draw_footprint_panel(db, zoom_asset, bars, inst, chart_top, chart_bottom, 0, cols,
-                                          profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"]),
+                                          profile_mode, build_trade_markers(zoom_asset, bars, inst, snap["trade_pairs"], engine=_zoom_engine),
                                           hscroll_bars=chart_scroll[_zoom_state_key], live_price=live, live_bar=live_bar,
                                           focused=True,
                                           market_closed=(zoom_asset == "QQQ" and snap["qqq_market_closed"]),
@@ -22929,7 +23858,7 @@ def curses_main(stdscr):
                                                         show_ndx=_zoom_shows_ndx),
                                           ohlc_trade_events=build_trade_markers(
                                               zoom_asset, z_1m + ([z_1m_live] if z_1m_live else []),
-                                              inst, snap["trade_pairs"]))
+                                              inst, snap["trade_pairs"], engine=_zoom_engine))
                 else:
                     mid = cols // 2
                     # 2026-08-26 user request: a blank gutter between ETH's
@@ -22940,8 +23869,10 @@ def curses_main(stdscr):
                     pane_gap = 2
                     eth_x1 = mid - pane_gap // 2
                     qqq_x0 = mid + pane_gap // 2
+                    # 2026-09-07 'Dual' mode: see eth_inst's own comment above.
+                    _eth_engine = ohlc_engine_focus if DUAL_MODE_ACTIVE else None
                     draw_footprint_panel(db, "ETH", eth_bars, eth_inst, chart_top, chart_bottom, 0, eth_x1,
-                                          profile_mode, build_trade_markers("ETH", eth_bars, eth_inst, snap["trade_pairs"]),
+                                          profile_mode, build_trade_markers("ETH", eth_bars, eth_inst, snap["trade_pairs"], engine=_eth_engine),
                                           hscroll_bars=chart_scroll["ETH"], live_price=eth_live, live_bar=eth_live_bar,
                                           focused=(chart_focus == "ETH"),
                                           crosshair_bar_idx=(chart_crosshair_idx["ETH"] if chart_crosshair_active["ETH"] else None),
@@ -22951,7 +23882,7 @@ def curses_main(stdscr):
                                           ohlc_vert_offset=ohlc_vert_offset["ETH"], ohlc_ui=ohlc_ui_common,
                                           ohlc_trade_events=build_trade_markers(
                                               "ETH", eth_1m + ([eth_1m_live] if eth_1m_live else []),
-                                              eth_inst, snap["trade_pairs"]))
+                                              eth_inst, snap["trade_pairs"], engine=_eth_engine))
                     # 2026-09-02: see the zoomed-pane call site's own comment
                     # just above for why this pulls from NDX's own scroll/
                     # crosshair/vert-pan state slot instead of QQQ's real one
@@ -23847,6 +24778,57 @@ def curses_main(stdscr):
             if scope is not None:
                 _flatten_scope[0] = scope
                 _flatten_all_evt.set()
+        elif key in (ord("b"), ord("B")):
+            # 2026-09-07 'Dual' mode — enable/reconfigure/disable. DRY_RUN-
+            # only (a real Phemex account has exactly one real balance, so
+            # "each engine's own starting balance" has no coherent real-
+            # money meaning) and refused while any instrument this would
+            # touch has an open position/pending order, since toggling
+            # rebuilds `instruments` from scratch in engine_loop — a fresh
+            # AthenaInstrument starts clean, so anything actually open
+            # would be silently orphaned rather than properly closed.
+            if not DUAL_MODE_ACTIVE:
+                if not DRY_RUN:
+                    console_log(f"{RED}Dual mode requires --dry-run (paper trading only) — via [B]{RST}")
+                elif (snap["instruments"].get("ETH") or {}).get("position") or (snap["instruments"].get("ETH") or {}).get("pending"):
+                    console_log(f"{RED}Can't enable Dual mode with an open ETH position/pending order — close it first (via [B]){RST}")
+                else:
+                    new_engines = _run_dual_engine_setup(stdscr, DUAL_ENGINES)
+                    db.prev = None   # wizard wrote straight to stdscr across every one of its own prompts
+                    if new_engines is not None:
+                        DUAL_ENGINES = new_engines
+                        DUAL_MODE_ACTIVE = True
+                        _save_dual_engine_state()
+                        _dual_mode_toggle_evt.set()
+                        console_log(f"{GRN}{BLD}Dual mode ENABLED (via [B]){RST}")
+                        log_event("SYSTEM", "dual_mode_enabled", {"engines": DUAL_ENGINES})
+            else:
+                choice = _prompt_choice(stdscr, "Dual mode is active",
+                                         [("c", "reconfigure engines", "reconfigure"),
+                                          ("d", "disable (back to single-engine)", "disable")])
+                db.prev = None
+                if choice == "reconfigure":
+                    new_engines = _run_dual_engine_setup(stdscr, DUAL_ENGINES)
+                    db.prev = None
+                    if new_engines is not None:
+                        DUAL_ENGINES = new_engines
+                        _save_dual_engine_state()
+                        console_log(f"{GRN}Dual mode config updated (via [B]){RST}")
+                        log_event("SYSTEM", "dual_mode_reconfigured", {"engines": DUAL_ENGINES})
+                elif choice == "disable":
+                    _eth1_busy = bool((snap["instruments"].get("ETH#1") or {}).get("position")
+                                       or (snap["instruments"].get("ETH#1") or {}).get("pending"))
+                    _eth2_busy = bool((snap["instruments"].get("ETH#2") or {}).get("position")
+                                       or (snap["instruments"].get("ETH#2") or {}).get("pending"))
+                    if _eth1_busy or _eth2_busy:
+                        console_log(f"{RED}Can't disable Dual mode with an open position/pending order on "
+                                    f"Engine 1 or 2 — close it first (via [B]){RST}")
+                    else:
+                        DUAL_MODE_ACTIVE = False
+                        _save_dual_engine_state()
+                        _dual_mode_toggle_evt.set()
+                        console_log(f"{YLW}Dual mode DISABLED — back to single-engine ETH/QQQ (via [B]){RST}")
+                        log_event("SYSTEM", "dual_mode_disabled", {})
         elif key in (ord("d"), ord("D")):
             data_view = True
             table_scroll = 0
@@ -23876,9 +24858,17 @@ def curses_main(stdscr):
         elif mode_help_open["trading"] and key == curses.KEY_DOWN:
             mode_help_scroll["trading"] = min(mode_help_scroll["trading"] + key_repeat_n, _help_menu_max_scroll(len(TRADING_HELP_LINES), rows))
         elif key in (ord("n"), ord("N")):
-            NO_SESSION = not NO_SESSION
-            console_log(f"{YLW}Session requirement {'BYPASSED (24H mode)' if NO_SESSION else 'RE-ENABLED'} (via [N]){RST}")
-            log_event("SYSTEM", "no_session_toggled", {"no_session": NO_SESSION})
+            # 2026-09-06 user request ("[N] should now cycle through 3
+            # modes: 'Standard Sessions' -> 'Sunday On' -> '24H'") —
+            # replaces the old plain on/off NO_SESSION toggle. Standard
+            # Sessions and Sunday On both still adhere to every Sessions &
+            # Exclusion rule (kill zones, the Tue/Wed 09:00-10:00
+            # exclusion); Sunday On's only difference is Sunday itself is
+            # no longer excluded (see status_get_session_status). 24H
+            # disregards all of it, same as the old NO_SESSION=True.
+            SESSION_MODE = {"standard": "sunday_on", "sunday_on": "24h", "24h": "standard"}[SESSION_MODE]
+            console_log(f"{YLW}Session mode: {SESSION_MODE_LABELS[SESSION_MODE]} (via [N]){RST}")
+            log_event("SYSTEM", "session_mode_changed", {"session_mode": SESSION_MODE})
         elif key in (ord("a"), ord("A")):
             # Acts on whichever pane is currently [Tab]-focused — per-asset
             # toggle (explicit user request 2026-07-24), not one shared
@@ -23894,6 +24884,23 @@ def curses_main(stdscr):
                           f"open positions still managed normally{RST}") if not ATHENA_ENABLED[focus_asset]
                          else f"{GRN}{BLD}{focus_asset} RESUMED (via [A]){RST}")
             log_event(focus_asset, "athena_enabled_toggled", {"enabled": ATHENA_ENABLED[focus_asset]})
+        elif (key in (ord("9"), ord("8"), ord("p"), ord("P"), ord("e"), ord("E"))
+              or (key == ord("0") and profile_mode != "ohlc")) and DUAL_MODE_ACTIVE:
+            # 2026-09-07 user-decided ("[9]/[8]/[P]/[E]/[0] become no-ops
+            # with a message while Dual mode is active"): each of these
+            # normally mutates ONE global trading-config value
+            # (TRADING_MODE/RISK_STRUCTURE/PCT-RISK_MODE-RISK_DOLLARS/
+            # FEE_ETH_PCT-FEE_QQQ_PER_UNIT/SIZING_MODE) that neither Dual
+            # engine reads anymore (see AthenaInstrument._eff) — letting
+            # them silently keep mutating a dead value would be confusing
+            # at best. Placed FIRST in this elif chain (ahead of each
+            # key's own normal handler below) so it intercepts before any
+            # of them fire; [0] only intercepted outside the OHLC panel,
+            # matching its own real guard exactly, since [0] genuinely
+            # means something else (candle/line style) in that view,
+            # unrelated to sizing and unaffected by Dual mode.
+            console_log(f"{DIM}[9]/[8]/[P]/[E]/[0] are inert while Dual mode is active — "
+                        f"press [B] to edit each engine's own settings instead{RST}")
         elif key == ord("0") and profile_mode != "ohlc":
             # 2026-08-27: replaces Blackjack's own [B] toggle — cycles
             # between the two SIZING_MODES (Standard/Aggressive). Guarded
@@ -23944,11 +24951,12 @@ def curses_main(stdscr):
             console_log(f"{YLW}{BLD}Trading mode: {TRADING_MODE}{RST} (via [9])")
             log_event("SYSTEM", "trading_mode_changed", {"mode": TRADING_MODE})
         elif key == ord("8"):
-            # 2026-09-02: cycles RISK_STRUCTURE (Fixed/VE) — only meaningful
-            # while ETH is trading under NV/NV-Auto (see that global's own
-            # module-level comment), but freely togglable any time so it's
-            # already set correctly before the user switches TRADING_MODE
-            # into NV/NV-Auto via [9].
+            # 2026-09-02: cycles RISK_STRUCTURE (Standard -> Fixed -> VE,
+            # Standard added 2026-09-08) — only meaningful while ETH is
+            # trading under NV/NV-Auto (see that global's own module-level
+            # comment), but freely togglable any time so it's already set
+            # correctly before the user switches TRADING_MODE into
+            # NV/NV-Auto via [9].
             idx = RISK_STRUCTURES.index(RISK_STRUCTURE)
             RISK_STRUCTURE = RISK_STRUCTURES[(idx + 1) % len(RISK_STRUCTURES)]
             _save_risk_structure()
@@ -24204,6 +25212,19 @@ def curses_main(stdscr):
             # at each call site).
             ohlc_qqq_extra_view = ({None: "markets", "markets": "ndx", "ndx": None}
                                     [ohlc_qqq_extra_view])
+        elif key in (ord("u"), ord("U")) and profile_mode == "ohlc" and DUAL_MODE_ACTIVE:
+            # 2026-09-07 'Dual' mode — switches the ETH OHLC/footprint
+            # pane between Engine 1's and Engine 2's own position/pending/
+            # targets/historical trades (both trade the same real ETH, so
+            # nothing else on this pane can tell them apart on its own).
+            # Plain local toggle, same non-global/non-persisted/no-
+            # log_event pattern chart_focus's own [Tab] handler uses — a
+            # chart DISPLAY choice, not a trading-config change. [U] is
+            # free here: its only other binding in the file is inside
+            # Options Flow mode's own key dispatch (OPTFLOW_MUTED), a
+            # mutually exclusive mode.
+            ohlc_engine_focus = {None: 1, 1: 2, 2: None}[ohlc_engine_focus]
+            console_log(f"{YLW}ETH pane: {'Engine ' + str(ohlc_engine_focus) if ohlc_engine_focus else 'live'} (via [U]){RST}")
         elif key == 27 and mode_help_open["trading"]:
             mode_help_open["trading"] = False
             mode_help_scroll["trading"] = 0

@@ -15,7 +15,8 @@ Athena implements the **CCCCWIDE** framework — a rules-based system that requi
 - [Modes](#modes)
 - [Trading Engine](#trading-engine)
 - [Sizing Modes](#sizing-modes)
-- [Risk Structures (Fixed / VE)](#risk-structures-fixed--ve)
+- [Risk Structures (Standard / Fixed / VE)](#risk-structures-standard--fixed--ve)
+- [Dual Mode](#dual-mode)
 - [Drawdown De-Risking Ladder](#drawdown-de-risking-ladder)
 - [DVOL Layer](#dvol-layer)
 - [Target System](#target-system)
@@ -91,7 +92,7 @@ python3 athena.py [OPTIONS]
 | `--interval SEC` | `2` | Engine poll cadence in seconds (clamped to 1–3) |
 | `--pct FLOAT` | `1.0` | % of balance to risk per trade |
 | `--dry-run` | off | Paper-trade via SimAccount (no real orders) |
-| `--no-session` | off | 24-hour mode — removes Session from the readiness gate |
+| `--no-session` | off | Starts straight into 24H session mode (see [N] below) — removes Session from the readiness gate |
 | `--reset-sim` | off | Wipe paper account to starting balance on launch |
 | `--sim-balance FLOAT` | `10000` | Paper-account balance to seed or reset to |
 | `--backfill-hours FLOAT` | auto | Footprint backfill depth in hours |
@@ -153,6 +154,8 @@ Two same-day follow-ups from a later user pass over the initial port: **(1)** "R
 **VolEffort now on by default (2026-08-30 user request):** `ohlc_vol_effort` started `False` when first ported (a brand-new indicator, deliberately conservative) — now defaults to `True`, same default-on treatment `[4]`'s own Historical Mode already got on 2026-08-27. `[6]` still toggles it off per-session as before.
 
 **EEOD boundary moved to 19:30 CT (2026-08-30 user-reported — "EEOD should begin at 19:30 CT, not 18:30 CT"):** EEOD's start was defined in three separate places that all needed the same change: `STATUS_KILL_ZONES`/`STATUS_EXCL_EEOD_START` (the Data view's own session-status readout, `status_get_session_status`), `OPTFLOW_KILL_ZONES`/`OPTFLOW_EXCL_EEOD_START` (the same session logic duplicated for the options-flow view, `_optflow_session_status`), and the OHLC panel's own in-chart `OHLC_SESSIONS` boundary-marker list. All three had EEOD starting at minute 1110 (18:30 CT) / `(18,30)` — all three now start it at minute 1170 (19:30 CT) / `(19,30)`. EOD's own boundary (16:00–18:00 CT) is unchanged, so there's now an unlabeled 18:00–19:30 CT gap between EOD and EEOD in all three views, same as the pre-existing 18:00–18:30 gap before this change — just wider.
+
+**EEOD is now tradable (2026-09-06 user request — "The EEOD session should be tradable and no longer restricted"):** EEOD (19:30 CT–midnight) used to force `excl_reason = 'EEOD — no trading'` in both `status_get_session_status` and its `_optflow_session_status` display duplicate — the ONLY kill zone that ever did this (every other named zone is tradable whenever the Session light is otherwise green for it). That exclusion branch (and the now-dead `STATUS_EXCL_EEOD_START`/`OPTFLOW_EXCL_EEOD_START` constants it used) has been removed — EEOD behaves exactly like Morning/Lunchtime/Power Hour/EOD now. It stays a named kill zone (still shown in the Status screen and session/regime breakdowns), just no longer an excluded one. The OHLC chart's own EEOD session-band color changed from red (which visually meant "excluded," shared with the genuine Wed/Thu 09:00–10:00 exclusion band) to dim gray, so a tradable EEOD no longer looks like a restricted one on the chart either.
 
 **OHLC chart scale bug fixed (2026-09-01 user-reported, with a screenshot showing candles crushed into the bottom half of the pane — "should scale to the highest high and lowest low of all of the candles visible... the scaling is too small here"):** the 2026-08-27 fix that excludes an ER-type TP leg from extending the chart's own visible price range only ever listed `"ER 100%"`/`"ER 150%"` — it predates `ER 40%`/`ER 80%` joining the target list as their own TP types (added earlier the same day as this report). A TP leg landing on either of those two newer tiers was still blowing the visible range out exactly like ER 100%/150% used to, exactly as seen in the reported screenshot (TP2 at `ER 80%`, 46 points from price). All four ER tiers are excluded from the range-extension now — the chart scales to the candles' own high/low (plus Entry/SL/BT/ST/Cluster/GEX Flip/VWAP/POC/VAH/VAL, which stay close enough to price not to cost readability) exactly as originally intended. Verified with a synthetic render: a TP2 leg 46 points outside the candle range no longer pulls the top axis label anywhere near it.
 
@@ -271,7 +274,7 @@ All five structural lights must be green before the engine arms:
 
 | Light | Condition |
 |---|---|
-| **Session** | Inside a defined trading session (skipped with `--no-session`) |
+| **Session** | Inside a defined trading session (skipped in 24H mode — see `[N]` below) |
 | **Volatility** | DVOL (ETH) or VXN (QQQ) data available |
 | **PCVR** | Put/Call Volume Ratio in a directional regime (≤0.98 = Long, ≥1.02 = Short) |
 | **HPLs** | At least one high-probability level active (from status.py) |
@@ -294,6 +297,8 @@ In **BTD** trading mode (`[9]` toggle), entries fire off `btd_confirmation` inst
 ### NV Confirmation
 
 **NV** (2026-09-01 user request) is a third trading mode, `[9]`-cycled alongside Order Flow and BTD: `Order Flow → BTD → NV → Order Flow`. It shares BTD's *exact* candle-close confirmation mechanism (same `btd_confirmation` call, same entry/target/sizing/risk-management pipeline downstream — none of that changed) — the only thing NV changes is where `regime` (the long/short directional bias) comes from. Every other mode derives it from PCVR (a single TLT-based ratio shared by both ETH and QQQ); NV derives it **per-asset**, independently, from that asset's own **Net Volume** status (see below) — ETH always reads ETH's own Net Volume, QQQ always reads QQQ's own, with no cross-asset or TLT influence at all. Entry-placement events log the actual mode (`"trigger": "BTD"` or `"trigger": "NV"`) instead of always saying "BTD", so trade-log/backtest analysis can tell the two apart.
+
+**PCVR's TLT/ETH source switch is now holiday/early-close aware (2026-09-07 user-reported — Labor Day, "the market is currently closed today... but Athena is using TLT's PCVR for 08:30-15:00 like it normally does"):** `fetch_status_pcvr()` sources PCVR from TLT's own CBOE options chain during `status_in_tlt_window()` (weekdays, 08:45-15:00 CT) and falls back to ETH's own Deribit options volume outside it — that window check used to be pure weekday + time-of-day, with no notion of an NYSE holiday or early-close day at all, so a fully-closed session (Labor Day, Thanksgiving, Christmas, etc.) still read TLT's own stale/absent options volume as if it were a normal live trading day. `status_in_tlt_window()` (and `status_qqq_market_closed()`, same root cause) now check `NYSE_HOLIDAYS`/`NYSE_EARLY_CLOSES` — a hardcoded calendar covering the current + next year, sourced from NYSE Group's own published holiday/early-closing schedule — returning "closed" all day on a full-closure holiday, and narrowing the window to end at `NYSE_EARLY_CLOSE_CT_MIN` (noon CT / 1:00 PM ET) rather than the regular 15:00 CT close on an early-close day (day after Thanksgiving, Christmas Eve). **This calendar needs a fresh year's dates added annually** — a year with no entries silently falls back to the pre-fix weekday-only behavior for that year, it doesn't raise or warn.
 
 **Immediate close on a Net Volume flip (2026-09-01 same-day follow-up):** needed no new code. The existing PCVR-flip emergency-close (`_manage_position`'s own `flipped` check, and the analogous `pending_flipped` check for a still-resting entry) already just compares the open position's side against whatever `regime` the CURRENT cycle's `instrument_lights` call produced — and under NV that's already Net-Volume-derived. A Positive→Negative (or Negative→Positive) flip trips it exactly like a PCVR flip always has, market-closes the position, and logs `pcvr_flip_close` (event name unchanged — it's the same mechanism, just fed by a different regime source under NV). Merely moving to Neutral does **not** trigger this — `regime` becomes `None`, which matches neither side of the `flipped` check, same as PCVR's own dead-zone never force-closing a position on its own.
 
@@ -321,6 +326,18 @@ No new entries are placed between 19:00–19:30 CT (the daily session boundary).
 
 ---
 
+## Session Modes
+
+**2026-09-06 user request: "[N] should now cycle through 3 modes."** Replaces the old plain on/off 24H toggle. `[N]` cycles `Standard Sessions → Sunday On → 24H → Standard Sessions`:
+
+- **Standard Sessions** — full Sessions & Exclusion rules apply: the Session light only goes green inside a defined kill zone (NDO/Morning/Lunchtime/Power Hour/EOD/EEOD), Sunday is excluded entirely, and the Wed/Thu 09:00–10:00 CT window is excluded.
+- **Sunday On** — identical to Standard Sessions in every other respect (kill zones, the Wed/Thu 09:00–10:00 exclusion), except Sunday is no longer excluded — the Session light can go green on a Sunday same as any other day, provided the current time still falls in a defined kill zone.
+- **24H** — disregards Sessions & Exclusion rules entirely, same as the old `NO_SESSION=True`/`--no-session` behavior: the Session light is dropped from the readiness gate outright (`required_status_lights()`), so Athena can arm and trade around the clock regardless of session, day of week, or exclusion window.
+
+`--no-session` at launch starts straight into 24H, same as it always has. The dashboard header shows `[24H MODE]` or `[SUN ON]` next to `[DRY RUN]` when either non-default mode is active (nothing shown in Standard Sessions); the compact readiness row's own Session light shows `(bypassed)` only in 24H, since Sunday On's Session light still behaves normally — it's just no longer forced red on a Sunday.
+
+---
+
 ## Sizing Modes
 
 **2026-08-27: replaces the old Blackjack loss-progression ladder entirely.** Three user-selectable sizing modes, cycled with `[0]`, all built on the same base risk-per-trade amount (`[P]`, see Risk Sizing below):
@@ -340,20 +357,55 @@ State is persisted to `sizing_state.json` and survives restarts. (This file repl
 
 ---
 
-## Risk Structures (Fixed / VE)
+## Risk Structures (Standard / Fixed / VE)
 
-**2026-09-02 user request** — two SL/TP management structures, `[8]`-cycled, that apply **only to ETH, only under NV or NV-Auto trading mode** (every other asset/mode combination is unaffected and keeps the normal [Target System](#target-system)-driven TP1/TP2 selection):
+**2026-09-02 user request** — SL/TP management structures, `[8]`-cycled, that apply **only to ETH, only under NV or NV-Auto trading mode** (every other asset/mode combination is unaffected and always uses the normal [Target System](#target-system)-driven TP1/TP2 selection regardless of this setting):
 
+- **Standard** (2026-09-08 user request — "use Athena's original TP1/TP2, set to the 2 nearest targets from the target list, automatically adjusting like it normally does") — restores the exact same [Target System](#target-system)-driven TP1/TP2 selection every non-NV trading mode already uses: the 2 nearest qualifying targets from the target list (falling back to 1, or the least-invalid dropped candidate, exactly like the standard path does elsewhere), SL at the normal $1.00/unit-cushion breakeven lock once TP1 fills. This is the "no special NV/NV-Auto risk structure" option — functionally, an ETH NV/NV-Auto trade under Standard is managed identically to a BTD or Order Flow trade.
 - **Fixed** — TP1 is set exactly $20 from entry, TP2 exactly $30 (`NV_FIXED_TP1_DISTANCE`/`NV_FIXED_TP2_DISTANCE`), split 50/50 same as the standard target system. SL begins static at $10. Once TP1 fills, SL moves to **true breakeven** — "the level where the open position's entry & exit trading costs are recovered," i.e. exactly $0.00 of net profit beyond fees, not the $1.00/unit cushion every other mode's own TP1-breakeven-lock gives (`_apply_tp1_breakeven_lock`'s `net_per_unit` parameter is `0.0` here, `1.00` everywhere else).
 - **VE** — no TP1/TP2 are ever placed (`tp_legs` stays empty). Instead, **1/3 of the position closes each time a VolEffort signal (`[6]` in the OHLC panel) shows absorption in the direction OPPOSING the trade** — a bullish absorption bar while short, a bearish absorption bar while long — up to 3 signals, at which point the 3rd signal closes whatever remains (never leaves dust from the `/3` rounding). SL begins at $10; once price has moved **2R** into profit (`NV_VE_BREAKEVEN_R_MULTIPLE`), SL moves to the same true-breakeven level Fixed's own TP1 lock uses. Since VE has no TP legs for the generic TP1-partial-fill-detection code to react to, its own breakeven move and partial closes are both handled directly in `_manage_position`, and the trade is pre-marked as if its TP1 lock had already fired at entry time so the generic code never tries.
+  - **+1R minimum before the first partial close (2026-09-06 user request — "VE mode should not begin taking profits until price has moved at least +1R in profit"):** an opposing-absorption signal arriving before the trade has moved **1R** into profit (`NV_VE_MIN_PROFIT_R_TO_CLOSE`) is now a non-event — same treatment a same-direction absorption bar already got — rather than triggering an early partial close. This only gates the FIRST close; once profit-taking has actually begun (a 1st signal has fired), later signals fire on the opposing-absorption read alone again, even if price pulls back below +1R in between — the gate is specifically about not *beginning* to take profit too early, not a running requirement on every signal.
 
 Persisted as `_risk_structure` in `sizing_state.json`, same reserved-key pattern as `_trading_mode`/`_sizing_mode`.
 
 ---
 
+## Dual Mode
+
+**2026-09-07 user request** — run two fully independent, concurrently-trading ETH strategies ("engines") side by side, to compare configurations directly instead of testing one at a time. Toggled/reconfigured with `[B]` on the Trading dashboard. **Dry-run only** — a real Phemex account has exactly one real balance, so "each engine's own starting balance" only makes sense against the simulated paper ledger; `[B]` refuses to enable Dual mode without `--dry-run`, and Dual mode never resumes active on a live-mode restart even if it was left on before switching.
+
+Each engine gets its own full 7-field configuration, set via a guided prompt sequence (`[B]` re-opens the same flow later, pre-filled with the current values, to edit anything):
+
+- **Trading mode** — Order Flow, BTD candle-close, NV candle-close, or NV-Auto immediate-entry
+- **Starting balance** — default $500
+- **Sizing mode** — Standard, Aggressive/1R+W, or Aggressive/1R+0.33W (see Sizing Modes, above)
+- **Risk per trade (%)**
+- **Risk structure** — Standard, Fixed, or VE, only meaningful under NV/NV-Auto (see Risk Structures, above)
+- **Fees** — % of position value
+- **Restrictions** — Standard Sessions, Sunday On, or 24H (the `[N]` cycle, see Session Modes, above)
+
+Both engines trade the real, shared ETH market data concurrently, but are otherwise fully isolated from each other and from single-engine mode:
+
+- **Independent paper ledgers** — each engine gets its own `SimAccount`, its own starting balance, its own fee rate, and its own save file (`sim_account_engine1.json`/`sim_account_engine2.json`), so their balances can never cross-contaminate.
+- **Independent drawdown/closed-PnL tracking** — each engine has its own equity-peak and closed-PnL bucket, so one engine's losing streak can never trip the other's Drawdown De-Risking Ladder or Daily/Max Win limits, and their realized PnL is never merged.
+- **`[9]`/`[8]`/`[P]`/`[E]`/`[0]`** (trading mode, risk structure, risk %, fees, sizing mode) have no single engine to apply to while Dual mode is active — they become no-ops with a console message pointing back at `[B]`, rather than silently mutating a global neither engine reads. `[N]` (session restriction) is unaffected — it isn't part of the Dual per-engine config surface.
+- **`[R]`** resets **both** engines to their own configured starting balance (not one shared prompted value).
+
+**Dashboard** — while Dual mode is active, the Trading dashboard shows three rows instead of two: "ETH (Engine 1)", "ETH (Engine 2)", and QQQ's existing monitoring-only row — each ETH row showing that engine's own trading mode, sizing mode, risk structure, and session mode inline, exactly like the normal single-engine ETH row does.
+
+**Data view** — the combined trade log and PnL chart include every trade from both engines, tagged with a new **Engine** column (`Engine 1`/`Engine 2`; blank for any pre-Dual-mode trade). The running-balance walk is computed independently per engine (each starts from its own configured/reset balance), then merged by exit time for display.
+
+**OHLC chart switch** — `[U]`, OHLC profile only, while Dual mode is active — switches the ETH pane between Engine 1's and Engine 2's own live position and historical trade markers. Cycles `Engine 1 → Engine 2 → (back to whichever the dashboard focus resolves to)`, a plain per-session display choice, not persisted.
+
+**Guardrails** — `[B]` refuses to enable, reconfigure, or disable Dual mode while either ETH engine (or the single-engine ETH instrument, when disabling) has an open position or a pending order, since toggling rebuilds the traded-instrument list from scratch and would otherwise orphan anything actually open. Engine configuration + the active/inactive flag persist to their own `dual_engine_state.json`.
+
+---
+
 ## Drawdown De-Risking Ladder
 
-Protects the equity curve independent of whichever sizing mode is active — tracks each account's own **all-time equity high-water mark** (never resets) and scales every new trade's own risk-per-trade dollar amount down as the account's current equity falls further from that peak:
+Protects the equity curve independent of whichever sizing mode is active — tracks each account's own **all-time realized-balance high-water mark** (never resets) and scales every new trade's own risk-per-trade dollar amount down as the account's current realized balance falls further from that peak:
+
+**Realized-only, frozen while a trade is open (2026-09-07 user-reported — "the account is always in drawdown since it takes the deduction of fees as a dip from the equity high... should only calculate DD AFTER a trade is closed, net of fees"):** used to track live equity (balance + open PnL) every cycle — the entry fee is deducted from balance the instant a trade fills, before price has even had a chance to move, so merely *opening* a trade always registered as some amount of drawdown, even with zero actual loss. The peak/tier tracker (`_update_equity_peak`) — and every dashboard/sizing readout that reports a dd%  (the ACCOUNT line's own `DD` tag, `current_drawdown_mult`, a manual `[1]` clear) — now reads `AppState.realized_balance`: balance as of the last moment the account was fully flat, frozen for the *entire* duration any position is open (regardless of how deep into open profit, open loss, or fee-drag it currently sits) and only reassigned the instant a trade actually closes, at which point balance already reflects that trade's full net result, fees included. The "Equity" figure elsewhere on the dashboard is unaffected — it still shows live balance + open PnL, exactly as before; only the drawdown/sizing-ladder calculation changed.
 
 **Down-triggers are immediate and unconditional** — moving to a worse tier never waits:
 
@@ -449,7 +501,7 @@ Position size: `qty = trade_risk / SL_distance`
 - **TP1 Breakeven Lock** — After TP1 fills, the SL moves to breakeven on the remaining position.
 - **PCVR Flip Close** — If PCVR flips to the opposite extreme (long position + PCVR ≥ 1.02, or short + PCVR ≤ 0.98), the position is market-closed immediately. Under NV/NV-Auto, the same mechanism reacts to a Net Volume flip (Positive↔Negative) instead — no separate code path, `regime` is just sourced differently.
 - **EOD Flatten** — QQQ positions used to close at market close (15:00 CT); moot since 2026-09-02 — QQQ can no longer hold a position under any mode (see Trading mode's own QQQ-removal note). ETH under NV-Auto instead flattens at **00:00 CT** (see NV-Auto Confirmation) since Net Volume's own counter resets there.
-- **Risk Structures (Fixed / VE)** — ETH-only, NV/NV-Auto-only alternate SL/TP management; see [Risk Structures](#risk-structures-fixed--ve) above.
+- **Risk Structures (Standard / Fixed / VE)** — ETH-only, NV/NV-Auto-only SL/TP management selector; see [Risk Structures](#risk-structures-standard--fixed--ve) above.
 - **Funding Rate** — Phemex funding rates are fetched and displayed. In `--dry-run` mode, funding is accrued to the SimAccount every 8 hours.
 - **Duration** (2026-08-27) — shown on the dashboard's Position line next to Realized, `HH:MM:SS` elapsed since fill, recomputed live every render (started as `HH:MM`-only, switched to include seconds since a fresh position under a minute old otherwise reads as stuck at "00:00" with no visible movement). A reconciled position (one already open when Athena starts, DRY_RUN or real) used to always stamp `fill_time` as the moment of reconciliation, so Duration silently reset to `00:00:00` on every relaunch — fixed: `_last_fill_ts` recovers the TRUE original entry timestamp from `athena_logs`' own `filled` event (written on every fill regardless of mode), falling back to the reconciliation moment only if that log entry genuinely isn't there (rotated away, or a position that predates this fix).
 
@@ -465,7 +517,7 @@ Binds to the LAN interface (auto-detected) and optionally a WireGuard VPN addres
 
 - Status lines, GEX state, footprint bars
 - Position/PnL data, sizing mode state
-- DRY_RUN/NO_SESSION/ENABLED flags
+- DRY_RUN/SESSION_MODE/ENABLED flags
 - Data view trade history
 
 ### Client Mode
@@ -501,7 +553,7 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `sim_account.json` | Paper account state (balance, positions, orders) |
 | `sim_logs/YYYY/MM/DD/*.jsonl` | Paper trade ledger (one file per day) |
 | `athena_logs/YYYY/MM/DD/*.jsonl` | Event log (entries, fills, closes, errors) |
-| `sizing_state.json` | Sizing mode, Aggressive's pending win-boost per asset, Aggressive/1R+0.33W's pending win-boost per asset, the persisted trading mode (Order Flow/BTD/NV/NV-Auto), and the persisted risk structure (Fixed/VE) |
+| `sizing_state.json` | Sizing mode, Aggressive's pending win-boost per asset, Aggressive/1R+0.33W's pending win-boost per asset, the persisted trading mode (Order Flow/BTD/NV/NV-Auto), and the persisted risk structure (Standard/Fixed/VE) |
 | `equity_peak_state.json` | All-time equity high-water mark + drawdown block state, per sim/real account |
 | `daily_loss_state.json` | Consecutive loss tracker per asset |
 | `max_win_state.json` | Consecutive win tracker per asset |
@@ -545,19 +597,21 @@ The sync handshake uses HMAC-SHA256 with a challenge-response protocol. The shar
 | `W` | Set SL distance |
 | `E` | Set fee per unit |
 | `T` | Set imbalance ratio |
-| `N` | Toggle 24H/session mode |
+| `N` | Cycle session mode: Standard Sessions → Sunday On → 24H (2026-09-06, see Session Modes below; was a plain 24H on/off toggle) |
 | `0` | Cycle sizing mode (Standard → Aggressive → Aggressive/1R+0.33W) — candle/line style toggle instead, while viewing the OHLC profile. Aggressive/1R+0.33W added 2026-09-02, see Sizing Modes |
 | `1` | Clear an active Drawdown Full Stop block (manual review) |
 | `2` | Toggle the profit ratchet (trail an open stop to lock +(N-1)R at each +NR) — 2026-09-02 bugfix: used to silently do nothing while viewing the OHLC profile (a stray copy-paste of `0`'s own guard, with no actual OHLC-mode meaning of its own to justify it); now works in every view |
-| `8` | Cycle risk structure (Fixed ↔ VE) — ETH only, under NV/NV-Auto (2026-09-02, see Risk Structures) |
+| `8` | Cycle risk structure (Standard → Fixed → VE) — ETH only, under NV/NV-Auto (2026-09-02, see Risk Structures; Standard added 2026-09-08) |
 | `9` | Cycle trading mode (Order Flow → BTD → NV → NV-Auto → Order Flow) — renamed 2026-08-27, was "CCCCWIDE"; NV added 2026-09-01, NV-Auto added 2026-09-02 (see Trading Engine's own NV/NV-Auto Confirmation sections) |
 | `Y` | OHLC profile, QQQ pane only — cycle candle chart → Markets macro overview → NDX candlestick chart → back (NDX added 2026-09-02) |
 | `4` | OHLC profile — toggle VAH/VAL/POC Historical Mode (on by default as of 2026-08-27). Current state (`VP:Normal`/`VP:Historical`) shows right in the pane's own header (2026-08-28) |
 | `6` | OHLC profile — toggle **VolEffort** (2026-08-29), ported from `vol-effort.py`. Replaces the bottom VOL histogram with a z-score histogram of volume-per-range "effort" — off by default. Header shows `VolEffort:On` when active |
+| `U` | OHLC profile, Dual mode only (2026-09-07) — switch the ETH pane between Engine 1's and Engine 2's own position/trades. See Dual Mode below |
 | `F` | Flatten position |
 | `G` | Toggle live/sim mode |
 | `H` | Full key-reference overlay for this mode |
-| `R` (double) | Reset paper account (dry-run only) |
+| `R` (double) | Reset paper account (dry-run only) — resets both engines to their own configured starting balances while Dual mode is active |
+| `B` | Enable/reconfigure/disable **Dual mode** (2026-09-07, dry-run only). See Dual Mode below |
 
 ### GEX Mode
 
